@@ -8,7 +8,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC / first cut. Two tools; not yet smoke-tested against a live ComfyUI.
+> **Status:** early POC. Four tools; the comfy-cli plumbing is smoke-tested, a full generation round-trip is pending a running ComfyUI.
 
 ## Prerequisites
 
@@ -21,12 +21,14 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 
 | Tool | Wraps | Purpose |
 |---|---|---|
-| `run_workflow(workflow_path, timeout_seconds=600)` | `comfy run --workflow <path> --wait` | Run a workflow JSON on local ComfyUI and wait for the result. |
+| `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. Call first. |
+| `run_workflow(workflow_path, wait=True, timeout_seconds=600)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
+| `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `fetch_outputs(prompt_id, out_dir)` | `comfy download <prompt_id> --out-dir <dir>` | Download a finished job's outputs to disk. |
 
-Planned next, each a one-line passthrough: `job_status` (`comfy jobs status`),
-`discover` (`comfy discover` / `comfy which`), `launch`/`stop`
-(`comfy launch --background` / `comfy stop`).
+Planned next, each a one-line passthrough: `discover` (`comfy discover`),
+`launch`/`stop` (`comfy launch --background` / `comfy stop`) — plus a real
+generation round-trip test.
 
 ## Run
 

@@ -20,6 +20,10 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Stray uv lockfile — comfy-cli bundles uv and can write this into CWD;
+# this project uses pip/setuptools, so it is not ours.
+uv.lock
+
 # Env files
 .env
 .env.*

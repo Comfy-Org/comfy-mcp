@@ -102,17 +102,43 @@ def _last_json_object(stdout: str) -> dict | None:
 
 
 @mcp.tool()
-def run_workflow(workflow_path: str, timeout_seconds: float = 600.0) -> Any:
-    """Run a ComfyUI workflow JSON on the LOCAL ComfyUI and wait for it to finish.
+def server_info() -> Any:
+    """Report the local ComfyUI / comfy-cli environment.
+
+    Wraps ``comfy env``. Returns whether a local ComfyUI server is running and
+    its URL, plus the selected workspace and Python info. Call this first to
+    confirm a local ComfyUI is up before running a workflow.
+    """
+    return _run_comfy("env", timeout=60.0)
+
+
+@mcp.tool()
+def run_workflow(
+    workflow_path: str, wait: bool = True, timeout_seconds: float = 600.0
+) -> Any:
+    """Run a ComfyUI workflow JSON on the LOCAL ComfyUI.
 
     Accepts an API-format or UI-export workflow file. Wraps
-    ``comfy run --workflow <path> --wait``. Returns the run result (prompt_id,
-    status, and output references). For minutes-long generations, raise
-    ``timeout_seconds`` — this call blocks until the run completes.
+    ``comfy run --workflow <path>``. With ``wait=True`` (default) this blocks
+    until the run finishes and returns the full result; with ``wait=False`` it
+    submits and returns immediately with a ``prompt_id`` to poll via
+    ``job_status`` — use that for minutes-long generations so the call does not
+    block.
     """
-    return _run_comfy(
-        "run", "--workflow", workflow_path, "--wait", timeout=timeout_seconds
-    )
+    args = ["run", "--workflow", workflow_path]
+    if wait:
+        args.append("--wait")
+    return _run_comfy(*args, timeout=timeout_seconds if wait else 60.0)
+
+
+@mcp.tool()
+def job_status(prompt_id: str) -> Any:
+    """Check a submitted job's status (queued / running / completed / error).
+
+    Wraps ``comfy jobs status <prompt_id>``. Returns the job status and, when
+    finished, its output references. Poll this after ``run_workflow(wait=False)``.
+    """
+    return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
 
 @mcp.tool()
