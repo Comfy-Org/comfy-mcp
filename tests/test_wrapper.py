@@ -20,6 +20,23 @@ import pytest
 from comfy_local_mcp import server
 
 
+def _fake_run(envelope: dict):
+    """Return a ``subprocess.run`` stand-in that captures calls and emits ``envelope``.
+
+    Pure factory (no patching): returns ``(fake, calls)``. Tests either patch
+    ``fake`` in themselves or use the ``patched_run`` fixture, which wraps this.
+    """
+    calls: list[dict] = []
+
+    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
+        calls.append({"cmd": cmd, "env": env})
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(envelope), stderr=""
+        )
+
+    return fake, calls
+
+
 @pytest.fixture
 def patched_run(monkeypatch):
     """Patch away ``shutil.which`` + ``subprocess.run`` for ``_run_comfy``.
@@ -30,14 +47,7 @@ def patched_run(monkeypatch):
     """
 
     def setup(envelope: dict) -> list[dict]:
-        calls: list[dict] = []
-
-        def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
-            calls.append({"cmd": cmd, "env": env})
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout=json.dumps(envelope), stderr=""
-            )
-
+        fake, calls = _fake_run(envelope)
         monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
         monkeypatch.setattr(server.subprocess, "run", fake)
         return calls
@@ -266,3 +276,42 @@ def test_server_instructions_cover_canonical_flows():
     # The template on-ramp.
     for tool in ("search_templates", "fetch_template"):
         assert tool in instructions
+
+
+def test_launch_comfyui_passes_background_flag(patched_run):
+    """launch_comfyui must run `comfy … launch --background` (detached start)."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 42}})
+
+    assert server.launch_comfyui() == {"pid": 42}
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
+    assert cmd[4:] == ["launch", "--background"]  # no extras -> no `--` separator
+
+
+def test_launch_comfyui_forwards_extra_args_after_separator(patched_run):
+    """Extra args are forwarded to ComfyUI after a `--` separator."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.launch_comfyui(["--port", "8189"])
+
+    assert calls[0]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
+
+
+def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
+    """stop only targets comfy-cli's own pid; no recorded server -> clean error."""
+    calls = patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {
+                "code": "no_recorded_server",
+                "message": "no ComfyUI server was launched by comfy-cli",
+            },
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="no_recorded_server"):
+        server.stop_comfyui()
+
+    assert calls[0]["cmd"][4:] == ["stop"]
