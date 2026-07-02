@@ -21,7 +21,11 @@ from comfy_local_mcp import server
 
 
 def _fake_run(envelope: dict):
-    """Return a subprocess.run stand-in that captures the call and emits an envelope."""
+    """Return a ``subprocess.run`` stand-in that captures calls and emits ``envelope``.
+
+    Pure factory (no patching): returns ``(fake, calls)``. Tests either patch
+    ``fake`` in themselves or use the ``patched_run`` fixture, which wraps this.
+    """
     calls: list[dict] = []
 
     def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
@@ -33,11 +37,27 @@ def _fake_run(envelope: dict):
     return fake, calls
 
 
-def test_global_flags_precede_subcommand(monkeypatch):
+@pytest.fixture
+def patched_run(monkeypatch):
+    """Patch away ``shutil.which`` + ``subprocess.run`` for ``_run_comfy``.
+
+    Returns a ``setup(envelope) -> calls`` helper: call it with the envelope
+    the fake comfy-cli should emit, and get back the list that captures each
+    invocation (``cmd`` + ``env``).
+    """
+
+    def setup(envelope: dict) -> list[dict]:
+        fake, calls = _fake_run(envelope)
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        return calls
+
+    return setup
+
+
+def test_global_flags_precede_subcommand(patched_run):
     """Regression: `comfy run … --json` errors; it must be `comfy --json … run`."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"x": 1}})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
 
     assert server._run_comfy("jobs", "status", "abc") == {"x": 1}
 
@@ -48,7 +68,71 @@ def test_global_flags_precede_subcommand(monkeypatch):
     assert calls[0]["env"]["COMFY_WHERE"] == "local"  # belt-and-suspenders pin
 
 
-def test_error_envelope_raises_with_code(monkeypatch):
+def test_error_envelope_raises_with_code(patched_run):
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="server_not_running"):
+        server._run_comfy("env")
+
+
+def test_missing_binary_raises(monkeypatch):
+    monkeypatch.setattr(server.shutil, "which", lambda _: None)
+    with pytest.raises(server.ComfyCliError, match="not found on PATH"):
+        server._run_comfy("env")
+
+
+def test_cancel_job_maps_command_and_returns_data(monkeypatch):
+    """cancel_job wraps `comfy jobs cancel <id>` and returns the envelope data."""
+    fake, calls = _fake_run(
+        {"type": "envelope", "ok": True, "data": {"cancelled": "abc"}}
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.cancel_job("abc") == {"cancelled": "abc"}
+    assert calls[0]["cmd"][4:] == ["jobs", "cancel", "abc"]  # mapped subcommand
+
+
+def test_cancel_job_unknown_id_raises_error_envelope(monkeypatch):
+    """Cancelling an unknown prompt_id surfaces comfy-cli's error envelope."""
+    fake, _ = _fake_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "not_found", "message": "no such job: nope"},
+        }
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="not_found"):
+        server.cancel_job("nope")
+
+
+def test_get_queue_maps_command_and_returns_data(monkeypatch):
+    """get_queue wraps `comfy jobs ls` and returns the merged job list."""
+    jobs = {
+        "jobs": [
+            {"prompt_id": "a", "status": "running"},
+            {"prompt_id": "b", "status": "completed"},
+        ]
+    }
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": jobs})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.get_queue() == jobs
+    assert calls[0]["cmd"][4:] == ["jobs", "ls"]  # no positional args
+
+
+def test_get_queue_error_envelope_raises(monkeypatch):
+    """A failing `comfy jobs ls` (e.g. server unreachable) raises ComfyCliError."""
     fake, _ = _fake_run(
         {
             "type": "envelope",
@@ -60,13 +144,63 @@ def test_error_envelope_raises_with_code(monkeypatch):
     monkeypatch.setattr(server.subprocess, "run", fake)
 
     with pytest.raises(server.ComfyCliError, match="server_not_running"):
-        server._run_comfy("env")
+        server.get_queue()
 
 
-def test_missing_binary_raises(monkeypatch):
-    monkeypatch.setattr(server.shutil, "which", lambda _: None)
-    with pytest.raises(server.ComfyCliError, match="not found on PATH"):
-        server._run_comfy("env")
+def test_upload_file_passes_paths_and_overwrite(monkeypatch):
+    """upload_file forwards every path and appends --overwrite when asked."""
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"uploaded": 2}})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.upload_file(["a.png", "b.png"], overwrite=True) == {"uploaded": 2}
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["upload", "a.png", "b.png", "--overwrite"]
+
+
+def test_upload_file_omits_overwrite_by_default(monkeypatch):
+    """Without overwrite the flag must be absent, not passed as False."""
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"uploaded": 1}})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server.upload_file(["only.png"])
+
+    assert calls[0]["cmd"][4:] == ["upload", "only.png"]
+    assert "--overwrite" not in calls[0]["cmd"]
+
+
+def test_validate_workflow_returns_results_for_valid(monkeypatch):
+    """A valid workflow returns comfy-cli's validation data unwrapped."""
+    fake, calls = _fake_run(
+        {"type": "envelope", "ok": True, "data": {"valid": True, "nodes": 7}}
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.validate_workflow("wf.json") == {"valid": True, "nodes": 7}
+    assert calls[0]["cmd"][4:] == ["validate", "--workflow", "wf.json"]
+
+
+def test_validate_workflow_raises_with_error_code(monkeypatch):
+    """An invalid workflow surfaces comfy-cli's structured error code, not a swallow."""
+    fake, _ = _fake_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {
+                "code": "workflow_unknown_nodes",
+                "message": "Unknown node type: FooSampler",
+            },
+        }
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="workflow_unknown_nodes"):
+        server.validate_workflow("broken.json")
 
 
 def test_fetch_outputs_copies_on_disk_path(monkeypatch, tmp_path):
