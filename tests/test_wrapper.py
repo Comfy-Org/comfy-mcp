@@ -137,6 +137,51 @@ def test_get_queue_error_envelope_raises(monkeypatch):
         server.get_queue()
 
 
+def test_launch_comfyui_passes_background_flag(monkeypatch):
+    """launch_comfyui must run `comfy … launch --background` (detached start)."""
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"pid": 42}})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.launch_comfyui() == {"pid": 42}
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
+    assert cmd[4:] == ["launch", "--background"]  # no extras -> no `--` separator
+
+
+def test_launch_comfyui_forwards_extra_args_after_separator(monkeypatch):
+    """Extra args are forwarded to ComfyUI after a `--` separator."""
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {}})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server.launch_comfyui(["--port", "8189"])
+
+    assert calls[0]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
+
+
+def test_stop_comfyui_surfaces_no_recorded_server_error(monkeypatch):
+    """stop only targets comfy-cli's own pid; no recorded server -> clean error."""
+    fake, calls = _fake_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {
+                "code": "no_recorded_server",
+                "message": "no ComfyUI server was launched by comfy-cli",
+            },
+        }
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="no_recorded_server"):
+        server.stop_comfyui()
+
+    assert calls[0]["cmd"][4:] == ["stop"]
+
+
 def test_fetch_outputs_copies_on_disk_path(monkeypatch, tmp_path):
     """Regression: local `comfy run` emits bare paths; we copy, never `comfy download`."""
     src = tmp_path / "src" / "img.png"

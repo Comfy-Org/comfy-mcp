@@ -27,10 +27,11 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
 | `fetch_outputs(prompt_id, out_dir)` | `comfy download <prompt_id> --out-dir <dir>` | Download a finished job's outputs to disk. |
+| `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
+| `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
 
-Planned next, each a one-line passthrough: `discover` (`comfy discover`),
-`launch`/`stop` (`comfy launch --background` / `comfy stop`) — plus a real
-generation round-trip test.
+Planned next, each a one-line passthrough: `discover` (`comfy discover`) — plus
+a real generation round-trip test.
 
 ## Run
 
