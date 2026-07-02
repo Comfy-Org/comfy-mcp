@@ -170,7 +170,23 @@ Discovery (`search_nodes` / `get_node` / `search_models`) reads the **user's liv
 (custom nodes included), not a static catalog — that's the local differentiator from the cloud
 MCP's equivalents.
 
-Planned next: `discover` (`comfy discover`), progress streaming for long runs.
+Planned next: `discover` (`comfy discover`).
+
+## Smoke test
+
+Turn the manual validation ritual into one command. The e2e smoke test drives the
+real tools end-to-end (no mocks): `server_info` → `run_workflow` on a checkpoint-free
+`EmptyImage` → `SaveImage` graph → `fetch_outputs`, and asserts a valid PNG lands in
+a temp out_dir.
+
+```bash
+./scripts/smoke.sh            # or: python -m pytest tests/e2e -m e2e
+```
+
+It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`)
+**and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
+rather than fails, so it's safe to run anywhere — and the plain `pytest` gate stays
+green on CI runners that have neither.
 
 ## License
 
