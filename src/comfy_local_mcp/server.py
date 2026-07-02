@@ -20,13 +20,34 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import urllib.request
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("comfy-local-mcp")
+# Rides every client handshake — teach an agent the canonical flows up front so
+# it does not have to rediscover them tool-by-tool. Keep this short.
+INSTRUCTIONS = """\
+This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
+
+- Call `server_info` FIRST to confirm a local ComfyUI is running before anything
+  else.
+- Long generations: submit non-blocking with `run_workflow(wait=False)` to get a
+  `prompt_id`, poll `wait_for_job` (a short bounded wait — chain several) or
+  `job_status` until it finishes, then collect files with `fetch_outputs`.
+  Prefer this over `run_workflow(wait=True)` for slow runs so nothing blocks.
+- Start from a template: `search_templates` to find one, `fetch_template` to save
+  its workflow JSON, then `run_workflow` on that file.
+- When custom nodes or models may be missing, pre-flight with `validate_workflow`
+  before running.
+- Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
+
+Everything targets the LOCAL server only — there is no cloud access here.
+"""
+
+mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
 
 # Allow overriding the binary (e.g. a venv path) without touching code.
 COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
@@ -141,6 +162,58 @@ def job_status(prompt_id: str) -> Any:
     finished, its output references. Poll this after ``run_workflow(wait=False)``.
     """
     return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
+
+
+# Statuses that mean a job is finished (no point polling further). comfy-cli
+# surfaces ComfyUI's own states plus its wrapper's, so match generously and
+# case-insensitively; anything else (queued / pending / running) keeps polling.
+_TERMINAL_STATUSES = frozenset(
+    {
+        "completed",
+        "complete",
+        "success",
+        "succeeded",
+        "done",
+        "error",
+        "failed",
+        "cancelled",
+        "canceled",
+    }
+)
+
+
+def _is_terminal(status: Any) -> bool:
+    """True if a ``jobs status`` payload reports a finished state."""
+    if isinstance(status, dict):
+        value = status.get("status")
+        if isinstance(value, str):
+            return value.lower() in _TERMINAL_STATUSES
+    return False
+
+
+@mcp.tool()
+def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
+    """Wait (bounded) for a submitted LOCAL job to reach a terminal status.
+
+    Polls ``comfy jobs status <prompt_id>`` with a short sleep between polls
+    until the job finishes (completed / error / cancelled) or
+    ``timeout_seconds`` elapses. Returns the final status payload on completion,
+    or ``{"timed_out": True, "status": <last payload>}`` on expiry. The wait is
+    bounded by design — chain several short ``wait_for_job`` calls (checking
+    ``job_status`` in between) rather than issuing one long block. Use after
+    ``run_workflow(wait=False)``.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    poll_interval = 2.0
+    last: Any = None
+    while True:
+        last = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
+        if _is_terminal(last):
+            return last
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"timed_out": True, "status": last}
+        time.sleep(min(poll_interval, remaining))
 
 
 @mcp.tool()
