@@ -32,13 +32,14 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 | `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
 | `get_node(name)` | `comfy nodes show <ClassName>` | Full input/output schema for one node class — what you need to author/repair a graph. |
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
+| `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
+| `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
 
 Discovery reads the **user's live install** (custom nodes included), not a static
 catalog — that's the local differentiator from the cloud MCP's equivalents.
 
-Planned next, each a one-line passthrough: `discover` (`comfy discover`),
-`launch`/`stop` (`comfy launch --background` / `comfy stop`) — plus a real
-generation round-trip test.
+Planned next: `discover` (`comfy discover`), progress streaming for long runs,
+and a real generation round-trip test.
 
 ## Run
 

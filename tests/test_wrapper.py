@@ -235,3 +235,42 @@ def test_fetch_outputs_fetches_view_url(monkeypatch, tmp_path):
     assert fetched == [url]
     assert result["saved"] == [str(out_dir / "gen.png")]  # name from ?filename=
     assert (out_dir / "gen.png").read_bytes() == b"view-bytes"
+
+
+def test_launch_comfyui_passes_background_flag(patched_run):
+    """launch_comfyui must run `comfy … launch --background` (detached start)."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 42}})
+
+    assert server.launch_comfyui() == {"pid": 42}
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
+    assert cmd[4:] == ["launch", "--background"]  # no extras -> no `--` separator
+
+
+def test_launch_comfyui_forwards_extra_args_after_separator(patched_run):
+    """Extra args are forwarded to ComfyUI after a `--` separator."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.launch_comfyui(["--port", "8189"])
+
+    assert calls[0]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
+
+
+def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
+    """stop only targets comfy-cli's own pid; no recorded server -> clean error."""
+    calls = patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {
+                "code": "no_recorded_server",
+                "message": "no ComfyUI server was launched by comfy-cli",
+            },
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="no_recorded_server"):
+        server.stop_comfyui()
+
+    assert calls[0]["cmd"][4:] == ["stop"]

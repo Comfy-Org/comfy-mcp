@@ -5,10 +5,10 @@ target, asks for JSON, parses comfy-cli's versioned ``envelope/1`` result, and
 returns its ``data``. There is deliberately no HTTP client and no code shared
 with the Comfy Cloud MCP — comfy-cli is the engine.
 
-First cut: the run -> get-output core loop (2 tools). Next tools to add, each a
-one-line passthrough: ``job_status`` (``comfy jobs status``), ``discover``
-(``comfy discover`` / ``comfy which``), ``launch``/``stop``
-(``comfy launch --background`` / ``comfy stop``).
+Tools so far: the run -> get-output core loop plus job management
+(``job_status`` / ``cancel_job`` / ``get_queue``) and the ``launch_comfyui`` /
+``stop_comfyui`` lifecycle pair (``comfy launch --background`` / ``comfy stop``).
+Next passthrough to add: ``discover`` (``comfy discover`` / ``comfy which``).
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
 against a real comfy-cli install and a running local ComfyUI.
@@ -193,6 +193,46 @@ def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
             shutil.copy2(ref, dst)
             saved.append(dst)
     return {"saved": saved, "source_outputs": outputs}
+
+
+@mcp.tool()
+def launch_comfyui(extra_args: list[str] | None = None) -> Any:
+    """Start the LOCAL ComfyUI server, detached, and return once it is up.
+
+    Wraps ``comfy launch --background``, which boots ComfyUI as a background
+    process and records its pid so ``stop_comfyui`` can later shut it down. Any
+    ``extra_args`` are forwarded to ComfyUI itself after a ``--`` separator
+    (e.g. ``["--port", "8189"]`` -> ``comfy launch --background -- --port 8189``).
+    The timeout is generous because the first boot loads torch and can take a
+    while.
+
+    Call ``server_info`` first if you only want to check whether a server is
+    already running — launching a second one will fail on the port.
+
+    NOTE (temporary upstream caveat): ``comfy launch --background`` currently
+    crashes on Python 3.14 (comfy-cli asyncio ``get_event_loop`` issue; a fix is
+    in review upstream). On affected comfy-cli versions the crash surfaces here
+    as a clean :class:`ComfyCliError` from the error envelope. Remove this note
+    once the upstream fix ships.
+    """
+    args = ["launch", "--background"]
+    if extra_args:
+        args += ["--", *extra_args]
+    return _run_comfy(*args, timeout=180.0)
+
+
+@mcp.tool()
+def stop_comfyui() -> Any:
+    """Stop the LOCAL ComfyUI server that comfy-cli launched.
+
+    Wraps ``comfy stop``. Ownership semantics: comfy-cli only kills the pid it
+    recorded when IT launched the server via ``launch_comfyui`` /
+    ``comfy launch --background``. It therefore cannot stop a ComfyUI started by
+    the desktop app or by hand — in that case comfy-cli reports it has no
+    recorded server and this tool raises a :class:`ComfyCliError` carrying that
+    message, rather than killing an unrelated process.
+    """
+    return _run_comfy("stop", timeout=60.0)
 
 
 def _template_matches(item: Any, query_lower: str) -> bool:
