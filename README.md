@@ -39,8 +39,7 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 Discovery reads the **user's live install** (custom nodes included), not a static
 catalog — that's the local differentiator from the cloud MCP's equivalents.
 
-Planned next: `discover` (`comfy discover`), progress streaming for long runs,
-and a real generation round-trip test.
+Planned next: `discover` (`comfy discover`) and progress streaming for long runs.
 
 ## Run
 
@@ -50,6 +49,22 @@ comfy-local-mcp   # serves over stdio
 ```
 
 Point your MCP client at the `comfy-local-mcp` command.
+
+## Smoke test
+
+Turn the manual validation ritual into one command. The e2e smoke test drives the
+real tools end-to-end (no mocks): `server_info` → `run_workflow` on a checkpoint-free
+`EmptyImage` → `SaveImage` graph → `fetch_outputs`, and asserts a valid PNG lands in
+a temp out_dir.
+
+```bash
+./scripts/smoke.sh            # or: python -m pytest tests/e2e -m e2e
+```
+
+It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`)
+**and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
+rather than fails, so it's safe to run anywhere — and the plain `pytest` gate stays
+green on CI runners that have neither.
 
 ## License
 
