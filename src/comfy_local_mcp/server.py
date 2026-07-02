@@ -144,6 +144,29 @@ def job_status(prompt_id: str) -> Any:
 
 
 @mcp.tool()
+def cancel_job(prompt_id: str) -> Any:
+    """Cancel a queued or running LOCAL job.
+
+    Wraps ``comfy jobs cancel <prompt_id>``. Use this to stop a job you
+    submitted via ``run_workflow(wait=False)`` before it finishes; cancelling an
+    unknown or already-finished ``prompt_id`` surfaces comfy-cli's error envelope.
+    """
+    return _run_comfy("jobs", "cancel", prompt_id, timeout=60.0)
+
+
+@mcp.tool()
+def get_queue() -> Any:
+    """List known LOCAL jobs with their status (pending / running / completed).
+
+    Wraps ``comfy jobs ls``. comfy-cli merges its on-disk job state with the
+    running ComfyUI server's queue, so this returns both jobs still in the queue
+    and recently completed ones — call it to find a ``prompt_id`` to inspect with
+    ``job_status`` or cancel with ``cancel_job``.
+    """
+    return _run_comfy("jobs", "ls", timeout=60.0)
+
+
+@mcp.tool()
 def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
     """Collect a completed job's output files into ``out_dir``; returns the paths.
 

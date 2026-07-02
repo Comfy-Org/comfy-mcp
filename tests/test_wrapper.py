@@ -77,6 +77,66 @@ def test_missing_binary_raises(monkeypatch):
         server._run_comfy("env")
 
 
+def test_cancel_job_maps_command_and_returns_data(monkeypatch):
+    """cancel_job wraps `comfy jobs cancel <id>` and returns the envelope data."""
+    fake, calls = _fake_run(
+        {"type": "envelope", "ok": True, "data": {"cancelled": "abc"}}
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.cancel_job("abc") == {"cancelled": "abc"}
+    assert calls[0]["cmd"][4:] == ["jobs", "cancel", "abc"]  # mapped subcommand
+
+
+def test_cancel_job_unknown_id_raises_error_envelope(monkeypatch):
+    """Cancelling an unknown prompt_id surfaces comfy-cli's error envelope."""
+    fake, _ = _fake_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "not_found", "message": "no such job: nope"},
+        }
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="not_found"):
+        server.cancel_job("nope")
+
+
+def test_get_queue_maps_command_and_returns_data(monkeypatch):
+    """get_queue wraps `comfy jobs ls` and returns the merged job list."""
+    jobs = {
+        "jobs": [
+            {"prompt_id": "a", "status": "running"},
+            {"prompt_id": "b", "status": "completed"},
+        ]
+    }
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": jobs})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.get_queue() == jobs
+    assert calls[0]["cmd"][4:] == ["jobs", "ls"]  # no positional args
+
+
+def test_get_queue_error_envelope_raises(monkeypatch):
+    """A failing `comfy jobs ls` (e.g. server unreachable) raises ComfyCliError."""
+    fake, _ = _fake_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+        }
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="server_not_running"):
+        server.get_queue()
+
+
 def test_fetch_outputs_copies_on_disk_path(monkeypatch, tmp_path):
     """Regression: local `comfy run` emits bare paths; we copy, never `comfy download`."""
     src = tmp_path / "src" / "img.png"
