@@ -9,7 +9,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Twenty tools, core loop validated end-to-end against a live local
+> **Status:** early POC. Twenty-two tools, core loop validated end-to-end against a live local
 > ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -143,7 +143,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-Twenty tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
+Twenty-two tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
 comfy-cli's `envelope/1`, and returns its `data`.
 
 | Tool | Wraps | Purpose |
@@ -158,6 +158,8 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `fetch_outputs(prompt_id, out_dir, url_only=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes. |
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
+| `discover()` | `comfy discover` | comfy-cli's self-describing surface (commands, arg schemas, error codes) — learn the CLI's own contract at runtime. |
+| `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
 | `search_templates(query="")` | `comfy templates ls` (filtered client-side) | Find a built-in workflow template by name/description; empty `query` lists all. |
 | `get_template(name)` | `comfy templates show <name>` | Show one template's details/schema before fetching it. |
 | `fetch_template(name, out_path)` | `comfy templates fetch <name> --out <path>` | Write a template's runnable workflow JSON to `out_path`; returns the absolute path for `run_workflow`. |
@@ -181,8 +183,6 @@ Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream
 read the **user's live install** (custom nodes included), not a static catalog — that's the
 local differentiator from the cloud MCP's equivalents. The graph-wiring verbs (`upstream` /
 `downstream` / `path`) are what an agent authoring a workflow uses to find compatible nodes.
-
-Planned next: `discover` (`comfy discover`).
 
 ## Smoke test
 
