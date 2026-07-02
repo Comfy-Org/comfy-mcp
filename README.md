@@ -25,6 +25,12 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `fetch_outputs(prompt_id, out_dir)` | `comfy download <prompt_id> --out-dir <dir>` | Download a finished job's outputs to disk. |
+| `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
+| `get_node(name)` | `comfy nodes show <ClassName>` | Full input/output schema for one node class — what you need to author/repair a graph. |
+| `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
+
+Discovery reads the **user's live install** (custom nodes included), not a static
+catalog — that's the local differentiator from the cloud MCP's equivalents.
 
 Planned next, each a one-line passthrough: `discover` (`comfy discover`),
 `launch`/`stop` (`comfy launch --background` / `comfy stop`) — plus a real

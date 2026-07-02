@@ -172,6 +172,55 @@ def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
     return {"saved": saved, "source_outputs": outputs}
 
 
+@mcp.tool()
+def search_nodes(query: str) -> Any:
+    """Search node classes in the LOCAL ComfyUI's live ``object_info``.
+
+    Wraps ``comfy nodes search <query>``. Because the catalog is read from the
+    user's running install, results include their INSTALLED custom nodes — not a
+    static/bundled catalog. Use this to find the class name of a node (e.g.
+    "KSampler", "load image") before authoring or repairing a workflow graph;
+    pass the returned name to ``get_node`` for its full schema.
+    """
+    return _run_comfy("nodes", "search", query, timeout=60.0)
+
+
+@mcp.tool()
+def get_node(name: str) -> Any:
+    """Return one node class's full input/output schema from the live local catalog.
+
+    Wraps ``comfy nodes show <ClassName>``. ``name`` is the node's class name
+    (as returned by ``search_nodes``). The schema — required/optional inputs,
+    their types and defaults, and outputs — is what an agent needs to author or
+    repair a workflow graph. Reflects the user's live install, so it resolves
+    custom-node classes too (not just built-ins).
+    """
+    return _run_comfy("nodes", "show", name, timeout=60.0)
+
+
+@mcp.tool()
+def search_models(query: str = "", folder: str = "") -> Any:
+    """Search / list model files available to the LOCAL ComfyUI install.
+
+    Thin passthrough with three modes, in precedence order:
+
+    - ``query`` given → ``comfy models search <query>`` (match model filenames).
+    - else ``folder`` given → ``comfy models list-folder <folder>`` (list one
+      model folder, e.g. ``checkpoints``, ``loras``).
+    - else (both empty) → ``comfy models list-folders`` (list the folder names).
+
+    LOCAL DEGRADATION: unlike the cloud catalog, this returns only what is on
+    disk — filenames, with no enrichment (no base-model / hash / description /
+    download metadata). Agents should set expectations accordingly: it answers
+    "which model files does this install have?", not "tell me about this model".
+    """
+    if query:
+        return _run_comfy("models", "search", query, timeout=60.0)
+    if folder:
+        return _run_comfy("models", "list-folder", folder, timeout=60.0)
+    return _run_comfy("models", "list-folders", timeout=60.0)
+
+
 def main() -> None:
     """Entry point: serve the MCP over stdio."""
     mcp.run()
