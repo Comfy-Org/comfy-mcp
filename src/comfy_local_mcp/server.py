@@ -195,6 +195,84 @@ def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
     return {"saved": saved, "source_outputs": outputs}
 
 
+def _template_matches(item: Any, query_lower: str) -> bool:
+    """True if ``query_lower`` (already lowercased) is a substring of a template entry.
+
+    Handles both shapes comfy-cli might emit for a template: a bare name string,
+    or a dict of fields (name / title / description / …) — we match against every
+    string value so the query hits any of them.
+    """
+    if isinstance(item, str):
+        return query_lower in item.lower()
+    if isinstance(item, dict):
+        return any(
+            isinstance(v, str) and query_lower in v.lower() for v in item.values()
+        )
+    return False
+
+
+@mcp.tool()
+def search_templates(query: str = "") -> Any:
+    """Search the built-in ComfyUI workflow templates by name/description.
+
+    Wraps ``comfy templates ls``. When ``query`` is non-empty the listing is
+    filtered client-side (case-insensitive substring match against each
+    template's name and any text fields) — comfy-cli's ``ls`` has no server-side
+    filter argument, so the narrowing happens here; an empty ``query`` returns
+    the full list.
+
+    Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
+    with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
+    a runnable workflow JSON and pass that path straight to ``run_workflow`` — a
+    working generation without hand-authoring workflow JSON.
+    """
+    data = _run_comfy("templates", "ls", timeout=60.0)
+    if not query:
+        return data
+    q = query.lower()
+    if isinstance(data, list):
+        return [item for item in data if _template_matches(item, q)]
+    if isinstance(data, dict) and isinstance(data.get("templates"), list):
+        return {
+            **data,
+            "templates": [t for t in data["templates"] if _template_matches(t, q)],
+        }
+    # Unknown shape — return it unfiltered rather than silently dropping data.
+    return data
+
+
+@mcp.tool()
+def get_template(name: str) -> Any:
+    """Show one template's details/schema (inputs, description, node graph).
+
+    Wraps ``comfy templates show <name>``, using a ``name`` from
+    ``search_templates``. Step 2 of the on-ramp: inspect a template before
+    fetching it, then ``fetch_template(name, out_path)`` writes the runnable JSON
+    for ``run_workflow``.
+    """
+    return _run_comfy("templates", "show", name, timeout=60.0)
+
+
+@mcp.tool()
+def fetch_template(name: str, out_path: str) -> str:
+    """Write a template's runnable workflow JSON to ``out_path``; return its absolute path.
+
+    Wraps ``comfy templates fetch <name> --out <path>``, which materializes the
+    template as a workflow JSON file on disk. Returns the ABSOLUTE path so it can
+    be passed straight to ``run_workflow(workflow_path=...)``, completing the
+    template on-ramp::
+
+        search_templates("flux")               # find a template
+        get_template("flux_dev")               # inspect it
+        path = fetch_template("flux_dev", "/tmp/flux.json")
+        run_workflow(path)                      # generate — no hand-authored JSON
+
+    so an agent reaches a working generation without hand-authoring workflow JSON.
+    """
+    _run_comfy("templates", "fetch", name, "--out", out_path, timeout=60.0)
+    return os.path.abspath(out_path)
+
+
 @mcp.tool()
 def search_nodes(query: str) -> Any:
     """Search node classes in the LOCAL ComfyUI's live ``object_info``.
