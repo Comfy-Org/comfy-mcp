@@ -8,7 +8,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Six tools, core loop validated end-to-end against a live local ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on 3.10 and 3.14.
+> **Status:** early POC. Twelve tools, core loop validated end-to-end against a live local ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on 3.10 and 3.14.
 
 ## Prerequisites
 
@@ -24,6 +24,7 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 | `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. Call first. |
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
+| `wait_for_job(prompt_id, timeout_seconds=25)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a timed-out payload on expiry. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
 | `fetch_outputs(prompt_id, out_dir)` | `comfy download <prompt_id> --out-dir <dir>` | Download a finished job's outputs to disk. |
