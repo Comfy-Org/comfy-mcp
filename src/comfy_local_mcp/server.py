@@ -16,6 +16,7 @@ against a real comfy-cli install and a running local ComfyUI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -25,7 +26,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 # Rides every client handshake — teach an agent the canonical flows up front so
 # it does not have to rediscover them tool-by-tool. Keep this short.
@@ -88,18 +89,31 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
             f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
         ) from exc
 
-    envelope = _last_json_object(proc.stdout)
+    return _unwrap_envelope(
+        _last_json_object(proc.stdout), args, proc.returncode, proc.stderr
+    )
+
+
+def _unwrap_envelope(
+    envelope: dict | None, args: tuple[str, ...], returncode: int, stderr: str
+) -> Any:
+    """Unwrap comfy-cli's ``envelope/1`` result, raising on error/absence.
+
+    Shared by the plain (`--json`) and streaming (`--json-stream`) paths so both
+    have identical terminal behavior: return ``data`` on success, and raise a
+    :class:`ComfyCliError` carrying the envelope's ``error.code`` on failure.
+    """
     if envelope is None:
         raise ComfyCliError(
-            f"comfy-cli returned no JSON (exit {proc.returncode}). "
-            f"stderr: {proc.stderr.strip()[:500]}"
+            f"comfy-cli returned no JSON (exit {returncode}). "
+            f"stderr: {stderr.strip()[:500]}"
         )
     if not envelope.get("ok", False):
         err = envelope.get("error") or {}
         raise ComfyCliError(
             f"comfy {' '.join(args)} failed "
             f"[{err.get('code', 'unknown')}]: "
-            f"{err.get('message') or proc.stderr.strip()[:500]}"
+            f"{err.get('message') or stderr.strip()[:500]}"
         )
     return envelope.get("data")
 
@@ -124,6 +138,139 @@ def _last_json_object(stdout: str) -> dict | None:
     return best
 
 
+def _parse_event(line: str) -> dict | None:
+    """Parse one NDJSON stream line into a dict, or None if it isn't JSON."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+class _StreamProgress:
+    """Maps comfy-cli's ``--json-stream`` run events to MCP progress values.
+
+    comfy-cli's run dialect (see comfy-cli ``execution.py``) emits, per line:
+    a ``queued`` event carrying the workflow's node manifest, then per node an
+    ``executing`` event, throttled ``progress`` events (per-node step counts,
+    ~10Hz), and an ``executed`` / ``execution_cached`` event. We turn those into
+    a single overall bar: ``total`` = node count from the manifest, and
+    ``progress`` = fully-finished nodes plus the current node's step fraction, so
+    the value climbs monotonically 0..total across the run.
+    """
+
+    def __init__(self) -> None:
+        self.total: float | None = None  # node count (from the queued manifest)
+        self.done = 0  # nodes fully executed or served from cache
+        self._last = -1.0  # last value reported (kept non-decreasing)
+
+    async def report(self, ctx: Context, event: dict) -> None:
+        """Forward one stream event as an MCP progress notification, if relevant."""
+        etype = event.get("type")
+        if etype == "queued":
+            nodes = event.get("nodes")
+            if isinstance(nodes, list) and nodes:
+                self.total = float(len(nodes))
+            progress, message = 0.0, "queued"
+        elif etype == "executing":
+            progress = float(self.done)
+            message = f"executing {event.get('title') or event.get('node')}"
+        elif etype in ("executed", "execution_cached"):
+            self.done += 1
+            progress = float(self.done)
+            message = f"finished {event.get('title') or event.get('node')}"
+        elif etype == "progress":
+            completed = event.get("completed") or 0
+            node_total = event.get("total") or 0
+            frac = (completed / node_total) if node_total else 0.0
+            progress = self.done + frac
+            message = f"node {event.get('node')}: {completed}/{node_total}"
+        else:
+            return  # output / execution_error / unknown -> not a progress tick
+        # MCP guidance: progress should not go backwards, even as nodes reset.
+        progress = max(progress, self._last)
+        self._last = progress
+        await ctx.report_progress(progress=progress, total=self.total, message=message)
+
+
+async def _run_comfy_streaming(
+    *args: str, ctx: Context | None = None, timeout: float | None = None
+) -> Any:
+    """Run ``comfy --json-stream --where local <args>`` and stream progress.
+
+    Spawns comfy-cli with :class:`subprocess.Popen`, reads its NDJSON stdout
+    line-by-line (each ``readline`` off-loaded to a thread so the event loop
+    stays free), and forwards run events as MCP progress notifications via
+    ``ctx.report_progress``. The final ``envelope/1`` line is unwrapped exactly
+    as :func:`_run_comfy` does, so an error envelope raises
+    :class:`ComfyCliError` with the same code — terminal behavior is unchanged.
+    """
+    if shutil.which(COMFY_BIN) is None:
+        raise ComfyCliError(
+            f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
+            "(`pip install comfy-cli`) or set the COMFY_BIN env var."
+        )
+    # --json-stream is a global flag and, like --json/--where, MUST precede the
+    # subcommand; a trailing form errors with "No such option".
+    cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
+    env = {**os.environ, "COMFY_WHERE": "local"}
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    lines: list[str] = []
+    tracker = _StreamProgress()
+
+    async def _pump() -> None:
+        assert proc.stdout is not None
+        while True:
+            line = await asyncio.to_thread(proc.stdout.readline)
+            if not line:  # EOF: comfy-cli closed stdout
+                break
+            lines.append(line)
+            if ctx is not None:
+                event = _parse_event(line)
+                if event is not None:
+                    await tracker.report(ctx, event)
+
+    # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
+    stderr_future = (
+        asyncio.ensure_future(asyncio.to_thread(proc.stderr.read))
+        if proc.stderr is not None
+        else None
+    )
+    try:
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(_pump(), timeout=timeout)
+            else:
+                await _pump()
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise ComfyCliError(
+                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+            ) from exc
+
+        returncode = await asyncio.to_thread(proc.wait)
+        stderr = (await stderr_future) if stderr_future is not None else ""
+        return _unwrap_envelope(
+            _last_json_object("".join(lines)), args, returncode, stderr
+        )
+    finally:
+        # Never leave a stray child or a dangling stderr reader on any exit path
+        # (timeout, a report_progress error, or normal completion).
+        if proc.poll() is None:
+            proc.kill()
+            await asyncio.to_thread(proc.wait)
+        if stderr_future is not None and not stderr_future.done():
+            stderr_future.cancel()
+
+
 @mcp.tool()
 def server_info() -> Any:
     """Report the local ComfyUI / comfy-cli environment.
@@ -136,22 +283,32 @@ def server_info() -> Any:
 
 
 @mcp.tool()
-def run_workflow(
-    workflow_path: str, wait: bool = True, timeout_seconds: float = 600.0
+async def run_workflow(
+    workflow_path: str,
+    wait: bool = True,
+    timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
 ) -> Any:
     """Run a ComfyUI workflow JSON on the LOCAL ComfyUI.
 
     Accepts an API-format or UI-export workflow file. Wraps
-    ``comfy run --workflow <path>``. With ``wait=True`` (default) this blocks
-    until the run finishes and returns the full result; with ``wait=False`` it
-    submits and returns immediately with a ``prompt_id`` to poll via
-    ``job_status`` — use that for minutes-long generations so the call does not
-    block.
+    ``comfy run --workflow <path>``. With ``wait=True`` (default) this waits
+    until the run finishes and returns the full result, streaming live progress
+    as MCP progress notifications (per-node execution + sampler step counts) so
+    a long generation is not a silent block; with ``wait=False`` it submits and
+    returns immediately with a ``prompt_id`` to poll via ``job_status``.
     """
-    args = ["run", "--workflow", workflow_path]
-    if wait:
-        args.append("--wait")
-    return _run_comfy(*args, timeout=timeout_seconds if wait else 60.0)
+    if not wait:
+        # Fire-and-return: no stream to follow, so keep the plain --json path.
+        return _run_comfy("run", "--workflow", workflow_path, timeout=60.0)
+    return await _run_comfy_streaming(
+        "run",
+        "--workflow",
+        workflow_path,
+        "--wait",
+        ctx=ctx,
+        timeout=timeout_seconds,
+    )
 
 
 @mcp.tool()
