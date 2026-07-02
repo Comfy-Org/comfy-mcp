@@ -20,24 +20,34 @@ import pytest
 from comfy_local_mcp import server
 
 
-def _fake_run(envelope: dict):
-    """Return a subprocess.run stand-in that captures the call and emits an envelope."""
-    calls: list[dict] = []
+@pytest.fixture
+def patched_run(monkeypatch):
+    """Patch away ``shutil.which`` + ``subprocess.run`` for ``_run_comfy``.
 
-    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env})
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(envelope), stderr=""
-        )
+    Returns a ``setup(envelope) -> calls`` helper: call it with the envelope
+    the fake comfy-cli should emit, and get back the list that captures each
+    invocation (``cmd`` + ``env``).
+    """
 
-    return fake, calls
+    def setup(envelope: dict) -> list[dict]:
+        calls: list[dict] = []
+
+        def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
+            calls.append({"cmd": cmd, "env": env})
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps(envelope), stderr=""
+            )
+
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        return calls
+
+    return setup
 
 
-def test_global_flags_precede_subcommand(monkeypatch):
+def test_global_flags_precede_subcommand(patched_run):
     """Regression: `comfy run … --json` errors; it must be `comfy --json … run`."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"x": 1}})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
 
     assert server._run_comfy("jobs", "status", "abc") == {"x": 1}
 
@@ -48,16 +58,14 @@ def test_global_flags_precede_subcommand(monkeypatch):
     assert calls[0]["env"]["COMFY_WHERE"] == "local"  # belt-and-suspenders pin
 
 
-def test_error_envelope_raises_with_code(monkeypatch):
-    fake, _ = _fake_run(
+def test_error_envelope_raises_with_code(patched_run):
+    patched_run(
         {
             "type": "envelope",
             "ok": False,
             "error": {"code": "server_not_running", "message": "ComfyUI not running"},
         }
     )
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
 
     with pytest.raises(server.ComfyCliError, match="server_not_running"):
         server._run_comfy("env")
