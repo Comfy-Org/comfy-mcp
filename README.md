@@ -8,7 +8,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Six tools, core loop validated end-to-end against a live local ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on 3.10 and 3.14.
+> **Status:** early POC. Eight tools, core loop validated end-to-end against a live local ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on 3.10 and 3.14.
 
 ## Prerequisites
 
