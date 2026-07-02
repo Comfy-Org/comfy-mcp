@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and newest — comfy-cli itself runs on 3.14, where
+        # asyncio/typing behavior has shifted, so both ends matter.
+        python-version: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Format check (ruff)
+        run: ruff format --check .
+      - name: Tests
+        run: pytest -q
