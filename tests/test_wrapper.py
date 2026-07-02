@@ -69,6 +69,62 @@ def test_missing_binary_raises(monkeypatch):
         server._run_comfy("env")
 
 
+def test_upload_file_passes_paths_and_overwrite(monkeypatch):
+    """upload_file forwards every path and appends --overwrite when asked."""
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"uploaded": 2}})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.upload_file(["a.png", "b.png"], overwrite=True) == {"uploaded": 2}
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["upload", "a.png", "b.png", "--overwrite"]
+
+
+def test_upload_file_omits_overwrite_by_default(monkeypatch):
+    """Without overwrite the flag must be absent, not passed as False."""
+    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"uploaded": 1}})
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server.upload_file(["only.png"])
+
+    assert calls[0]["cmd"][4:] == ["upload", "only.png"]
+    assert "--overwrite" not in calls[0]["cmd"]
+
+
+def test_validate_workflow_returns_results_for_valid(monkeypatch):
+    """A valid workflow returns comfy-cli's validation data unwrapped."""
+    fake, calls = _fake_run(
+        {"type": "envelope", "ok": True, "data": {"valid": True, "nodes": 7}}
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server.validate_workflow("wf.json") == {"valid": True, "nodes": 7}
+    assert calls[0]["cmd"][4:] == ["validate", "--workflow", "wf.json"]
+
+
+def test_validate_workflow_raises_with_error_code(monkeypatch):
+    """An invalid workflow surfaces comfy-cli's structured error code, not a swallow."""
+    fake, _ = _fake_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {
+                "code": "workflow_unknown_nodes",
+                "message": "Unknown node type: FooSampler",
+            },
+        }
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="workflow_unknown_nodes"):
+        server.validate_workflow("broken.json")
+
+
 def test_fetch_outputs_copies_on_disk_path(monkeypatch, tmp_path):
     """Regression: local `comfy run` emits bare paths; we copy, never `comfy download`."""
     src = tmp_path / "src" / "img.png"

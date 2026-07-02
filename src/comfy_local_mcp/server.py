@@ -172,6 +172,37 @@ def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
     return {"saved": saved, "source_outputs": outputs}
 
 
+@mcp.tool()
+def upload_file(paths: list[str], overwrite: bool = False) -> Any:
+    """Upload local files into the LOCAL ComfyUI ``input`` directory.
+
+    Wraps ``comfy upload <files...> [--overwrite]``. Use this to stage source
+    images/masks a workflow references by filename before running it — it is
+    what unlocks img2img / inpaint workflows on a local ComfyUI. Pass
+    ``overwrite=True`` to replace files that already exist in the input dir
+    (otherwise comfy-cli skips or errors on collisions).
+    """
+    args = ["upload", *paths]
+    if overwrite:
+        args.append("--overwrite")
+    return _run_comfy(*args, timeout=300.0)
+
+
+@mcp.tool()
+def validate_workflow(workflow_path: str) -> Any:
+    """Pre-flight a workflow against the live local ComfyUI before running it.
+
+    Wraps ``comfy validate --workflow <path>``. Checks the workflow's
+    class_types, input shapes, enum values and wiring against the running
+    ComfyUI's ``object_info`` and returns the validation result — cheap
+    insurance before a slow ``run_workflow``. On an invalid workflow this
+    raises :class:`ComfyCliError` carrying comfy-cli's structured error code
+    (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
+    missing-model problem stays actionable instead of failing deep inside a run.
+    """
+    return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+
+
 def main() -> None:
     """Entry point: serve the MCP over stdio."""
     mcp.run()

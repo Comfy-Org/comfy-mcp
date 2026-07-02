@@ -25,6 +25,8 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `fetch_outputs(prompt_id, out_dir)` | `comfy download <prompt_id> --out-dir <dir>` | Download a finished job's outputs to disk. |
+| `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
+| `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
 
 Planned next, each a one-line passthrough: `discover` (`comfy discover`),
 `launch`/`stop` (`comfy launch --background` / `comfy stop`) — plus a real
