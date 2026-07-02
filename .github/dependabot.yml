@@ -1,0 +1,31 @@
+# Dependabot configuration
+# Docs: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#
+# Two ecosystems for this small Python repo: the pip dependencies declared in
+# pyproject.toml, and the SHA-pinned GitHub Actions in the workflows. No Docker
+# image ships from this repo, so there is no docker ecosystem.
+version: 2
+
+updates:
+  # pip — runtime + dev dependencies (pyproject.toml)
+  - package-ecosystem: 'pip'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+      day: 'monday'
+    groups:
+      pip-dependencies:
+        patterns: ['*']
+    labels: ['dependencies']
+    open-pull-requests-limit: 5
+
+  # GitHub Actions — the SHA-pinned actions across all workflows
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'monthly'
+    groups:
+      github-actions:
+        patterns: ['*']
+    labels: ['dependencies']
+    open-pull-requests-limit: 3
