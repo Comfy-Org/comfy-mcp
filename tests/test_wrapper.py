@@ -20,6 +20,23 @@ import pytest
 from comfy_local_mcp import server
 
 
+def _fake_run(envelope: dict):
+    """Return a ``subprocess.run`` stand-in that captures calls and emits ``envelope``.
+
+    Pure factory (no patching): returns ``(fake, calls)``. Tests either patch
+    ``fake`` in themselves or use the ``patched_run`` fixture, which wraps this.
+    """
+    calls: list[dict] = []
+
+    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
+        calls.append({"cmd": cmd, "env": env})
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(envelope), stderr=""
+        )
+
+    return fake, calls
+
+
 @pytest.fixture
 def patched_run(monkeypatch):
     """Patch away ``shutil.which`` + ``subprocess.run`` for ``_run_comfy``.
@@ -30,14 +47,7 @@ def patched_run(monkeypatch):
     """
 
     def setup(envelope: dict) -> list[dict]:
-        calls: list[dict] = []
-
-        def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
-            calls.append({"cmd": cmd, "env": env})
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout=json.dumps(envelope), stderr=""
-            )
-
+        fake, calls = _fake_run(envelope)
         monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
         monkeypatch.setattr(server.subprocess, "run", fake)
         return calls
