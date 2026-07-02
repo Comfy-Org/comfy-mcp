@@ -5,10 +5,10 @@ target, asks for JSON, parses comfy-cli's versioned ``envelope/1`` result, and
 returns its ``data``. There is deliberately no HTTP client and no code shared
 with the Comfy Cloud MCP — comfy-cli is the engine.
 
-Tools so far: the run -> get-output core loop plus ``job_status`` and the
-``launch_comfyui`` / ``stop_comfyui`` lifecycle pair (``comfy launch
---background`` / ``comfy stop``). Next passthrough to add: ``discover``
-(``comfy discover`` / ``comfy which``).
+Tools so far: the run -> get-output core loop plus job management
+(``job_status`` / ``cancel_job`` / ``get_queue``) and the ``launch_comfyui`` /
+``stop_comfyui`` lifecycle pair (``comfy launch --background`` / ``comfy stop``).
+Next passthrough to add: ``discover`` (``comfy discover`` / ``comfy which``).
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
 against a real comfy-cli install and a running local ComfyUI.
