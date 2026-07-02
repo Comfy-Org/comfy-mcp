@@ -235,6 +235,164 @@ def stop_comfyui() -> Any:
     return _run_comfy("stop", timeout=60.0)
 
 
+def _template_matches(item: Any, query_lower: str) -> bool:
+    """True if ``query_lower`` (already lowercased) is a substring of a template entry.
+
+    Handles both shapes comfy-cli might emit for a template: a bare name string,
+    or a dict of fields (name / title / description / …) — we match against every
+    string value so the query hits any of them.
+    """
+    if isinstance(item, str):
+        return query_lower in item.lower()
+    if isinstance(item, dict):
+        return any(
+            isinstance(v, str) and query_lower in v.lower() for v in item.values()
+        )
+    return False
+
+
+@mcp.tool()
+def search_templates(query: str = "") -> Any:
+    """Search the built-in ComfyUI workflow templates by name/description.
+
+    Wraps ``comfy templates ls``. When ``query`` is non-empty the listing is
+    filtered client-side (case-insensitive substring match against each
+    template's name and any text fields) — comfy-cli's ``ls`` has no server-side
+    filter argument, so the narrowing happens here; an empty ``query`` returns
+    the full list.
+
+    Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
+    with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
+    a runnable workflow JSON and pass that path straight to ``run_workflow`` — a
+    working generation without hand-authoring workflow JSON.
+    """
+    data = _run_comfy("templates", "ls", timeout=60.0)
+    if not query:
+        return data
+    q = query.lower()
+    if isinstance(data, list):
+        return [item for item in data if _template_matches(item, q)]
+    if isinstance(data, dict) and isinstance(data.get("templates"), list):
+        return {
+            **data,
+            "templates": [t for t in data["templates"] if _template_matches(t, q)],
+        }
+    # Unknown shape — return it unfiltered rather than silently dropping data.
+    return data
+
+
+@mcp.tool()
+def get_template(name: str) -> Any:
+    """Show one template's details/schema (inputs, description, node graph).
+
+    Wraps ``comfy templates show <name>``, using a ``name`` from
+    ``search_templates``. Step 2 of the on-ramp: inspect a template before
+    fetching it, then ``fetch_template(name, out_path)`` writes the runnable JSON
+    for ``run_workflow``.
+    """
+    return _run_comfy("templates", "show", name, timeout=60.0)
+
+
+@mcp.tool()
+def fetch_template(name: str, out_path: str) -> str:
+    """Write a template's runnable workflow JSON to ``out_path``; return its absolute path.
+
+    Wraps ``comfy templates fetch <name> --out <path>``, which materializes the
+    template as a workflow JSON file on disk. Returns the ABSOLUTE path so it can
+    be passed straight to ``run_workflow(workflow_path=...)``, completing the
+    template on-ramp::
+
+        search_templates("flux")               # find a template
+        get_template("flux_dev")               # inspect it
+        path = fetch_template("flux_dev", "/tmp/flux.json")
+        run_workflow(path)                      # generate — no hand-authored JSON
+
+    so an agent reaches a working generation without hand-authoring workflow JSON.
+    """
+    _run_comfy("templates", "fetch", name, "--out", out_path, timeout=60.0)
+    return os.path.abspath(out_path)
+
+
+@mcp.tool()
+def search_nodes(query: str) -> Any:
+    """Search node classes in the LOCAL ComfyUI's live ``object_info``.
+
+    Wraps ``comfy nodes search <query>``. Because the catalog is read from the
+    user's running install, results include their INSTALLED custom nodes — not a
+    static/bundled catalog. Use this to find the class name of a node (e.g.
+    "KSampler", "load image") before authoring or repairing a workflow graph;
+    pass the returned name to ``get_node`` for its full schema.
+    """
+    return _run_comfy("nodes", "search", query, timeout=60.0)
+
+
+@mcp.tool()
+def get_node(name: str) -> Any:
+    """Return one node class's full input/output schema from the live local catalog.
+
+    Wraps ``comfy nodes show <ClassName>``. ``name`` is the node's class name
+    (as returned by ``search_nodes``). The schema — required/optional inputs,
+    their types and defaults, and outputs — is what an agent needs to author or
+    repair a workflow graph. Reflects the user's live install, so it resolves
+    custom-node classes too (not just built-ins).
+    """
+    return _run_comfy("nodes", "show", name, timeout=60.0)
+
+
+@mcp.tool()
+def search_models(query: str = "", folder: str = "") -> Any:
+    """Search / list model files available to the LOCAL ComfyUI install.
+
+    Thin passthrough with three modes, in precedence order:
+
+    - ``query`` given → ``comfy models search <query>`` (match model filenames).
+    - else ``folder`` given → ``comfy models list-folder <folder>`` (list one
+      model folder, e.g. ``checkpoints``, ``loras``).
+    - else (both empty) → ``comfy models list-folders`` (list the folder names).
+
+    LOCAL DEGRADATION: unlike the cloud catalog, this returns only what is on
+    disk — filenames, with no enrichment (no base-model / hash / description /
+    download metadata). Agents should set expectations accordingly: it answers
+    "which model files does this install have?", not "tell me about this model".
+    """
+    if query:
+        return _run_comfy("models", "search", query, timeout=60.0)
+    if folder:
+        return _run_comfy("models", "list-folder", folder, timeout=60.0)
+    return _run_comfy("models", "list-folders", timeout=60.0)
+
+
+@mcp.tool()
+def upload_file(paths: list[str], overwrite: bool = False) -> Any:
+    """Upload local files into the LOCAL ComfyUI ``input`` directory.
+
+    Wraps ``comfy upload <files...> [--overwrite]``. Use this to stage source
+    images/masks a workflow references by filename before running it — it is
+    what unlocks img2img / inpaint workflows on a local ComfyUI. Pass
+    ``overwrite=True`` to replace files that already exist in the input dir
+    (otherwise comfy-cli skips or errors on collisions).
+    """
+    args = ["upload", *paths]
+    if overwrite:
+        args.append("--overwrite")
+    return _run_comfy(*args, timeout=300.0)
+
+
+@mcp.tool()
+def validate_workflow(workflow_path: str) -> Any:
+    """Pre-flight a workflow against the live local ComfyUI before running it.
+
+    Wraps ``comfy validate --workflow <path>``. Checks the workflow's
+    class_types, input shapes, enum values and wiring against the running
+    ComfyUI's ``object_info`` and returns the validation result — cheap
+    insurance before a slow ``run_workflow``. On an invalid workflow this
+    raises :class:`ComfyCliError` carrying comfy-cli's structured error code
+    (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
+    missing-model problem stays actionable instead of failing deep inside a run.
+    """
+    return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+
+
 def main() -> None:
     """Entry point: serve the MCP over stdio."""
     mcp.run()
