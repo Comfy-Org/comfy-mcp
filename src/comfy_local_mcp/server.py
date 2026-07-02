@@ -144,6 +144,29 @@ def job_status(prompt_id: str) -> Any:
 
 
 @mcp.tool()
+def cancel_job(prompt_id: str) -> Any:
+    """Cancel a queued or running LOCAL job.
+
+    Wraps ``comfy jobs cancel <prompt_id>``. Use this to stop a job you
+    submitted via ``run_workflow(wait=False)`` before it finishes; cancelling an
+    unknown or already-finished ``prompt_id`` surfaces comfy-cli's error envelope.
+    """
+    return _run_comfy("jobs", "cancel", prompt_id, timeout=60.0)
+
+
+@mcp.tool()
+def get_queue() -> Any:
+    """List known LOCAL jobs with their status (pending / running / completed).
+
+    Wraps ``comfy jobs ls``. comfy-cli merges its on-disk job state with the
+    running ComfyUI server's queue, so this returns both jobs still in the queue
+    and recently completed ones — call it to find a ``prompt_id`` to inspect with
+    ``job_status`` or cancel with ``cancel_job``.
+    """
+    return _run_comfy("jobs", "ls", timeout=60.0)
+
+
+@mcp.tool()
 def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
     """Collect a completed job's output files into ``out_dir``; returns the paths.
 
@@ -219,6 +242,37 @@ def search_models(query: str = "", folder: str = "") -> Any:
     if folder:
         return _run_comfy("models", "list-folder", folder, timeout=60.0)
     return _run_comfy("models", "list-folders", timeout=60.0)
+
+
+@mcp.tool()
+def upload_file(paths: list[str], overwrite: bool = False) -> Any:
+    """Upload local files into the LOCAL ComfyUI ``input`` directory.
+
+    Wraps ``comfy upload <files...> [--overwrite]``. Use this to stage source
+    images/masks a workflow references by filename before running it — it is
+    what unlocks img2img / inpaint workflows on a local ComfyUI. Pass
+    ``overwrite=True`` to replace files that already exist in the input dir
+    (otherwise comfy-cli skips or errors on collisions).
+    """
+    args = ["upload", *paths]
+    if overwrite:
+        args.append("--overwrite")
+    return _run_comfy(*args, timeout=300.0)
+
+
+@mcp.tool()
+def validate_workflow(workflow_path: str) -> Any:
+    """Pre-flight a workflow against the live local ComfyUI before running it.
+
+    Wraps ``comfy validate --workflow <path>``. Checks the workflow's
+    class_types, input shapes, enum values and wiring against the running
+    ComfyUI's ``object_info`` and returns the validation result — cheap
+    insurance before a slow ``run_workflow``. On an invalid workflow this
+    raises :class:`ComfyCliError` carrying comfy-cli's structured error code
+    (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
+    missing-model problem stays actionable instead of failing deep inside a run.
+    """
+    return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
 
 
 def main() -> None:
