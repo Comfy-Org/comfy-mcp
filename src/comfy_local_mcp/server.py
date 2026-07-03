@@ -56,6 +56,10 @@ mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
 # Allow overriding the binary (e.g. a venv path) without touching code.
 COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 
+# Hard ceiling for a single bounded watch so `float('inf')` / an absurd value
+# can't hold a `comfy jobs watch` child open effectively forever (1 hour).
+_MAX_WATCH_TIMEOUT = 3600.0
+
 
 class ComfyCliError(RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope."""
@@ -182,8 +186,13 @@ class _StreamProgress:
             "nodes_done": self.done,
         }
 
-    async def report(self, ctx: Context, event: dict) -> None:
-        """Forward one stream event as an MCP progress notification, if relevant."""
+    async def report(self, ctx: Context | None, event: dict) -> None:
+        """Advance tracker state from one stream event; notify via ``ctx`` if set.
+
+        State (``total`` / ``done`` / ``_last``) is updated unconditionally so a
+        bounded, ctx-less watch still reports real progress in its timed-out
+        :meth:`snapshot`; the MCP notification is the only ctx-gated part.
+        """
         etype = event.get("type")
         if etype == "queued":
             nodes = event.get("nodes")
@@ -208,7 +217,10 @@ class _StreamProgress:
         # MCP guidance: progress should not go backwards, even as nodes reset.
         progress = max(progress, self._last)
         self._last = progress
-        await ctx.report_progress(progress=progress, total=self.total, message=message)
+        if ctx is not None:
+            await ctx.report_progress(
+                progress=progress, total=self.total, message=message
+            )
 
 
 async def _run_comfy_streaming(
@@ -258,10 +270,11 @@ async def _run_comfy_streaming(
             if not line:  # EOF: comfy-cli closed stdout
                 break
             lines.append(line)
-            if ctx is not None:
-                event = _parse_event(line)
-                if event is not None:
-                    await tracker.report(ctx, event)
+            # Advance the tracker even without a ctx so a timed-out ctx-less
+            # watch still returns real progress; report() no-ops the notify.
+            event = _parse_event(line)
+            if event is not None:
+                await tracker.report(ctx, event)
 
     # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
     stderr_future = (
@@ -269,12 +282,23 @@ async def _run_comfy_streaming(
         if proc.stderr is not None
         else None
     )
+
+    async def _drain() -> Any:
+        # Read the whole stream, then reap the child and its stderr. Bounding
+        # this entire coroutine (not just _pump) means a child that closes
+        # stdout without exiting can't wedge the unbounded proc.wait/stderr read.
+        await _pump()
+        returncode = await asyncio.to_thread(proc.wait)
+        stderr = (await stderr_future) if stderr_future is not None else ""
+        return _unwrap_envelope(
+            _last_json_object("".join(lines)), args, returncode, stderr
+        )
+
     try:
         try:
             if timeout is not None:
-                await asyncio.wait_for(_pump(), timeout=timeout)
-            else:
-                await _pump()
+                return await asyncio.wait_for(_drain(), timeout=timeout)
+            return await _drain()
         except (asyncio.TimeoutError, TimeoutError) as exc:
             if not raise_on_timeout:
                 # Bounded tail: report how far the run got instead of erroring
@@ -283,12 +307,6 @@ async def _run_comfy_streaming(
             raise ComfyCliError(
                 f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
             ) from exc
-
-        returncode = await asyncio.to_thread(proc.wait)
-        stderr = (await stderr_future) if stderr_future is not None else ""
-        return _unwrap_envelope(
-            _last_json_object("".join(lines)), args, returncode, stderr
-        )
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion).
@@ -417,10 +435,17 @@ async def watch_job(
 
     Use this to get LIVE progress on a job already submitted with
     ``run_workflow(wait=False)`` — the streaming counterpart to the polled
-    ``wait_for_job``. The wait is bounded by ``timeout_seconds`` so it can never
-    block forever; on expiry it returns ``{"timed_out": True, "status": <last
-    known progress>}`` (consistent with ``wait_for_job``) instead of raising.
+    ``wait_for_job``. The wait is bounded by ``timeout_seconds`` (clamped to a
+    sane maximum) so it can never block forever; on expiry it returns the same
+    ``{"timed_out": True, "status": ...}`` envelope shape as ``wait_for_job``,
+    except ``status`` here carries a live progress snapshot
+    (``{progress, total, nodes_done}``) rather than a raw ``jobs status`` dict.
     """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject
+        # it rather than let `jobs watch` misread the id (argument injection).
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
+    timeout_seconds = min(max(timeout_seconds, 0.0), _MAX_WATCH_TIMEOUT)
     return await _run_comfy_streaming(
         "jobs",
         "watch",

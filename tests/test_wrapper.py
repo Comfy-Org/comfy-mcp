@@ -570,6 +570,53 @@ def test_watch_job_times_out_returns_payload(monkeypatch):
     assert procs[0].killed  # the child was cleaned up on timeout
 
 
+def test_watch_job_times_out_reports_progress_without_ctx(monkeypatch):
+    """A ctx-less watch still advances the tracker, so its timed-out snapshot is real."""
+    queued = json.dumps(
+        {"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]}
+    )
+    executed = json.dumps({"type": "executed", "node": "1"})
+    procs: list[_BlockingProc] = []
+
+    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+        proc = _BlockingProc(cmd, [queued + "\n", executed + "\n"])
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    # No ctx: the notification is a no-op, but tracker state must still advance
+    # so the snapshot reports the node that actually finished (not all zeros).
+    result = asyncio.run(server.watch_job("pid", timeout_seconds=0.25))
+
+    assert result["timed_out"] is True
+    assert result["status"]["total"] == 2.0
+    assert result["status"]["nodes_done"] == 1  # the `executed` event was tracked
+    assert result["status"]["progress"] == 1.0  # not None / not zero
+    assert procs[0].killed
+
+
+def test_watch_job_rejects_option_like_prompt_id():
+    """A leading-dash prompt_id is refused so comfy-cli can't parse it as a flag."""
+    with pytest.raises(server.ComfyCliError, match="invalid prompt_id"):
+        asyncio.run(server.watch_job("--help"))
+
+
+def test_watch_job_clamps_oversized_timeout(monkeypatch):
+    """timeout_seconds is clamped to the module ceiling, not passed through raw."""
+    seen: dict = {}
+
+    async def fake_stream(*args, ctx=None, timeout=None, raise_on_timeout=True):
+        seen["timeout"] = timeout
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+    asyncio.run(server.watch_job("pid", timeout_seconds=float("inf")))
+
+    assert seen["timeout"] == server._MAX_WATCH_TIMEOUT
+
+
 def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
     """wait=False keeps the plain --json _run_comfy path (no streaming, no --wait)."""
     seen: dict = {}
