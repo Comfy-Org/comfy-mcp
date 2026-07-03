@@ -19,6 +19,7 @@ import asyncio
 import io
 import json
 import subprocess
+import time
 
 import pytest
 
@@ -465,6 +466,108 @@ def test_run_workflow_stream_works_without_ctx(patched_stream):
     result = asyncio.run(server.run_workflow("wf.json", wait=True))
 
     assert result == {"outputs": ["/x.png"]}
+
+
+def test_watch_job_streams_progress_and_returns_data(patched_stream):
+    """watch_job tails `comfy jobs watch <id>`, emits progress, returns the data."""
+    procs = patched_stream(_OK_STREAM)
+    ctx = _RecordingCtx()
+
+    result = asyncio.run(server.watch_job("pid", ctx=ctx))
+
+    assert result == {"outputs": ["/x.png"]}  # final envelope's data unwrapped
+    assert len(ctx.calls) >= 1  # progress ticks forwarded
+
+    cmd = procs[0].cmd
+    assert cmd[0] == server.COMFY_BIN
+    assert cmd[1:4] == ["--json-stream", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["jobs", "watch", "pid"]  # subcommand strictly after
+
+    # Same overall bar as run_workflow: 2-node manifest -> total, never drops.
+    assert all(c["total"] == 2.0 for c in ctx.calls if c["total"] is not None)
+    values = [c["progress"] for c in ctx.calls]
+    assert values == sorted(values)  # monotonically non-decreasing
+    assert values[-1] == 2.0  # both nodes finished
+
+
+def test_watch_job_stream_error_envelope_raises_with_code(patched_stream):
+    """A watch that ends on an error envelope raises ComfyCliError with its code."""
+    stream = (
+        "\n".join(
+            json.dumps(evt)
+            for evt in [
+                {"type": "queued", "nodes": [{"node_id": "1"}]},
+                {
+                    "schema": "envelope/1",
+                    "type": "envelope",
+                    "ok": False,
+                    "error": {"code": "execution_error", "message": "boom"},
+                },
+            ]
+        )
+        + "\n"
+    )
+    patched_stream(stream)
+
+    with pytest.raises(server.ComfyCliError, match="execution_error"):
+        asyncio.run(server.watch_job("pid"))
+
+
+class _BlockingProc:
+    """A fake Popen whose stdout yields ``first_lines`` then blocks (forces a timeout)."""
+
+    def __init__(self, cmd, first_lines):
+        self.cmd = cmd
+        self._lines = list(first_lines)
+        self.stdout = self  # readline lives on the proc itself
+        self.stderr = io.StringIO("")
+        self.returncode = 0
+        self.killed = False
+        self._alive = True
+
+    def readline(self):
+        if self._lines:
+            return self._lines.pop(0)
+        time.sleep(1.0)  # outlives the test's tiny timeout, never yields the envelope
+        return ""
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+    def wait(self):
+        self._alive = False
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+
+def test_watch_job_times_out_returns_payload(monkeypatch):
+    """A watch bounded by timeout_seconds returns a timed-out payload, not an error."""
+    queued = json.dumps(
+        {"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]}
+    )
+    procs: list[_BlockingProc] = []
+
+    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+        proc = _BlockingProc(cmd, [queued + "\n"])
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    # MCP always injects a ctx, so the tracker has advanced by the time we expire.
+    result = asyncio.run(
+        server.watch_job("pid", timeout_seconds=0.25, ctx=_RecordingCtx())
+    )
+
+    # Consistent with wait_for_job: a {"timed_out": True, ...} marker, no raise.
+    assert result["timed_out"] is True
+    assert result["status"]["total"] == 2.0  # queued manifest was seen first
+    assert result["status"]["nodes_done"] == 0  # never reached a completion
+    assert procs[0].killed  # the child was cleaned up on timeout
 
 
 def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):

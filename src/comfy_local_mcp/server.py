@@ -6,8 +6,9 @@ returns its ``data``. There is deliberately no HTTP client and no code shared
 with the Comfy Cloud MCP — comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
-(``job_status`` / ``cancel_job`` / ``get_queue``) and the ``launch_comfyui`` /
-``stop_comfyui`` lifecycle pair (``comfy launch --background`` / ``comfy stop``).
+(``job_status`` / ``wait_for_job`` / ``watch_job`` / ``cancel_job`` /
+``get_queue``) and the ``launch_comfyui`` / ``stop_comfyui`` lifecycle pair
+(``comfy launch --background`` / ``comfy stop``).
 Next passthrough to add: ``discover`` (``comfy discover`` / ``comfy which``).
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
@@ -39,6 +40,8 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `prompt_id`, poll `wait_for_job` (a short bounded wait — chain several) or
   `job_status` until it finishes, then collect files with `fetch_outputs`.
   Prefer this over `run_workflow(wait=True)` for slow runs so nothing blocks.
+  For LIVE progress on an already-submitted job, `watch_job(prompt_id)` tails
+  its execution events (bounded, like `wait_for_job`).
 - Start from a template: `search_templates` to find one, `fetch_template` to save
   its workflow JSON, then `run_workflow` on that file.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
@@ -167,6 +170,18 @@ class _StreamProgress:
         self.done = 0  # nodes fully executed or served from cache
         self._last = -1.0  # last value reported (kept non-decreasing)
 
+    def snapshot(self) -> dict:
+        """Last-known progress, for a bounded watch that timed out mid-run.
+
+        ``progress`` is None until the first tick is reported (``_last`` starts
+        below zero), so a timed-out payload never claims phantom progress.
+        """
+        return {
+            "progress": self._last if self._last >= 0 else None,
+            "total": self.total,
+            "nodes_done": self.done,
+        }
+
     async def report(self, ctx: Context, event: dict) -> None:
         """Forward one stream event as an MCP progress notification, if relevant."""
         etype = event.get("type")
@@ -197,7 +212,10 @@ class _StreamProgress:
 
 
 async def _run_comfy_streaming(
-    *args: str, ctx: Context | None = None, timeout: float | None = None
+    *args: str,
+    ctx: Context | None = None,
+    timeout: float | None = None,
+    raise_on_timeout: bool = True,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
@@ -207,6 +225,12 @@ async def _run_comfy_streaming(
     ``ctx.report_progress``. The final ``envelope/1`` line is unwrapped exactly
     as :func:`_run_comfy` does, so an error envelope raises
     :class:`ComfyCliError` with the same code — terminal behavior is unchanged.
+
+    ``timeout`` bounds the whole stream. By default an expiry raises
+    :class:`ComfyCliError` (the run-workflow contract); pass
+    ``raise_on_timeout=False`` for a bounded *tail* that should instead return a
+    ``{"timed_out": True, "status": <progress snapshot>}`` payload (mirroring
+    :func:`wait_for_job`) rather than surface the deadline as an error.
     """
     if shutil.which(COMFY_BIN) is None:
         raise ComfyCliError(
@@ -252,6 +276,10 @@ async def _run_comfy_streaming(
             else:
                 await _pump()
         except (asyncio.TimeoutError, TimeoutError) as exc:
+            if not raise_on_timeout:
+                # Bounded tail: report how far the run got instead of erroring
+                # (the finally below still kills the child).
+                return {"timed_out": True, "status": tracker.snapshot()}
             raise ComfyCliError(
                 f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
             ) from exc
@@ -371,6 +399,36 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
         if remaining <= 0:
             return {"timed_out": True, "status": last}
         time.sleep(min(poll_interval, remaining))
+
+
+@mcp.tool()
+async def watch_job(
+    prompt_id: str,
+    timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
+) -> Any:
+    """Tail a submitted LOCAL job's live execution, streaming progress.
+
+    Wraps ``comfy jobs watch <prompt_id>``, which follows a job's execution
+    events (per-node execution + sampler step counts) and ends on the terminal
+    envelope. Runs through the same streaming machinery as
+    ``run_workflow(wait=True)``, forwarding those events as MCP progress
+    notifications, and returns the final result ``data`` on completion.
+
+    Use this to get LIVE progress on a job already submitted with
+    ``run_workflow(wait=False)`` — the streaming counterpart to the polled
+    ``wait_for_job``. The wait is bounded by ``timeout_seconds`` so it can never
+    block forever; on expiry it returns ``{"timed_out": True, "status": <last
+    known progress>}`` (consistent with ``wait_for_job``) instead of raising.
+    """
+    return await _run_comfy_streaming(
+        "jobs",
+        "watch",
+        prompt_id,
+        ctx=ctx,
+        timeout=timeout_seconds,
+        raise_on_timeout=False,
+    )
 
 
 @mcp.tool()
