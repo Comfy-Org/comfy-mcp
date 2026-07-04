@@ -6,7 +6,8 @@ returns its ``data``. There is deliberately no HTTP client and no code shared
 with the Comfy Cloud MCP — comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
-(``job_status`` / ``cancel_job`` / ``get_queue``) and the ``launch_comfyui`` /
+(``job_status`` / ``get_execution_error`` / ``cancel_job`` / ``get_queue``) and
+the ``launch_comfyui`` /
 ``stop_comfyui`` lifecycle pair (``comfy launch --background`` / ``comfy stop``).
 Next passthrough to add: ``discover`` (``comfy discover`` / ``comfy which``).
 
@@ -319,6 +320,100 @@ def job_status(prompt_id: str) -> Any:
     finished, its output references. Poll this after ``run_workflow(wait=False)``.
     """
     return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
+
+
+# How many trailing traceback frames survive into a get_execution_error verdict.
+# A full ComfyUI traceback can run hundreds of frames; the tail carries the
+# actual failure site. Mirrors comfy-cli's execution_errors._TRACEBACK_TAIL_FRAMES
+# (a smaller tail there — this tool is the deliberate deep-dive companion).
+_TRACEBACK_TAIL_FRAMES = 20
+
+# Byte cap on the joined traceback tail, so a pathological (megabyte) traceback
+# can't dump into an agent's context. Content is a Python traceback — no secret
+# redaction is required, only a size bound.
+_TRACEBACK_TAIL_MAX_CHARS = 8000
+
+
+def _cap_traceback_tail(frames: list[str]) -> list[str]:
+    """Bound the joined traceback tail to ``_TRACEBACK_TAIL_MAX_CHARS`` chars.
+
+    Drops leading (oldest) frames until the remainder fits, prepending a
+    ``"...(truncated)"`` marker so the caller knows frames were dropped. If a
+    single frame alone exceeds the cap, its characters are hard-truncated (keep
+    the tail — that's the failure site). Returns the frames unchanged, with no
+    marker, when already under the cap.
+    """
+
+    def joined_len(items: list[str]) -> int:
+        # Newline-joined length: chars plus one separator between frames.
+        return sum(len(f) for f in items) + max(0, len(items) - 1)
+
+    frames = list(frames)
+    if joined_len(frames) <= _TRACEBACK_TAIL_MAX_CHARS:
+        return frames
+    while len(frames) > 1 and joined_len(frames) > _TRACEBACK_TAIL_MAX_CHARS:
+        frames.pop(0)
+    if frames and joined_len(frames) > _TRACEBACK_TAIL_MAX_CHARS:
+        # One oversized frame remains; hard-cap its characters.
+        frames = [frames[0][-_TRACEBACK_TAIL_MAX_CHARS:]]
+    return ["...(truncated)", *frames]
+
+
+@mcp.tool()
+def get_execution_error(prompt_id: str) -> Any:
+    """Diagnostics companion to ``job_status``: the failure verdict for a run.
+
+    Call this after a run reports failure (``job_status`` returning
+    ``status: error``) to get the compact cause an agent needs to self-repair
+    the workflow — the failing ``node_type``/``node_id``, the
+    ``exception_type``/``exception_message``, and a bounded tail of the Python
+    traceback — without digging it out of the large raw status blob. Wraps
+    ``comfy jobs status <prompt_id>`` (the same source comfy-cli points at for
+    the full traceback) and normalizes ComfyUI's raw ``execution_error`` payload
+    from that snapshot's ``error`` field.
+
+    On a healthy prompt (completed / queued / running — no ``error``) it returns
+    ``{"prompt_id", "status", "error": None}`` rather than raising, so it is safe
+    to call speculatively.
+    """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject
+        # it rather than let `jobs status` misread the id (argument injection).
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
+
+    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
+
+    error = status.get("error") if isinstance(status, dict) else None
+    if not error:
+        # No execution error — job completed, still queued/running, or an
+        # unexpected payload shape. Report an explicit no-error result.
+        reported = status.get("status") if isinstance(status, dict) else None
+        return {"prompt_id": prompt_id, "status": reported, "error": None}
+
+    # `error` is normally ComfyUI's execution_error dict, but tolerate a bare
+    # string (some failure paths surface just a message) so the tool never
+    # crashes on an unexpected shape — mirrors comfy-cli's parse_error_message.
+    if not isinstance(error, dict):
+        error = {"exception_message": str(error)}
+
+    # Mirror comfy-cli's parse_error_message shape (execution_errors.py): flat
+    # fields plus a tail of the traceback frames, with node_id coerced to str.
+    node_id = error.get("node_id")
+    traceback = error.get("traceback") or []
+    if isinstance(traceback, str):
+        traceback = [traceback]
+    traceback_tail = [str(frame) for frame in traceback[-_TRACEBACK_TAIL_FRAMES:]]
+    traceback_tail = _cap_traceback_tail(traceback_tail)
+
+    return {
+        "prompt_id": prompt_id,
+        "status": "error",
+        "exception_message": error.get("exception_message"),
+        "exception_type": error.get("exception_type"),
+        "node_id": str(node_id) if node_id is not None else None,
+        "node_type": error.get("node_type"),
+        "traceback_tail": traceback_tail,
+    }
 
 
 # Statuses that mean a job is finished (no point polling further). comfy-cli
