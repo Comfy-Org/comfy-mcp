@@ -593,6 +593,43 @@ def search_models(query: str = "", folder: str = "") -> Any:
 
 
 @mcp.tool()
+def download_model(
+    url: str, relative_path: str | None = None, filename: str | None = None
+) -> Any:
+    """Download a model file into the LOCAL ComfyUI models dir, by URL.
+
+    Wraps ``comfy model download --url <url> [--relative-path <path>]
+    [--filename <name>]`` (note the SINGULAR ``model`` verb group — the download
+    engine — distinct from the plural ``models`` catalog that ``search_models``
+    reads). comfy-cli understands HuggingFace and CivitAI URLs; any access
+    tokens are configured out-of-band via comfy-cli / environment variables and
+    are NOT passed through this tool. The file lands in the workspace models
+    directory, optionally under ``relative_path`` (e.g. ``models/loras`` to place
+    a LoRA in the right folder) and optionally renamed via ``filename``.
+
+    DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
+    there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
+    such search), so the caller must already have the direct model URL. Returns
+    comfy-cli's envelope ``data`` (the saved path / download metadata).
+    """
+    # comfy-cli parses a leading-dash value as an option/flag; reject any so a
+    # crafted argument can't be smuggled in as a CLI flag (argument injection).
+    if url.startswith("-"):
+        raise ComfyCliError(f"invalid url: {url!r} (leading '-')")
+    if relative_path is not None and relative_path.startswith("-"):
+        raise ComfyCliError(f"invalid relative_path: {relative_path!r} (leading '-')")
+    if filename is not None and filename.startswith("-"):
+        raise ComfyCliError(f"invalid filename: {filename!r} (leading '-')")
+    args = ["model", "download", "--url", url]
+    if relative_path is not None:
+        args += ["--relative-path", relative_path]
+    if filename is not None:
+        args += ["--filename", filename]
+    # Generous timeout: multi-GB checkpoints can take a long time to fetch.
+    return _run_comfy(*args, timeout=1800.0)
+
+
+@mcp.tool()
 def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     """Upload local files into the LOCAL ComfyUI ``input`` directory.
 

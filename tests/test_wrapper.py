@@ -163,6 +163,105 @@ def test_upload_file_omits_overwrite_by_default(patched_run):
     assert "--overwrite" not in calls[0]["cmd"]
 
 
+def test_download_model_url_only(patched_run):
+    """download_model wraps the SINGULAR `model download --url` and returns data."""
+    calls = patched_run(
+        {"type": "envelope", "ok": True, "data": {"saved": "/models/x.safetensors"}}
+    )
+
+    assert server.download_model("https://hf.co/x.safetensors") == {
+        "saved": "/models/x.safetensors"
+    }
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    # SINGULAR `model` verb group (download engine), not the plural catalog.
+    assert cmd[4:] == ["model", "download", "--url", "https://hf.co/x.safetensors"]
+
+
+def test_download_model_threads_relative_path(patched_run):
+    """--relative-path is appended only when provided."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.download_model("https://hf.co/l.safetensors", relative_path="models/loras")
+
+    assert calls[0]["cmd"][4:] == [
+        "model",
+        "download",
+        "--url",
+        "https://hf.co/l.safetensors",
+        "--relative-path",
+        "models/loras",
+    ]
+
+
+def test_download_model_threads_filename(patched_run):
+    """--filename is appended only when provided."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.download_model("https://hf.co/c.safetensors", filename="renamed.safetensors")
+
+    assert calls[0]["cmd"][4:] == [
+        "model",
+        "download",
+        "--url",
+        "https://hf.co/c.safetensors",
+        "--filename",
+        "renamed.safetensors",
+    ]
+
+
+def test_download_model_threads_all_optionals(patched_run):
+    """Both optional args thread through together, in order, only when set."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.download_model(
+        "https://civitai.com/api/download/models/42",
+        relative_path="models/checkpoints",
+        filename="sd.safetensors",
+    )
+
+    assert calls[0]["cmd"][4:] == [
+        "model",
+        "download",
+        "--url",
+        "https://civitai.com/api/download/models/42",
+        "--relative-path",
+        "models/checkpoints",
+        "--filename",
+        "sd.safetensors",
+    ]
+
+
+def test_download_model_omits_absent_optionals(patched_run):
+    """Neither optional flag is emitted when the argument is left unset."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.download_model("https://hf.co/x.safetensors")
+
+    cmd = calls[0]["cmd"]
+    assert "--relative-path" not in cmd
+    assert "--filename" not in cmd
+
+
+def test_download_model_rejects_option_like_url():
+    """A leading-dash url is refused so comfy-cli can't parse it as a flag."""
+    with pytest.raises(server.ComfyCliError, match="invalid url"):
+        server.download_model("--config")
+
+
+def test_download_model_rejects_option_like_relative_path():
+    """A leading-dash relative_path is refused (argument injection guard)."""
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path="-rf")
+
+
+def test_download_model_rejects_option_like_filename():
+    """A leading-dash filename is refused (argument injection guard)."""
+    with pytest.raises(server.ComfyCliError, match="invalid filename"):
+        server.download_model("https://hf.co/x.safetensors", filename="--evil")
+
+
 def test_validate_workflow_returns_results_for_valid(patched_run):
     """A valid workflow returns comfy-cli's validation data unwrapped."""
     calls = patched_run(
