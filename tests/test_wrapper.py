@@ -262,6 +262,42 @@ def test_download_model_rejects_option_like_filename():
         server.download_model("https://hf.co/x.safetensors", filename="--evil")
 
 
+@pytest.mark.parametrize(
+    "bad_url", ["file:///etc/passwd", "ftp://host/x", "/etc/passwd"]
+)
+def test_download_model_rejects_non_http_scheme(bad_url):
+    """Only http(s) URLs are allowed; file://, ftp:// and bare paths are refused."""
+    with pytest.raises(server.ComfyCliError, match="invalid url"):
+        server.download_model(bad_url)
+
+
+@pytest.mark.parametrize(
+    "bad_path", ["../../etc", "models/../../etc", "/abs/models", "..\\..\\etc"]
+)
+def test_download_model_rejects_traversal_relative_path(bad_path):
+    """relative_path must stay within the models dir: no `..` or absolute paths."""
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+
+@pytest.mark.parametrize("bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b"])
+def test_download_model_rejects_pathy_filename(bad_name):
+    """filename must be a bare name: no separators or `..` to escape the dir."""
+    with pytest.raises(server.ComfyCliError, match="invalid filename"):
+        server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+
+def test_download_model_omits_empty_string_optionals(patched_run):
+    """Explicit empty-string optionals are treated as unset, not forwarded as ``""``."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.download_model("https://hf.co/x.safetensors", relative_path="", filename="")
+
+    cmd = calls[0]["cmd"]
+    assert "--relative-path" not in cmd
+    assert "--filename" not in cmd
+
+
 def test_validate_workflow_returns_results_for_valid(patched_run):
     """A valid workflow returns comfy-cli's validation data unwrapped."""
     calls = patched_run(

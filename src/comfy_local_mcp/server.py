@@ -616,14 +616,38 @@ def download_model(
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
     if url.startswith("-"):
         raise ComfyCliError(f"invalid url: {url!r} (leading '-')")
-    if relative_path is not None and relative_path.startswith("-"):
-        raise ComfyCliError(f"invalid relative_path: {relative_path!r} (leading '-')")
-    if filename is not None and filename.startswith("-"):
-        raise ComfyCliError(f"invalid filename: {filename!r} (leading '-')")
+    # Restrict to http(s): this is a remote fetch of a known model URL, so a
+    # `file://` path or other scheme — an SSRF / local-file-read primitive whose
+    # body would be written straight into the models dir — is never legitimate.
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise ComfyCliError(f"invalid url: {url!r} (scheme must be http/https)")
+    # Optional args are treated as unset when falsy (None or ""), so an explicit
+    # empty string is omitted rather than forwarded as `--relative-path ""`.
+    if relative_path:
+        if relative_path.startswith("-"):
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} (leading '-')"
+            )
+        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
+        # write inside the models dir by rejecting absolute paths and `..`.
+        parts = relative_path.replace("\\", "/").split("/")
+        if os.path.isabs(relative_path) or ".." in parts:
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} (path traversal)"
+            )
+    if filename:
+        if filename.startswith("-"):
+            raise ComfyCliError(f"invalid filename: {filename!r} (leading '-')")
+        # filename is a single output name, not a path; reject separators and `..`
+        # so it can't redirect the write out of the target directory.
+        if filename in (".", "..") or "/" in filename or "\\" in filename:
+            raise ComfyCliError(
+                f"invalid filename: {filename!r} (must be a bare filename)"
+            )
     args = ["model", "download", "--url", url]
-    if relative_path is not None:
+    if relative_path:
         args += ["--relative-path", relative_path]
-    if filename is not None:
+    if filename:
         args += ["--filename", filename]
     # Generous timeout: multi-GB checkpoints can take a long time to fetch.
     return _run_comfy(*args, timeout=1800.0)
