@@ -108,6 +108,61 @@ def test_get_execution_error_no_error_returns_explicit_none(monkeypatch):
     assert result == {"prompt_id": "pid", "status": "completed", "error": None}
 
 
+def test_get_execution_error_error_status_with_empty_payload_is_not_healthy(
+    monkeypatch,
+):
+    """``status: error`` with a falsy ``error`` field must not masquerade as healthy."""
+    monkeypatch.setattr(
+        server,
+        "_run_comfy",
+        lambda *a, **k: {"status": "error", "error": {}},  # failed but no details
+    )
+
+    result = server.get_execution_error("pid")
+
+    # Distinguished from the no-error branch: status stays "error", not error=None.
+    assert result["status"] == "error"
+    assert "error" not in result  # flat failure shape, not the healthy shape
+    assert result["exception_message"] is None
+    assert result["traceback_tail"] == []
+
+
+def test_get_execution_error_tolerates_non_sequence_traceback(monkeypatch):
+    """A malformed non-sequence ``traceback`` (dict/int) is dropped, not crashed on."""
+    monkeypatch.setattr(
+        server,
+        "_run_comfy",
+        lambda *a, **k: {
+            "status": "error",
+            "error": {
+                "exception_message": "boom",
+                "traceback": {"unexpected": "shape"},
+            },
+        },
+    )
+
+    result = server.get_execution_error("pid")
+
+    assert result["exception_message"] == "boom"
+    assert result["traceback_tail"] == []  # garbage traceback dropped, no TypeError
+
+
+def test_get_execution_error_caps_oversized_exception_message(monkeypatch):
+    """A multi-megabyte ``exception_message`` is bounded, not dumped whole."""
+    huge = "z" * (server._EXCEPTION_TEXT_MAX_CHARS + 10_000)
+    monkeypatch.setattr(
+        server,
+        "_run_comfy",
+        lambda *a, **k: {"status": "error", "error": {"exception_message": huge}},
+    )
+
+    result = server.get_execution_error("pid")
+
+    msg = result["exception_message"]
+    assert len(msg) <= server._EXCEPTION_TEXT_MAX_CHARS + len("...(truncated)")
+    assert msg.endswith("...(truncated)")
+
+
 def test_get_execution_error_rejects_leading_dash(monkeypatch):
     """A leading-dash prompt_id is rejected before any comfy-cli call."""
     called = False
@@ -131,5 +186,9 @@ def test_cap_traceback_tail_hard_truncates_single_oversized_frame():
 
     assert capped[0] == "...(truncated)"
     assert len(capped) == 2
-    assert len(capped[1]) == server._TRACEBACK_TAIL_MAX_CHARS
-    assert capped[1] == frame[-server._TRACEBACK_TAIL_MAX_CHARS :]
+    # The marker + separator are charged to the budget, so the *joined* result
+    # (marker + frame) stays within the documented cap — not just the frame.
+    joined = "\n".join(capped)
+    assert len(joined) <= server._TRACEBACK_TAIL_MAX_CHARS
+    # The tail of the oversized frame (the failure site) is what survives.
+    assert capped[1] == frame[-len(capped[1]) :]

@@ -328,10 +328,24 @@ def job_status(prompt_id: str) -> Any:
 # (a smaller tail there — this tool is the deliberate deep-dive companion).
 _TRACEBACK_TAIL_FRAMES = 20
 
-# Byte cap on the joined traceback tail, so a pathological (megabyte) traceback
-# can't dump into an agent's context. Content is a Python traceback — no secret
-# redaction is required, only a size bound.
+# Character cap on the joined traceback tail, so a pathological (megabyte)
+# traceback can't dump into an agent's context. ``len()`` counts Unicode code
+# points, not bytes; that's close enough for a context-size guard. Content is a
+# Python traceback — no secret redaction is required, only a size bound.
 _TRACEBACK_TAIL_MAX_CHARS = 8000
+
+# Marker prepended to a truncated tail so the caller knows frames were dropped.
+_TRACEBACK_TRUNCATION_MARKER = "...(truncated)"
+
+# Character cap on free-text failure fields (``exception_message`` etc.). A
+# hostile or buggy custom node can raise with a multi-megabyte message; bound it
+# for the same context-bloat reason the traceback tail is capped.
+_EXCEPTION_TEXT_MAX_CHARS = 8000
+
+# Reported statuses that mean the run failed. Used to tell a genuinely healthy
+# run apart from a failure that carried a falsy/empty `error` field, so the
+# latter is not reported as `error: None`. Compared case-insensitively.
+_ERROR_STATUSES = frozenset({"error", "failed", "failure"})
 
 
 def _cap_traceback_tail(frames: list[str]) -> list[str]:
@@ -340,8 +354,9 @@ def _cap_traceback_tail(frames: list[str]) -> list[str]:
     Drops leading (oldest) frames until the remainder fits, prepending a
     ``"...(truncated)"`` marker so the caller knows frames were dropped. If a
     single frame alone exceeds the cap, its characters are hard-truncated (keep
-    the tail — that's the failure site). Returns the frames unchanged, with no
-    marker, when already under the cap.
+    the tail — that's the failure site). The marker and its separator are
+    charged to the budget, so the joined result stays within the cap. Returns
+    the frames unchanged, with no marker, when already under the cap.
     """
 
     def joined_len(items: list[str]) -> int:
@@ -351,12 +366,27 @@ def _cap_traceback_tail(frames: list[str]) -> list[str]:
     frames = list(frames)
     if joined_len(frames) <= _TRACEBACK_TAIL_MAX_CHARS:
         return frames
-    while len(frames) > 1 and joined_len(frames) > _TRACEBACK_TAIL_MAX_CHARS:
+    # Reserve room for the marker plus its trailing separator so the final
+    # joined tail (marker + frames) never exceeds the documented cap.
+    budget = max(0, _TRACEBACK_TAIL_MAX_CHARS - (len(_TRACEBACK_TRUNCATION_MARKER) + 1))
+    while len(frames) > 1 and joined_len(frames) > budget:
         frames.pop(0)
-    if frames and joined_len(frames) > _TRACEBACK_TAIL_MAX_CHARS:
+    if frames and joined_len(frames) > budget:
         # One oversized frame remains; hard-cap its characters.
-        frames = [frames[0][-_TRACEBACK_TAIL_MAX_CHARS:]]
-    return ["...(truncated)", *frames]
+        frames = [frames[0][-budget:]] if budget else [""]
+    return [_TRACEBACK_TRUNCATION_MARKER, *frames]
+
+
+def _cap_text(value: Any, limit: int = _EXCEPTION_TEXT_MAX_CHARS) -> Any:
+    """Bound a free-text failure field to ``limit`` chars.
+
+    Non-strings (including ``None``) pass through untouched so the field's shape
+    is preserved for callers that key off it; only oversized strings are cut and
+    marked truncated.
+    """
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + _TRACEBACK_TRUNCATION_MARKER
+    return value
 
 
 @mcp.tool()
@@ -384,10 +414,24 @@ def get_execution_error(prompt_id: str) -> Any:
     status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
     error = status.get("error") if isinstance(status, dict) else None
+    reported = status.get("status") if isinstance(status, dict) else None
     if not error:
-        # No execution error — job completed, still queued/running, or an
-        # unexpected payload shape. Report an explicit no-error result.
-        reported = status.get("status") if isinstance(status, dict) else None
+        # No error payload. Distinguish a genuinely healthy run from a failed
+        # one that reported an error status but a falsy/empty `error` field
+        # ({}, "", 0): the latter must not masquerade as `error: None` and let a
+        # caller treat the failure as healthy.
+        reported_l = reported.strip().lower() if isinstance(reported, str) else None
+        if reported_l in _ERROR_STATUSES:
+            return {
+                "prompt_id": prompt_id,
+                "status": "error",
+                "exception_message": None,
+                "exception_type": None,
+                "node_id": None,
+                "node_type": None,
+                "traceback_tail": [],
+            }
+        # Job completed, still queued/running, or an unexpected payload shape.
         return {"prompt_id": prompt_id, "status": reported, "error": None}
 
     # `error` is normally ComfyUI's execution_error dict, but tolerate a bare
@@ -402,16 +446,21 @@ def get_execution_error(prompt_id: str) -> Any:
     traceback = error.get("traceback") or []
     if isinstance(traceback, str):
         traceback = [traceback]
+    elif not isinstance(traceback, (list, tuple)):
+        # Malformed payload (dict / int / etc.): a non-sequence would raise on
+        # the slice below. Drop it rather than crash — the "never crashes on an
+        # unexpected shape" contract wins over salvaging a garbage traceback.
+        traceback = []
     traceback_tail = [str(frame) for frame in traceback[-_TRACEBACK_TAIL_FRAMES:]]
     traceback_tail = _cap_traceback_tail(traceback_tail)
 
     return {
         "prompt_id": prompt_id,
         "status": "error",
-        "exception_message": error.get("exception_message"),
-        "exception_type": error.get("exception_type"),
+        "exception_message": _cap_text(error.get("exception_message")),
+        "exception_type": _cap_text(error.get("exception_type")),
         "node_id": str(node_id) if node_id is not None else None,
-        "node_type": error.get("node_type"),
+        "node_type": _cap_text(error.get("node_type")),
         "traceback_tail": traceback_tail,
     }
 
