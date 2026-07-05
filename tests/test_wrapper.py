@@ -455,6 +455,27 @@ def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
     assert calls[0]["cmd"][4:] == ["stop"]
 
 
+def test_discover_maps_command_and_returns_data(patched_run):
+    """discover wraps `comfy discover` and returns the envelope data verbatim."""
+    surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
+    calls = patched_run({"type": "envelope", "ok": True, "data": surface})
+
+    assert server.discover() == surface
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["discover"]  # bare subcommand, no positional args
+
+
+def test_which_maps_command_and_returns_data(patched_run):
+    """which wraps `comfy which` and returns the selected-workspace data."""
+    calls = patched_run(
+        {"type": "envelope", "ok": True, "data": {"workspace": "/home/me/ComfyUI"}}
+    )
+
+    assert server.which() == {"workspace": "/home/me/ComfyUI"}
+    assert calls[0]["cmd"][4:] == ["which"]  # no positional args
+
+
 # --- streaming run_workflow(wait=True) -------------------------------------
 
 
