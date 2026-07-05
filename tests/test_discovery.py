@@ -55,6 +55,119 @@ def test_get_node_argv(monkeypatch):
     assert calls[0][4:] == ["nodes", "show", "KSampler"]
 
 
+def test_list_nodes_no_filters_bare_ls(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([{"name": "KSampler"}]))
+    assert server.list_nodes() == [{"name": "KSampler"}]
+    # no filters -> a bare `nodes ls`, no stray flags
+    assert calls[0][4:] == ["nodes", "ls"]
+
+
+def test_list_nodes_all_filters_in_order(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([]))
+    server.list_nodes(
+        produces="IMAGE",
+        accepts="MODEL",
+        category="loaders",
+        pack="was-suite",
+        label="Load",
+    )
+    assert calls[0][4:] == [
+        "nodes",
+        "ls",
+        "--produces",
+        "IMAGE",
+        "--accepts",
+        "MODEL",
+        "--category",
+        "loaders",
+        "--pack",
+        "was-suite",
+        "--label",
+        "Load",
+    ]
+
+
+def test_list_nodes_omits_empty_filters(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([]))
+    server.list_nodes(produces="IMAGE", category="sampling")
+    # only the two non-empty filters are passed, in declared order
+    assert calls[0][4:] == [
+        "nodes",
+        "ls",
+        "--produces",
+        "IMAGE",
+        "--category",
+        "sampling",
+    ]
+
+
+def test_nodes_upstream_without_limit(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([{"name": "CheckpointLoaderSimple"}]))
+    assert server.nodes_upstream("KSampler") == [{"name": "CheckpointLoaderSimple"}]
+    assert calls[0][4:] == ["nodes", "upstream", "KSampler"]
+
+
+def test_nodes_upstream_with_limit(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([]))
+    server.nodes_upstream("KSampler", limit=5)
+    assert calls[0][4:] == ["nodes", "upstream", "KSampler", "--limit", "5"]
+
+
+def test_nodes_downstream_without_limit(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([{"name": "VAEDecode"}]))
+    assert server.nodes_downstream("KSampler") == [{"name": "VAEDecode"}]
+    assert calls[0][4:] == ["nodes", "downstream", "KSampler"]
+
+
+def test_nodes_downstream_with_limit(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([]))
+    server.nodes_downstream("KSampler", limit=3)
+    assert calls[0][4:] == ["nodes", "downstream", "KSampler", "--limit", "3"]
+
+
+def test_nodes_path_defaults(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([]))
+    server.nodes_path("MODEL", "IMAGE")
+    # concrete int defaults are always passed, so the argv is deterministic
+    assert calls[0][4:] == [
+        "nodes",
+        "path",
+        "MODEL",
+        "IMAGE",
+        "--max-depth",
+        "6",
+        "--max-paths",
+        "10",
+    ]
+
+
+def test_nodes_path_overrides(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok([]))
+    server.nodes_path("LATENT", "IMAGE", max_depth=3, max_paths=2)
+    assert calls[0][4:] == [
+        "nodes",
+        "path",
+        "LATENT",
+        "IMAGE",
+        "--max-depth",
+        "3",
+        "--max-paths",
+        "2",
+    ]
+
+
+def test_nodes_types_argv(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok(["MODEL", "IMAGE", "LATENT"]))
+    assert server.nodes_types() == ["MODEL", "IMAGE", "LATENT"]
+    assert calls[0][4:] == ["nodes", "types"]
+
+
+def test_nodes_categories_argv(monkeypatch):
+    calls = _stub_comfy(monkeypatch, _ok({"loaders": {}}))
+    assert server.nodes_categories() == {"loaders": {}}
+    assert calls[0][4:] == ["nodes", "categories"]
+
+
 def test_search_models_query_uses_search(monkeypatch):
     calls = _stub_comfy(monkeypatch, _ok(["sd_xl_base.safetensors"]))
     assert server.search_models(query="xl") == ["sd_xl_base.safetensors"]

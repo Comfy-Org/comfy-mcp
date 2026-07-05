@@ -9,7 +9,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Seventeen tools, core loop validated end-to-end against a live local
+> **Status:** early POC. Twenty tools, core loop validated end-to-end against a live local
 > ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -143,7 +143,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-Seventeen tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
+Twenty tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
 comfy-cli's `envelope/1`, and returns its `data`.
 
 | Tool | Wraps | Purpose |
@@ -152,9 +152,10 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
+| `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
-| `fetch_outputs(prompt_id, out_dir)` | `comfy jobs status <prompt_id>` → copy/`/view` fetch | Collect a finished job's output files into `out_dir` (local outputs are on disk, so this copies them — not a cloud download). |
+| `fetch_outputs(prompt_id, out_dir, url_only=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes. |
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
 | `search_templates(query="")` | `comfy templates ls` (filtered client-side) | Find a built-in workflow template by name/description; empty `query` lists all. |
@@ -162,13 +163,24 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `fetch_template(name, out_path)` | `comfy templates fetch <name> --out <path>` | Write a template's runnable workflow JSON to `out_path`; returns the absolute path for `run_workflow`. |
 | `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
 | `get_node(name)` | `comfy nodes show <ClassName>` | Full input/output schema for one node class — what you need to author/repair a graph. |
+| `list_nodes(produces="", accepts="", category="", pack="", label="")` | `comfy nodes ls [--produces/--accepts/--category/--pack/--label …]` | List node classes, filtered by output/input type, category, pack, or label; bare call lists all. Reads the **live install**. |
+| `nodes_upstream(name, limit=None)` | `comfy nodes upstream <name> [--limit N]` | Nodes whose outputs can feed `<name>`'s inputs ("what wires INTO this?"). Reads the **live install**. |
+| `nodes_downstream(name, limit=None)` | `comfy nodes downstream <name> [--limit N]` | Nodes that accept `<name>`'s output types ("what does this wire INTO?"). Reads the **live install**. |
+| `nodes_path(from_type, to_type, max_depth=6, max_paths=10)` | `comfy nodes path <FROM> <TO> --max-depth N --max-paths N` | Node chains routing a value between two connection types (e.g. `MODEL` → `IMAGE`). Reads the **live install**. |
+| `nodes_types()` | `comfy nodes types` | All connection types (`MODEL`, `IMAGE`, …) ranked by connectivity. Reads the **live install**. |
+| `nodes_categories()` | `comfy nodes categories` | The node category tree. Reads the **live install**. |
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
+| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
+| `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
+| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
 
-Discovery (`search_nodes` / `get_node` / `search_models`) reads the **user's live install**
-(custom nodes included), not a static catalog — that's the local differentiator from the cloud
-MCP's equivalents.
+Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream` /
+`nodes_downstream` / `nodes_path` / `nodes_types` / `nodes_categories`) and `search_models`
+read the **user's live install** (custom nodes included), not a static catalog — that's the
+local differentiator from the cloud MCP's equivalents. The graph-wiring verbs (`upstream` /
+`downstream` / `path`) are what an agent authoring a workflow uses to find compatible nodes.
 
 Planned next: `discover` (`comfy discover`).
 

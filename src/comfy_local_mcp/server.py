@@ -6,9 +6,9 @@ returns its ``data``. There is deliberately no HTTP client and no code shared
 with the Comfy Cloud MCP — comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
-(``job_status`` / ``get_execution_error`` / ``cancel_job`` / ``get_queue``) and
-the ``launch_comfyui`` /
-``stop_comfyui`` lifecycle pair (``comfy launch --background`` / ``comfy stop``).
+(``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
+``cancel_job`` / ``get_queue``) and the ``launch_comfyui`` / ``stop_comfyui``
+lifecycle pair (``comfy launch --background`` / ``comfy stop``).
 Next passthrough to add: ``discover`` (``comfy discover`` / ``comfy which``).
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
@@ -23,9 +23,8 @@ import os
 import shutil
 import subprocess
 import time
-import urllib.request
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -40,8 +39,13 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `prompt_id`, poll `wait_for_job` (a short bounded wait — chain several) or
   `job_status` until it finishes, then collect files with `fetch_outputs`.
   Prefer this over `run_workflow(wait=True)` for slow runs so nothing blocks.
+  For LIVE progress on an already-submitted job, `watch_job(prompt_id)` tails
+  its execution events (bounded, like `wait_for_job`).
 - Start from a template: `search_templates` to find one, `fetch_template` to save
-  its workflow JSON, then `run_workflow` on that file.
+  its workflow JSON, then `run_workflow` on that file. To change the prompt / seed
+  / steps / model of a fetched template before running, inspect its tweakable slots
+  with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
+  by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
@@ -53,6 +57,10 @@ mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
 
 # Allow overriding the binary (e.g. a venv path) without touching code.
 COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
+
+# Hard ceiling for a single bounded watch so `float('inf')` / an absurd value
+# can't hold a `comfy jobs watch` child open effectively forever (1 hour).
+_MAX_WATCH_TIMEOUT = 3600.0
 
 
 class ComfyCliError(RuntimeError):
@@ -168,8 +176,25 @@ class _StreamProgress:
         self.done = 0  # nodes fully executed or served from cache
         self._last = -1.0  # last value reported (kept non-decreasing)
 
-    async def report(self, ctx: Context, event: dict) -> None:
-        """Forward one stream event as an MCP progress notification, if relevant."""
+    def snapshot(self) -> dict:
+        """Last-known progress, for a bounded watch that timed out mid-run.
+
+        ``progress`` is None until the first tick is reported (``_last`` starts
+        below zero), so a timed-out payload never claims phantom progress.
+        """
+        return {
+            "progress": self._last if self._last >= 0 else None,
+            "total": self.total,
+            "nodes_done": self.done,
+        }
+
+    async def report(self, ctx: Context | None, event: dict) -> None:
+        """Advance tracker state from one stream event; notify via ``ctx`` if set.
+
+        State (``total`` / ``done`` / ``_last``) is updated unconditionally so a
+        bounded, ctx-less watch still reports real progress in its timed-out
+        :meth:`snapshot`; the MCP notification is the only ctx-gated part.
+        """
         etype = event.get("type")
         if etype == "queued":
             nodes = event.get("nodes")
@@ -194,11 +219,17 @@ class _StreamProgress:
         # MCP guidance: progress should not go backwards, even as nodes reset.
         progress = max(progress, self._last)
         self._last = progress
-        await ctx.report_progress(progress=progress, total=self.total, message=message)
+        if ctx is not None:
+            await ctx.report_progress(
+                progress=progress, total=self.total, message=message
+            )
 
 
 async def _run_comfy_streaming(
-    *args: str, ctx: Context | None = None, timeout: float | None = None
+    *args: str,
+    ctx: Context | None = None,
+    timeout: float | None = None,
+    raise_on_timeout: bool = True,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
@@ -208,6 +239,12 @@ async def _run_comfy_streaming(
     ``ctx.report_progress``. The final ``envelope/1`` line is unwrapped exactly
     as :func:`_run_comfy` does, so an error envelope raises
     :class:`ComfyCliError` with the same code — terminal behavior is unchanged.
+
+    ``timeout`` bounds the whole stream. By default an expiry raises
+    :class:`ComfyCliError` (the run-workflow contract); pass
+    ``raise_on_timeout=False`` for a bounded *tail* that should instead return a
+    ``{"timed_out": True, "status": <progress snapshot>}`` payload (mirroring
+    :func:`wait_for_job`) rather than surface the deadline as an error.
     """
     if shutil.which(COMFY_BIN) is None:
         raise ComfyCliError(
@@ -235,10 +272,11 @@ async def _run_comfy_streaming(
             if not line:  # EOF: comfy-cli closed stdout
                 break
             lines.append(line)
-            if ctx is not None:
-                event = _parse_event(line)
-                if event is not None:
-                    await tracker.report(ctx, event)
+            # Advance the tracker even without a ctx so a timed-out ctx-less
+            # watch still returns real progress; report() no-ops the notify.
+            event = _parse_event(line)
+            if event is not None:
+                await tracker.report(ctx, event)
 
     # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
     stderr_future = (
@@ -246,22 +284,31 @@ async def _run_comfy_streaming(
         if proc.stderr is not None
         else None
     )
-    try:
-        try:
-            if timeout is not None:
-                await asyncio.wait_for(_pump(), timeout=timeout)
-            else:
-                await _pump()
-        except (asyncio.TimeoutError, TimeoutError) as exc:
-            raise ComfyCliError(
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
-            ) from exc
 
+    async def _drain() -> Any:
+        # Read the whole stream, then reap the child and its stderr. Bounding
+        # this entire coroutine (not just _pump) means a child that closes
+        # stdout without exiting can't wedge the unbounded proc.wait/stderr read.
+        await _pump()
         returncode = await asyncio.to_thread(proc.wait)
         stderr = (await stderr_future) if stderr_future is not None else ""
         return _unwrap_envelope(
             _last_json_object("".join(lines)), args, returncode, stderr
         )
+
+    try:
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(_drain(), timeout=timeout)
+            return await _drain()
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            if not raise_on_timeout:
+                # Bounded tail: report how far the run got instead of erroring
+                # (the finally below still kills the child).
+                return {"timed_out": True, "status": tracker.snapshot()}
+            raise ComfyCliError(
+                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+            ) from exc
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion).
@@ -518,6 +565,43 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
 
 
 @mcp.tool()
+async def watch_job(
+    prompt_id: str,
+    timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
+) -> Any:
+    """Tail a submitted LOCAL job's live execution, streaming progress.
+
+    Wraps ``comfy jobs watch <prompt_id>``, which follows a job's execution
+    events (per-node execution + sampler step counts) and ends on the terminal
+    envelope. Runs through the same streaming machinery as
+    ``run_workflow(wait=True)``, forwarding those events as MCP progress
+    notifications, and returns the final result ``data`` on completion.
+
+    Use this to get LIVE progress on a job already submitted with
+    ``run_workflow(wait=False)`` — the streaming counterpart to the polled
+    ``wait_for_job``. The wait is bounded by ``timeout_seconds`` (clamped to a
+    sane maximum) so it can never block forever; on expiry it returns the same
+    ``{"timed_out": True, "status": ...}`` envelope shape as ``wait_for_job``,
+    except ``status`` here carries a live progress snapshot
+    (``{progress, total, nodes_done}``) rather than a raw ``jobs status`` dict.
+    """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject
+        # it rather than let `jobs watch` misread the id (argument injection).
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
+    timeout_seconds = min(max(timeout_seconds, 0.0), _MAX_WATCH_TIMEOUT)
+    return await _run_comfy_streaming(
+        "jobs",
+        "watch",
+        prompt_id,
+        ctx=ctx,
+        timeout=timeout_seconds,
+        raise_on_timeout=False,
+    )
+
+
+@mcp.tool()
 def cancel_job(prompt_id: str) -> Any:
     """Cancel a queued or running LOCAL job.
 
@@ -541,32 +625,20 @@ def get_queue() -> Any:
 
 
 @mcp.tool()
-def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
-    """Collect a completed job's output files into ``out_dir``; returns the paths.
+def fetch_outputs(prompt_id: str, out_dir: str, url_only: bool = False) -> Any:
+    """Download a completed LOCAL job's output files into ``out_dir``.
 
-    A LOCAL ComfyUI writes outputs straight to disk (and also serves them at a
-    ``/view`` URL), so there is no remote download step — this resolves the job's
-    outputs via ``comfy jobs status`` and, for each, copies the on-disk file or
-    fetches the ``/view`` URL into ``out_dir``. (``comfy download`` is a cloud
-    verb and refuses local file paths.)
+    Thin passthrough to ``comfy download <prompt_id> --where local -o <out_dir>``:
+    comfy-cli resolves the job's outputs and writes them into ``out_dir``, so
+    there is no hand-rolled HTTP client here. (The ``--where local`` flag is
+    supplied by :func:`_run_comfy` as a global flag.) Pass ``url_only=True`` to
+    add ``--url-only`` — comfy-cli then emits the output URLs without downloading,
+    handy for handing URLs to other tools instead of copying bytes.
     """
-    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
-    outputs = status.get("outputs") or [] if isinstance(status, dict) else []
-    os.makedirs(out_dir, exist_ok=True)
-    saved: list[str] = []
-    for ref in outputs:
-        parsed = urlparse(ref)
-        if parsed.scheme in ("http", "https"):
-            name = parse_qs(parsed.query).get("filename", ["output"])[0]
-            dst = os.path.join(out_dir, os.path.basename(name) or "output")
-            with urllib.request.urlopen(ref, timeout=30) as resp, open(dst, "wb") as fh:
-                shutil.copyfileobj(resp, fh)
-            saved.append(dst)
-        elif os.path.exists(ref):
-            dst = os.path.join(out_dir, os.path.basename(ref))
-            shutil.copy2(ref, dst)
-            saved.append(dst)
-    return {"saved": saved, "source_outputs": outputs}
+    args = ["download", prompt_id, "-o", out_dir]
+    if url_only:
+        args.append("--url-only")
+    return _run_comfy(*args, timeout=300.0)
 
 
 @mcp.tool()
@@ -714,6 +786,123 @@ def get_node(name: str) -> Any:
 
 
 @mcp.tool()
+def list_nodes(
+    produces: str = "",
+    accepts: str = "",
+    category: str = "",
+    pack: str = "",
+    label: str = "",
+) -> Any:
+    """List node classes from the live local ``object_info``, with optional filters.
+
+    Wraps ``comfy nodes ls``. Each argument, when non-empty, adds the matching
+    filter flag (empty ones are omitted, so a bare call lists everything):
+
+    - ``produces`` → ``--produces <TYPE>``: nodes whose outputs include ``<TYPE>``
+      (e.g. ``IMAGE``, ``MODEL``).
+    - ``accepts`` → ``--accepts <TYPE>``: nodes with an input of ``<TYPE>``.
+    - ``category`` → ``--category <path>``: nodes under a menu category
+      (e.g. ``loaders``).
+    - ``pack`` → ``--pack <name>``: nodes from a given custom-node pack.
+    - ``label`` → ``--label <text>``: nodes matching a display-label substring.
+
+    Reads the user's live install, so results include installed custom nodes —
+    the broad "what nodes can do X?" companion to ``search_nodes``' name search.
+    """
+    args = ["nodes", "ls"]
+    for flag, value in (
+        ("--produces", produces),
+        ("--accepts", accepts),
+        ("--category", category),
+        ("--pack", pack),
+        ("--label", label),
+    ):
+        if value:
+            args += [flag, value]
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def nodes_upstream(name: str, limit: int | None = None) -> Any:
+    """List node classes whose outputs can feed ``name``'s inputs.
+
+    Wraps ``comfy nodes upstream <name> [--limit N]``. Answers "what can I wire
+    INTO this node?" — the candidates that produce the types ``name`` accepts,
+    computed against the live local ``object_info`` (custom nodes included). Pass
+    ``limit`` to cap the number of results; omit it for the full set.
+    """
+    args = ["nodes", "upstream", name]
+    if limit is not None:
+        args += ["--limit", str(limit)]
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def nodes_downstream(name: str, limit: int | None = None) -> Any:
+    """List node classes that accept ``name``'s output types.
+
+    Wraps ``comfy nodes downstream <name> [--limit N]``. Answers "what can I wire
+    this node INTO?" — the candidates whose inputs accept the types ``name``
+    produces, computed against the live local ``object_info`` (custom nodes
+    included). Pass ``limit`` to cap the number of results; omit it for the full
+    set.
+    """
+    args = ["nodes", "downstream", name]
+    if limit is not None:
+        args += ["--limit", str(limit)]
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def nodes_path(
+    from_type: str, to_type: str, max_depth: int = 6, max_paths: int = 10
+) -> Any:
+    """Find node chains that route a value from ``from_type`` to ``to_type``.
+
+    Wraps ``comfy nodes path <FROM> <TO> --max-depth N --max-paths N``. Given two
+    connection types (e.g. ``MODEL`` → ``IMAGE``), returns sequences of nodes
+    whose wiring carries a value from ``from_type`` to ``to_type`` over the live
+    local ``object_info`` graph. ``max_depth`` bounds the chain length and
+    ``max_paths`` caps how many routes are returned.
+    """
+    return _run_comfy(
+        "nodes",
+        "path",
+        from_type,
+        to_type,
+        "--max-depth",
+        str(max_depth),
+        "--max-paths",
+        str(max_paths),
+        timeout=60.0,
+    )
+
+
+@mcp.tool()
+def nodes_types() -> Any:
+    """List every connection type in the live local graph, ranked by connectivity.
+
+    Wraps ``comfy nodes types``. Returns the set of edge types (``MODEL``,
+    ``IMAGE``, ``LATENT``, ``CONDITIONING``, …) present across the user's
+    installed nodes, ordered by how connective each is — the vocabulary you wire
+    with. Reflects custom nodes, so install-specific types show up too.
+    """
+    return _run_comfy("nodes", "types", timeout=60.0)
+
+
+@mcp.tool()
+def nodes_categories() -> Any:
+    """Return the node category tree from the live local ``object_info``.
+
+    Wraps ``comfy nodes categories``. Gives the menu-category hierarchy the
+    user's installed nodes fall under — a map for browsing what is available by
+    area (loaders, sampling, image, …) rather than by name. Reflects the live
+    install, so custom-node categories appear too.
+    """
+    return _run_comfy("nodes", "categories", timeout=60.0)
+
+
+@mcp.tool()
 def search_models(query: str = "", folder: str = "") -> Any:
     """Search / list model files available to the LOCAL ComfyUI install.
 
@@ -734,6 +923,67 @@ def search_models(query: str = "", folder: str = "") -> Any:
     if folder:
         return _run_comfy("models", "list-folder", folder, timeout=60.0)
     return _run_comfy("models", "list-folders", timeout=60.0)
+
+
+@mcp.tool()
+def download_model(
+    url: str, relative_path: str | None = None, filename: str | None = None
+) -> Any:
+    """Download a model file into the LOCAL ComfyUI models dir, by URL.
+
+    Wraps ``comfy model download --url <url> [--relative-path <path>]
+    [--filename <name>]`` (note the SINGULAR ``model`` verb group — the download
+    engine — distinct from the plural ``models`` catalog that ``search_models``
+    reads). comfy-cli understands HuggingFace and CivitAI URLs; any access
+    tokens are configured out-of-band via comfy-cli / environment variables and
+    are NOT passed through this tool. The file lands in the workspace models
+    directory, optionally under ``relative_path`` (e.g. ``models/loras`` to place
+    a LoRA in the right folder) and optionally renamed via ``filename``.
+
+    DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
+    there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
+    such search), so the caller must already have the direct model URL. Returns
+    comfy-cli's envelope ``data`` (the saved path / download metadata).
+    """
+    # comfy-cli parses a leading-dash value as an option/flag; reject any so a
+    # crafted argument can't be smuggled in as a CLI flag (argument injection).
+    if url.startswith("-"):
+        raise ComfyCliError(f"invalid url: {url!r} (leading '-')")
+    # Restrict to http(s): this is a remote fetch of a known model URL, so a
+    # `file://` path or other scheme — an SSRF / local-file-read primitive whose
+    # body would be written straight into the models dir — is never legitimate.
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise ComfyCliError(f"invalid url: {url!r} (scheme must be http/https)")
+    # Optional args are treated as unset when falsy (None or ""), so an explicit
+    # empty string is omitted rather than forwarded as `--relative-path ""`.
+    if relative_path:
+        if relative_path.startswith("-"):
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} (leading '-')"
+            )
+        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
+        # write inside the models dir by rejecting absolute paths and `..`.
+        parts = relative_path.replace("\\", "/").split("/")
+        if os.path.isabs(relative_path) or ".." in parts:
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} (path traversal)"
+            )
+    if filename:
+        if filename.startswith("-"):
+            raise ComfyCliError(f"invalid filename: {filename!r} (leading '-')")
+        # filename is a single output name, not a path; reject separators and `..`
+        # so it can't redirect the write out of the target directory.
+        if filename in (".", "..") or "/" in filename or "\\" in filename:
+            raise ComfyCliError(
+                f"invalid filename: {filename!r} (must be a bare filename)"
+            )
+    args = ["model", "download", "--url", url]
+    if relative_path:
+        args += ["--relative-path", relative_path]
+    if filename:
+        args += ["--filename", filename]
+    # Generous timeout: multi-GB checkpoints can take a long time to fetch.
+    return _run_comfy(*args, timeout=1800.0)
 
 
 @mcp.tool()
@@ -765,6 +1015,74 @@ def validate_workflow(workflow_path: str) -> Any:
     missing-model problem stays actionable instead of failing deep inside a run.
     """
     return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+
+
+@mcp.tool()
+def list_workflow_slots(workflow_path: str) -> Any:
+    """List the agent-tweakable slots a frontend-format workflow exposes.
+
+    Wraps ``comfy workflow slots <path>``. A "slot" is a parameter comfy-cli
+    surfaces as a stable ``ADDR`` (e.g. the positive prompt text, a seed, step
+    count, or model name) together with its current value, so an agent can see
+    what a template exposes without hand-reading the raw workflow JSON. Operates
+    on the frontend-format (UI export) workflow that ``fetch_template`` writes and
+    ``run_workflow`` accepts. Pass a slot's ``ADDR`` back to ``set_workflow_slot``
+    (or ``vary_workflow``) to change it.
+    """
+    return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+
+
+@mcp.tool()
+def set_workflow_slot(
+    workflow_path: str, overrides: list[str], stdout: bool = True
+) -> Any:
+    """Set one or more slot values on a frontend-format workflow.
+
+    Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]``, where
+    ``overrides`` is a list of ``"ADDR=VALUE"`` strings (the ``ADDR``s come from
+    ``list_workflow_slots``). This is the parameterize step of the template
+    on-ramp — change the prompt / seed / steps / model of a fetched template
+    without hand-editing its JSON.
+
+    ``stdout`` defaults to ``True`` (``--stdout``), so the tool is
+    NON-DESTRUCTIVE: comfy-cli returns the modified workflow instead of mutating
+    ``workflow_path`` in place. Set ``stdout=False`` to write the change back to
+    the file. Canonical loop::
+
+        path = fetch_template("flux_dev", "/tmp/flux.json")
+        modified = set_workflow_slot(path, ["6.text=a red bicycle", "3.seed=42"])
+        # write `modified` to disk (or call with stdout=False), then run_workflow
+    """
+    args = ["workflow", "set-slot", workflow_path, *overrides]
+    if stdout:
+        args.append("--stdout")
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def vary_workflow(
+    workflow_path: str, slots: list[str], out_dir: str | None = None
+) -> Any:
+    """Fan a frontend-format workflow out into variants over slot value lists.
+
+    Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``.
+    ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
+    ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
+    so every list MUST be the same length — e.g. ``["3.seed=[1,2,3]",
+    "6.text=[cat,dog,fish]"]`` yields three variants pairing seed 1/cat, 2/dog,
+    3/fish.
+
+    With ``out_dir`` unset (default) comfy-cli emits the variants as NDJSON to
+    stdout; set ``out_dir`` to instead write ``<stem>_<N>.json`` files there (and
+    forward ``--out-dir``). Run each variant with ``run_workflow`` to sweep a
+    parameter grid.
+    """
+    args = ["workflow", "vary", workflow_path]
+    for slot in slots:
+        args += ["--slot", slot]
+    if out_dir:
+        args += ["--out-dir", out_dir]
+    return _run_comfy(*args, timeout=120.0)
 
 
 def main() -> None:
