@@ -40,7 +40,10 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `job_status` until it finishes, then collect files with `fetch_outputs`.
   Prefer this over `run_workflow(wait=True)` for slow runs so nothing blocks.
 - Start from a template: `search_templates` to find one, `fetch_template` to save
-  its workflow JSON, then `run_workflow` on that file.
+  its workflow JSON, then `run_workflow` on that file. To change the prompt / seed
+  / steps / model of a fetched template before running, inspect its tweakable slots
+  with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
+  by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
@@ -738,6 +741,74 @@ def validate_workflow(workflow_path: str) -> Any:
     missing-model problem stays actionable instead of failing deep inside a run.
     """
     return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+
+
+@mcp.tool()
+def list_workflow_slots(workflow_path: str) -> Any:
+    """List the agent-tweakable slots a frontend-format workflow exposes.
+
+    Wraps ``comfy workflow slots <path>``. A "slot" is a parameter comfy-cli
+    surfaces as a stable ``ADDR`` (e.g. the positive prompt text, a seed, step
+    count, or model name) together with its current value, so an agent can see
+    what a template exposes without hand-reading the raw workflow JSON. Operates
+    on the frontend-format (UI export) workflow that ``fetch_template`` writes and
+    ``run_workflow`` accepts. Pass a slot's ``ADDR`` back to ``set_workflow_slot``
+    (or ``vary_workflow``) to change it.
+    """
+    return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+
+
+@mcp.tool()
+def set_workflow_slot(
+    workflow_path: str, overrides: list[str], stdout: bool = True
+) -> Any:
+    """Set one or more slot values on a frontend-format workflow.
+
+    Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]``, where
+    ``overrides`` is a list of ``"ADDR=VALUE"`` strings (the ``ADDR``s come from
+    ``list_workflow_slots``). This is the parameterize step of the template
+    on-ramp — change the prompt / seed / steps / model of a fetched template
+    without hand-editing its JSON.
+
+    ``stdout`` defaults to ``True`` (``--stdout``), so the tool is
+    NON-DESTRUCTIVE: comfy-cli returns the modified workflow instead of mutating
+    ``workflow_path`` in place. Set ``stdout=False`` to write the change back to
+    the file. Canonical loop::
+
+        path = fetch_template("flux_dev", "/tmp/flux.json")
+        modified = set_workflow_slot(path, ["6.text=a red bicycle", "3.seed=42"])
+        # write `modified` to disk (or call with stdout=False), then run_workflow
+    """
+    args = ["workflow", "set-slot", workflow_path, *overrides]
+    if stdout:
+        args.append("--stdout")
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def vary_workflow(
+    workflow_path: str, slots: list[str], out_dir: str | None = None
+) -> Any:
+    """Fan a frontend-format workflow out into variants over slot value lists.
+
+    Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``.
+    ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
+    ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
+    so every list MUST be the same length — e.g. ``["3.seed=[1,2,3]",
+    "6.text=[cat,dog,fish]"]`` yields three variants pairing seed 1/cat, 2/dog,
+    3/fish.
+
+    With ``out_dir`` unset (default) comfy-cli emits the variants as NDJSON to
+    stdout; set ``out_dir`` to instead write ``<stem>_<N>.json`` files there (and
+    forward ``--out-dir``). Run each variant with ``run_workflow`` to sweep a
+    parameter grid.
+    """
+    args = ["workflow", "vary", workflow_path]
+    for slot in slots:
+        args += ["--slot", slot]
+    if out_dir:
+        args += ["--out-dir", out_dir]
+    return _run_comfy(*args, timeout=120.0)
 
 
 def main() -> None:

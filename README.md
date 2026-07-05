@@ -9,7 +9,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Seventeen tools, core loop validated end-to-end against a live local
+> **Status:** early POC. Twenty tools, core loop validated end-to-end against a live local
 > ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -143,7 +143,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-Seventeen tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
+Twenty tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
 comfy-cli's `envelope/1`, and returns its `data`.
 
 | Tool | Wraps | Purpose |
@@ -171,6 +171,9 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
+| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
+| `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
+| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
 
 Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream` /
 `nodes_downstream` / `nodes_path` / `nodes_types` / `nodes_categories`) and `search_models`
