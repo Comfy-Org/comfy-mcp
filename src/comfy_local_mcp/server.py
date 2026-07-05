@@ -7,9 +7,10 @@ with the Comfy Cloud MCP — comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
 (``job_status`` / ``wait_for_job`` / ``watch_job`` / ``cancel_job`` /
-``get_queue``) and the ``launch_comfyui`` / ``stop_comfyui`` lifecycle pair
-(``comfy launch --background`` / ``comfy stop``).
-Next passthrough to add: ``discover`` (``comfy discover`` / ``comfy which``).
+``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` lifecycle pair
+(``comfy launch --background`` / ``comfy stop``), and the ``discover`` /
+``which`` introspection pair (``comfy discover`` / ``comfy which``) that lets
+an agent learn the CLI's own contract and selection.
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
 against a real comfy-cli install and a running local ComfyUI.
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -535,6 +537,30 @@ def stop_comfyui() -> Any:
     message, rather than killing an unrelated process.
     """
     return _run_comfy("stop", timeout=60.0)
+
+
+@mcp.tool()
+def discover() -> Any:
+    """Return comfy-cli's self-describing command surface (its own contract).
+
+    Wraps ``comfy discover``. comfy-cli emits a machine-readable description of
+    itself — the available commands, their argument schemas, and the error codes
+    they can return — so an agent can learn the CLI's contract at runtime instead
+    of hard-coding it. Returns that description verbatim.
+    """
+    return _run_comfy("discover", timeout=60.0)
+
+
+@mcp.tool()
+def which() -> Any:
+    """Report which ComfyUI install/workspace comfy-cli currently targets.
+
+    Wraps ``comfy which``. A lightweight "which one is selected?" answer; note
+    that ``server_info`` (``comfy env``) already reports the same selected
+    workspace alongside the running-server and Python details, so reach for this
+    only when the bare selection is all you want.
+    """
+    return _run_comfy("which", timeout=60.0)
 
 
 def _template_matches(item: Any, query_lower: str) -> bool:
