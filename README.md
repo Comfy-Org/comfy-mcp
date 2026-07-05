@@ -154,7 +154,7 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
-| `fetch_outputs(prompt_id, out_dir)` | `comfy jobs status <prompt_id>` → copy/`/view` fetch | Collect a finished job's output files into `out_dir` (local outputs are on disk, so this copies them — not a cloud download). |
+| `fetch_outputs(prompt_id, out_dir, url_only=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes. |
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
 | `search_templates(query="")` | `comfy templates ls` (filtered client-side) | Find a built-in workflow template by name/description; empty `query` lists all. |

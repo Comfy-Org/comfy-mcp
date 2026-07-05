@@ -22,9 +22,7 @@ import os
 import shutil
 import subprocess
 import time
-import urllib.request
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -400,32 +398,20 @@ def get_queue() -> Any:
 
 
 @mcp.tool()
-def fetch_outputs(prompt_id: str, out_dir: str) -> Any:
-    """Collect a completed job's output files into ``out_dir``; returns the paths.
+def fetch_outputs(prompt_id: str, out_dir: str, url_only: bool = False) -> Any:
+    """Download a completed LOCAL job's output files into ``out_dir``.
 
-    A LOCAL ComfyUI writes outputs straight to disk (and also serves them at a
-    ``/view`` URL), so there is no remote download step — this resolves the job's
-    outputs via ``comfy jobs status`` and, for each, copies the on-disk file or
-    fetches the ``/view`` URL into ``out_dir``. (``comfy download`` is a cloud
-    verb and refuses local file paths.)
+    Thin passthrough to ``comfy download <prompt_id> --where local -o <out_dir>``:
+    comfy-cli resolves the job's outputs and writes them into ``out_dir``, so
+    there is no hand-rolled HTTP client here. (The ``--where local`` flag is
+    supplied by :func:`_run_comfy` as a global flag.) Pass ``url_only=True`` to
+    add ``--url-only`` — comfy-cli then emits the output URLs without downloading,
+    handy for handing URLs to other tools instead of copying bytes.
     """
-    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
-    outputs = status.get("outputs") or [] if isinstance(status, dict) else []
-    os.makedirs(out_dir, exist_ok=True)
-    saved: list[str] = []
-    for ref in outputs:
-        parsed = urlparse(ref)
-        if parsed.scheme in ("http", "https"):
-            name = parse_qs(parsed.query).get("filename", ["output"])[0]
-            dst = os.path.join(out_dir, os.path.basename(name) or "output")
-            with urllib.request.urlopen(ref, timeout=30) as resp, open(dst, "wb") as fh:
-                shutil.copyfileobj(resp, fh)
-            saved.append(dst)
-        elif os.path.exists(ref):
-            dst = os.path.join(out_dir, os.path.basename(ref))
-            shutil.copy2(ref, dst)
-            saved.append(dst)
-    return {"saved": saved, "source_outputs": outputs}
+    args = ["download", prompt_id, "-o", out_dir]
+    if url_only:
+        args.append("--url-only")
+    return _run_comfy(*args, timeout=300.0)
 
 
 @mcp.tool()

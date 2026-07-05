@@ -3,10 +3,9 @@
 These lock in the two behaviors that actually broke during development:
 1. comfy-cli's global flags (``--json``, ``--where``) MUST precede the
    subcommand — a trailing ``--json`` errors with "No such option".
-2. ``fetch_outputs`` must handle BOTH output representations a local run
-   produces: bare on-disk paths (from ``comfy run --wait``) and ``/view``
-   HTTP URLs (from ``comfy jobs status``) — ``comfy download`` refuses the
-   path form, which is why the tool collects outputs itself.
+2. ``fetch_outputs`` is a thin passthrough to
+   ``comfy download <prompt_id> --where local -o <dir>`` — comfy-cli owns the
+   local download, so the tool only maps its argv (no hand-rolled HTTP client).
 
 Plus the streaming ``run_workflow(wait=True)`` path: it drives
 ``comfy --json-stream … run --wait`` via Popen, forwards NDJSON run events as
@@ -235,38 +234,36 @@ def test_wait_for_job_times_out_cleanly(monkeypatch):
     assert result == {"timed_out": True, "status": {"status": "running"}}
 
 
-def test_fetch_outputs_copies_on_disk_path(monkeypatch, tmp_path):
-    """Regression: local `comfy run` emits bare paths; we copy, never `comfy download`."""
-    src = tmp_path / "src" / "img.png"
-    src.parent.mkdir()
-    src.write_bytes(b"png-bytes")
-    out_dir = tmp_path / "out"
+def test_fetch_outputs_wraps_comfy_download(patched_run):
+    """fetch_outputs is a thin `comfy download … --where local -o <dir>` passthrough."""
+    calls = patched_run(
+        {"type": "envelope", "ok": True, "data": {"downloaded": ["img.png"]}}
+    )
 
-    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"outputs": [str(src)]})
-    result = server.fetch_outputs("pid", str(out_dir))
+    assert server.fetch_outputs("pid", "/tmp/out") == {"downloaded": ["img.png"]}
 
-    assert result["saved"] == [str(out_dir / "img.png")]
-    assert (out_dir / "img.png").read_bytes() == b"png-bytes"
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global --where pins local
+    assert cmd[4:] == ["download", "pid", "-o", "/tmp/out"]  # mapped subcommand
+    assert calls[0]["env"]["COMFY_WHERE"] == "local"
 
 
-def test_fetch_outputs_fetches_view_url(monkeypatch, tmp_path):
-    """Regression: `comfy jobs status` emits /view URLs; we fetch those."""
-    url = "http://127.0.0.1:8188/view?filename=gen.png&subfolder=&type=output"
-    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"outputs": [url]})
+def test_fetch_outputs_url_only_appends_flag(patched_run):
+    """url_only=True adds --url-only so comfy emits URLs without downloading bytes."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"urls": []}})
 
-    fetched: list[str] = []
+    server.fetch_outputs("pid", "/tmp/out", url_only=True)
 
-    def fake_urlopen(ref, timeout):  # noqa: ARG001
-        fetched.append(ref)
-        return io.BytesIO(b"view-bytes")
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", "/tmp/out", "--url-only"]
 
-    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
-    out_dir = tmp_path / "out"
-    result = server.fetch_outputs("pid", str(out_dir))
 
-    assert fetched == [url]
-    assert result["saved"] == [str(out_dir / "gen.png")]  # name from ?filename=
-    assert (out_dir / "gen.png").read_bytes() == b"view-bytes"
+def test_fetch_outputs_omits_url_only_by_default(patched_run):
+    """Without url_only the flag must be absent, not passed as False."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.fetch_outputs("pid", "/tmp/out")
+
+    assert "--url-only" not in calls[0]["cmd"]
 
 
 def test_server_instructions_cover_canonical_flows():

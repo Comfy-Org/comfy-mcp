@@ -99,11 +99,15 @@ def test_no_model_round_trip(tmp_path):
     prompt_id = _extract_prompt_id(result)
     assert prompt_id, f"no prompt_id in run_workflow result: {result!r}"
 
-    # 3. Collect the outputs into a temp dir and prove a real PNG landed.
+    # 3. Download the outputs into a temp dir and prove a real PNG landed there.
+    #    fetch_outputs now wraps `comfy download --where local -o <dir>`, so we
+    #    assert on the files it writes into out_dir rather than on its return shape.
     out_dir = tmp_path / "smoke_out"
-    collected = server.fetch_outputs(prompt_id, str(out_dir))
-    saved = collected.get("saved") or []
-    assert saved, f"fetch_outputs wrote no files: {collected!r}"
+    server.fetch_outputs(prompt_id, str(out_dir))
 
-    pngs = [p for p in saved if Path(p).read_bytes()[:8] == _PNG_MAGIC]
-    assert pngs, f"no valid PNG among collected outputs: {saved}"
+    pngs = [
+        p
+        for p in out_dir.rglob("*")
+        if p.is_file() and p.read_bytes()[:8] == _PNG_MAGIC
+    ]
+    assert pngs, f"no valid PNG downloaded into {out_dir}"
