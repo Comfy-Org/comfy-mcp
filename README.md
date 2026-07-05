@@ -162,13 +162,21 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `fetch_template(name, out_path)` | `comfy templates fetch <name> --out <path>` | Write a template's runnable workflow JSON to `out_path`; returns the absolute path for `run_workflow`. |
 | `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
 | `get_node(name)` | `comfy nodes show <ClassName>` | Full input/output schema for one node class — what you need to author/repair a graph. |
+| `list_nodes(produces="", accepts="", category="", pack="", label="")` | `comfy nodes ls [--produces/--accepts/--category/--pack/--label …]` | List node classes, filtered by output/input type, category, pack, or label; bare call lists all. Reads the **live install**. |
+| `nodes_upstream(name, limit=None)` | `comfy nodes upstream <name> [--limit N]` | Nodes whose outputs can feed `<name>`'s inputs ("what wires INTO this?"). Reads the **live install**. |
+| `nodes_downstream(name, limit=None)` | `comfy nodes downstream <name> [--limit N]` | Nodes that accept `<name>`'s output types ("what does this wire INTO?"). Reads the **live install**. |
+| `nodes_path(from_type, to_type, max_depth=6, max_paths=10)` | `comfy nodes path <FROM> <TO> --max-depth N --max-paths N` | Node chains routing a value between two connection types (e.g. `MODEL` → `IMAGE`). Reads the **live install**. |
+| `nodes_types()` | `comfy nodes types` | All connection types (`MODEL`, `IMAGE`, …) ranked by connectivity. Reads the **live install**. |
+| `nodes_categories()` | `comfy nodes categories` | The node category tree. Reads the **live install**. |
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
 
-Discovery (`search_nodes` / `get_node` / `search_models`) reads the **user's live install**
-(custom nodes included), not a static catalog — that's the local differentiator from the cloud
-MCP's equivalents.
+Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream` /
+`nodes_downstream` / `nodes_path` / `nodes_types` / `nodes_categories`) and `search_models`
+read the **user's live install** (custom nodes included), not a static catalog — that's the
+local differentiator from the cloud MCP's equivalents. The graph-wiring verbs (`upstream` /
+`downstream` / `path`) are what an agent authoring a workflow uses to find compatible nodes.
 
 Planned next: `discover` (`comfy discover`).
 

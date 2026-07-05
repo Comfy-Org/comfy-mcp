@@ -570,6 +570,123 @@ def get_node(name: str) -> Any:
 
 
 @mcp.tool()
+def list_nodes(
+    produces: str = "",
+    accepts: str = "",
+    category: str = "",
+    pack: str = "",
+    label: str = "",
+) -> Any:
+    """List node classes from the live local ``object_info``, with optional filters.
+
+    Wraps ``comfy nodes ls``. Each argument, when non-empty, adds the matching
+    filter flag (empty ones are omitted, so a bare call lists everything):
+
+    - ``produces`` → ``--produces <TYPE>``: nodes whose outputs include ``<TYPE>``
+      (e.g. ``IMAGE``, ``MODEL``).
+    - ``accepts`` → ``--accepts <TYPE>``: nodes with an input of ``<TYPE>``.
+    - ``category`` → ``--category <path>``: nodes under a menu category
+      (e.g. ``loaders``).
+    - ``pack`` → ``--pack <name>``: nodes from a given custom-node pack.
+    - ``label`` → ``--label <text>``: nodes matching a display-label substring.
+
+    Reads the user's live install, so results include installed custom nodes —
+    the broad "what nodes can do X?" companion to ``search_nodes``' name search.
+    """
+    args = ["nodes", "ls"]
+    for flag, value in (
+        ("--produces", produces),
+        ("--accepts", accepts),
+        ("--category", category),
+        ("--pack", pack),
+        ("--label", label),
+    ):
+        if value:
+            args += [flag, value]
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def nodes_upstream(name: str, limit: int | None = None) -> Any:
+    """List node classes whose outputs can feed ``name``'s inputs.
+
+    Wraps ``comfy nodes upstream <name> [--limit N]``. Answers "what can I wire
+    INTO this node?" — the candidates that produce the types ``name`` accepts,
+    computed against the live local ``object_info`` (custom nodes included). Pass
+    ``limit`` to cap the number of results; omit it for the full set.
+    """
+    args = ["nodes", "upstream", name]
+    if limit is not None:
+        args += ["--limit", str(limit)]
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def nodes_downstream(name: str, limit: int | None = None) -> Any:
+    """List node classes that accept ``name``'s output types.
+
+    Wraps ``comfy nodes downstream <name> [--limit N]``. Answers "what can I wire
+    this node INTO?" — the candidates whose inputs accept the types ``name``
+    produces, computed against the live local ``object_info`` (custom nodes
+    included). Pass ``limit`` to cap the number of results; omit it for the full
+    set.
+    """
+    args = ["nodes", "downstream", name]
+    if limit is not None:
+        args += ["--limit", str(limit)]
+    return _run_comfy(*args, timeout=60.0)
+
+
+@mcp.tool()
+def nodes_path(
+    from_type: str, to_type: str, max_depth: int = 6, max_paths: int = 10
+) -> Any:
+    """Find node chains that route a value from ``from_type`` to ``to_type``.
+
+    Wraps ``comfy nodes path <FROM> <TO> --max-depth N --max-paths N``. Given two
+    connection types (e.g. ``MODEL`` → ``IMAGE``), returns sequences of nodes
+    whose wiring carries a value from ``from_type`` to ``to_type`` over the live
+    local ``object_info`` graph. ``max_depth`` bounds the chain length and
+    ``max_paths`` caps how many routes are returned.
+    """
+    return _run_comfy(
+        "nodes",
+        "path",
+        from_type,
+        to_type,
+        "--max-depth",
+        str(max_depth),
+        "--max-paths",
+        str(max_paths),
+        timeout=60.0,
+    )
+
+
+@mcp.tool()
+def nodes_types() -> Any:
+    """List every connection type in the live local graph, ranked by connectivity.
+
+    Wraps ``comfy nodes types``. Returns the set of edge types (``MODEL``,
+    ``IMAGE``, ``LATENT``, ``CONDITIONING``, …) present across the user's
+    installed nodes, ordered by how connective each is — the vocabulary you wire
+    with. Reflects custom nodes, so install-specific types show up too.
+    """
+    return _run_comfy("nodes", "types", timeout=60.0)
+
+
+@mcp.tool()
+def nodes_categories() -> Any:
+    """Return the node category tree from the live local ``object_info``.
+
+    Wraps ``comfy nodes categories``. Gives the menu-category hierarchy the
+    user's installed nodes fall under — a map for browsing what is available by
+    area (loaders, sampling, image, …) rather than by name. Reflects the live
+    install, so custom-node categories appear too.
+    """
+    return _run_comfy("nodes", "categories", timeout=60.0)
+
+
+@mcp.tool()
 def search_models(query: str = "", folder: str = "") -> Any:
     """Search / list model files available to the LOCAL ComfyUI install.
 
