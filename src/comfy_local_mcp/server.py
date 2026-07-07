@@ -394,16 +394,20 @@ async def generate_image(
     Everything targets the LOCAL server (``--where local`` is injected by
     ``_run_comfy``), so there is no cloud reachability here.
     """
-    checkpoint_args = ["--checkpoint", checkpoint] if checkpoint else []
+    # Pass the free-form text as ``--flag=value`` so a prompt (or checkpoint)
+    # that begins with ``-`` is read as the value rather than mis-parsed by
+    # comfy-cli as an option token. The leading-dash guards elsewhere reject
+    # such input, but a prompt legitimately can start with ``-``, so we keep it
+    # instead of rejecting it.
+    checkpoint_args = [f"--checkpoint={checkpoint}"] if checkpoint else []
     if not wait:
         # Fire-and-return: no stream to follow, so keep the plain --json path.
         return _run_comfy(
-            "generate", "--prompt", prompt, *checkpoint_args, timeout=60.0
+            "generate", f"--prompt={prompt}", *checkpoint_args, timeout=60.0
         )
     return await _run_comfy_streaming(
         "generate",
-        "--prompt",
-        prompt,
+        f"--prompt={prompt}",
         *checkpoint_args,
         "--wait",
         ctx=ctx,

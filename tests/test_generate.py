@@ -24,22 +24,34 @@ def test_generate_image_streams_and_maps_command(patched_stream):
     cmd = procs[0].cmd
     assert cmd[0] == server.COMFY_BIN
     assert cmd[1:4] == ["--json-stream", "--where", "local"]  # global flags first
-    # No checkpoint given -> no --checkpoint pair in the command.
-    assert cmd[4:] == ["generate", "--prompt", "a red fox in snow", "--wait"]
+    # No checkpoint given -> no --checkpoint token in the command. The prompt is
+    # passed as --prompt=<value> so a leading dash can't be misread as a flag.
+    assert cmd[4:] == ["generate", "--prompt=a red fox in snow", "--wait"]
 
 
 def test_generate_image_forwards_checkpoint_when_streaming(patched_stream):
-    """A checkpoint is forwarded as `--checkpoint <name>` before `--wait`."""
+    """A checkpoint is forwarded as `--checkpoint=<name>` before `--wait`."""
     procs = patched_stream(_OK_STREAM)
 
     asyncio.run(server.generate_image("a cat", checkpoint="sd_xl.safetensors"))
 
     assert procs[0].cmd[4:] == [
         "generate",
-        "--prompt",
-        "a cat",
-        "--checkpoint",
-        "sd_xl.safetensors",
+        "--prompt=a cat",
+        "--checkpoint=sd_xl.safetensors",
+        "--wait",
+    ]
+
+
+def test_generate_image_leading_dash_prompt_is_not_parsed_as_flag(patched_stream):
+    """A prompt starting with `-` is kept as the value via `--prompt=<value>`."""
+    procs = patched_stream(_OK_STREAM)
+
+    asyncio.run(server.generate_image("--not-a-flag, just text"))
+
+    assert procs[0].cmd[4:] == [
+        "generate",
+        "--prompt=--not-a-flag, just text",
         "--wait",
     ]
 
@@ -62,7 +74,7 @@ def test_generate_image_wait_false_uses_plain_json_no_stream(monkeypatch):
     result = asyncio.run(server.generate_image("a red fox in snow", wait=False))
 
     assert result == {"prompt_id": "p1"}
-    assert seen["args"] == ("generate", "--prompt", "a red fox in snow")  # no --wait
+    assert seen["args"] == ("generate", "--prompt=a red fox in snow")  # no --wait
     assert seen["timeout"] == 60.0
 
 
@@ -83,8 +95,6 @@ def test_generate_image_wait_false_forwards_checkpoint(monkeypatch):
     assert server_result == {"prompt_id": "p2"}
     assert seen["args"] == (
         "generate",
-        "--prompt",
-        "a dog",
-        "--checkpoint",
-        "dreamshaper.safetensors",
+        "--prompt=a dog",
+        "--checkpoint=dreamshaper.safetensors",
     )
