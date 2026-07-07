@@ -383,7 +383,9 @@ async def generate_image(
     streams live progress as MCP progress notifications (per-node execution +
     sampler step counts) so a long generation is not a silent block; with
     ``wait=False`` it submits and returns immediately with a ``prompt_id`` to
-    poll via ``job_status``.
+    poll via ``job_status``. ``timeout_seconds`` only bounds the ``wait=True``
+    streaming path; the ``wait=False`` submit-and-return branch uses a fixed
+    short timeout, so callers should not expect it to govern that case.
 
     This is the quickest path to an image. For full control — choosing a
     template, editing its graph, or running a hand-authored workflow — use the

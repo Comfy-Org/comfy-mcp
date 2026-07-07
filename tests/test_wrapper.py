@@ -21,6 +21,7 @@ import subprocess
 import time
 
 import pytest
+from conftest import _OK_STREAM, _RecordingCtx
 
 from comfy_local_mcp import server
 
@@ -479,92 +480,6 @@ def test_which_maps_command_and_returns_data(patched_run):
 # --- streaming run_workflow(wait=True) -------------------------------------
 
 
-class _FakeProc:
-    """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
-
-    def __init__(self, cmd, stdout_text, stderr_text=""):
-        self.cmd = cmd
-        self.stdout = io.StringIO(stdout_text)
-        self.stderr = io.StringIO(stderr_text)
-        self.returncode = 0
-        self.killed = False
-
-    def poll(self):
-        return self.returncode  # already "finished" once the stream is drained
-
-    def wait(self):
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-
-
-class _RecordingCtx:
-    """A fake FastMCP Context that records each ``report_progress`` call."""
-
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    async def report_progress(self, progress, total=None, message=None):
-        self.calls.append({"progress": progress, "total": total, "message": message})
-
-
-@pytest.fixture
-def patched_stream(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.Popen`` for the streaming path.
-
-    Returns ``setup(stdout_text) -> procs`` — the list capturing each spawned
-    ``_FakeProc`` (so the test can assert the command line that was run).
-    """
-
-    def setup(stdout_text: str) -> list[_FakeProc]:
-        procs: list[_FakeProc] = []
-
-        def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text)
-            procs.append(proc)
-            return proc
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
-        return procs
-
-    return setup
-
-
-# A queued event (2-node manifest), a per-node step progress event, two
-# node-completion events, then the success envelope on the last line.
-_OK_STREAM = (
-    "\n".join(
-        json.dumps(evt)
-        for evt in [
-            {
-                "schema": "event/1",
-                "type": "queued",
-                "nodes": [{"node_id": "1"}, {"node_id": "2"}],
-            },
-            {"schema": "event/1", "type": "executing", "node": "1", "title": "Load"},
-            {
-                "schema": "event/1",
-                "type": "progress",
-                "node": "1",
-                "completed": 5,
-                "total": 10,
-            },
-            {"schema": "event/1", "type": "executed", "node": "1", "title": "Load"},
-            {"schema": "event/1", "type": "executed", "node": "2", "title": "Save"},
-            {
-                "schema": "envelope/1",
-                "type": "envelope",
-                "ok": True,
-                "data": {"outputs": ["/x.png"]},
-            },
-        ]
-    )
-    + "\n"
-)
-
-
 def test_run_workflow_streams_progress_and_returns_data(patched_stream):
     """wait=True drives --json-stream, emits progress, returns the envelope data."""
     procs = patched_stream(_OK_STREAM)
@@ -791,85 +706,3 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == ("run", "--workflow", "wf.json")  # no --wait
     assert seen["timeout"] == 60.0
-
-
-# --- generate_image (thin passthrough to `comfy generate`) -----------------
-
-
-def test_generate_image_streams_and_maps_command(patched_stream):
-    """wait=True drives `comfy --json-stream … generate --prompt … --wait`."""
-    procs = patched_stream(_OK_STREAM)
-    ctx = _RecordingCtx()
-
-    result = asyncio.run(server.generate_image("a red fox in snow", ctx=ctx))
-
-    assert result == {"outputs": ["/x.png"]}  # same envelope shape as run_workflow
-    assert len(ctx.calls) >= 1  # progress notifications forwarded when wait=True
-
-    cmd = procs[0].cmd
-    assert cmd[0] == server.COMFY_BIN
-    assert cmd[1:4] == ["--json-stream", "--where", "local"]  # global flags first
-    # No checkpoint given -> no --checkpoint pair in the command.
-    assert cmd[4:] == ["generate", "--prompt", "a red fox in snow", "--wait"]
-
-
-def test_generate_image_forwards_checkpoint_when_streaming(patched_stream):
-    """A checkpoint is forwarded as `--checkpoint <name>` before `--wait`."""
-    procs = patched_stream(_OK_STREAM)
-
-    asyncio.run(server.generate_image("a cat", checkpoint="sd_xl.safetensors"))
-
-    assert procs[0].cmd[4:] == [
-        "generate",
-        "--prompt",
-        "a cat",
-        "--checkpoint",
-        "sd_xl.safetensors",
-        "--wait",
-    ]
-
-
-def test_generate_image_wait_false_uses_plain_json_no_stream(monkeypatch):
-    """wait=False keeps the plain --json _run_comfy path (no streaming, no --wait)."""
-    seen: dict = {}
-
-    def fake_run_comfy(*args, timeout=None):
-        seen["args"] = args
-        seen["timeout"] = timeout
-        return {"prompt_id": "p1"}
-
-    def boom(*a, **k):  # streaming must not be taken for wait=False
-        raise AssertionError("wait=False must not stream")
-
-    monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
-    monkeypatch.setattr(server, "_run_comfy_streaming", boom)
-
-    result = asyncio.run(server.generate_image("a red fox in snow", wait=False))
-
-    assert result == {"prompt_id": "p1"}
-    assert seen["args"] == ("generate", "--prompt", "a red fox in snow")  # no --wait
-    assert seen["timeout"] == 60.0
-
-
-def test_generate_image_wait_false_forwards_checkpoint(monkeypatch):
-    """wait=False still forwards a checkpoint to `comfy generate --checkpoint`."""
-    seen: dict = {}
-
-    def fake_run_comfy(*args, timeout=None):
-        seen["args"] = args
-        return {"prompt_id": "p2"}
-
-    monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
-
-    server_result = asyncio.run(
-        server.generate_image("a dog", checkpoint="dreamshaper.safetensors", wait=False)
-    )
-
-    assert server_result == {"prompt_id": "p2"}
-    assert seen["args"] == (
-        "generate",
-        "--prompt",
-        "a dog",
-        "--checkpoint",
-        "dreamshaper.safetensors",
-    )
