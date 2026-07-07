@@ -16,7 +16,8 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 ## Prerequisites
 
 - **Python ≥ 3.10.**
-- **comfy-cli** on your `PATH`: `pip install comfy-cli`. This is the engine every tool wraps.
+- **comfy-cli ≥ 1.12.0** on your `PATH`: `pip install 'comfy-cli>=1.12.0'`. This is the engine
+  every tool wraps; the server refuses to run against an older comfy-cli with an upgrade message.
 - **A ComfyUI workspace.** If you don't have one, `comfy-cli` can create it: `comfy install`
   sets up a ComfyUI workspace it will point at. (An existing ComfyUI checkout works too — see
   `comfy set-default <path>`.)
@@ -111,7 +112,7 @@ Zero to a generated image:
 1. **Install the pieces.**
 
    ```bash
-   pip install comfy-cli          # the engine
+   pip install 'comfy-cli>=1.12.0'  # the engine (>= 1.12.0 required)
    comfy install                  # create a ComfyUI workspace (skip if you have one)
    pip install .                  # this MCP server → the `comfy-local-mcp` command
    ```
@@ -143,7 +144,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-Twenty-two tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
+Thirty-two tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
 comfy-cli's `envelope/1`, and returns its `data`.
 
 | Tool | Wraps | Purpose |
@@ -158,6 +159,7 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `fetch_outputs(prompt_id, out_dir, url_only=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes. |
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
+| `get_logs(tail=200)` | `comfy logs --tail <tail>` | Tail the background ComfyUI's captured log (`<workspace>/user/comfyui_<port>.log`) — closes the debugging loop after a detached `launch_comfyui`. Returns `{lines, path, truncated}`; a missing log file returns `{"error": "no_log_file", …}` rather than raising. |
 | `discover()` | `comfy discover` | comfy-cli's self-describing surface (commands, arg schemas, error codes) — learn the CLI's own contract at runtime. |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
 | `search_templates(query="")` | `comfy templates ls` (filtered client-side) | Find a built-in workflow template by name/description; empty `query` lists all. |
