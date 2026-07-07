@@ -66,7 +66,31 @@ _MAX_WATCH_TIMEOUT = 3600.0
 
 
 class ComfyCliError(RuntimeError):
-    """comfy-cli was missing, timed out, or returned an error envelope."""
+    """comfy-cli was missing, timed out, or returned an error envelope.
+
+    ``code`` carries the envelope's structured ``error.code`` when the failure
+    came from an error envelope (else ``None`` for missing-binary/timeout/no-JSON
+    cases), so callers can branch on a specific outcome instead of scraping the
+    message string.
+    """
+
+    def __init__(self, *args: object, code: str | None = None) -> None:
+        super().__init__(*args)
+        self.code = code
+
+
+# comfy-cli's error code for "I have no server pid recorded to stop" — the one
+# stop failure ``restart_comfyui`` treats as benign (see its docstring).
+_NO_RECORDED_SERVER_CODE = "no_recorded_server"
+
+
+def _is_no_recorded_server(exc: ComfyCliError) -> bool:
+    """True when ``exc`` is comfy-cli's benign 'nothing recorded to stop' error.
+
+    Prefers the structured ``code`` and falls back to the message so it also
+    recognizes the error when only the human-readable string carries the marker.
+    """
+    return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
 
 
 def _run_comfy(*args: str, timeout: float | None = None) -> Any:
@@ -124,7 +148,8 @@ def _unwrap_envelope(
         raise ComfyCliError(
             f"comfy {' '.join(args)} failed "
             f"[{err.get('code', 'unknown')}]: "
-            f"{err.get('message') or stderr.strip()[:500]}"
+            f"{err.get('message') or stderr.strip()[:500]}",
+            code=err.get("code"),
         )
     return envelope.get("data")
 
@@ -631,6 +656,14 @@ def get_queue() -> Any:
 # suffix would fall back to ``application/octet-stream`` and not render).
 _INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
+# Bounds on what ``fetch_outputs(inline_images=True)`` base64-inlines into the
+# reply, mirroring the module's other output caps (``_TRACEBACK_TAIL_MAX_CHARS``,
+# ``_EXCEPTION_TEXT_MAX_CHARS``): a big batch or high-res render must not force an
+# unbounded allocation / blow the agent's context. The on-disk copies in
+# ``out_dir`` are untouched — only the inline preview is capped.
+_INLINE_IMAGE_MAX_COUNT = 8
+_INLINE_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+
 
 def _iter_strings(obj: Any) -> Any:
     """Yield every string value nested anywhere inside ``obj`` (dicts/lists/scalars)."""
@@ -644,31 +677,68 @@ def _iter_strings(obj: Any) -> Any:
             yield from _iter_strings(value)
 
 
+def _is_within(root: str, path: str) -> bool:
+    """True if ``path`` (already realpath'd) is ``root`` itself or nested under it."""
+    return path == root or path.startswith(root + os.sep)
+
+
 def _collect_output_images(data: Any, out_dir: str) -> list[str]:
     """Resolve image files referenced by ``comfy download``'s data to on-disk paths.
 
     Walks every string in the envelope ``data``, keeps those with an image
-    suffix, resolves each against ``out_dir`` when it is not already an existing
-    absolute/relative path, and returns the files that actually exist on disk
-    (deduped, order-preserving). Anything that does not resolve to a real file is
-    skipped — inline return is best-effort and never masks the on-disk copy.
+    suffix, and returns the ones that resolve to a real file **inside**
+    ``out_dir`` (deduped, order-preserving). ``comfy download -o out_dir`` writes
+    every file it produces into ``out_dir``, so scoping to that directory is what
+    keeps the inline preview honest: a bare/relative name binds to the copy just
+    written rather than a same-named file in the process CWD, and an absolute or
+    ``../``-traversal path that escapes ``out_dir`` (an input reference, a URL
+    basename, or an outright traversal in the metadata) is rejected instead of
+    read and inlined. Inline return is best-effort and never masks the on-disk
+    copy.
     """
+    out_root = os.path.realpath(out_dir)
     resolved: dict[str, None] = {}
     for value in _iter_strings(data):
         if not value.lower().endswith(_INLINE_IMAGE_SUFFIXES):
             continue
-        # Try the path as given, then relative to out_dir, then just its
-        # basename inside out_dir — comfy-cli may report absolute paths, paths
-        # relative to out_dir, or bare filenames depending on the invocation.
+        # Most-specific form first (the value as given, then joined onto out_dir,
+        # then bare basename in out_dir) — but every candidate must resolve to a
+        # real file INSIDE out_dir. Containment is what neutralizes the CWD
+        # shadow (a bare "gen.png" resolves to CWD/gen.png, outside out_dir, so
+        # it's rejected in favor of the out_dir copy) and the `../` traversal.
         for candidate in (
             value,
             os.path.join(out_dir, value),
             os.path.join(out_dir, os.path.basename(value)),
         ):
-            if os.path.isfile(candidate):
-                resolved.setdefault(os.path.abspath(candidate), None)
+            real = os.path.realpath(candidate)
+            if _is_within(out_root, real) and os.path.isfile(real):
+                resolved.setdefault(real, None)
                 break
     return list(resolved)
+
+
+def _select_inline_images(paths: list[str]) -> list[str]:
+    """Cap the inlined set to ``_INLINE_IMAGE_MAX_COUNT`` files / aggregate bytes.
+
+    Preserves order and stops as soon as either bound would be exceeded, so a
+    large batch or a high-res render can't force an unbounded base64 payload into
+    the reply. Unreadable files are skipped (the on-disk copy still stands).
+    """
+    selected: list[str] = []
+    total = 0
+    for path in paths:
+        if len(selected) >= _INLINE_IMAGE_MAX_COUNT:
+            break
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if selected and total + size > _INLINE_IMAGE_MAX_BYTES:
+            break
+        selected.append(path)
+        total += size
+    return selected
 
 
 @mcp.tool()
@@ -693,15 +763,21 @@ def fetch_outputs(
     that mode the return is a list whose first element is comfy-cli's usual
     metadata and whose remaining elements are the image files just written; a
     non-image output (or ``url_only=True``, which downloads no bytes) simply
-    yields no inline images.
+    yields no inline images. The inline preview is capped
+    (``_INLINE_IMAGE_MAX_COUNT`` files / ``_INLINE_IMAGE_MAX_BYTES`` aggregate) so
+    a large batch can't blow up the reply — the on-disk copies are never capped.
     """
     args = ["download", prompt_id, "-o", out_dir]
     if url_only:
         args.append("--url-only")
     data = _run_comfy(*args, timeout=300.0)
-    if not inline_images:
+    # ``url_only=True`` downloads no bytes, so there is nothing on disk to inline
+    # — short-circuit rather than let basename matching surface stale files from
+    # a previous run into ``out_dir`` (which would contradict the docstring).
+    if not inline_images or url_only:
         return data
-    images = [Image(path=path) for path in _collect_output_images(data, out_dir)]
+    paths = _select_inline_images(_collect_output_images(data, out_dir))
+    images = [Image(path=path) for path in paths]
     return [data, *images]
 
 
@@ -756,16 +832,18 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
     separator), so a restart is also how you relaunch with different flags.
     Returns the new server's status (``launch_comfyui``'s envelope data).
 
-    The stop step is best-effort: if comfy-cli has no recorded server to stop
-    (e.g. nothing is running, or ComfyUI was started outside comfy-cli), that
-    ``ComfyCliError`` is swallowed and the launch proceeds — a restart should
-    still bring the server up. Any genuine problem the failed stop would cause
-    (such as the old process still holding the port) surfaces from the launch.
+    The stop step is best-effort ONLY for the benign "nothing to stop" case: if
+    comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
+    started outside comfy-cli) it returns the ``no_recorded_server`` code, which
+    is swallowed so the restart still brings the server up. Any OTHER stop
+    failure (a process that couldn't be killed, a permission error, a comfy-cli
+    malfunction) is re-raised rather than silently masked behind the launch.
     """
     try:
         stop_comfyui()
-    except ComfyCliError:
-        pass
+    except ComfyCliError as exc:
+        if not _is_no_recorded_server(exc):
+            raise
     return launch_comfyui(extra_args)
 
 

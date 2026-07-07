@@ -837,6 +837,41 @@ def test_restart_comfyui_tolerates_no_recorded_server(monkeypatch):
     assert launched == [["--cpu"]]  # launch happened despite the stop error
 
 
+def test_restart_comfyui_reraises_genuine_stop_failure(monkeypatch):
+    """A stop failure that ISN'T 'no recorded server' propagates — launch is skipped."""
+    launched: list = []
+
+    def fake_stop():
+        raise server.ComfyCliError(
+            "comfy stop failed [permission_denied]: cannot kill pid 7",
+            code="permission_denied",
+        )
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="permission_denied"):
+        server.restart_comfyui()
+    assert launched == []  # genuine failure is not masked by a relaunch
+
+
+def test_error_envelope_populates_structured_code(patched_run):
+    """ComfyCliError from an error envelope carries the code as an attribute, not just text."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+    assert excinfo.value.code == "server_not_running"
+
+
 def test_restart_comfyui_returns_new_server_status(monkeypatch):
     """restart returns launch_comfyui's data (the fresh server status), not stop's."""
     monkeypatch.setattr(server, "stop_comfyui", lambda: {"stopped": True})
@@ -877,7 +912,7 @@ def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path
 def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
     patched_run, tmp_path
 ):
-    """Absolute image paths nested anywhere in the data are found and returned."""
+    """Absolute image paths nested anywhere in the data (under out_dir) are found."""
     img = tmp_path / "a.jpg"
     img.write_bytes(b"jpeg-bytes")
     patched_run(
@@ -888,12 +923,120 @@ def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
         }
     )
 
-    # out_dir is unrelated here — the data carries an absolute path.
-    result = server.fetch_outputs("pid", "/some/other/dir", inline_images=True)
+    # The absolute path the data carries lives inside out_dir (comfy download -o
+    # writes there), so it is inlined.
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
     images = [r for r in result if isinstance(r, server.Image)]
     assert len(images) == 1
     assert images[0].to_image_content().mimeType == "image/jpeg"
+
+
+def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
+    patched_run, tmp_path
+):
+    """A real image referenced by the data but living OUTSIDE out_dir is not inlined.
+
+    comfy download only writes into out_dir, so an absolute/`..` path escaping it
+    is an input reference or a traversal, never a file this job produced.
+    """
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(_FAKE_PNG)  # a real image, but outside out_dir
+
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            # both an absolute escape and a ../ traversal that resolve outside
+            "data": {"abs": str(outside), "rel": "../elsewhere.png"},
+        }
+    )
+
+    result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
+
+    assert not any(isinstance(r, server.Image) for r in result)
+
+
+def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
+    patched_run, tmp_path, monkeypatch
+):
+    """A bare filename binds to the copy in out_dir, not a same-named file in the CWD."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "gen.png").write_bytes(_FAKE_PNG)  # the real output
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "gen.png").write_bytes(b"cwd-decoy-not-this-one")  # a CWD shadow
+    monkeypatch.chdir(cwd)
+
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+
+    result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    assert len(images) == 1
+    import base64
+
+    # the out_dir copy, never the CWD decoy
+    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+
+
+def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
+    """url_only downloads no bytes, so inline_images can't surface stale out_dir files."""
+    # A stale image from a prior run whose basename the emitted URL echoes.
+    (tmp_path / "old.png").write_bytes(_FAKE_PNG)
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"urls": ["http://localhost:8188/view/old.png"]},
+        }
+    )
+
+    result = server.fetch_outputs(
+        "pid", str(tmp_path), url_only=True, inline_images=True
+    )
+
+    # Bare envelope data — no [data, Image...] wrapping, no stale file inlined.
+    assert result == {"urls": ["http://localhost:8188/view/old.png"]}
+
+
+def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
+    """No more than _INLINE_IMAGE_MAX_COUNT images are inlined, however many exist."""
+    names = [f"g{i}.png" for i in range(server._INLINE_IMAGE_MAX_COUNT + 5)]
+    for name in names:
+        (tmp_path / name).write_bytes(_FAKE_PNG)
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": names}})
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    assert len(images) == server._INLINE_IMAGE_MAX_COUNT
+
+
+def test_fetch_outputs_inline_images_caps_aggregate_bytes(
+    patched_run, tmp_path, monkeypatch
+):
+    """Inlining stops once the aggregate byte budget would be exceeded."""
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 10)
+    for name in ("a.png", "b.png", "c.png"):
+        (tmp_path / name).write_bytes(b"1234567")  # 7 bytes each
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"downloaded": ["a.png", "b.png", "c.png"]},
+        }
+    )
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    # first (7B) fits; second would push to 14B > 10B budget -> stop.
+    assert len(images) == 1
 
 
 def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tmp_path):
