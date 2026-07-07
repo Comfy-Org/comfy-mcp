@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Local MCP server for ComfyUI — a thin wrapper over comfy-cli."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [{ name = "Comfy Org" }]
 dependencies = [
     "mcp>=1.2.0",
@@ -17,7 +17,7 @@ dev = ["pytest>=8", "ruff>=0.15,<0.16"]
 comfy-local-mcp = "comfy_local_mcp.server:main"
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
