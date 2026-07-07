@@ -33,9 +33,9 @@ jobs:
     # SHA-pinned. Bump this SHA to pick up upstream changes; keep workflows_ref
     # matching so prompts/scripts load from the same commit. The
     # bump-cursor-review-callers workflow updates this automatically.
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@2836b64e0a6993efaa96d5334aa52288ec229fc6 # github-workflows#16
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@fb648ab5ab3b0f56ca281d38bc18a4f3cac67af2 # github-workflows main (fb648ab)
     with:
-      workflows_ref: 2836b64e0a6993efaa96d5334aa52288ec229fc6
+      workflows_ref: fb648ab5ab3b0f56ca281d38bc18a4f3cac67af2
       # Lockfiles, venvs, caches, egg-info, and the GPL license text carry no
       # review signal and would only eat into the diff size cap.
       diff_excludes: >-
