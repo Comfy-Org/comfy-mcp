@@ -103,7 +103,14 @@ def _parse_version(text: str) -> tuple[int, int, int] | None:
     Returns a ``(major, minor, patch)`` tuple (a missing patch defaults to 0), or
     ``None`` when no version-looking token is present.
     """
-    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    # Prefer a version token that follows the word "version" (comfy-cli prints
+    # "comfy-cli, version X.Y.Z"), so we don't latch onto an earlier dotted
+    # token — a Python version, a path segment like ``.../3.10/...`` — and end
+    # up comparing the wrong value. Fall back to the first dotted-numeric token
+    # anywhere in the text (still fails OPEN on no match, per the guard's docs).
+    match = re.search(r"version[^\d]*(\d+)\.(\d+)(?:\.(\d+))?", text, re.IGNORECASE)
+    if match is None:
+        match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
     if match is None:
         return None
     major, minor, patch = match.groups(default="0")
@@ -129,11 +136,18 @@ def _check_comfy_version() -> None:
             [COMFY_BIN, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",  # never crash on undecodable `--version` bytes
             timeout=30.0,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        # A hung `--version` is latched so we don't re-block every later call on
+        # the same 30s wait; fail OPEN for the rest of the process.
+        _version_checked = True
+        return
     except (OSError, subprocess.SubprocessError):
-        _version_checked = True  # fail open — never block on a flaky `--version`
+        # A transient spawn failure fails OPEN for THIS call but is NOT latched —
+        # a later call re-checks rather than permanently disabling the guard.
         return
     version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
     if version is not None and version < _MIN_COMFY_CLI:
@@ -199,7 +213,9 @@ def _unwrap_envelope(
             f"stderr: {stderr.strip()[:500]}"
         )
     if not envelope.get("ok", False):
-        err = envelope.get("error") or {}
+        err = envelope.get("error")
+        if not isinstance(err, dict):  # tolerate a malformed non-dict `error`
+            err = {}
         code = err.get("code", "unknown")
         raise ComfyCliError(
             f"comfy {' '.join(args)} failed "
@@ -334,7 +350,10 @@ async def _run_comfy_streaming(
             f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
             "(`pip install comfy-cli`) or set the COMFY_BIN env var."
         )
-    _check_comfy_version()
+    # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
+    # the first call per process); offload it so the async event loop is never
+    # blocked while it runs.
+    await asyncio.to_thread(_check_comfy_version)
     # --json-stream is a global flag and, like --json/--where, MUST precede the
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
@@ -769,6 +788,12 @@ def stop_comfyui() -> Any:
 # yet (nothing has been launched in the background, so nothing was captured).
 _NO_LOG_FILE_CODE = "no_log_file"
 
+# Bounds for get_logs' caller-controlled `tail`: at least 1 line (a negative
+# value would forward a malformed `--tail -N`), capped so an absurd request
+# can't make comfy-cli read/return an enormous log slice.
+_MIN_LOG_TAIL = 1
+_MAX_LOG_TAIL = 10000
+
 
 @mcp.tool()
 def get_logs(tail: int = 200) -> Any:
@@ -785,7 +810,12 @@ def get_logs(tail: int = 200) -> Any:
     returns a ``no_log_file`` error envelope; rather than raise, this tool returns
     it as data — ``{"error": "no_log_file", "message": ...}`` — so "no logs yet"
     reads as a normal answer instead of a failure. Every other error still raises.
+
+    ``tail`` is clamped to ``[1, 10000]`` before forwarding, so a negative value
+    can't produce a malformed ``--tail -N`` and an absurd value can't make
+    comfy-cli read back an enormous log slice.
     """
+    tail = max(_MIN_LOG_TAIL, min(int(tail), _MAX_LOG_TAIL))
     try:
         return _run_comfy("logs", "--tail", str(tail), timeout=60.0)
     except ComfyCliError as exc:

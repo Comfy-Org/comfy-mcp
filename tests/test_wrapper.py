@@ -115,7 +115,7 @@ def _fake_version(stdout: str, *, stderr: str = "", raises: Exception | None = N
     """A `subprocess.run` stand-in for `comfy --version`; records each call."""
     calls: list[list[str]] = []
 
-    def fake(cmd, capture_output, text, timeout, check):  # noqa: ARG001
+    def fake(cmd, capture_output, text, timeout, check, errors=None):  # noqa: ARG001
         calls.append(cmd)
         if raises is not None:
             raise raises
@@ -173,9 +173,23 @@ def test_version_guard_fails_open_on_unparseable_version(monkeypatch):
 
 
 def test_version_guard_fails_open_when_version_errors(monkeypatch):
-    """A `comfy --version` that can't be spawned fails OPEN, not closed."""
+    """A `comfy --version` that can't be spawned fails OPEN, not closed —
+    and a transient spawn error is NOT latched, so a later call re-checks."""
     monkeypatch.setattr(server, "_version_checked", False)
     fake, _ = _fake_version("", raises=OSError("boom"))
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+    assert server._version_checked is False  # transient error not latched
+
+
+def test_version_guard_latches_on_timeout(monkeypatch):
+    """A hung `--version` (timeout) fails OPEN and IS latched, so a later call
+    doesn't re-block on the same 30s wait."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    fake, _ = _fake_version(
+        "", raises=subprocess.TimeoutExpired(cmd="comfy --version", timeout=30.0)
+    )
     monkeypatch.setattr(server.subprocess, "run", fake)
 
     server._check_comfy_version()  # no raise
@@ -186,6 +200,16 @@ def test_parse_version_reads_two_and_three_part_and_none():
     assert server._parse_version("comfy-cli, version 1.12") == (1, 12, 0)
     assert server._parse_version("v2.0.5 extra") == (2, 0, 5)
     assert server._parse_version("no version token here") is None
+
+
+def test_parse_version_prefers_token_after_version_keyword():
+    """A leading dotted token (a Python version) must not be mistaken for the
+    comfy-cli version when a `version X.Y.Z` token is present."""
+    assert server._parse_version("Python 3.10.2\ncomfy-cli, version 1.12.0") == (
+        1,
+        12,
+        0,
+    )
 
 
 # --- get_logs ---------------------------------------------------------------
@@ -214,6 +238,18 @@ def test_get_logs_forwards_custom_tail(patched_run):
     server.get_logs(tail=50)
 
     assert calls[0]["cmd"][4:] == ["logs", "--tail", "50"]
+
+
+def test_get_logs_clamps_negative_and_huge_tail(patched_run):
+    """A negative tail can't forward a malformed `--tail -N`, and an absurd tail
+    is capped so comfy-cli isn't asked for an enormous slice."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"lines": []}})
+
+    server.get_logs(tail=-5)
+    assert calls[-1]["cmd"][4:] == ["logs", "--tail", str(server._MIN_LOG_TAIL)]
+
+    server.get_logs(tail=10**9)
+    assert calls[-1]["cmd"][4:] == ["logs", "--tail", str(server._MAX_LOG_TAIL)]
 
 
 def test_get_logs_no_log_file_returned_not_raised(patched_run):
