@@ -791,3 +791,146 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == ("run", "--workflow", "wf.json")  # no --wait
     assert seen["timeout"] == 60.0
+
+
+# --- restart_comfyui (stop -> launch composition) --------------------------
+
+
+def test_restart_comfyui_runs_stop_then_launch(patched_run):
+    """restart is a thin `comfy stop` then `comfy launch --background` composition."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
+
+    # patched_run's fake emits the same envelope for every call, so launch's
+    # data ({"pid": 7}) is what restart returns.
+    assert server.restart_comfyui() == {"pid": 7}
+
+    assert len(calls) == 2  # exactly stop then launch, nothing else
+    assert calls[0]["cmd"][4:] == ["stop"]
+    assert calls[1]["cmd"][4:] == ["launch", "--background"]
+
+
+def test_restart_comfyui_forwards_extra_args_to_launch(patched_run):
+    """extra_args ride the launch step after the `--` separator, not the stop."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.restart_comfyui(["--port", "8189"])
+
+    assert calls[0]["cmd"][4:] == ["stop"]  # stop takes no extras
+    assert calls[1]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
+
+
+def test_restart_comfyui_tolerates_no_recorded_server(monkeypatch):
+    """A failed stop (nothing recorded to stop) is swallowed; launch still runs."""
+    launched: list = []
+
+    def fake_stop():
+        raise server.ComfyCliError("comfy stop failed [no_recorded_server]: none")
+
+    def fake_launch(extra_args=None):
+        launched.append(extra_args)
+        return {"pid": 1}
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    assert server.restart_comfyui(["--cpu"]) == {"pid": 1}
+    assert launched == [["--cpu"]]  # launch happened despite the stop error
+
+
+def test_restart_comfyui_returns_new_server_status(monkeypatch):
+    """restart returns launch_comfyui's data (the fresh server status), not stop's."""
+    monkeypatch.setattr(server, "stop_comfyui", lambda: {"stopped": True})
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: {"pid": 42, "port": 8188}
+    )
+
+    assert server.restart_comfyui() == {"pid": 42, "port": 8188}
+
+
+# --- fetch_outputs inline image return -------------------------------------
+
+# A few bytes standing in for a PNG — Image just base64-encodes the file, it
+# does not decode/validate the pixels, so any bytes exercise the round-trip.
+_FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
+
+
+def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path):
+    """inline_images=True returns [metadata, Image...] for each downloaded image."""
+    (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert isinstance(result, list)
+    assert result[0] == {"downloaded": ["gen.png"]}  # metadata preserved first
+    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    assert len(images) == 1
+
+    content = images[0].to_image_content()
+    assert content.type == "image"
+    assert content.mimeType == "image/png"
+    import base64
+
+    assert base64.b64decode(content.data) == _FAKE_PNG  # the real file bytes
+
+
+def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
+    patched_run, tmp_path
+):
+    """Absolute image paths nested anywhere in the data are found and returned."""
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"jpeg-bytes")
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"files": [{"path": str(img), "node": "SaveImage"}]},
+        }
+    )
+
+    # out_dir is unrelated here — the data carries an absolute path.
+    result = server.fetch_outputs("pid", "/some/other/dir", inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    assert len(images) == 1
+    assert images[0].to_image_content().mimeType == "image/jpeg"
+
+
+def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tmp_path):
+    """Non-image outputs and dangling references yield no inline images."""
+    (tmp_path / "notes.txt").write_bytes(b"hello")
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"downloaded": ["notes.txt", "ghost.png"]},
+        }
+    )
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert result[0] == {"downloaded": ["notes.txt", "ghost.png"]}
+    assert not any(isinstance(r, server.Image) for r in result)  # neither qualifies
+
+
+def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
+    """Inline return is additive: the `comfy download -o` copy command is unchanged."""
+    (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
+    calls = patched_run(
+        {"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}}
+    )
+
+    server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    # Same passthrough argv as the plain path — no --url-only, still copies bytes.
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", str(tmp_path)]
+
+
+def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
+    """Without inline_images the bare envelope data is returned (no list wrapping)."""
+    (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+
+    result = server.fetch_outputs("pid", str(tmp_path))
+
+    assert result == {"downloaded": ["gen.png"]}  # dict, not a [data, ...] list

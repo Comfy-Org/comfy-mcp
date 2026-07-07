@@ -7,8 +7,9 @@ with the Comfy Cloud MCP — comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
 (``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
-``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui``
-lifecycle pair (``comfy launch --background`` / ``comfy stop``), and the
+``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` /
+``restart_comfyui`` lifecycle trio (``comfy launch --background`` /
+``comfy stop`` / stop-then-launch), and the
 ``discover`` / ``which`` introspection pair (``comfy discover`` /
 ``comfy which``) that lets an agent learn the CLI's own contract and selection.
 
@@ -27,7 +28,7 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 
 # Rides every client handshake — teach an agent the canonical flows up front so
 # it does not have to rediscover them tool-by-tool. Keep this short.
@@ -625,8 +626,58 @@ def get_queue() -> Any:
     return _run_comfy("jobs", "ls", timeout=60.0)
 
 
+# Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
+# ``mcp.server.fastmcp.Image`` maps to a real ``image/*`` MIME type (an unknown
+# suffix would fall back to ``application/octet-stream`` and not render).
+_INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+def _iter_strings(obj: Any) -> Any:
+    """Yield every string value nested anywhere inside ``obj`` (dicts/lists/scalars)."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _iter_strings(value)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            yield from _iter_strings(value)
+
+
+def _collect_output_images(data: Any, out_dir: str) -> list[str]:
+    """Resolve image files referenced by ``comfy download``'s data to on-disk paths.
+
+    Walks every string in the envelope ``data``, keeps those with an image
+    suffix, resolves each against ``out_dir`` when it is not already an existing
+    absolute/relative path, and returns the files that actually exist on disk
+    (deduped, order-preserving). Anything that does not resolve to a real file is
+    skipped — inline return is best-effort and never masks the on-disk copy.
+    """
+    resolved: dict[str, None] = {}
+    for value in _iter_strings(data):
+        if not value.lower().endswith(_INLINE_IMAGE_SUFFIXES):
+            continue
+        # Try the path as given, then relative to out_dir, then just its
+        # basename inside out_dir — comfy-cli may report absolute paths, paths
+        # relative to out_dir, or bare filenames depending on the invocation.
+        for candidate in (
+            value,
+            os.path.join(out_dir, value),
+            os.path.join(out_dir, os.path.basename(value)),
+        ):
+            if os.path.isfile(candidate):
+                resolved.setdefault(os.path.abspath(candidate), None)
+                break
+    return list(resolved)
+
+
 @mcp.tool()
-def fetch_outputs(prompt_id: str, out_dir: str, url_only: bool = False) -> Any:
+def fetch_outputs(
+    prompt_id: str,
+    out_dir: str,
+    url_only: bool = False,
+    inline_images: bool = False,
+) -> Any:
     """Download a completed LOCAL job's output files into ``out_dir``.
 
     Thin passthrough to ``comfy download <prompt_id> --where local -o <out_dir>``:
@@ -635,11 +686,23 @@ def fetch_outputs(prompt_id: str, out_dir: str, url_only: bool = False) -> Any:
     supplied by :func:`_run_comfy` as a global flag.) Pass ``url_only=True`` to
     add ``--url-only`` — comfy-cli then emits the output URLs without downloading,
     handy for handing URLs to other tools instead of copying bytes.
+
+    Pass ``inline_images=True`` to ALSO return the copied images as inline MCP
+    image content (base64) so the calling agent can see the result without a
+    second read — the on-disk copy into ``out_dir`` is unchanged either way. In
+    that mode the return is a list whose first element is comfy-cli's usual
+    metadata and whose remaining elements are the image files just written; a
+    non-image output (or ``url_only=True``, which downloads no bytes) simply
+    yields no inline images.
     """
     args = ["download", prompt_id, "-o", out_dir]
     if url_only:
         args.append("--url-only")
-    return _run_comfy(*args, timeout=300.0)
+    data = _run_comfy(*args, timeout=300.0)
+    if not inline_images:
+        return data
+    images = [Image(path=path) for path in _collect_output_images(data, out_dir)]
+    return [data, *images]
 
 
 @mcp.tool()
@@ -680,6 +743,30 @@ def stop_comfyui() -> Any:
     message, rather than killing an unrelated process.
     """
     return _run_comfy("stop", timeout=60.0)
+
+
+@mcp.tool()
+def restart_comfyui(extra_args: list[str] | None = None) -> Any:
+    """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
+
+    Composes the existing :func:`stop_comfyui` and :func:`launch_comfyui` — there
+    is no ``comfy restart`` subcommand, so this is a thin stop-then-launch over
+    comfy-cli, not a new engine feature. ``extra_args`` are forwarded to the new
+    ComfyUI exactly as :func:`launch_comfyui` forwards them (after a ``--``
+    separator), so a restart is also how you relaunch with different flags.
+    Returns the new server's status (``launch_comfyui``'s envelope data).
+
+    The stop step is best-effort: if comfy-cli has no recorded server to stop
+    (e.g. nothing is running, or ComfyUI was started outside comfy-cli), that
+    ``ComfyCliError`` is swallowed and the launch proceeds — a restart should
+    still bring the server up. Any genuine problem the failed stop would cause
+    (such as the old process still holding the port) surfaces from the launch.
+    """
+    try:
+        stop_comfyui()
+    except ComfyCliError:
+        pass
+    return launch_comfyui(extra_args)
 
 
 @mcp.tool()
