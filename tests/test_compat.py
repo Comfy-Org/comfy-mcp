@@ -47,6 +47,14 @@ def test_unwrap_rejects_incompatible_envelope_major():
         server._unwrap_envelope(envelope, ("env",), 0, "")
 
 
+@pytest.mark.parametrize("schema", ["envelope-v2", "envelope/1-foo", "v2", "envelope/"])
+def test_unwrap_rejects_declared_but_unparseable_schema(schema):
+    """A declared schema that isn't a bare ``envelope/<N>`` fails closed, not open."""
+    envelope = {"schema": schema, "type": "envelope", "ok": True, "data": {"x": 1}}
+    with pytest.raises(server.ComfyCliError, match="incompatible comfy-cli envelope"):
+        server._unwrap_envelope(envelope, ("env",), 0, "")
+
+
 def test_unwrap_rejects_incompatible_major_even_on_error_envelope():
     """An incompatible schema is reported as such, not as its (untrusted) error."""
     envelope = {
@@ -99,7 +107,7 @@ def test_detect_version_none_when_binary_missing(monkeypatch):
 def test_detect_version_parses_cli_output(monkeypatch):
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    def fake(cmd, capture_output, text, timeout, check):  # noqa: ARG001
+    def fake(cmd, capture_output, text, errors, timeout, check):  # noqa: ARG001
         assert cmd == [server.COMFY_BIN, "--version"]
         return subprocess.CompletedProcess(
             cmd, 0, stdout="comfy-cli, 1.12.0\n", stderr=""
@@ -107,6 +115,20 @@ def test_detect_version_parses_cli_output(monkeypatch):
 
     monkeypatch.setattr(server.subprocess, "run", fake)
     assert server._detect_comfy_cli_version() == "1.12.0"
+
+
+def test_detect_version_ignores_stderr_and_nonzero_exit(monkeypatch):
+    """Only stdout on a clean exit is trusted; a stderr number / bad exit -> None."""
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+
+    def fake(cmd, capture_output, text, errors, timeout, check):  # noqa: ARG001
+        # Non-zero exit, and a misleading dotted number only on stderr.
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="Python 3.11.7 error\n"
+        )
+
+    monkeypatch.setattr(server.subprocess, "run", fake)
+    assert server._detect_comfy_cli_version() is None
 
 
 def test_detect_version_none_on_subprocess_error(monkeypatch):
@@ -161,6 +183,18 @@ def test_check_raises_when_version_below_floor(monkeypatch):
 
     with pytest.raises(server.ComfyCliError, match="older than the required minimum"):
         server._check_comfy_cli_version()
+
+
+@pytest.mark.parametrize("bad_floor", ["2", "latest", "v-next"])
+def test_check_warns_when_floor_is_unparseable(monkeypatch, bad_floor):
+    """A misconfigured floor must not silently no-op: warn instead of failing open."""
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", bad_floor)
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+
+    report = server._check_comfy_cli_version()
+
+    assert report["warnings"]  # warns the floor was unparseable / not enforced
+    assert any("not a parseable" in w for w in report["warnings"])
 
 
 def test_check_warns_but_does_not_raise_when_floor_set_and_version_unknown(monkeypatch):

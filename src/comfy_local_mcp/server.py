@@ -197,15 +197,17 @@ def _envelope_schema(envelope: dict) -> str | None:
 def _envelope_major(envelope: dict) -> int | None:
     """Major version an envelope declares via ``schema`` (``envelope/<N>``), or None.
 
-    ``None`` means the envelope did not declare a schema at all — comfy-cli
-    builds that predate the tagged ``schema`` field simply omit it. We treat
-    that as "unknown, assume compatible" (see :func:`_unwrap_envelope`) rather
-    than reject it, so only a POSITIVELY different major trips the assertion.
+    ``None`` means the ``schema`` string is absent OR present-but-unparseable.
+    :func:`_unwrap_envelope` disambiguates the two: it only calls this once it
+    knows a ``schema`` was declared, so a ``None`` here then means "declared but
+    not ``envelope/<N>``" and is refused. The pattern is fully anchored, so a
+    decorated schema like ``envelope/1-foo`` or a future ``envelope-v2`` does
+    NOT masquerade as a bare major.
     """
     schema = _envelope_schema(envelope)
     if not schema:
         return None
-    match = re.match(r"envelope/(\d+)", schema.strip())
+    match = re.fullmatch(r"envelope/(\d+)", schema.strip())
     return int(match.group(1)) if match else None
 
 
@@ -229,10 +231,14 @@ def _unwrap_envelope(
             f"comfy-cli returned no JSON (exit {returncode}). "
             f"stderr: {stderr.strip()[:500]}"
         )
-    major = _envelope_major(envelope)
-    if major is not None and major != ENVELOPE_SCHEMA_MAJOR:
+    # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
+    # Absent schema -> assume compatible (older comfy-cli); declared-but-unparseable
+    # or a different major -> refuse loudly rather than fail open on a shape we
+    # can't vouch for.
+    schema = _envelope_schema(envelope)
+    if schema is not None and _envelope_major(envelope) != ENVELOPE_SCHEMA_MAJOR:
         raise ComfyCliError(
-            f"incompatible comfy-cli envelope schema {_envelope_schema(envelope)!r}: "
+            f"incompatible comfy-cli envelope schema {schema!r}: "
             f"this server speaks envelope/{ENVELOPE_SCHEMA_MAJOR}. "
             "Upgrade or pin comfy-cli to a version whose envelope contract matches."
         )
@@ -488,12 +494,19 @@ def _detect_comfy_cli_version() -> str | None:
             [COMFY_BIN, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",  # never crash on non-UTF-8 bytes; report None instead
             timeout=30.0,
             check=False,
         )
     except (subprocess.SubprocessError, OSError):
         return None
-    parsed = _parse_version(f"{proc.stdout}\n{proc.stderr}")
+    # Only trust stdout on a clean exit: a non-zero exit or a stderr warning can
+    # carry an unrelated dotted number (an embedded Python / ComfyUI core version)
+    # that _parse_version's first-match would wrongly report as the CLI version,
+    # then falsely trip or bypass the COMFY_CLI_MIN_VERSION floor.
+    if proc.returncode != 0:
+        return None
+    parsed = _parse_version(proc.stdout)
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
@@ -517,16 +530,25 @@ def _check_comfy_cli_version() -> dict:
     if MIN_COMFY_CLI_VERSION:
         floor = _parse_version(MIN_COMFY_CLI_VERSION)
         got = _parse_version(detected) if detected else None
-        if floor is not None and got is not None and got < floor:
+        if floor is None:
+            # A misconfigured floor (e.g. "2" or "latest") would otherwise make
+            # the whole check a silent no-op: the deployment believes it enforces
+            # a minimum that never runs. Warn loudly instead of failing open.
+            report["warnings"].append(
+                f"COMFY_CLI_MIN_VERSION={MIN_COMFY_CLI_VERSION!r} is not a parseable "
+                'version (expected e.g. "1.5.0"), so the configured minimum was '
+                "NOT enforced."
+            )
+        elif got is None:
+            report["warnings"].append(
+                "could not determine the comfy-cli version, so the configured "
+                f"minimum {MIN_COMFY_CLI_VERSION} was not verified."
+            )
+        elif got < floor:
             raise ComfyCliError(
                 f"comfy-cli {detected} is older than the required minimum "
                 f"{MIN_COMFY_CLI_VERSION} (set via COMFY_CLI_MIN_VERSION). "
                 "Upgrade comfy-cli to a compatible version."
-            )
-        if got is None:
-            report["warnings"].append(
-                "could not determine the comfy-cli version, so the configured "
-                f"minimum {MIN_COMFY_CLI_VERSION} was not verified."
             )
     elif detected is None:
         report["warnings"].append("could not determine the comfy-cli version.")
@@ -551,10 +573,10 @@ def server_info() -> Any:
     alongside the ``comfy env`` data.
     """
     envelope, _stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
+    # _unwrap_envelope has already raised if envelope was None, so it is non-None here.
     data = _unwrap_envelope(envelope, args, returncode, stderr)
     compat = _check_comfy_cli_version()
-    if envelope is not None:
-        compat["envelope_schema"] = _envelope_schema(envelope)
+    compat["envelope_schema"] = _envelope_schema(envelope)
     if isinstance(data, dict):
         return {**data, "compatibility": compat}
     return {"env": data, "compatibility": compat}
