@@ -107,7 +107,17 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
         ) from exc
 
     envelope = _last_json_object(proc.stdout)
-    if plain_ok and envelope is None and proc.returncode == 0:
+    # A lifecycle command that exits 0 without a *real* envelope is a success
+    # (BE-2953). `_last_json_object` may return a stray non-envelope JSON line
+    # (e.g. a diagnostic log that happens to parse), so key the fast-path off the
+    # absence of a `type==envelope` object rather than the absence of any JSON —
+    # otherwise one incidental JSON line on a successful launch/stop would be
+    # mis-unwrapped into a spurious "failed" raise. A real error envelope still
+    # has `type==envelope`, so it flows to `_unwrap_envelope` and raises as usual.
+    real_envelope = (
+        envelope if envelope and envelope.get("type") == "envelope" else None
+    )
+    if plain_ok and real_envelope is None and proc.returncode == 0:
         return _synthesize_lifecycle_result(args, proc.stdout, proc.stderr)
     return _unwrap_envelope(envelope, args, proc.returncode, proc.stderr)
 
@@ -149,10 +159,11 @@ def _synthesize_lifecycle_result(
     would invite a retry of a non-idempotent lifecycle action.
     """
     text = " ".join(part.strip() for part in (stderr, stdout) if part.strip())
+    message = text or f"comfy {' '.join(args)} completed (exit 0)."
     return {
         "ok": True,
         "action": args[0] if args else "",
-        "message": text[:1000] or f"comfy {' '.join(args)} completed (exit 0).",
+        "message": message[:1000],  # cap both real output and the fallback
         "note": (
             "comfy-cli emitted no JSON envelope for this lifecycle command; "
             "a clean exit is treated as success."

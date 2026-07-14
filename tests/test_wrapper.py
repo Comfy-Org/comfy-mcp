@@ -518,6 +518,26 @@ def test_launch_comfyui_nonzero_exit_still_raises(patched_plain_run):
         server.launch_comfyui()
 
 
+def test_plain_ok_synthesizes_despite_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON line on a clean lifecycle exit is still success.
+
+    `_last_json_object` returns any JSON object (not just `type==envelope`), so a
+    diagnostic line that happens to parse must NOT be mistaken for a result
+    envelope and unwrapped into a spurious failure (BE-2953 edge case).
+    """
+    patched_plain_run(
+        0,
+        stdout='{"level": "info", "msg": "bound port 8188"}\n',
+        stderr="Launched ComfyUI in the background.",
+    )
+
+    result = server.launch_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "launch"
+    assert "Launched ComfyUI" in result["message"]
+
+
 def test_plain_ok_does_not_leak_to_other_commands(patched_plain_run):
     """Without plain_ok, an exit-0 command with no JSON still raises (unchanged)."""
     patched_plain_run(0, stdout="not json")
