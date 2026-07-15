@@ -84,7 +84,9 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     # Belt-and-suspenders: pin the target via env too, so we never touch cloud.
-    env = {**os.environ, "COMFY_WHERE": "local"}
+    # COMFY_NO_WATCH suppresses comfy-cli's file watcher for agentic callers like
+    # this MCP; a harmless no-op on comfy-cli versions that don't know the flag.
+    env = {**os.environ, "COMFY_WHERE": "local", "COMFY_NO_WATCH": "1"}
     try:
         proc = subprocess.run(
             cmd,
@@ -255,7 +257,9 @@ async def _run_comfy_streaming(
     # --json-stream is a global flag and, like --json/--where, MUST precede the
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
-    env = {**os.environ, "COMFY_WHERE": "local"}
+    # COMFY_NO_WATCH suppresses comfy-cli's file watcher for agentic callers (see
+    # _run_comfy); harmless on comfy-cli versions that don't know the flag.
+    env = {**os.environ, "COMFY_WHERE": "local", "COMFY_NO_WATCH": "1"}
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,

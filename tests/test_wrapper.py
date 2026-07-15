@@ -73,6 +73,15 @@ def test_global_flags_precede_subcommand(patched_run):
     assert calls[0]["env"]["COMFY_WHERE"] == "local"  # belt-and-suspenders pin
 
 
+def test_run_comfy_sets_no_watch_env(patched_run):
+    """Agentic caller: comfy-cli's file watcher is suppressed via COMFY_NO_WATCH."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["COMFY_NO_WATCH"] == "1"
+
+
 def test_error_envelope_raises_with_code(patched_run):
     patched_run(
         {
@@ -482,8 +491,9 @@ def test_which_maps_command_and_returns_data(patched_run):
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
-    def __init__(self, cmd, stdout_text, stderr_text=""):
+    def __init__(self, cmd, stdout_text, stderr_text="", env=None):
         self.cmd = cmd
+        self.env = env
         self.stdout = io.StringIO(stdout_text)
         self.stderr = io.StringIO(stderr_text)
         self.returncode = 0
@@ -521,7 +531,7 @@ def patched_stream(monkeypatch):
         procs: list[_FakeProc] = []
 
         def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text)
+            proc = _FakeProc(cmd, stdout_text, env=env)
             procs.append(proc)
             return proc
 
@@ -585,6 +595,16 @@ def test_run_workflow_streams_progress_and_returns_data(patched_stream):
     values = [c["progress"] for c in ctx.calls]
     assert values == sorted(values)  # monotonically non-decreasing
     assert values[-1] == 2.0  # both nodes finished
+
+
+def test_run_workflow_stream_sets_no_watch_env(patched_stream):
+    """The streaming path also suppresses comfy-cli's watcher via COMFY_NO_WATCH."""
+    procs = patched_stream(_OK_STREAM)
+
+    asyncio.run(server.run_workflow("wf.json", wait=True))
+
+    assert procs[0].env["COMFY_WHERE"] == "local"
+    assert procs[0].env["COMFY_NO_WATCH"] == "1"
 
 
 def test_run_workflow_stream_error_envelope_raises_with_code(patched_stream):
