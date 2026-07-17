@@ -95,13 +95,35 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        # subprocess.run attaches whatever the child wrote before being killed
+        # (capture_output=True) to the exception — surface it so a crashed,
+        # wedged comfy-cli (e.g. a traceback on stderr) is not indistinguishable
+        # from a genuinely slow one. See BE-3343.
         raise ComfyCliError(
-            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+            f"stderr tail: {_tail(exc.stderr) or '<empty>'}; "
+            f"stdout tail: {_tail(exc.stdout) or '<empty>'}"
         ) from exc
 
     return _unwrap_envelope(
         _last_json_object(proc.stdout), args, proc.returncode, proc.stderr
     )
+
+
+def _tail(text: str | bytes | None, limit: int = 500) -> str:
+    """Bounded tail of captured output; decodes bytes defensively.
+
+    On POSIX, ``TimeoutExpired.stdout``/``.stderr`` arrive as *bytes* even under
+    ``text=True`` (CPython quirk: ``communicate()`` raises with raw bytes; on
+    Windows ``run()`` re-communicates after the kill and returns ``str``), so
+    callers can hand us either. The ``limit`` hard-bounds the result so a chatty
+    child cannot inflate an error payload.
+    """
+    if not text:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    return text.strip()[-limit:]
 
 
 def _unwrap_envelope(
@@ -307,8 +329,24 @@ async def _run_comfy_streaming(
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
                 return {"timed_out": True, "status": tracker.snapshot()}
+            # Surface what the child wrote before the deadline (BE-3343). Kill it
+            # FIRST so its stderr pipe closes and the drain returns the buffered
+            # output (a wedged child with an open pipe would otherwise block).
+            if proc.poll() is None:
+                proc.kill()
+                await asyncio.to_thread(proc.wait)
+            stderr_tail = ""
+            if stderr_future is not None:
+                try:
+                    stderr_tail = _tail(await asyncio.wait_for(stderr_future, 2.0))
+                except Exception:
+                    # Diagnostics are best-effort: never let gathering the tail
+                    # mask the timeout itself.
+                    stderr_tail = ""
             raise ComfyCliError(
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+                f"stderr tail: {stderr_tail or '<empty>'}; "
+                f"stdout tail: {_tail(''.join(lines)) or '<empty>'}"
             ) from exc
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
