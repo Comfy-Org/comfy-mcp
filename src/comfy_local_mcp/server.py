@@ -54,6 +54,9 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
+- Partner-API nodes (Seedream/Veo/Kling/Gemini/…) require a Comfy credential in
+  the server's environment (`COMFY_API_KEY` in the client registration). A
+  credential error is retried briefly and surfaces a hint with alternatives.
 
 Everything targets the LOCAL server only — there is no cloud access here.
 """
@@ -72,9 +75,10 @@ class ComfyCliError(RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope.
 
     ``code`` carries the envelope's structured ``error.code`` when the failure
-    came from an error envelope (else ``None`` for missing-binary/timeout/no-JSON
-    cases), so callers can branch on a specific outcome instead of scraping the
-    message string.
+    came from an error envelope (used to drive the bounded credential retry in
+    ``run_workflow``); it is ``None`` for local failures the wrapper raises
+    itself (missing binary, timeout, no-JSON output), so callers can branch on a
+    specific outcome instead of scraping the message string.
     """
 
     def __init__(self, *args: object, code: str | None = None) -> None:
@@ -166,12 +170,23 @@ def _unwrap_envelope(
         )
     if not envelope.get("ok", False):
         err = envelope.get("error") or {}
-        raise ComfyCliError(
+        code = err.get("code")
+        # Keep comfy-cli's actionable extras: `error.hint` (e.g. the working
+        # `comfy auth set comfy-cloud-api-key --key …` credential fallback) and
+        # useful `error.details` (e.g. the `partner_nodes` that lack a
+        # credential) — dropping them was the exact workaround testers needed.
+        parts = [
             f"comfy {' '.join(args)} failed "
-            f"[{err.get('code', 'unknown')}]: "
-            f"{err.get('message') or stderr.strip()[:500]}",
-            code=err.get("code"),
-        )
+            f"[{code or 'unknown'}]: "
+            f"{err.get('message') or stderr.strip()[:500]}"
+        ]
+        hint = err.get("hint")
+        if hint:
+            parts.append(f"hint: {hint}")
+        detail_str = _render_error_details(err.get("details"))
+        if detail_str:
+            parts.append(detail_str)
+        raise ComfyCliError("\n".join(parts), code=code)
     return envelope.get("data")
 
 
@@ -198,6 +213,27 @@ def _synthesize_lifecycle_result(
             "a clean exit is treated as success."
         ),
     }
+
+
+# Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
+# message. ``partner_nodes`` names the offending nodes on a partner-credential
+# failure; keep the set small so a large envelope can't bloat the message.
+_SURFACED_DETAIL_KEYS = ("partner_nodes",)
+
+
+def _render_error_details(details: Any) -> str | None:
+    """Render the useful keys of an envelope's ``error.details`` for the message."""
+    if not isinstance(details, dict):
+        return None
+    parts: list[str] = []
+    for key in _SURFACED_DETAIL_KEYS:
+        value = details.get(key)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value)
+        parts.append(f"{key}: {value}")
+    return "; ".join(parts) if parts else None
 
 
 def _last_json_object(stdout: str) -> dict | None:
@@ -403,6 +439,27 @@ def server_info() -> Any:
     return _run_comfy("env", timeout=60.0)
 
 
+# comfy-cli error codes worth a short bounded retry from ``run_workflow`` —
+# transient credential failures the run's PREFLIGHT raises BEFORE the job is
+# submitted, so re-invoking `comfy run` cannot double-submit. Verified against
+# comfy-cli source (BE-3344):
+#   * `partner_node_requires_credential` — raised in run preflight
+#     (`command/run/__init__.py`) BEFORE `execution.queue()`; safe to retry.
+#   * `cloud_unauthorized` — only raised on the CLOUD execute path; it never
+#     fires on `--where local` (all this server ever runs), so it is dormant
+#     here. Included defensively per the field request; it can't double-submit.
+# `transient_auth` is deliberately EXCLUDED: on the local path it is raised
+# from the execution watcher (`command/run/execution.py` `on_error`) AFTER
+# submission, so retrying it would re-run a job that already executed.
+_RETRYABLE_CREDENTIAL_CODES = frozenset(
+    {"partner_node_requires_credential", "cloud_unauthorized"}
+)
+
+# Backoff (seconds) before each RETRY attempt — so up to 2 extra attempts after
+# the initial one, at 1s then 2s.
+_CREDENTIAL_RETRY_BACKOFFS = (1.0, 2.0)
+
+
 @mcp.tool()
 async def run_workflow(
     workflow_path: str,
@@ -418,18 +475,46 @@ async def run_workflow(
     as MCP progress notifications (per-node execution + sampler step counts) so
     a long generation is not a silent block; with ``wait=False`` it submits and
     returns immediately with a ``prompt_id`` to poll via ``job_status``.
+
+    Partner-API nodes (Seedream/Veo/Kling/Gemini/…) need a Comfy credential in
+    the server's environment (``COMFY_API_KEY`` in the client registration). A
+    transient credential failure is retried up to twice with a short backoff;
+    the surfaced error carries comfy-cli's hint (including the working
+    ``comfy auth set comfy-cloud-api-key`` fallback).
     """
-    if not wait:
-        # Fire-and-return: no stream to follow, so keep the plain --json path.
-        return _run_comfy("run", "--workflow", workflow_path, timeout=60.0)
-    return await _run_comfy_streaming(
-        "run",
-        "--workflow",
-        workflow_path,
-        "--wait",
-        ctx=ctx,
-        timeout=timeout_seconds,
-    )
+
+    async def _attempt() -> Any:
+        if not wait:
+            # Fire-and-return: no stream to follow, so keep the plain --json path.
+            return _run_comfy("run", "--workflow", workflow_path, timeout=60.0)
+        return await _run_comfy_streaming(
+            "run",
+            "--workflow",
+            workflow_path,
+            "--wait",
+            ctx=ctx,
+            timeout=timeout_seconds,
+        )
+
+    # Try once, then up to len(_CREDENTIAL_RETRY_BACKOFFS) more times on a
+    # transient credential code. ``backoff is None`` marks the final attempt.
+    for attempt, backoff in enumerate((*_CREDENTIAL_RETRY_BACKOFFS, None)):
+        try:
+            return await _attempt()
+        except ComfyCliError as exc:
+            retryable = exc.code in _RETRYABLE_CREDENTIAL_CODES
+            if backoff is None or not retryable:
+                if attempt and retryable:
+                    # Retries exhausted on a credential error: surface the
+                    # hint-bearing error, noting the retries already made.
+                    plural = "y" if attempt == 1 else "ies"
+                    raise ComfyCliError(
+                        f"{exc}\n(gave up after {attempt} retr{plural} on "
+                        f"transient `{exc.code}`)",
+                        code=exc.code,
+                    ) from exc
+                raise
+            await asyncio.sleep(backoff)
 
 
 @mcp.tool()
