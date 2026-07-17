@@ -114,6 +114,13 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
             cmd,
             capture_output=True,
             text=True,
+            # Pin the parent-side decode to UTF-8 so it matches what the child
+            # is forced to emit (_comfy_env). Without this, text=True decodes
+            # the pipe with the system locale (cp1252 on a default Windows
+            # console) and the non-ASCII catalog output raises UnicodeDecodeError
+            # or yields mojibake before _unwrap_envelope — the exact crash this
+            # fix targets, just moved to the reader.
+            encoding="utf-8",
             timeout=timeout,
             env=env,
             check=False,
@@ -285,6 +292,11 @@ async def _run_comfy_streaming(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # Match the child's forced UTF-8 output (see _comfy_env); otherwise
+        # readline()/stderr.read() decode with the parent locale (cp1252 on
+        # Windows) and non-ASCII stream lines raise UnicodeDecodeError or
+        # corrupt to mojibake before _parse_event/_last_json_object.
+        encoding="utf-8",
         env=env,
     )
     lines: list[str] = []

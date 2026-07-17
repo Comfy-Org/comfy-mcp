@@ -33,8 +33,8 @@ def _fake_run(envelope: dict):
     """
     calls: list[dict] = []
 
-    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env})
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        calls.append({"cmd": cmd, "env": env, "encoding": encoding})
         return subprocess.CompletedProcess(
             cmd, 0, stdout=json.dumps(envelope), stderr=""
         )
@@ -95,6 +95,21 @@ def test_run_comfy_forces_utf8_env(patched_run):
 
     assert calls[0]["env"]["PYTHONUTF8"] == "1"
     assert calls[0]["env"]["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_run_comfy_pins_parent_decode_to_utf8(patched_run):
+    """The parent-side read is pinned to UTF-8 to match the child's forced output.
+
+    Without an explicit ``encoding``, ``text=True`` decodes the pipe with the
+    system locale (cp1252 on a default Windows console), so the non-ASCII catalog
+    output raises UnicodeDecodeError/mojibake before ``_unwrap_envelope`` — the
+    same crash, just moved from the child's write to the parent's read.
+    """
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["encoding"] == "utf-8"
 
 
 def test_run_comfy_utf8_env_overrides_inherited(patched_run, monkeypatch):
@@ -518,9 +533,10 @@ def test_which_maps_command_and_returns_data(patched_run):
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
-    def __init__(self, cmd, stdout_text, stderr_text="", env=None):
+    def __init__(self, cmd, stdout_text, stderr_text="", env=None, encoding=None):
         self.cmd = cmd
         self.env = env
+        self.encoding = encoding
         self.stdout = io.StringIO(stdout_text)
         self.stderr = io.StringIO(stderr_text)
         self.returncode = 0
@@ -557,8 +573,8 @@ def patched_stream(monkeypatch):
     def setup(stdout_text: str) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
-        def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text, env=env)
+        def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
+            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding)
             procs.append(proc)
             return proc
 
@@ -642,6 +658,9 @@ def test_run_workflow_stream_forces_utf8_env(patched_stream):
 
     assert procs[0].env["PYTHONUTF8"] == "1"
     assert procs[0].env["PYTHONIOENCODING"] == "utf-8"
+    # And the parent-side stream read is pinned to UTF-8 to match (readline()/
+    # stderr.read() would otherwise decode with the cp1252 parent locale).
+    assert procs[0].encoding == "utf-8"
 
 
 def test_run_workflow_stream_error_envelope_raises_with_code(patched_stream):
@@ -760,7 +779,7 @@ def test_watch_job_times_out_returns_payload(monkeypatch):
     )
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+    def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
         proc = _BlockingProc(cmd, [queued + "\n"])
         procs.append(proc)
         return proc
@@ -788,7 +807,7 @@ def test_watch_job_times_out_reports_progress_without_ctx(monkeypatch):
     executed = json.dumps({"type": "executed", "node": "1"})
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+    def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
         proc = _BlockingProc(cmd, [queued + "\n", executed + "\n"])
         procs.append(proc)
         return proc
