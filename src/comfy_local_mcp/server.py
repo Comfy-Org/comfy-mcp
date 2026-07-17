@@ -64,6 +64,31 @@ COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 _MAX_WATCH_TIMEOUT = 3600.0
 
 
+def _comfy_env() -> dict[str, str]:
+    """Child-process environment for every comfy-cli spawn.
+
+    Single source of truth so the two spawn sites (``_run_comfy`` /
+    ``_run_comfy_streaming``) cannot drift. Injected keys are placed AFTER
+    ``os.environ`` so they win over any inherited values:
+
+    - ``COMFY_WHERE=local`` — belt-and-suspenders pin so we never touch cloud.
+    - ``COMFY_NO_WATCH=1`` — suppress comfy-cli's file watcher for agentic
+      callers like this MCP; a harmless no-op on versions that lack the flag.
+    - ``PYTHONUTF8=1`` / ``PYTHONIOENCODING=utf-8`` — force UTF-8 on the child's
+      console. Without them a default Windows (cp1252) console raises
+      ``UnicodeEncodeError`` printing the UTF-8 catalog output and wedges, so the
+      discovery tools present as a 60s timeout. UTF-8 is already the practical
+      default on macOS/Linux, so this is a no-op there.
+    """
+    return {
+        **os.environ,
+        "COMFY_WHERE": "local",
+        "COMFY_NO_WATCH": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+
+
 class ComfyCliError(RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope."""
 
@@ -83,10 +108,7 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
     # Global flags (--json, --where) MUST precede the subcommand in comfy-cli;
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
-    # Belt-and-suspenders: pin the target via env too, so we never touch cloud.
-    # COMFY_NO_WATCH suppresses comfy-cli's file watcher for agentic callers like
-    # this MCP; a harmless no-op on comfy-cli versions that don't know the flag.
-    env = {**os.environ, "COMFY_WHERE": "local", "COMFY_NO_WATCH": "1"}
+    env = _comfy_env()
     try:
         proc = subprocess.run(
             cmd,
@@ -257,9 +279,7 @@ async def _run_comfy_streaming(
     # --json-stream is a global flag and, like --json/--where, MUST precede the
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
-    # COMFY_NO_WATCH suppresses comfy-cli's file watcher for agentic callers (see
-    # _run_comfy); harmless on comfy-cli versions that don't know the flag.
-    env = {**os.environ, "COMFY_WHERE": "local", "COMFY_NO_WATCH": "1"}
+    env = _comfy_env()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
