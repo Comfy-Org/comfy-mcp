@@ -85,6 +85,56 @@ def test_error_without_hint_or_details_still_raises_cleanly():
     assert excinfo.value.code == "server_not_running"
 
 
+# --- malformed-envelope hardening -------------------------------------------
+
+
+def test_non_dict_error_field_raises_cleanly():
+    """`error` as a bare string must not raise AttributeError (falls back to {})."""
+    envelope = {"type": "envelope", "ok": False, "error": "catastrophic failure"}
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "boom")
+    # No code recoverable from a non-dict error; message still renders.
+    assert excinfo.value.code is None
+    assert "[unknown]" in str(excinfo.value)
+
+
+def test_non_string_error_code_is_coerced_not_crashing():
+    """A non-hashable `error.code` is coerced to str so the retry check is safe."""
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": ["weird", "list"], "message": "nope"},
+    }
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+    err = excinfo.value
+    assert isinstance(err.code, str)
+    # The coerced code is a plain string, so the membership test can't raise.
+    assert err.code not in server._RETRYABLE_CREDENTIAL_CODES
+
+
+def test_oversized_error_fields_are_length_capped():
+    """A huge message/hint/partner_nodes list can't produce an unbounded string."""
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {
+            "code": "server_error",
+            "message": "x" * 10_000,
+            "hint": "y" * 10_000,
+            "details": {"partner_nodes": ["z" * 10_000]},
+        },
+    }
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+    msg = str(excinfo.value)
+    # Each rendered field is bounded; the whole message stays a small multiple
+    # of the per-field cap rather than tens of KB.
+    assert "x" * (server._MAX_ERROR_FIELD_CHARS + 1) not in msg
+    assert "y" * (server._MAX_ERROR_FIELD_CHARS + 1) not in msg
+    assert "z" * (server._MAX_ERROR_FIELD_CHARS + 1) not in msg
+
+
 # --- bounded retry ----------------------------------------------------------
 
 

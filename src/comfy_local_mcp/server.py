@@ -169,20 +169,33 @@ def _unwrap_envelope(
             f"stderr: {stderr.strip()[:500]}"
         )
     if not envelope.get("ok", False):
-        err = envelope.get("error") or {}
+        # A malformed envelope may set `error` to a non-dict (e.g. a bare
+        # string); fall back to `{}` so `.get()` below can't raise AttributeError.
+        err = envelope.get("error")
+        if not isinstance(err, dict):
+            err = {}
         code = err.get("code")
+        # `error.code` can be any JSON type in a malformed envelope, including a
+        # non-hashable list/dict that would make the `in _RETRYABLE_...`
+        # membership test in run_workflow raise TypeError. Coerce to a string so
+        # the retry check and the rendered message both stay well-defined.
+        if code is not None and not isinstance(code, str):
+            code = str(code)
         # Keep comfy-cli's actionable extras: `error.hint` (e.g. the working
         # `comfy auth set comfy-cloud-api-key --key …` credential fallback) and
         # useful `error.details` (e.g. the `partner_nodes` that lack a
         # credential) — dropping them was the exact workaround testers needed.
+        # Each field is length-capped so a huge/malformed envelope can't bloat
+        # the message propagated to the MCP client.
+        message = err.get("message") or stderr.strip()[:_MAX_ERROR_FIELD_CHARS]
         parts = [
             f"comfy {' '.join(args)} failed "
             f"[{code or 'unknown'}]: "
-            f"{err.get('message') or stderr.strip()[:500]}"
+            f"{str(message)[:_MAX_ERROR_FIELD_CHARS]}"
         ]
         hint = err.get("hint")
         if hint:
-            parts.append(f"hint: {hint}")
+            parts.append(f"hint: {str(hint)[:_MAX_ERROR_FIELD_CHARS]}")
         detail_str = _render_error_details(err.get("details"))
         if detail_str:
             parts.append(detail_str)
@@ -220,6 +233,11 @@ def _synthesize_lifecycle_result(
 # failure; keep the set small so a large envelope can't bloat the message.
 _SURFACED_DETAIL_KEYS = ("partner_nodes",)
 
+# Per-field cap for the rendered error message (mirrors the stderr cap) so a
+# multi-KB `message`/`hint` or a huge `partner_nodes` array can't produce an
+# unbounded error string in the MCP client / logs.
+_MAX_ERROR_FIELD_CHARS = 500
+
 
 def _render_error_details(details: Any) -> str | None:
     """Render the useful keys of an envelope's ``error.details`` for the message."""
@@ -232,7 +250,7 @@ def _render_error_details(details: Any) -> str | None:
             continue
         if isinstance(value, (list, tuple)):
             value = ", ".join(str(v) for v in value)
-        parts.append(f"{key}: {value}")
+        parts.append(f"{key}: {str(value)[:_MAX_ERROR_FIELD_CHARS]}")
     return "; ".join(parts) if parts else None
 
 
@@ -485,8 +503,13 @@ async def run_workflow(
 
     async def _attempt() -> Any:
         if not wait:
-            # Fire-and-return: no stream to follow, so keep the plain --json path.
-            return _run_comfy("run", "--workflow", workflow_path, timeout=60.0)
+            # Fire-and-return: no stream to follow, so keep the plain --json
+            # path — but run the blocking subprocess in a worker thread so the
+            # submit doesn't stall the event loop (and other concurrent MCP
+            # requests) for up to the 60s timeout.
+            return await asyncio.to_thread(
+                _run_comfy, "run", "--workflow", workflow_path, timeout=60.0
+            )
         return await _run_comfy_streaming(
             "run",
             "--workflow",
