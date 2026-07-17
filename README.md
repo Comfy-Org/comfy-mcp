@@ -9,13 +9,21 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** beta. Twenty-two tools, core loop validated end-to-end against a live local
+> **Status:** beta. Thirty-one tools, core loop validated end-to-end against a live local
 > ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
 ## Prerequisites
 
-- **Python ≥ 3.10.**
+- **Python ≥ 3.10.** Check first with `python3 --version`. On Python 3.9 — the
+  macOS **system** Python — the install fails only later, at `pip install` time,
+  as pip's generic "requires a different Python" resolution error, so confirm the
+  version up front rather than decoding that message.
+- **An Opus-class agent model.** Agent quality here is validated against **Claude
+  Opus-class models**; sessions driven by smaller models (e.g. Sonnet) repeatedly
+  broke in dogfooding — the multi-step tool loops (submit → poll → fetch, or
+  author → validate → run) are where they fall down. Use an Opus-class model for
+  anything beyond a single call.
 - **comfy-cli** on your `PATH`: `pip install comfy-cli`. This is the engine every tool wraps.
 - **A ComfyUI workspace.** If you don't have one, `comfy-cli` can create it: `comfy install`
   sets up a ComfyUI workspace it will point at. (An existing ComfyUI checkout works too — see
@@ -41,6 +49,10 @@ comfy-local-mcp        # serves the MCP over stdio
 `pip install` puts a `comfy-local-mcp` console script on your `PATH`; that command is what you
 point your AI client at below. (Installing into a dedicated venv is fine — just remember MCP
 clients may not see that venv's `PATH`, which is exactly what `COMFY_BIN` is for.)
+
+> **Using a `uv` venv?** uv-created virtualenvs ship **without** `pip`, so
+> `pip install .` fails inside one with `No module named pip` — use `uv pip
+> install .` instead.
 
 ## Configure your AI client
 
@@ -113,7 +125,7 @@ Zero to a generated image:
    ```bash
    pip install comfy-cli          # the engine
    comfy install                  # create a ComfyUI workspace (skip if you have one)
-   pip install .                  # this MCP server → the `comfy-local-mcp` command
+   pip install .                  # this MCP server (uv venv: `uv pip install .`)
    ```
 
 2. **Launch ComfyUI** and leave it running:
@@ -122,8 +134,11 @@ Zero to a generated image:
    comfy launch
    ```
 
-3. **Add the server to your client** using the snippet for your client above, then restart /
-   reload it so the tools appear.
+3. **Add the server to your client** using the snippet for your client above, then **fully
+   restart / reload the client** so the tools appear. Registering the server mid-session is
+   invisible until that restart — and an agent asked to use the tools *before* restarting may
+   **claim it did** while actually hallucinating the result. **Confirm the tools are really
+   loaded** (e.g. `/mcp` in Claude Code lists them) before trusting any output.
 
 4. **Ask your agent to run a workflow.** For example:
 
@@ -143,7 +158,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-Twenty-two tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
+Thirty-one tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
 comfy-cli's `envelope/1`, and returns its `data`.
 
 | Tool | Wraps | Purpose |
@@ -151,6 +166,7 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. **Call first.** |
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
+| `get_execution_error(prompt_id)` | `comfy jobs status <prompt_id>` | After a run fails (`job_status` → `status: error`), the compact failure verdict — failing `node_type`/`node_id`, `exception_type`/`exception_message`, and a bounded traceback tail — for self-repair. Returns `error: None` on a healthy run, so it's safe to call speculatively. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
@@ -172,8 +188,9 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `nodes_types()` | `comfy nodes types` | All connection types (`MODEL`, `IMAGE`, …) ranked by connectivity. Reads the **live install**. |
 | `nodes_categories()` | `comfy nodes categories` | The node category tree. Reads the **live install**. |
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
+| `download_model(url, relative_path=None, filename=None)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>]` | Download a model file into the local models dir by direct HuggingFace/CivitAI URL (http/https only), optionally under `relative_path` (e.g. `models/loras`) and renamed via `filename`. Download-by-URL only — not a hub search. |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
-| `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
+| `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. On frontend-format (UI export) workflows, `non_node_key` warnings are **benign** (exports carry non-node top-level keys) — don't "repair" a valid workflow over them. |
 | `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
 | `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
 | `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
@@ -199,6 +216,14 @@ It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`
 **and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
 rather than fails, so it's safe to run anywhere — and the plain `pytest` gate stays
 green on CI runners that have neither.
+
+## Troubleshooting
+
+- **Windows: discovery tools hang or crash on non-ASCII output.** ComfyUI /
+  comfy-cli output can contain UTF-8 that Windows' default console encoding
+  (cp1252) can't decode. Set `PYTHONUTF8=1` (or `PYTHONIOENCODING=utf-8`) in the
+  environment your MCP client launches the server with — the same `env` block
+  that holds `COMFY_BIN` in the snippets above — to force UTF-8 I/O.
 
 ## Contributing
 

@@ -48,7 +48,9 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
-  before running.
+  before running. On a frontend-format (UI export) workflow, `non_node_key`
+  warnings are BENIGN — frontend exports carry non-node top-level keys — so do
+  NOT "repair" an otherwise-valid workflow over them.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
 
 Everything targets the LOCAL server only — there is no cloud access here.
