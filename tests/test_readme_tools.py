@@ -23,7 +23,8 @@ from comfy_local_mcp import server
 README = Path(__file__).resolve().parent.parent / "README.md"
 
 # First column of a tool-table row: `| `tool_name(...)` | ... |`.
-_ROW_RE = re.compile(r"^\s*\|\s*`([a-z_]+)\(")
+# The name class includes digits so a tool like ``nodes_v2`` is still captured.
+_ROW_RE = re.compile(r"^\s*\|\s*`([a-z0-9_]+)\(")
 
 # Spelled-out English numbers, matching the README's prose voice ("Thirty-one
 # tools"). Covers 0..99 — well past any realistic tool count.
@@ -59,12 +60,17 @@ def _registered_tool_names() -> set[str]:
     return {tool.name for tool in asyncio.run(server.mcp.list_tools())}
 
 
-def _readme_table_tool_names(text: str) -> set[str]:
-    names: set[str] = set()
+def _readme_table_tool_names(text: str) -> list[str]:
+    """Tool names from the table's first column, in document order.
+
+    Returns a list (not a set) so callers can detect duplicate rows for the
+    same tool, which the one-row-per-tool contract forbids.
+    """
+    names: list[str] = []
     for line in text.splitlines():
         match = _ROW_RE.match(line)
         if match:
-            names.add(match.group(1))
+            names.append(match.group(1))
     return names
 
 
@@ -73,8 +79,12 @@ def test_readme_table_matches_registered_tools():
     registered = _registered_tool_names()
     table = _readme_table_tool_names(README.read_text(encoding="utf-8"))
 
-    missing = registered - table
-    extra = table - registered
+    duplicates = sorted({name for name in table if table.count(name) > 1})
+    assert not duplicates, f"README table has more than one row for: {duplicates}"
+
+    table_set = set(table)
+    missing = registered - table_set
+    extra = table_set - registered
     assert not missing, (
         f"tools registered but absent from the README table: {sorted(missing)}"
     )
@@ -84,12 +94,22 @@ def test_readme_table_matches_registered_tools():
 def test_readme_stated_count_matches_registered():
     """The prose count (both stated locations) matches the registered tool count."""
     count = len(_registered_tool_names())
-    phrase = f"{_int_to_words(count).capitalize()} tools"
-    occurrences = README.read_text(encoding="utf-8").count(phrase)
-    # The Status blockquote and the `## Tools` header both state the count; both
-    # must agree with the registry. Exactly two mentions keeps them in lockstep.
-    assert occurrences == 2, (
-        f"expected {phrase!r} stated in exactly 2 places (Status line + Tools "
-        f"header), found {occurrences}; update the count to match "
+    noun = "tool" if count == 1 else "tools"
+    phrase = f"{_int_to_words(count).capitalize()} {noun}"
+
+    text = README.read_text(encoding="utf-8")
+    # Both intended locations must state the count independently, so drift in
+    # one is caught even if a stray mention elsewhere keeps a bare total right.
+    status_line = next(
+        (line for line in text.splitlines() if "**Status:**" in line), ""
+    )
+    tools_section = text.split("## Tools", 1)[1] if "## Tools" in text else ""
+
+    assert phrase in status_line, (
+        f"Status blockquote must state {phrase!r}; update it to match "
+        f"{count} registered tools (found: {status_line.strip()!r})"
+    )
+    assert phrase in tools_section, (
+        f"the `## Tools` section must state {phrase!r}; update it to match "
         f"{count} registered tools"
     )
