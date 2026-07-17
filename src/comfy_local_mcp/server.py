@@ -715,6 +715,10 @@ def which() -> Any:
 # blowing the MCP client's tool-output cap.
 _TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
 
+# Upper bound on a single page so an oversized `limit` can't build a response
+# that trips the MCP client's tool-output cap; callers page the rest via `offset`.
+_TEMPLATE_LIST_MAX_LIMIT = 200
+
 
 def _template_matches(row: dict, query_lower: str) -> bool:
     """True if ``query_lower`` (already lowercased) matches a template ``row``.
@@ -765,7 +769,7 @@ def search_templates(
     - ``exclude_api=True`` — drop rows carrying the ``API`` tag (templates that
       call a hosted API and need a key), approximating "runnable locally".
       comfy-cli's ``--tag`` only includes, so this negation is applied here.
-    - ``limit`` (default 25) / ``offset`` — page the filtered rows.
+    - ``limit`` (default 25, capped at 200) / ``offset`` — page the filtered rows.
 
     Returns ``{"total", "shown", "offset", "rows"}`` where ``total`` is the
     filtered match count, ``rows`` is the current page projected down to
@@ -777,6 +781,10 @@ def search_templates(
     a runnable workflow JSON and pass that path straight to ``run_workflow`` — a
     working generation without hand-authoring workflow JSON.
     """
+    if limit < 0:
+        raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
+    limit = min(limit, _TEMPLATE_LIST_MAX_LIMIT)
+
     args = ["templates", "ls"]
     for flag, value in (
         ("--tag", tag),
@@ -785,6 +793,11 @@ def search_templates(
         ("--provider", provider),
     ):
         if value:
+            if value.startswith("-"):
+                # comfy-cli parses a leading-dash value as an option/flag; reject
+                # it rather than let `templates ls` misread the filter (argument
+                # injection).
+                raise ComfyCliError(f"invalid {flag} value: {value!r} (leading '-')")
             args += [flag, value]
     data = _run_comfy(*args, timeout=60.0)
 
@@ -799,7 +812,15 @@ def search_templates(
             f"`rows` list, got {shape}. comfy-cli's output shape may have drifted."
         )
 
-    rows = [r for r in data["rows"] if isinstance(r, dict)]
+    rows = data["rows"]
+    bad = sum(1 for r in rows if not isinstance(r, dict))
+    if bad:
+        # Fail loudly on shape drift rather than silently dropping rows (which
+        # would undercount `total`), matching the payload guard above.
+        raise ComfyCliError(
+            f"unexpected `comfy templates ls` payload: {bad} of {len(rows)} rows "
+            "are not objects. comfy-cli's output shape may have drifted."
+        )
     if exclude_api:
         rows = [
             r
@@ -814,7 +835,7 @@ def search_templates(
 
     total = len(rows)
     offset = max(0, offset)
-    page = rows[offset : offset + limit] if limit >= 0 else []
+    page = rows[offset : offset + limit]
     projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
     return {
         "total": total,

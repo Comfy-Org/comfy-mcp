@@ -246,6 +246,51 @@ def test_search_templates_bad_shape_raises(monkeypatch):
         server.search_templates()
 
 
+def test_search_templates_non_dict_rows_raise(monkeypatch):
+    """Non-dict rows are shape drift -> raise loudly, never silently dropped (BE-3342).
+
+    Silently filtering them would undercount `total` and vanish templates, which
+    contradicts the loud-fail guard the rest of the function is built around.
+    """
+    monkeypatch.setattr(
+        server, "_run_comfy", lambda *a, **k: _payload(rows=ROWS[:1] + ["bare-string"])
+    )
+    with pytest.raises(server.ComfyCliError, match="not objects"):
+        server.search_templates()
+
+
+def test_search_templates_rejects_leading_dash_filter_values(monkeypatch):
+    """A filter value starting with '-' is rejected before it reaches comfy-cli argv."""
+    _patch_ls(monkeypatch)
+    for kwargs in (
+        {"tag": "--foo"},
+        {"type": "-x"},
+        {"model": "--bar"},
+        {"provider": "-p"},
+    ):
+        with pytest.raises(server.ComfyCliError, match="leading '-'"):
+            server.search_templates(**kwargs)
+
+
+def test_search_templates_negative_limit_raises(monkeypatch):
+    """A negative limit is a caller typo -> raise, not a silently-empty page."""
+    _patch_ls(monkeypatch)
+    with pytest.raises(server.ComfyCliError, match="limit"):
+        server.search_templates(limit=-1)
+
+
+def test_search_templates_limit_capped(monkeypatch):
+    """An oversized limit is clamped so the response can't blow the tool-output cap."""
+    big = [
+        dict(ROWS[0], name=f"t{i}") for i in range(server._TEMPLATE_LIST_MAX_LIMIT + 50)
+    ]
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: _payload(rows=big))
+
+    result = server.search_templates(limit=10_000)
+    assert result["total"] == len(big)  # total still reports the full match count
+    assert result["shown"] == server._TEMPLATE_LIST_MAX_LIMIT  # page is capped
+
+
 def test_get_template_argv(monkeypatch):
     """Passthrough: `comfy --json --where local templates show <name>`."""
     fake, calls = _fake_run(
