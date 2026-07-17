@@ -67,6 +67,13 @@ COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 # can't hold a `comfy jobs watch` child open effectively forever (1 hour).
 _MAX_WATCH_TIMEOUT = 3600.0
 
+# Once the terminal envelope is read the authoritative result is in hand, but
+# comfy-cli can outlive its own envelope under a pipe (observed with
+# comfy-cli v1.12.0 `--json-stream`). Give such a child a short grace to exit on
+# its own, then fall through to the `finally` that kills it — never block on a
+# lingering child once the answer is already parsed.
+_POST_ENVELOPE_REAP_GRACE = 5.0
+
 
 class ComfyCliError(RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope.
@@ -338,17 +345,31 @@ async def _run_comfy_streaming(
     lines: list[str] = []
     tracker = _StreamProgress()
 
-    async def _pump() -> None:
+    async def _pump() -> bool:
+        """Read stdout until the terminal envelope (preferred) or stdout EOF.
+
+        Returns True if the loop stopped on the ``type == "envelope"`` line (the
+        authoritative result is already appended to ``lines``), False if it
+        stopped on stdout EOF. Breaking on the envelope — mirroring
+        :func:`_last_json_object`'s preference for it — keeps a fast run from
+        sitting in ``readline`` when comfy-cli lingers after emitting its
+        envelope (see ``_POST_ENVELOPE_REAP_GRACE``).
+        """
         assert proc.stdout is not None
         while True:
             line = await asyncio.to_thread(proc.stdout.readline)
             if not line:  # EOF: comfy-cli closed stdout
-                break
+                return False
             lines.append(line)
             # Advance the tracker even without a ctx so a timed-out ctx-less
             # watch still returns real progress; report() no-ops the notify.
             event = _parse_event(line)
             if event is not None:
+                if event.get("type") == "envelope":
+                    # Full result is in `lines`; _drain() unwraps it unchanged.
+                    # Don't block in readline for a child that may outlive its
+                    # own envelope under a pipe.
+                    return True
                 await tracker.report(ctx, event)
 
     # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
@@ -359,12 +380,27 @@ async def _run_comfy_streaming(
     )
 
     async def _drain() -> Any:
-        # Read the whole stream, then reap the child and its stderr. Bounding
-        # this entire coroutine (not just _pump) means a child that closes
-        # stdout without exiting can't wedge the unbounded proc.wait/stderr read.
-        await _pump()
-        returncode = await asyncio.to_thread(proc.wait)
-        stderr = (await stderr_future) if stderr_future is not None else ""
+        # Read the stream, then reap the child and its stderr. Bounding this
+        # entire coroutine (not just _pump) means a child that closes stdout
+        # without exiting can't wedge the unbounded proc.wait/stderr read.
+        got_envelope = await _pump()
+        if got_envelope:
+            # We have the answer. Give the child a brief grace to exit, then
+            # fall through — the `finally` kills a still-live child. Do NOT
+            # await stderr_future here: stderr may never EOF while the child
+            # lives, and the envelope already carries any error message.
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                pass  # lingering child; `finally` reaps it
+            returncode, stderr = proc.returncode, ""
+        else:
+            # EOF: the child has closed stdout, so a plain wait is safe and its
+            # stderr is collectible for the error message.
+            returncode = await asyncio.to_thread(proc.wait)
+            stderr = (await stderr_future) if stderr_future is not None else ""
         return _unwrap_envelope(
             _last_json_object("".join(lines)), args, returncode, stderr
         )
@@ -380,7 +416,10 @@ async def _run_comfy_streaming(
                 # (the finally below still kills the child).
                 return {"timed_out": True, "status": tracker.snapshot()}
             raise ComfyCliError(
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+                f"Progress so far: {tracker.snapshot()}. The run may still be "
+                "going — check `job_status`, or for long generations submit "
+                "with `wait=False` and poll `wait_for_job` / `watch_job`."
             ) from exc
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
@@ -407,7 +446,7 @@ def server_info() -> Any:
 async def run_workflow(
     workflow_path: str,
     wait: bool = True,
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float = 110.0,
     ctx: Context | None = None,
 ) -> Any:
     """Run a ComfyUI workflow JSON on the LOCAL ComfyUI.
@@ -418,6 +457,14 @@ async def run_workflow(
     as MCP progress notifications (per-node execution + sampler step counts) so
     a long generation is not a silent block; with ``wait=False`` it submits and
     returns immediately with a ``prompt_id`` to poll via ``job_status``.
+
+    ``timeout_seconds`` defaults to 110s — deliberately BELOW a typical MCP
+    client's ~120s tool budget, so a genuinely slow run surfaces this wrapper's
+    own actionable timeout (with a progress snapshot + next-step hint) instead
+    of an opaque client-side deadline. Keep it under your client's tool timeout;
+    for generations that may exceed it, submit with ``wait=False`` and poll
+    ``wait_for_job`` / ``watch_job`` (the server INSTRUCTIONS teach this flow)
+    rather than raising this bound.
     """
     if not wait:
         # Fire-and-return: no stream to follow, so keep the plain --json path.

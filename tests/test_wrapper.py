@@ -18,6 +18,7 @@ import asyncio
 import io
 import json
 import subprocess
+import threading
 import time
 
 import pytest
@@ -1090,3 +1091,190 @@ def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
     result = server.fetch_outputs("pid", str(tmp_path))
 
     assert result == {"downloaded": ["gen.png"]}  # dict, not a [data, ...] list
+
+
+# --- envelope-terminated read: don't wait on a lingering child ----------------
+
+
+class _LingeringProc:
+    """Fake Popen that emits ``lines`` (incl. the terminal envelope) then lingers.
+
+    Once the canned lines are exhausted ``stdout.readline`` blocks until the
+    child is killed, and ``wait()`` blocks the same way — modeling comfy-cli
+    outliving its own ``--json-stream`` envelope under a pipe. ``stderr.read``
+    blocks too, so a test also proves the envelope path never awaits stderr. The
+    block is bounded (10s) only so a buggy test can't hang the suite; the real
+    exit is ``kill()``.
+    """
+
+    def __init__(self, cmd, lines):
+        self.cmd = cmd
+        self._lines = list(lines)
+        self.stdout = self  # readline lives on the proc itself
+        self.stderr = self  # read() blocks the same way -> proves we don't await it
+        self.returncode = 0
+        self.killed = False
+        self._dead = threading.Event()
+
+    def readline(self):
+        if self._lines:
+            return self._lines.pop(0)
+        self._dead.wait(timeout=10.0)  # stdout never EOFs on its own
+        return ""
+
+    def read(self):
+        self._dead.wait(timeout=10.0)  # stderr never EOFs while the child lives
+        return ""
+
+    def poll(self):
+        return self.returncode if self._dead.is_set() else None
+
+    def wait(self):
+        self._dead.wait(timeout=10.0)  # a child that lingers past its envelope
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self._dead.set()
+
+
+def _lingering_popen(procs, stream_lines):
+    """A ``subprocess.Popen`` stand-in minting a fresh ``_LingeringProc`` per call."""
+
+    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+        proc = _LingeringProc(cmd, list(stream_lines))
+        procs.append(proc)
+        return proc
+
+    return fake_popen
+
+
+# Run events (2-node manifest + one completion) then the terminal envelope; the
+# child then lingers instead of closing stdout.
+_ENVELOPE_THEN_LINGER = [
+    json.dumps({"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]})
+    + "\n",
+    json.dumps({"type": "executed", "node": "1", "title": "Load"}) + "\n",
+    json.dumps(
+        {
+            "schema": "envelope/1",
+            "type": "envelope",
+            "ok": True,
+            "data": {"outputs": ["/x.png"]},
+        }
+    )
+    + "\n",
+]
+
+_ERROR_ENVELOPE_THEN_LINGER = [
+    json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]}) + "\n",
+    json.dumps(
+        {
+            "schema": "envelope/1",
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "execution_error", "message": "boom"},
+        }
+    )
+    + "\n",
+]
+
+
+def test_run_workflow_returns_on_envelope_despite_lingering_child(monkeypatch):
+    """Child emits its envelope then never closes stdout: return promptly, reap it.
+
+    The core fix — the read loop terminates on the ``envelope`` line, so a fast
+    run does not sit in ``readline`` waiting for a child that outlives its own
+    envelope. The result comes back well under the tool timeout.
+    """
+    procs: list[_LingeringProc] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess, "Popen", _lingering_popen(procs, _ENVELOPE_THEN_LINGER)
+    )
+    # Tiny post-envelope grace so the lingering child is reaped fast in-test.
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
+
+    start = time.monotonic()
+    result = asyncio.run(
+        server.run_workflow(
+            "wf.json", wait=True, timeout_seconds=30.0, ctx=_RecordingCtx()
+        )
+    )
+    elapsed = time.monotonic() - start
+
+    assert result == {"outputs": ["/x.png"]}  # the envelope's data, unwrapped
+    assert elapsed < 5.0  # did NOT block on the lingering child
+    assert procs[0].killed  # the child was killed / reaped on the way out
+
+
+def test_run_workflow_error_envelope_with_open_pipe_raises(monkeypatch):
+    """An error envelope followed by an open pipe still raises with its error code."""
+    procs: list[_LingeringProc] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess, "Popen", _lingering_popen(procs, _ERROR_ENVELOPE_THEN_LINGER)
+    )
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
+
+    with pytest.raises(server.ComfyCliError, match="execution_error"):
+        asyncio.run(server.run_workflow("wf.json", wait=True, timeout_seconds=30.0))
+
+    assert procs[0].killed  # still reaped on the error path
+
+
+def test_two_overlapping_run_workflow_calls_complete_independently(monkeypatch):
+    """Two concurrent wait=True runs against independent children both finish.
+
+    There is no shared state in the wrapper (each call spawns its own child), so
+    the reported "second concurrent call hung" is the same envelope-vs-EOF wait —
+    with the envelope-terminated read, both return.
+    """
+    procs: list[_LingeringProc] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess, "Popen", _lingering_popen(procs, _ENVELOPE_THEN_LINGER)
+    )
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
+
+    async def _both():
+        return await asyncio.gather(
+            server.run_workflow("a.json", wait=True, timeout_seconds=30.0),
+            server.run_workflow("b.json", wait=True, timeout_seconds=30.0),
+        )
+
+    results = asyncio.run(_both())
+
+    assert results == [{"outputs": ["/x.png"]}, {"outputs": ["/x.png"]}]
+    assert len(procs) == 2  # two independent children spawned
+    assert all(p.killed for p in procs)  # both cleaned up
+
+
+def test_run_workflow_timeout_error_includes_snapshot_and_hint(monkeypatch):
+    """A genuine timeout surfaces the progress snapshot + a job_status/wait=False hint."""
+    queued = json.dumps(
+        {"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]}
+    )
+    procs: list[_BlockingProc] = []
+
+    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+        proc = _BlockingProc(cmd, [queued + "\n"])
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        asyncio.run(
+            server.run_workflow(
+                "wf.json", wait=True, timeout_seconds=0.25, ctx=_RecordingCtx()
+            )
+        )
+
+    msg = str(excinfo.value)
+    assert "timed out" in msg
+    assert "nodes_done" in msg  # tracker.snapshot() dict is embedded
+    assert "job_status" in msg  # actionable next-step hints
+    assert "wait=False" in msg
+    assert procs[0].killed  # the child was still cleaned up on timeout
