@@ -158,7 +158,7 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
 
 
 def _unwrap_envelope(
-    envelope: dict | None, args: tuple[str, ...], returncode: int, stderr: str
+    envelope: dict | None, args: tuple[str, ...], returncode: int | None, stderr: str
 ) -> Any:
     """Unwrap comfy-cli's ``envelope/1`` result, raising on error/absence.
 
@@ -346,14 +346,16 @@ async def _run_comfy_streaming(
     tracker = _StreamProgress()
 
     async def _pump() -> bool:
-        """Read stdout until the terminal envelope (preferred) or stdout EOF.
+        """Read stdout until the terminal ``envelope/1`` line or stdout EOF.
 
-        Returns True if the loop stopped on the ``type == "envelope"`` line (the
+        Returns True if the loop stopped on the terminal envelope (the
         authoritative result is already appended to ``lines``), False if it
-        stopped on stdout EOF. Breaking on the envelope — mirroring
-        :func:`_last_json_object`'s preference for it — keeps a fast run from
-        sitting in ``readline`` when comfy-cli lingers after emitting its
-        envelope (see ``_POST_ENVELOPE_REAP_GRACE``).
+        stopped on stdout EOF. Only the ``schema == "envelope/1"`` line is
+        treated as terminal — an earlier or relayed ``type == "envelope"`` line
+        that is not the run's result envelope (e.g. custom-node output) must not
+        abort the read and kill the still-running child. Breaking on the real
+        envelope keeps a fast run from sitting in ``readline`` when comfy-cli
+        lingers after emitting it (see ``_POST_ENVELOPE_REAP_GRACE``).
         """
         assert proc.stdout is not None
         while True:
@@ -365,10 +367,13 @@ async def _run_comfy_streaming(
             # watch still returns real progress; report() no-ops the notify.
             event = _parse_event(line)
             if event is not None:
-                if event.get("type") == "envelope":
-                    # Full result is in `lines`; _drain() unwraps it unchanged.
-                    # Don't block in readline for a child that may outlive its
-                    # own envelope under a pipe.
+                if (
+                    event.get("type") == "envelope"
+                    and event.get("schema") == "envelope/1"
+                ):
+                    # Full result is in `lines`; it is unwrapped unchanged after
+                    # the reap grace. Don't block in readline for a child that
+                    # may outlive its own envelope under a pipe.
                     return True
                 await tracker.report(ctx, event)
 
@@ -379,37 +384,39 @@ async def _run_comfy_streaming(
         else None
     )
 
-    async def _drain() -> Any:
-        # Read the stream, then reap the child and its stderr. Bounding this
-        # entire coroutine (not just _pump) means a child that closes stdout
-        # without exiting can't wedge the unbounded proc.wait/stderr read.
+    async def _read() -> tuple[bool, Any]:
+        # Read up to the terminal envelope, then — on the EOF path only — reap
+        # the child and its stderr. Both are bounded by the caller's `timeout`
+        # (a child that closes stdout without exiting can't wedge the unbounded
+        # proc.wait/stderr read). On the envelope path the reap is deliberately
+        # left to the caller so it runs OFF the client budget.
         got_envelope = await _pump()
         if got_envelope:
-            # We have the answer. Give the child a brief grace to exit, then
-            # fall through — the `finally` kills a still-live child. Do NOT
-            # await stderr_future here: stderr may never EOF while the child
-            # lives, and the envelope already carries any error message.
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
-                )
-            except (asyncio.TimeoutError, TimeoutError):
-                pass  # lingering child; `finally` reaps it
-            returncode, stderr = proc.returncode, ""
-        else:
-            # EOF: the child has closed stdout, so a plain wait is safe and its
-            # stderr is collectible for the error message.
-            returncode = await asyncio.to_thread(proc.wait)
-            stderr = (await stderr_future) if stderr_future is not None else ""
-        return _unwrap_envelope(
+            return True, None
+        # EOF: the child has closed stdout, so a plain wait is safe and its
+        # stderr is collectible for the error message.
+        returncode = await asyncio.to_thread(proc.wait)
+        stderr = (await stderr_future) if stderr_future is not None else ""
+        return False, _unwrap_envelope(
             _last_json_object("".join(lines)), args, returncode, stderr
         )
 
     try:
+        # `_read` (reaching the envelope, plus the EOF-path reap) is bounded by
+        # the client's `timeout`. Once the envelope has been read it IS the
+        # answer; reaping a lingering child must NOT run on the client budget, or
+        # an envelope that lands within the reap grace of the deadline would be
+        # discarded and returned to sender as a spurious timeout (driving retries
+        # / duplicate jobs).
         try:
             if timeout is not None:
-                return await asyncio.wait_for(_drain(), timeout=timeout)
-            return await _drain()
+                got_envelope, eof_result = await asyncio.wait_for(
+                    _read(), timeout=timeout
+                )
+            else:
+                got_envelope, eof_result = await _read()
+            if not got_envelope:
+                return eof_result
         except (asyncio.TimeoutError, TimeoutError) as exc:
             if not raise_on_timeout:
                 # Bounded tail: report how far the run got instead of erroring
@@ -421,6 +428,30 @@ async def _run_comfy_streaming(
                 "going — check `job_status`, or for long generations submit "
                 "with `wait=False` and poll `wait_for_job` / `watch_job`."
             ) from exc
+
+        # Envelope path: the authoritative result is already in `lines`, read
+        # within the deadline. Give the child a brief grace to exit on a SEPARATE
+        # budget; the `finally` kills a still-live one.
+        envelope = _last_json_object("".join(lines))
+        child_reaped = True
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            child_reaped = False  # lingering child; `finally` reaps it
+        # stderr only matters for an error envelope whose `error.message` is
+        # empty (then `_unwrap_envelope` falls back to it). Collect it only when
+        # the child already exited during the grace — its stderr pipe has EOF'd,
+        # so the read can't block; a lingering child would, so skip it.
+        stderr = ""
+        if (
+            child_reaped
+            and stderr_future is not None
+            and not (envelope or {}).get("ok", False)
+        ):
+            stderr = await stderr_future
+        return _unwrap_envelope(envelope, args, proc.returncode, stderr)
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion).

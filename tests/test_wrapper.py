@@ -1112,7 +1112,10 @@ class _LingeringProc:
         self._lines = list(lines)
         self.stdout = self  # readline lives on the proc itself
         self.stderr = self  # read() blocks the same way -> proves we don't await it
-        self.returncode = 0
+        # None until reaped, mirroring real Popen: while the child lingers past
+        # its envelope its returncode is unknown, and _unwrap_envelope must
+        # tolerate that (it ignores returncode whenever an envelope is present).
+        self.returncode = None
         self.killed = False
         self._dead = threading.Event()
 
@@ -1135,6 +1138,7 @@ class _LingeringProc:
 
     def kill(self):
         self.killed = True
+        self.returncode = -9  # reaped by SIGKILL
         self._dead.set()
 
 
@@ -1278,3 +1282,143 @@ def test_run_workflow_timeout_error_includes_snapshot_and_hint(monkeypatch):
     assert "job_status" in msg  # actionable next-step hints
     assert "wait=False" in msg
     assert procs[0].killed  # the child was still cleaned up on timeout
+
+
+# Non-terminal ``type == "envelope"`` line (relayed custom-node output, schema
+# ``event/1``) followed by the REAL terminal ``schema == "envelope/1"`` result.
+_SPURIOUS_ENVELOPE_THEN_REAL = [
+    json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]}) + "\n",
+    json.dumps(
+        {
+            "schema": "event/1",
+            "type": "envelope",
+            "ok": True,
+            "data": {"spurious": "not the result"},
+        }
+    )
+    + "\n",
+    json.dumps({"type": "executed", "node": "1", "title": "Load"}) + "\n",
+    json.dumps(
+        {
+            "schema": "envelope/1",
+            "type": "envelope",
+            "ok": True,
+            "data": {"outputs": ["/real.png"]},
+        }
+    )
+    + "\n",
+]
+
+
+def test_run_workflow_returns_envelope_after_deadline_during_reap(monkeypatch):
+    """An envelope that lands before the deadline is returned even if reaping the
+    lingering child would overrun it.
+
+    Boundary case for the envelope-vs-deadline race: the authoritative result is
+    read within ``timeout``, but the post-envelope reap grace is LONGER than the
+    remaining budget. Because the reap runs off the client budget, the result
+    comes back instead of being discarded as a spurious timeout.
+    """
+    procs: list[_LingeringProc] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess, "Popen", _lingering_popen(procs, _ENVELOPE_THEN_LINGER)
+    )
+    # Grace (0.5s) deliberately exceeds the client timeout (0.2s): the OLD code
+    # ran the reap inside the client budget and raised; the fix returns the data.
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.5)
+
+    start = time.monotonic()
+    result = asyncio.run(
+        server.run_workflow(
+            "wf.json", wait=True, timeout_seconds=0.2, ctx=_RecordingCtx()
+        )
+    )
+    elapsed = time.monotonic() - start
+
+    assert result == {"outputs": ["/x.png"]}  # envelope data, not a timeout error
+    assert elapsed < 5.0  # reaped within the grace, not the 10s mock block
+    assert procs[0].killed  # lingering child still cleaned up
+
+
+def test_run_workflow_ignores_non_terminal_envelope_typed_line(monkeypatch):
+    """A relayed ``type == "envelope"`` line that isn't ``schema == "envelope/1"``
+    must not abort the read and return its payload as the result."""
+    procs: list[_LingeringProc] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "Popen",
+        _lingering_popen(procs, _SPURIOUS_ENVELOPE_THEN_REAL),
+    )
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
+
+    result = asyncio.run(
+        server.run_workflow(
+            "wf.json", wait=True, timeout_seconds=30.0, ctx=_RecordingCtx()
+        )
+    )
+
+    assert result == {
+        "outputs": ["/real.png"]
+    }  # the terminal envelope, not the spurious one
+    assert procs[0].killed
+
+
+class _ExitedErrorProc:
+    """Emits an error envelope with an empty message, then exits with stderr text.
+
+    Models an error run whose envelope carries no ``error.message`` but whose
+    stderr does — the envelope path must still surface that stderr text.
+    """
+
+    def __init__(self, cmd, lines, stderr_text):
+        self.cmd = cmd
+        self._lines = list(lines)
+        self.stdout = self
+        self.stderr = io.StringIO(stderr_text)
+        self.returncode = 1  # already exited by the time we reap
+        self.killed = False
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else ""
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+def test_run_workflow_error_envelope_empty_message_falls_back_to_stderr(monkeypatch):
+    """A message-less error envelope on the streaming path still reports stderr."""
+    lines = [
+        json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]}) + "\n",
+        json.dumps(
+            {
+                "schema": "envelope/1",
+                "type": "envelope",
+                "ok": False,
+                "error": {"code": "execution_error", "message": ""},
+            }
+        )
+        + "\n",
+    ]
+    stderr_text = "Traceback (most recent call last):\nRuntimeError: kaboom"
+
+    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+        return _ExitedErrorProc(cmd, lines, stderr_text)
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        asyncio.run(server.run_workflow("wf.json", wait=True, timeout_seconds=30.0))
+
+    msg = str(excinfo.value)
+    assert "execution_error" in msg  # the envelope's error code
+    assert "kaboom" in msg  # the stderr fallback filled the empty message
