@@ -1,8 +1,19 @@
-# Shared test helpers for the streaming (``--json-stream``) tool paths.
-#
-# ``run_workflow``, ``watch_job`` and ``generate_image`` all drive the same
-# ``subprocess.Popen`` NDJSON streaming path, so their tests share the fakes and
-# the ``patched_stream`` fixture defined here rather than each redefining them.
+"""Shared pytest fixtures.
+
+The comfy-cli version guard (`server._check_comfy_version`) shells out to
+`comfy --version` once per process from inside `_run_comfy`. The unit tests stub
+`subprocess.run` to emit canned envelopes and assert the exact argv — a stray
+`comfy --version` call would consume that stub and pollute those assertions. So
+by default we mark the guard "already checked" for every test; the dedicated
+guard tests (`test_wrapper.py`) re-enable it explicitly and mock `--version`.
+
+This module also holds the shared test helpers for the streaming
+(``--json-stream``) tool paths. ``run_workflow``, ``watch_job`` and
+``generate_image`` all drive the same ``subprocess.Popen`` NDJSON streaming
+path, so their tests share the fakes and the ``patched_stream`` fixture defined
+here rather than each redefining them.
+"""
+
 from __future__ import annotations
 
 import io
@@ -13,11 +24,19 @@ import pytest
 from comfy_local_mcp import server
 
 
+@pytest.fixture(autouse=True)
+def _skip_version_guard(monkeypatch):
+    """Neutralize the once-per-process comfy-cli version guard for unit tests."""
+    monkeypatch.setattr(server, "_version_checked", True)
+
+
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
-    def __init__(self, cmd, stdout_text, stderr_text=""):
+    def __init__(self, cmd, stdout_text, stderr_text="", env=None, encoding=None):
         self.cmd = cmd
+        self.env = env
+        self.encoding = encoding
         self.stdout = io.StringIO(stdout_text)
         self.stderr = io.StringIO(stderr_text)
         self.returncode = 0
@@ -54,8 +73,8 @@ def patched_stream(monkeypatch):
     def setup(stdout_text: str) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
-        def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text)
+        def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
+            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding)
             procs.append(proc)
             return proc
 

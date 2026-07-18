@@ -36,8 +36,9 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@3aead23f38c2ecfb969112883aa29bef070ed5d5 # github-workflows main (3aead23)
     with:
       workflows_ref: 3aead23f38c2ecfb969112883aa29bef070ed5d5
-      # Lockfiles, venvs, caches, egg-info, and the GPL license text carry no
-      # review signal and would only eat into the diff size cap.
+      # Lockfiles, venvs, caches, and egg-info carry no review signal and would
+      # only eat into the diff size cap. LICENSE/NOTICE are legal source-of-truth
+      # files, so they stay in scope for future licensing-change review.
       diff_excludes: >-
         :!**/uv.lock
         :!**/*.lock
@@ -46,7 +47,6 @@ jobs:
         :!**/*.egg-info/**
         :!**/dist/**
         :!**/.claude/**
-        :!LICENSE
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
