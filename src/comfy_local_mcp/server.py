@@ -597,14 +597,6 @@ async def _run_comfy_streaming(
             stderr_future.cancel()
 
 
-def _parse_version(text: str) -> tuple[int, int, int] | None:
-    """Extract a ``(major, minor, patch)`` tuple from a version string, or None."""
-    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
-    if match is None:
-        return None
-    return tuple(int(part) if part else 0 for part in match.groups())  # type: ignore[return-value]
-
-
 def _detect_comfy_cli_version() -> str | None:
     """Best-effort comfy-cli version via ``comfy --version`` (None if undetermined).
 
@@ -1273,6 +1265,14 @@ _NO_LOG_FILE_CODE = "no_log_file"
 _MIN_LOG_TAIL = 1
 _MAX_LOG_TAIL = 10000
 
+# Hard character cap on each returned log line. `_MAX_LOG_TAIL` bounds the line
+# COUNT, but a single pathological line — a base64 blob or tensor dump from a
+# buggy or hostile custom node — could still be megabytes and flood an agent's
+# context. Cap each line individually, mirroring the `_cap_text` guard on
+# get_execution_error's free-text fields. This is a TOTAL cap: the truncation
+# marker is charged against it (see get_logs) so a capped line never exceeds it.
+_MAX_LOG_LINE_CHARS = 4000
+
 
 @mcp.tool()
 def get_logs(tail: int = 200) -> Any:
@@ -1292,15 +1292,23 @@ def get_logs(tail: int = 200) -> Any:
 
     ``tail`` is clamped to ``[1, 10000]`` before forwarding, so a negative value
     can't produce a malformed ``--tail -N`` and an absurd value can't make
-    comfy-cli read back an enormous log slice.
+    comfy-cli read back an enormous log slice. Each returned line is also capped
+    to ``_MAX_LOG_LINE_CHARS`` so a single pathological line (a base64 blob or
+    tensor dump from a buggy node) can't flood the caller's context.
     """
     tail = max(_MIN_LOG_TAIL, min(int(tail), _MAX_LOG_TAIL))
     try:
-        return _run_comfy("logs", "--tail", str(tail), timeout=60.0)
+        data = _run_comfy("logs", "--tail", str(tail), timeout=60.0)
     except ComfyCliError as exc:
         if exc.code == _NO_LOG_FILE_CODE:
             return {"error": _NO_LOG_FILE_CODE, "message": str(exc)}
         raise
+    if isinstance(data, dict) and isinstance(data.get("lines"), list):
+        # Charge the truncation marker against the cap so a capped line's TOTAL
+        # length (content + marker) never exceeds `_MAX_LOG_LINE_CHARS`.
+        content_limit = _MAX_LOG_LINE_CHARS - len(_TRACEBACK_TRUNCATION_MARKER)
+        data["lines"] = [_cap_text(line, content_limit) for line in data["lines"]]
+    return data
 
 
 @mcp.tool()
