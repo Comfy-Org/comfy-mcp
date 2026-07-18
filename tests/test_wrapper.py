@@ -481,6 +481,20 @@ def test_auth_status_reports_registration_env_presence_not_value(
     assert "sk-super-secret-value" not in json.dumps(result)
 
 
+def test_auth_status_reports_flag_even_for_non_dict_payload(patched_run, monkeypatch):
+    """A non-dict whoami payload still carries registration_env_key_present."""
+    # Defensive: whoami normally returns an object, but if it ever hands back a
+    # non-dict (null / list), the flag must still be present per the docstring.
+    patched_run({"type": "envelope", "ok": True, "data": None})
+    monkeypatch.setenv("COMFY_API_KEY", "sk-super-secret-value")
+
+    result = server.auth_status()
+
+    assert result["registration_env_key_present"] is True
+    assert result["whoami"] is None
+    assert "sk-super-secret-value" not in json.dumps(result)
+
+
 def test_auth_status_never_returns_key_material(patched_run, monkeypatch):
     """A realistic redacted whoami stays redacted — no key/token material leaks out."""
     # comfy-cli pre-redacts secrets; the tool must pass them through, never re-derive.

@@ -51,11 +51,16 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
 - Before running a workflow whose nodes call partner APIs (Seedream / Veo /
-  Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials. If
-  it reports not signed in, tell the USER to authenticate, in this order:
-  (1) run `comfy cloud login` in a terminal (canonical), or (2) set
-  `COMFY_API_KEY` in the MCP client's registration env, or (3) persist a key
-  with `comfy cloud set-key --key …`. Never put a key in a workflow file.
+  Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials.
+  Treat credentials as GOOD if `signed_in` is true OR
+  `registration_env_key_present` is true — a registration-env key authenticates
+  partner-API runs even though whoami can't see it, so do NOT nag the user to
+  re-auth in that case. Only when BOTH are false, tell the USER to
+  authenticate, in this order: (1) run `comfy cloud login` in a terminal
+  (canonical), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
+  or (3) persist a key with `comfy cloud set-key` (avoid passing it inline as an
+  argument, which leaks the key into shell history). Never put a key in a
+  workflow file.
 
 Everything targets the LOCAL server only — there is no cloud access here.
 """
@@ -357,15 +362,19 @@ def auth_status() -> Any:
     ``api_key_source`` — whoami inspects only the cloud-purpose
     ``COMFY_CLOUD_API_KEY`` / stored key slot. So this tool ALSO reports
     ``registration_env_key_present`` (a local presence check — a bool, never
-    the value) so that path is at least visible.
+    the value) so that path is at least visible. The flag is ALWAYS present in
+    the returned mapping; on the rare non-dict whoami payload the raw value is
+    nested under ``whoami`` alongside it.
     """
     data = _run_comfy("cloud", "whoami", timeout=30.0)
     present = bool(os.environ.get("COMFY_API_KEY"))
     # Add the local presence flag WITHOUT altering any whoami field comfy-cli
-    # returned (which stays redacted as-is); only augment the dict shape.
+    # returned (which stays redacted as-is); only augment the dict shape. Always
+    # report the flag as the docstring promises: if whoami ever hands back a
+    # non-dict payload, wrap it under `whoami` rather than dropping the flag.
     if isinstance(data, dict):
         return {**data, "registration_env_key_present": present}
-    return data
+    return {"whoami": data, "registration_env_key_present": present}
 
 
 @mcp.tool()
