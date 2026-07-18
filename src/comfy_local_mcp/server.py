@@ -43,8 +43,11 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   Prefer this over `run_workflow(wait=True)` for slow runs so nothing blocks.
   For LIVE progress on an already-submitted job, `watch_job(prompt_id)` tails
   its execution events (bounded, like `wait_for_job`).
-- Start from a template: `search_templates` to find one, `fetch_template` to save
-  its workflow JSON, then `run_workflow` on that file. To change the prompt / seed
+- Start from a template: `search_templates(query=...)` to find one (free-text
+  search, paged 25 at a time via `limit`/`offset`; narrow with `tag`/`type`/
+  `model`/`provider`, or `exclude_api=True` for templates that run without a
+  hosted-API key), `fetch_template` to save its workflow JSON, then `run_workflow`
+  on that file. To change the prompt / seed
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
@@ -978,50 +981,140 @@ def which() -> Any:
     return _run_comfy("which", timeout=60.0)
 
 
-def _template_matches(item: Any, query_lower: str) -> bool:
-    """True if ``query_lower`` (already lowercased) is a substring of a template entry.
+# The compact per-row projection returned by the listing. The full detail
+# (tags / models / providers / category_title) is what ``get_template(name)``
+# returns — keeping the listing slim is what stops the full 558-row catalog from
+# blowing the MCP client's tool-output cap.
+_TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
 
-    Handles both shapes comfy-cli might emit for a template: a bare name string,
-    or a dict of fields (name / title / description / …) — we match against every
-    string value so the query hits any of them.
+# Upper bound on a single page so an oversized `limit` can't build a response
+# that trips the MCP client's tool-output cap; callers page the rest via `offset`.
+_TEMPLATE_LIST_MAX_LIMIT = 200
+
+
+def _template_matches(row: dict, query_lower: str) -> bool:
+    """True if ``query_lower`` (already lowercased) matches a template ``row``.
+
+    Case-insensitive substring match over the free-text fields ``name`` /
+    ``title`` / ``description`` plus the string items inside the ``tags`` and
+    ``models`` list values — deliberately NOT every string value, so a query
+    like ``"image"`` does not hit ``output_type`` on hundreds of rows.
     """
-    if isinstance(item, str):
-        return query_lower in item.lower()
-    if isinstance(item, dict):
-        return any(
-            isinstance(v, str) and query_lower in v.lower() for v in item.values()
-        )
+    for key in ("name", "title", "description"):
+        value = row.get(key)
+        if isinstance(value, str) and query_lower in value.lower():
+            return True
+    for key in ("tags", "models"):
+        for item in row.get(key) or []:
+            if isinstance(item, str) and query_lower in item.lower():
+                return True
     return False
 
 
 @mcp.tool()
-def search_templates(query: str = "") -> Any:
-    """Search the built-in ComfyUI workflow templates by name/description.
+def search_templates(
+    query: str = "",
+    limit: int = 25,
+    offset: int = 0,
+    tag: str = "",
+    type: str = "",
+    model: str = "",
+    provider: str = "",
+    exclude_api: bool = False,
+) -> Any:
+    """Search the built-in ComfyUI workflow-template gallery.
 
-    Wraps ``comfy templates ls``. When ``query`` is non-empty the listing is
-    filtered client-side (case-insensitive substring match against each
-    template's name and any text fields) — comfy-cli's ``ls`` has no server-side
-    filter argument, so the narrowing happens here; an empty ``query`` returns
-    the full list.
+    Wraps ``comfy templates ls``, whose payload is
+    ``{total_in_gallery, matched, shown, filters, rows: [...]}`` — one ``row``
+    per template with ``name / title / output_type / category_title / tags /
+    models / providers / description``. The full catalog is ~558 rows, far too
+    large to return whole, so this narrows and pages it:
+
+    - ``query`` — free-text, case-insensitive substring match applied
+      client-side over each row's ``name`` / ``title`` / ``description`` and the
+      items in its ``tags`` / ``models`` lists (comfy-cli's ``ls`` has no
+      free-text search flag, so this narrowing happens here).
+    - ``tag`` / ``type`` / ``model`` / ``provider`` — forwarded to comfy-cli as
+      ``--tag`` / ``--type`` / ``--model`` / ``--provider`` gallery filters
+      (``--tag`` and ``--type`` are exact-match, ``--model`` / ``--provider``
+      substring). Combine with ``query`` for free text on top.
+    - ``exclude_api=True`` — drop rows carrying the ``API`` tag (templates that
+      call a hosted API and need a key), approximating "runnable locally".
+      comfy-cli's ``--tag`` only includes, so this negation is applied here.
+    - ``limit`` (default 25, capped at 200) / ``offset`` — page the filtered rows.
+
+    Returns ``{"total", "shown", "offset", "rows"}`` where ``total`` is the
+    filtered match count, ``rows`` is the current page projected down to
+    ``name / title / description / output_type`` (page again with ``offset`` to
+    see more), and ``get_template(name)`` is the full-detail path.
 
     Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
     with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
     a runnable workflow JSON and pass that path straight to ``run_workflow`` — a
     working generation without hand-authoring workflow JSON.
     """
-    data = _run_comfy("templates", "ls", timeout=60.0)
-    if not query:
-        return data
-    q = query.lower()
-    if isinstance(data, list):
-        return [item for item in data if _template_matches(item, q)]
-    if isinstance(data, dict) and isinstance(data.get("templates"), list):
-        return {
-            **data,
-            "templates": [t for t in data["templates"] if _template_matches(t, q)],
-        }
-    # Unknown shape — return it unfiltered rather than silently dropping data.
-    return data
+    if limit < 0:
+        raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
+    limit = min(limit, _TEMPLATE_LIST_MAX_LIMIT)
+
+    args = ["templates", "ls"]
+    for flag, value in (
+        ("--tag", tag),
+        ("--type", type),
+        ("--model", model),
+        ("--provider", provider),
+    ):
+        if value:
+            if value.startswith("-"):
+                # comfy-cli parses a leading-dash value as an option/flag; reject
+                # it rather than let `templates ls` misread the filter (argument
+                # injection).
+                raise ComfyCliError(f"invalid {flag} value: {value!r} (leading '-')")
+            args += [flag, value]
+    data = _run_comfy(*args, timeout=60.0)
+
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        shape = (
+            "keys {" + ", ".join(sorted(map(str, data))) + "}"
+            if isinstance(data, dict)
+            else data.__class__.__name__
+        )
+        raise ComfyCliError(
+            "unexpected `comfy templates ls` payload: expected a dict with a "
+            f"`rows` list, got {shape}. comfy-cli's output shape may have drifted."
+        )
+
+    rows = data["rows"]
+    bad = sum(1 for r in rows if not isinstance(r, dict))
+    if bad:
+        # Fail loudly on shape drift rather than silently dropping rows (which
+        # would undercount `total`), matching the payload guard above.
+        raise ComfyCliError(
+            f"unexpected `comfy templates ls` payload: {bad} of {len(rows)} rows "
+            "are not objects. comfy-cli's output shape may have drifted."
+        )
+    if exclude_api:
+        rows = [
+            r
+            for r in rows
+            if not any(
+                isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
+            )
+        ]
+    if query:
+        q = query.lower()
+        rows = [r for r in rows if _template_matches(r, q)]
+
+    total = len(rows)
+    offset = max(0, offset)
+    page = rows[offset : offset + limit]
+    projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
+    return {
+        "total": total,
+        "shown": len(projected),
+        "offset": offset,
+        "rows": projected,
+    }
 
 
 @mcp.tool()
