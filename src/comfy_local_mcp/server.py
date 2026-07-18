@@ -7,10 +7,16 @@ with the Comfy Cloud MCP — comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
 (``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
-``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui``
-lifecycle pair (``comfy launch --background`` / ``comfy stop``), and the
+``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` /
+``restart_comfyui`` lifecycle trio (``comfy launch --background`` /
+``comfy stop`` / stop-then-launch) with ``get_logs`` (``comfy logs``) to read a
+detached launch's captured output, and the
 ``discover`` / ``which`` introspection pair (``comfy discover`` /
 ``comfy which``) that lets an agent learn the CLI's own contract and selection.
+
+Requires comfy-cli >= 1.12.0 (the ``comfy logs`` verb + the ``envelope/1``
+contract): :func:`_run_comfy` guards this once, up front, with an actionable
+upgrade error so a stale install fails clearly rather than cryptically.
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
 against a real comfy-cli install and a running local ComfyUI.
@@ -21,13 +27,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from typing import Any
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 
 # Rides every client handshake — teach an agent the canonical flows up front so
 # it does not have to rediscover them tool-by-tool. Keep this short.
@@ -42,8 +49,11 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   Prefer this over `run_workflow(wait=True)` for slow runs so nothing blocks.
   For LIVE progress on an already-submitted job, `watch_job(prompt_id)` tails
   its execution events (bounded, like `wait_for_job`).
-- Start from a template: `search_templates` to find one, `fetch_template` to save
-  its workflow JSON, then `run_workflow` on that file. To change the prompt / seed
+- Start from a template: `search_templates(query=...)` to find one (free-text
+  search, paged 25 at a time via `limit`/`offset`; narrow with `tag`/`type`/
+  `model`/`provider`, or `exclude_api=True` for templates that run without a
+  hosted-API key), `fetch_template` to save its workflow JSON, then `run_workflow`
+  on that file. To change the prompt / seed
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
@@ -61,6 +71,8 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   or (3) persist a key with `comfy cloud set-key` (avoid passing it inline as an
   argument, which leaks the key into shell history). Never put a key in a
   workflow file.
+- After a detached `launch_comfyui`, read the background server's own output with
+  `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
 
 Everything targets the LOCAL server only — there is no cloud access here.
 """
@@ -70,37 +82,190 @@ mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
 # Allow overriding the binary (e.g. a venv path) without touching code.
 COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 
+# The envelope schema major version this server speaks. comfy-cli tags every
+# result with a ``schema`` like ``envelope/1``; the whole contract (result
+# shape, error codes) is versioned by that major. A mismatch means comfy-cli
+# made a breaking change to the shape this wrapper parses, so we refuse it
+# loudly (``_unwrap_envelope``) rather than silently misread its ``data``.
+ENVELOPE_SCHEMA_MAJOR = 1
+
+# Optional minimum comfy-cli version, opt-in via the ``COMFY_CLI_MIN_VERSION``
+# env var (e.g. ``"1.5.0"``). Unset by default ON PURPOSE: the envelope-schema
+# assertion above is the load-bearing compatibility gate, and the contract this
+# server wraps is carried by a specific comfy-cli build reached through
+# PATH/COMFY_BIN — not a PyPI release we could meaningfully hard-pin. Deployments
+# that DO know their required floor enforce it by setting this; ``server_info``
+# then rejects an older CLI (see ``_check_comfy_cli_version``).
+MIN_COMFY_CLI_VERSION = os.environ.get("COMFY_CLI_MIN_VERSION") or None
+
 # Hard ceiling for a single bounded watch so `float('inf')` / an absurd value
 # can't hold a `comfy jobs watch` child open effectively forever (1 hour).
 _MAX_WATCH_TIMEOUT = 3600.0
 
+# comfy-cli floor. `comfy logs` (get_logs) and the structured `envelope/1`
+# contract this server relies on require comfy-cli >= 1.12.0; against an older
+# install `comfy logs` doesn't exist and would surface as a cryptic "No such
+# command", so `_run_comfy` guards this once, up front, with an upgrade message.
+_MIN_COMFY_CLI = (1, 12, 0)
+_MIN_COMFY_CLI_STR = "1.12.0"
+
+# The version guard shells out to `comfy --version`; memoize so it runs at most
+# once per process (it sits on the hot path of every _run_comfy call).
+_version_checked = False
+
+
+def _comfy_env() -> dict[str, str]:
+    """Child-process environment for every comfy-cli spawn.
+
+    Single source of truth so the two spawn sites (``_run_comfy`` /
+    ``_run_comfy_streaming``) cannot drift. Injected keys are placed AFTER
+    ``os.environ`` so they win over any inherited values:
+
+    - ``COMFY_WHERE=local`` — belt-and-suspenders pin so we never touch cloud.
+    - ``COMFY_NO_WATCH=1`` — suppress comfy-cli's file watcher for agentic
+      callers like this MCP; a harmless no-op on versions that lack the flag.
+    - ``PYTHONUTF8=1`` / ``PYTHONIOENCODING=utf-8`` — force UTF-8 on the child's
+      console. Without them a default Windows (cp1252) console raises
+      ``UnicodeEncodeError`` printing the UTF-8 catalog output and wedges, so the
+      discovery tools present as a 60s timeout. UTF-8 is already the practical
+      default on macOS/Linux, so this is a no-op there.
+    """
+    return {
+        **os.environ,
+        "COMFY_WHERE": "local",
+        "COMFY_NO_WATCH": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+
 
 class ComfyCliError(RuntimeError):
-    """comfy-cli was missing, timed out, or returned an error envelope."""
+    """comfy-cli was missing, timed out, or returned an error envelope.
+
+    ``code`` carries comfy-cli's structured ``error.code`` when the failure came
+    from an error envelope (``None`` for local failures like a missing binary, a
+    timeout, or no-JSON output), so callers can branch on a specific code without
+    string-matching the message — e.g. ``get_logs`` swallows ``no_log_file`` but
+    re-raises the rest.
+    """
+
+    def __init__(self, *args: object, code: str | None = None) -> None:
+        super().__init__(*args)
+        self.code = code
 
 
-def _run_comfy(*args: str, timeout: float | None = None) -> Any:
-    """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
+def _parse_version(text: str) -> tuple[int, int, int] | None:
+    """Extract the first dotted numeric version (e.g. ``1.12.0``) from ``text``.
 
-    comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
-    for ``--json``, or an NDJSON stream whose final line is the envelope). We
-    keep the last JSON object and unwrap ``ok`` / ``data`` / ``error``.
+    Returns a ``(major, minor, patch)`` tuple (a missing patch defaults to 0), or
+    ``None`` when no version-looking token is present.
+    """
+    # Prefer a version token that follows the word "version" (comfy-cli prints
+    # "comfy-cli, version X.Y.Z"), so we don't latch onto an earlier dotted
+    # token — a Python version, a path segment like ``.../3.10/...`` — and end
+    # up comparing the wrong value. Fall back to the first dotted-numeric token
+    # anywhere in the text (still fails OPEN on no match, per the guard's docs).
+    match = re.search(r"version[^\d]*(\d+)\.(\d+)(?:\.(\d+))?", text, re.IGNORECASE)
+    if match is None:
+        match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if match is None:
+        return None
+    major, minor, patch = match.groups(default="0")
+    return int(major), int(minor), int(patch)
+
+
+def _check_comfy_version() -> None:
+    """Guard: refuse to run against a comfy-cli older than :data:`_MIN_COMFY_CLI`.
+
+    Runs ``comfy --version`` once per process (memoized via ``_version_checked``).
+    If the reported version is below the floor, raises a clear, actionable
+    :class:`ComfyCliError` telling the user to upgrade — so a stale install fails
+    with "upgrade comfy-cli to >= 1.12.0" instead of a cryptic "No such command:
+    logs" deep inside a tool call. Fails OPEN on anything it can't positively read
+    as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
+    future comfy-cli output-format change can never wedge a working install.
+    """
+    global _version_checked
+    if _version_checked:
+        return
+    try:
+        proc = subprocess.run(
+            [COMFY_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            errors="replace",  # never crash on undecodable `--version` bytes
+            timeout=30.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung `--version` is latched so we don't re-block every later call on
+        # the same 30s wait; fail OPEN for the rest of the process.
+        _version_checked = True
+        return
+    except (OSError, subprocess.SubprocessError):
+        # A transient spawn failure fails OPEN for THIS call but is NOT latched —
+        # a later call re-checks rather than permanently disabling the guard.
+        return
+    version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
+    if version is not None and version < _MIN_COMFY_CLI:
+        # Deliberately do NOT memoize a too-old verdict: if the user upgrades and
+        # retries within the same process, re-check rather than latch the failure.
+        raise ComfyCliError(
+            f"comfy-cli {'.'.join(map(str, version))} is too old — this server "
+            f"requires comfy-cli >= {_MIN_COMFY_CLI_STR}. Upgrade it with "
+            f"`pip install --upgrade 'comfy-cli>={_MIN_COMFY_CLI_STR}'`."
+        )
+    _version_checked = True
+
+
+# comfy-cli's error code for "I have no server pid recorded to stop" — the one
+# stop failure ``restart_comfyui`` treats as benign (see its docstring).
+_NO_RECORDED_SERVER_CODE = "no_recorded_server"
+
+
+def _is_no_recorded_server(exc: ComfyCliError) -> bool:
+    """True when ``exc`` is comfy-cli's benign 'nothing recorded to stop' error.
+
+    Prefers the structured ``code`` and falls back to the message so it also
+    recognizes the error when only the human-readable string carries the marker.
+    """
+    return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
+
+
+def _run_comfy_raw(
+    *args: str, timeout: float | None = None
+) -> tuple[dict | None, str, tuple[str, ...], int, str]:
+    """Run ``comfy --json --where local <args>`` and return the RAW envelope + context.
+
+    The shared subprocess half of :func:`_run_comfy`: it resolves the binary,
+    runs comfy-cli, and returns ``(envelope, stdout, args, returncode, stderr)``
+    WITHOUT unwrapping — so a caller that needs the envelope itself (e.g.
+    ``server_info`` reading the versioned ``schema``) can inspect it, or the raw
+    ``stdout`` (e.g. the lifecycle-success synthesizer), while :func:`_run_comfy`
+    just unwraps it down to ``data``.
     """
     if shutil.which(COMFY_BIN) is None:
         raise ComfyCliError(
             f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
             "(`pip install comfy-cli`) or set the COMFY_BIN env var."
         )
+    _check_comfy_version()
     # Global flags (--json, --where) MUST precede the subcommand in comfy-cli;
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
-    # Belt-and-suspenders: pin the target via env too, so we never touch cloud.
-    env = {**os.environ, "COMFY_WHERE": "local"}
+    env = _comfy_env()
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            # Pin the parent-side decode to UTF-8 so it matches what the child
+            # is forced to emit (_comfy_env). Without this, text=True decodes
+            # the pipe with the system locale (cp1252 on a default Windows
+            # console) and the non-ASCII catalog output raises UnicodeDecodeError
+            # or yields mojibake before _unwrap_envelope — the exact crash this
+            # fix targets, just moved to the reader.
+            encoding="utf-8",
             timeout=timeout,
             env=env,
             check=False,
@@ -110,9 +275,66 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
             f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
         ) from exc
 
-    return _unwrap_envelope(
-        _last_json_object(proc.stdout), args, proc.returncode, proc.stderr
+    return (
+        _last_json_object(proc.stdout),
+        proc.stdout,
+        args,
+        proc.returncode,
+        proc.stderr,
     )
+
+
+def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
+    """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
+
+    comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
+    for ``--json``, or an NDJSON stream whose final line is the envelope). We
+    keep the last JSON object and unwrap ``ok`` / ``data`` / ``error``.
+
+    ``plain_ok`` relaxes the envelope requirement for the lifecycle commands
+    (``launch`` / ``stop``) that print human text and exit 0 WITHOUT emitting an
+    envelope (BE-2953): a clean exit with no JSON is treated as success and a
+    result dict is synthesized from the printed text, rather than raising the
+    "returned no JSON" error on an action that actually succeeded. A non-zero
+    exit, or a real error envelope, still raises as usual.
+    """
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    # A lifecycle command that exits 0 without a *real* envelope is a success
+    # (BE-2953). `_last_json_object` may return a stray non-envelope JSON line
+    # (e.g. a diagnostic log that happens to parse), so key the fast-path off the
+    # absence of a `type==envelope` object rather than the absence of any JSON —
+    # otherwise one incidental JSON line on a successful launch/stop would be
+    # mis-unwrapped into a spurious "failed" raise. A real error envelope still
+    # has `type==envelope`, so it flows to `_unwrap_envelope` and raises as usual.
+    real_envelope = (
+        envelope if envelope and envelope.get("type") == "envelope" else None
+    )
+    if plain_ok and real_envelope is None and returncode == 0:
+        return _synthesize_lifecycle_result(args, stdout, stderr)
+    return _unwrap_envelope(envelope, args, returncode, stderr)
+
+
+def _envelope_schema(envelope: dict) -> str | None:
+    """The envelope's declared ``schema`` string (e.g. ``"envelope/1"``), or None."""
+    value = envelope.get("schema")
+    return value if isinstance(value, str) else None
+
+
+def _envelope_major(envelope: dict) -> int | None:
+    """Major version an envelope declares via ``schema`` (``envelope/<N>``), or None.
+
+    ``None`` means the ``schema`` string is absent OR present-but-unparseable.
+    :func:`_unwrap_envelope` disambiguates the two: it only calls this once it
+    knows a ``schema`` was declared, so a ``None`` here then means "declared but
+    not ``envelope/<N>``" and is refused. The pattern is fully anchored, so a
+    decorated schema like ``envelope/1-foo`` or a future ``envelope-v2`` does
+    NOT masquerade as a bare major.
+    """
+    schema = _envelope_schema(envelope)
+    if not schema:
+        return None
+    match = re.fullmatch(r"envelope/(\d+)", schema.strip())
+    return int(match.group(1)) if match else None
 
 
 def _unwrap_envelope(
@@ -123,20 +345,66 @@ def _unwrap_envelope(
     Shared by the plain (`--json`) and streaming (`--json-stream`) paths so both
     have identical terminal behavior: return ``data`` on success, and raise a
     :class:`ComfyCliError` carrying the envelope's ``error.code`` on failure.
+
+    Also the envelope-version assertion: if comfy-cli declares an envelope
+    ``schema`` whose major differs from :data:`ENVELOPE_SCHEMA_MAJOR`, the whole
+    result shape is presumed incompatible and we refuse it with a clear error
+    (rather than silently misreading a differently-shaped ``data``). An envelope
+    with no declared schema is assumed compatible.
     """
     if envelope is None:
         raise ComfyCliError(
             f"comfy-cli returned no JSON (exit {returncode}). "
             f"stderr: {stderr.strip()[:500]}"
         )
+    # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
+    # Absent schema -> assume compatible (older comfy-cli); declared-but-unparseable
+    # or a different major -> refuse loudly rather than fail open on a shape we
+    # can't vouch for.
+    schema = _envelope_schema(envelope)
+    if schema is not None and _envelope_major(envelope) != ENVELOPE_SCHEMA_MAJOR:
+        raise ComfyCliError(
+            f"incompatible comfy-cli envelope schema {schema!r}: "
+            f"this server speaks envelope/{ENVELOPE_SCHEMA_MAJOR}. "
+            "Upgrade or pin comfy-cli to a version whose envelope contract matches."
+        )
     if not envelope.get("ok", False):
-        err = envelope.get("error") or {}
+        err = envelope.get("error")
+        if not isinstance(err, dict):  # tolerate a malformed non-dict `error`
+            err = {}
+        code = err.get("code", "unknown")
         raise ComfyCliError(
             f"comfy {' '.join(args)} failed "
-            f"[{err.get('code', 'unknown')}]: "
-            f"{err.get('message') or stderr.strip()[:500]}"
+            f"[{code}]: "
+            f"{err.get('message') or stderr.strip()[:500]}",
+            code=code,
         )
     return envelope.get("data")
+
+
+def _synthesize_lifecycle_result(
+    args: tuple[str, ...], stdout: str, stderr: str
+) -> dict:
+    """Success payload for a lifecycle command that exited 0 without an envelope.
+
+    ``comfy launch --background`` and ``comfy stop`` print human-readable text and
+    exit 0 instead of emitting an ``envelope/1`` object (BE-2953). For those
+    commands a clean exit IS the success signal, so we return a result dict
+    carrying whatever text comfy-cli printed (preferring stderr, per the CLI's
+    logging) rather than raising on the absent envelope — a false negative that
+    would invite a retry of a non-idempotent lifecycle action.
+    """
+    text = " ".join(part.strip() for part in (stderr, stdout) if part.strip())
+    message = text or f"comfy {' '.join(args)} completed (exit 0)."
+    return {
+        "ok": True,
+        "action": args[0] if args else "",
+        "message": message[:1000],  # cap both real output and the fallback
+        "note": (
+            "comfy-cli emitted no JSON envelope for this lifecycle command; "
+            "a clean exit is treated as success."
+        ),
+    }
 
 
 def _last_json_object(stdout: str) -> dict | None:
@@ -263,15 +531,24 @@ async def _run_comfy_streaming(
             f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
             "(`pip install comfy-cli`) or set the COMFY_BIN env var."
         )
+    # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
+    # the first call per process); offload it so the async event loop is never
+    # blocked while it runs.
+    await asyncio.to_thread(_check_comfy_version)
     # --json-stream is a global flag and, like --json/--where, MUST precede the
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
-    env = {**os.environ, "COMFY_WHERE": "local"}
+    env = _comfy_env()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # Match the child's forced UTF-8 output (see _comfy_env); otherwise
+        # readline()/stderr.read() decode with the parent locale (cp1252 on
+        # Windows) and non-ASCII stream lines raise UnicodeDecodeError or
+        # corrupt to mojibake before _parse_event/_last_json_object.
+        encoding="utf-8",
         env=env,
     )
     lines: list[str] = []
@@ -331,15 +608,116 @@ async def _run_comfy_streaming(
             stderr_future.cancel()
 
 
+def _parse_version(text: str) -> tuple[int, int, int] | None:
+    """Extract a ``(major, minor, patch)`` tuple from a version string, or None."""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if match is None:
+        return None
+    return tuple(int(part) if part else 0 for part in match.groups())  # type: ignore[return-value]
+
+
+def _detect_comfy_cli_version() -> str | None:
+    """Best-effort comfy-cli version via ``comfy --version`` (None if undetermined).
+
+    A version string is a NICE-TO-HAVE, not load-bearing: comfy-cli builds that
+    don't expose ``--version`` (or whose output we can't parse) return ``None``
+    here and are reported as "unknown" rather than rejected — the envelope-schema
+    assertion is the real gate. Kept separate from :func:`_run_comfy` because
+    ``--version`` is a plain flag, not a ``--json`` envelope command.
+    """
+    if shutil.which(COMFY_BIN) is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [COMFY_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            errors="replace",  # never crash on non-UTF-8 bytes; report None instead
+            timeout=30.0,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # Only trust stdout on a clean exit: a non-zero exit or a stderr warning can
+    # carry an unrelated dotted number (an embedded Python / ComfyUI core version)
+    # that _parse_version's first-match would wrongly report as the CLI version,
+    # then falsely trip or bypass the COMFY_CLI_MIN_VERSION floor.
+    if proc.returncode != 0:
+        return None
+    parsed = _parse_version(proc.stdout)
+    return ".".join(str(part) for part in parsed) if parsed else None
+
+
+def _check_comfy_cli_version() -> dict:
+    """Compatibility report for the comfy-cli backing this server.
+
+    Reports the detected comfy-cli version, the configured floor, and the
+    envelope schema major this server speaks. Raises :class:`ComfyCliError` ONLY
+    on a POSITIVE incompatibility — a detected version below a configured
+    :data:`MIN_COMFY_CLI_VERSION`. An undetectable version is reported as
+    ``None`` with a warning, never a hard failure, so a comfy-cli that simply
+    doesn't expose ``--version`` still works.
+    """
+    detected = _detect_comfy_cli_version()
+    report: dict[str, Any] = {
+        "comfy_cli_version": detected,
+        "min_comfy_cli_version": MIN_COMFY_CLI_VERSION,
+        "envelope_schema_major": ENVELOPE_SCHEMA_MAJOR,
+        "warnings": [],
+    }
+    if MIN_COMFY_CLI_VERSION:
+        floor = _parse_version(MIN_COMFY_CLI_VERSION)
+        got = _parse_version(detected) if detected else None
+        if floor is None:
+            # A misconfigured floor (e.g. "2" or "latest") would otherwise make
+            # the whole check a silent no-op: the deployment believes it enforces
+            # a minimum that never runs. Warn loudly instead of failing open.
+            report["warnings"].append(
+                f"COMFY_CLI_MIN_VERSION={MIN_COMFY_CLI_VERSION!r} is not a parseable "
+                'version (expected e.g. "1.5.0"), so the configured minimum was '
+                "NOT enforced."
+            )
+        elif got is None:
+            report["warnings"].append(
+                "could not determine the comfy-cli version, so the configured "
+                f"minimum {MIN_COMFY_CLI_VERSION} was not verified."
+            )
+        elif got < floor:
+            raise ComfyCliError(
+                f"comfy-cli {detected} is older than the required minimum "
+                f"{MIN_COMFY_CLI_VERSION} (set via COMFY_CLI_MIN_VERSION). "
+                "Upgrade comfy-cli to a compatible version."
+            )
+    elif detected is None:
+        report["warnings"].append("could not determine the comfy-cli version.")
+    return report
+
+
 @mcp.tool()
 def server_info() -> Any:
-    """Report the local ComfyUI / comfy-cli environment.
+    """Report the local ComfyUI / comfy-cli environment and verify compatibility.
 
     Wraps ``comfy env``. Returns whether a local ComfyUI server is running and
     its URL, plus the selected workspace and Python info. Call this first to
     confirm a local ComfyUI is up before running a workflow.
+
+    Also the compatibility gate for the unpinned comfy-cli this server shells
+    out to: it asserts comfy-cli's envelope schema major matches the
+    ``envelope/N`` this wrapper parses, and — when a ``COMFY_CLI_MIN_VERSION``
+    floor is configured — that comfy-cli meets it. On a mismatch it raises
+    :class:`ComfyCliError` saying so, catching an incompatible comfy-cli here
+    rather than deep inside a later tool. On success it attaches a
+    ``compatibility`` block (detected version, floor, envelope schema, warnings)
+    alongside the ``comfy env`` data.
     """
-    return _run_comfy("env", timeout=60.0)
+    envelope, _stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
+    # _unwrap_envelope has already raised if envelope was None, so it is non-None here.
+    data = _unwrap_envelope(envelope, args, returncode, stderr)
+    compat = _check_comfy_cli_version()
+    compat["envelope_schema"] = _envelope_schema(envelope)
+    if isinstance(data, dict):
+        return {**data, "compatibility": compat}
+    return {"env": data, "compatibility": compat}
 
 
 @mcp.tool()
@@ -400,6 +778,61 @@ async def run_workflow(
         "run",
         "--workflow",
         workflow_path,
+        "--wait",
+        ctx=ctx,
+        timeout=timeout_seconds,
+    )
+
+
+@mcp.tool()
+async def generate_image(
+    prompt: str,
+    checkpoint: str | None = None,
+    wait: bool = True,
+    timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
+) -> Any:
+    """Generate an image from a text prompt on the LOCAL ComfyUI — the fast on-ramp.
+
+    Wraps ``comfy generate --prompt <prompt>``: a single call that turns a text
+    prompt into an image, so an agent does not have to hand-assemble a workflow
+    graph. comfy-cli owns the text->workflow injection (which node/slot the
+    prompt fills, the default graph, checkpoint selection); this tool is a pure
+    passthrough to that verb. Returns the same envelope shape as
+    ``run_workflow`` (``prompt_id`` + outputs).
+
+    Pass ``checkpoint`` to pick a specific checkpoint model (forwarded to
+    ``comfy generate --checkpoint``); omit it to let comfy-cli choose a default.
+    With ``wait=True`` (default) this waits until the generation finishes and
+    streams live progress as MCP progress notifications (per-node execution +
+    sampler step counts) so a long generation is not a silent block; with
+    ``wait=False`` it submits and returns immediately with a ``prompt_id`` to
+    poll via ``job_status``. ``timeout_seconds`` only bounds the ``wait=True``
+    streaming path; the ``wait=False`` submit-and-return branch uses a fixed
+    short timeout, so callers should not expect it to govern that case.
+
+    This is the quickest path to an image. For full control — choosing a
+    template, editing its graph, or running a hand-authored workflow — use the
+    ``search_templates`` -> ``fetch_template`` -> ``run_workflow`` chain instead.
+
+    Everything targets the LOCAL server (``--where local`` is injected by
+    ``_run_comfy``), so there is no cloud reachability here.
+    """
+    # Pass the free-form text as ``--flag=value`` so a prompt (or checkpoint)
+    # that begins with ``-`` is read as the value rather than mis-parsed by
+    # comfy-cli as an option token. The leading-dash guards elsewhere reject
+    # such input, but a prompt legitimately can start with ``-``, so we keep it
+    # instead of rejecting it.
+    checkpoint_args = [f"--checkpoint={checkpoint}"] if checkpoint else []
+    if not wait:
+        # Fire-and-return: no stream to follow, so keep the plain --json path.
+        return _run_comfy(
+            "generate", f"--prompt={prompt}", *checkpoint_args, timeout=60.0
+        )
+    return await _run_comfy_streaming(
+        "generate",
+        f"--prompt={prompt}",
+        *checkpoint_args,
         "--wait",
         ctx=ctx,
         timeout=timeout_seconds,
@@ -671,8 +1104,103 @@ def get_queue() -> Any:
     return _run_comfy("jobs", "ls", timeout=60.0)
 
 
+# Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
+# ``mcp.server.fastmcp.Image`` maps to a real ``image/*`` MIME type (an unknown
+# suffix would fall back to ``application/octet-stream`` and not render).
+_INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+# Bounds on what ``fetch_outputs(inline_images=True)`` base64-inlines into the
+# reply, mirroring the module's other output caps (``_TRACEBACK_TAIL_MAX_CHARS``,
+# ``_EXCEPTION_TEXT_MAX_CHARS``): a big batch or high-res render must not force an
+# unbounded allocation / blow the agent's context. The on-disk copies in
+# ``out_dir`` are untouched — only the inline preview is capped.
+_INLINE_IMAGE_MAX_COUNT = 8
+_INLINE_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _iter_strings(obj: Any) -> Any:
+    """Yield every string value nested anywhere inside ``obj`` (dicts/lists/scalars)."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _iter_strings(value)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            yield from _iter_strings(value)
+
+
+def _is_within(root: str, path: str) -> bool:
+    """True if ``path`` (already realpath'd) is ``root`` itself or nested under it."""
+    return path == root or path.startswith(root + os.sep)
+
+
+def _collect_output_images(data: Any, out_dir: str) -> list[str]:
+    """Resolve image files referenced by ``comfy download``'s data to on-disk paths.
+
+    Walks every string in the envelope ``data``, keeps those with an image
+    suffix, and returns the ones that resolve to a real file **inside**
+    ``out_dir`` (deduped, order-preserving). ``comfy download -o out_dir`` writes
+    every file it produces into ``out_dir``, so scoping to that directory is what
+    keeps the inline preview honest: a bare/relative name binds to the copy just
+    written rather than a same-named file in the process CWD, and an absolute or
+    ``../``-traversal path that escapes ``out_dir`` (an input reference, a URL
+    basename, or an outright traversal in the metadata) is rejected instead of
+    read and inlined. Inline return is best-effort and never masks the on-disk
+    copy.
+    """
+    out_root = os.path.realpath(out_dir)
+    resolved: dict[str, None] = {}
+    for value in _iter_strings(data):
+        if not value.lower().endswith(_INLINE_IMAGE_SUFFIXES):
+            continue
+        # Most-specific form first (the value as given, then joined onto out_dir,
+        # then bare basename in out_dir) — but every candidate must resolve to a
+        # real file INSIDE out_dir. Containment is what neutralizes the CWD
+        # shadow (a bare "gen.png" resolves to CWD/gen.png, outside out_dir, so
+        # it's rejected in favor of the out_dir copy) and the `../` traversal.
+        for candidate in (
+            value,
+            os.path.join(out_dir, value),
+            os.path.join(out_dir, os.path.basename(value)),
+        ):
+            real = os.path.realpath(candidate)
+            if _is_within(out_root, real) and os.path.isfile(real):
+                resolved.setdefault(real, None)
+                break
+    return list(resolved)
+
+
+def _select_inline_images(paths: list[str]) -> list[str]:
+    """Cap the inlined set to ``_INLINE_IMAGE_MAX_COUNT`` files / aggregate bytes.
+
+    Preserves order and stops as soon as either bound would be exceeded, so a
+    large batch or a high-res render can't force an unbounded base64 payload into
+    the reply. Unreadable files are skipped (the on-disk copy still stands).
+    """
+    selected: list[str] = []
+    total = 0
+    for path in paths:
+        if len(selected) >= _INLINE_IMAGE_MAX_COUNT:
+            break
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if selected and total + size > _INLINE_IMAGE_MAX_BYTES:
+            break
+        selected.append(path)
+        total += size
+    return selected
+
+
 @mcp.tool()
-def fetch_outputs(prompt_id: str, out_dir: str, url_only: bool = False) -> Any:
+def fetch_outputs(
+    prompt_id: str,
+    out_dir: str,
+    url_only: bool = False,
+    inline_images: bool = False,
+) -> Any:
     """Download a completed LOCAL job's output files into ``out_dir``.
 
     Thin passthrough to ``comfy download <prompt_id> --where local -o <out_dir>``:
@@ -681,11 +1209,29 @@ def fetch_outputs(prompt_id: str, out_dir: str, url_only: bool = False) -> Any:
     supplied by :func:`_run_comfy` as a global flag.) Pass ``url_only=True`` to
     add ``--url-only`` — comfy-cli then emits the output URLs without downloading,
     handy for handing URLs to other tools instead of copying bytes.
+
+    Pass ``inline_images=True`` to ALSO return the copied images as inline MCP
+    image content (base64) so the calling agent can see the result without a
+    second read — the on-disk copy into ``out_dir`` is unchanged either way. In
+    that mode the return is a list whose first element is comfy-cli's usual
+    metadata and whose remaining elements are the image files just written; a
+    non-image output (or ``url_only=True``, which downloads no bytes) simply
+    yields no inline images. The inline preview is capped
+    (``_INLINE_IMAGE_MAX_COUNT`` files / ``_INLINE_IMAGE_MAX_BYTES`` aggregate) so
+    a large batch can't blow up the reply — the on-disk copies are never capped.
     """
     args = ["download", prompt_id, "-o", out_dir]
     if url_only:
         args.append("--url-only")
-    return _run_comfy(*args, timeout=300.0)
+    data = _run_comfy(*args, timeout=300.0)
+    # ``url_only=True`` downloads no bytes, so there is nothing on disk to inline
+    # — short-circuit rather than let basename matching surface stale files from
+    # a previous run into ``out_dir`` (which would contradict the docstring).
+    if not inline_images or url_only:
+        return data
+    paths = _select_inline_images(_collect_output_images(data, out_dir))
+    images = [Image(path=path) for path in paths]
+    return [data, *images]
 
 
 @mcp.tool()
@@ -702,6 +1248,11 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     Call ``server_info`` first if you only want to check whether a server is
     already running — launching a second one will fail on the port.
 
+    ``comfy launch --background`` prints human text and exits 0 without a JSON
+    envelope, so on success this returns a synthesized ``{"ok": True, ...}``
+    payload carrying that text (BE-2953); a launch failure (e.g. port in use)
+    exits non-zero and still raises a :class:`ComfyCliError`.
+
     NOTE (temporary upstream caveat): ``comfy launch --background`` currently
     crashes on Python 3.14 (comfy-cli asyncio ``get_event_loop`` issue; a fix is
     in review upstream). On affected comfy-cli versions the crash surfaces here
@@ -711,7 +1262,7 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     args = ["launch", "--background"]
     if extra_args:
         args += ["--", *extra_args]
-    return _run_comfy(*args, timeout=180.0)
+    return _run_comfy(*args, timeout=180.0, plain_ok=True)
 
 
 @mcp.tool()
@@ -724,8 +1275,78 @@ def stop_comfyui() -> Any:
     the desktop app or by hand — in that case comfy-cli reports it has no
     recorded server and this tool raises a :class:`ComfyCliError` carrying that
     message, rather than killing an unrelated process.
+
+    Like ``launch_comfyui``, ``comfy stop`` prints human text and exits 0 without
+    a JSON envelope, so a successful stop returns a synthesized
+    ``{"ok": True, ...}`` payload carrying that text (BE-2953).
     """
-    return _run_comfy("stop", timeout=60.0)
+    return _run_comfy("stop", timeout=60.0, plain_ok=True)
+
+
+@mcp.tool()
+def restart_comfyui(extra_args: list[str] | None = None) -> Any:
+    """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
+
+    Composes the existing :func:`stop_comfyui` and :func:`launch_comfyui` — there
+    is no ``comfy restart`` subcommand, so this is a thin stop-then-launch over
+    comfy-cli, not a new engine feature. ``extra_args`` are forwarded to the new
+    ComfyUI exactly as :func:`launch_comfyui` forwards them (after a ``--``
+    separator), so a restart is also how you relaunch with different flags.
+    Returns the new server's status (``launch_comfyui``'s envelope data).
+
+    The stop step is best-effort ONLY for the benign "nothing to stop" case: if
+    comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
+    started outside comfy-cli) it returns the ``no_recorded_server`` code, which
+    is swallowed so the restart still brings the server up. Any OTHER stop
+    failure (a process that couldn't be killed, a permission error, a comfy-cli
+    malfunction) is re-raised rather than silently masked behind the launch.
+    """
+    try:
+        stop_comfyui()
+    except ComfyCliError as exc:
+        if not _is_no_recorded_server(exc):
+            raise
+    return launch_comfyui(extra_args)
+
+
+# comfy-cli's `logs` reports this error code when no persisted log file exists
+# yet (nothing has been launched in the background, so nothing was captured).
+_NO_LOG_FILE_CODE = "no_log_file"
+
+# Bounds for get_logs' caller-controlled `tail`: at least 1 line (a negative
+# value would forward a malformed `--tail -N`), capped so an absurd request
+# can't make comfy-cli read/return an enormous log slice.
+_MIN_LOG_TAIL = 1
+_MAX_LOG_TAIL = 10000
+
+
+@mcp.tool()
+def get_logs(tail: int = 200) -> Any:
+    """Return the tail of the LOCAL background ComfyUI's captured log file.
+
+    Wraps ``comfy logs --tail <tail>``. comfy-cli persists a background ComfyUI's
+    stdout/stderr to ``<workspace>/user/comfyui_<port>.log`` (written when it is
+    started via ``launch_comfyui`` / ``comfy launch --background``), so this
+    closes the debugging loop after a detached launch — the server's output is
+    otherwise invisible. Returns ``{lines, path, truncated}``: the last ``tail``
+    log lines, the file they came from, and whether older lines were dropped.
+
+    If no log file exists yet (nothing was launched in the background), comfy-cli
+    returns a ``no_log_file`` error envelope; rather than raise, this tool returns
+    it as data — ``{"error": "no_log_file", "message": ...}`` — so "no logs yet"
+    reads as a normal answer instead of a failure. Every other error still raises.
+
+    ``tail`` is clamped to ``[1, 10000]`` before forwarding, so a negative value
+    can't produce a malformed ``--tail -N`` and an absurd value can't make
+    comfy-cli read back an enormous log slice.
+    """
+    tail = max(_MIN_LOG_TAIL, min(int(tail), _MAX_LOG_TAIL))
+    try:
+        return _run_comfy("logs", "--tail", str(tail), timeout=60.0)
+    except ComfyCliError as exc:
+        if exc.code == _NO_LOG_FILE_CODE:
+            return {"error": _NO_LOG_FILE_CODE, "message": str(exc)}
+        raise
 
 
 @mcp.tool()
@@ -752,50 +1373,140 @@ def which() -> Any:
     return _run_comfy("which", timeout=60.0)
 
 
-def _template_matches(item: Any, query_lower: str) -> bool:
-    """True if ``query_lower`` (already lowercased) is a substring of a template entry.
+# The compact per-row projection returned by the listing. The full detail
+# (tags / models / providers / category_title) is what ``get_template(name)``
+# returns — keeping the listing slim is what stops the full 558-row catalog from
+# blowing the MCP client's tool-output cap.
+_TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
 
-    Handles both shapes comfy-cli might emit for a template: a bare name string,
-    or a dict of fields (name / title / description / …) — we match against every
-    string value so the query hits any of them.
+# Upper bound on a single page so an oversized `limit` can't build a response
+# that trips the MCP client's tool-output cap; callers page the rest via `offset`.
+_TEMPLATE_LIST_MAX_LIMIT = 200
+
+
+def _template_matches(row: dict, query_lower: str) -> bool:
+    """True if ``query_lower`` (already lowercased) matches a template ``row``.
+
+    Case-insensitive substring match over the free-text fields ``name`` /
+    ``title`` / ``description`` plus the string items inside the ``tags`` and
+    ``models`` list values — deliberately NOT every string value, so a query
+    like ``"image"`` does not hit ``output_type`` on hundreds of rows.
     """
-    if isinstance(item, str):
-        return query_lower in item.lower()
-    if isinstance(item, dict):
-        return any(
-            isinstance(v, str) and query_lower in v.lower() for v in item.values()
-        )
+    for key in ("name", "title", "description"):
+        value = row.get(key)
+        if isinstance(value, str) and query_lower in value.lower():
+            return True
+    for key in ("tags", "models"):
+        for item in row.get(key) or []:
+            if isinstance(item, str) and query_lower in item.lower():
+                return True
     return False
 
 
 @mcp.tool()
-def search_templates(query: str = "") -> Any:
-    """Search the built-in ComfyUI workflow templates by name/description.
+def search_templates(
+    query: str = "",
+    limit: int = 25,
+    offset: int = 0,
+    tag: str = "",
+    type: str = "",
+    model: str = "",
+    provider: str = "",
+    exclude_api: bool = False,
+) -> Any:
+    """Search the built-in ComfyUI workflow-template gallery.
 
-    Wraps ``comfy templates ls``. When ``query`` is non-empty the listing is
-    filtered client-side (case-insensitive substring match against each
-    template's name and any text fields) — comfy-cli's ``ls`` has no server-side
-    filter argument, so the narrowing happens here; an empty ``query`` returns
-    the full list.
+    Wraps ``comfy templates ls``, whose payload is
+    ``{total_in_gallery, matched, shown, filters, rows: [...]}`` — one ``row``
+    per template with ``name / title / output_type / category_title / tags /
+    models / providers / description``. The full catalog is ~558 rows, far too
+    large to return whole, so this narrows and pages it:
+
+    - ``query`` — free-text, case-insensitive substring match applied
+      client-side over each row's ``name`` / ``title`` / ``description`` and the
+      items in its ``tags`` / ``models`` lists (comfy-cli's ``ls`` has no
+      free-text search flag, so this narrowing happens here).
+    - ``tag`` / ``type`` / ``model`` / ``provider`` — forwarded to comfy-cli as
+      ``--tag`` / ``--type`` / ``--model`` / ``--provider`` gallery filters
+      (``--tag`` and ``--type`` are exact-match, ``--model`` / ``--provider``
+      substring). Combine with ``query`` for free text on top.
+    - ``exclude_api=True`` — drop rows carrying the ``API`` tag (templates that
+      call a hosted API and need a key), approximating "runnable locally".
+      comfy-cli's ``--tag`` only includes, so this negation is applied here.
+    - ``limit`` (default 25, capped at 200) / ``offset`` — page the filtered rows.
+
+    Returns ``{"total", "shown", "offset", "rows"}`` where ``total`` is the
+    filtered match count, ``rows`` is the current page projected down to
+    ``name / title / description / output_type`` (page again with ``offset`` to
+    see more), and ``get_template(name)`` is the full-detail path.
 
     Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
     with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
     a runnable workflow JSON and pass that path straight to ``run_workflow`` — a
     working generation without hand-authoring workflow JSON.
     """
-    data = _run_comfy("templates", "ls", timeout=60.0)
-    if not query:
-        return data
-    q = query.lower()
-    if isinstance(data, list):
-        return [item for item in data if _template_matches(item, q)]
-    if isinstance(data, dict) and isinstance(data.get("templates"), list):
-        return {
-            **data,
-            "templates": [t for t in data["templates"] if _template_matches(t, q)],
-        }
-    # Unknown shape — return it unfiltered rather than silently dropping data.
-    return data
+    if limit < 0:
+        raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
+    limit = min(limit, _TEMPLATE_LIST_MAX_LIMIT)
+
+    args = ["templates", "ls"]
+    for flag, value in (
+        ("--tag", tag),
+        ("--type", type),
+        ("--model", model),
+        ("--provider", provider),
+    ):
+        if value:
+            if value.startswith("-"):
+                # comfy-cli parses a leading-dash value as an option/flag; reject
+                # it rather than let `templates ls` misread the filter (argument
+                # injection).
+                raise ComfyCliError(f"invalid {flag} value: {value!r} (leading '-')")
+            args += [flag, value]
+    data = _run_comfy(*args, timeout=60.0)
+
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        shape = (
+            "keys {" + ", ".join(sorted(map(str, data))) + "}"
+            if isinstance(data, dict)
+            else data.__class__.__name__
+        )
+        raise ComfyCliError(
+            "unexpected `comfy templates ls` payload: expected a dict with a "
+            f"`rows` list, got {shape}. comfy-cli's output shape may have drifted."
+        )
+
+    rows = data["rows"]
+    bad = sum(1 for r in rows if not isinstance(r, dict))
+    if bad:
+        # Fail loudly on shape drift rather than silently dropping rows (which
+        # would undercount `total`), matching the payload guard above.
+        raise ComfyCliError(
+            f"unexpected `comfy templates ls` payload: {bad} of {len(rows)} rows "
+            "are not objects. comfy-cli's output shape may have drifted."
+        )
+    if exclude_api:
+        rows = [
+            r
+            for r in rows
+            if not any(
+                isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
+            )
+        ]
+    if query:
+        q = query.lower()
+        rows = [r for r in rows if _template_matches(r, q)]
+
+    total = len(rows)
+    offset = max(0, offset)
+    page = rows[offset : offset + limit]
+    projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
+    return {
+        "total": total,
+        "shown": len(projected),
+        "offset": offset,
+        "rows": projected,
+    }
 
 
 @mcp.tool()
@@ -979,7 +1690,9 @@ def search_models(query: str = "", folder: str = "") -> Any:
 
     Thin passthrough with three modes, in precedence order:
 
-    - ``query`` given → ``comfy models search <query>`` (match model filenames).
+    - ``query`` given → ``comfy models search --text <query>`` (match model
+      filenames). ``--text`` is required: comfy-cli's ``search`` takes the query
+      as an option, not a positional (a positional exits 2 with a usage error).
     - else ``folder`` given → ``comfy models list-folder <folder>`` (list one
       model folder, e.g. ``checkpoints``, ``loras``).
     - else (both empty) → ``comfy models list-folders`` (list the folder names).
@@ -990,7 +1703,7 @@ def search_models(query: str = "", folder: str = "") -> Any:
     "which model files does this install have?", not "tell me about this model".
     """
     if query:
-        return _run_comfy("models", "search", query, timeout=60.0)
+        return _run_comfy("models", "search", "--text", query, timeout=60.0)
     if folder:
         return _run_comfy("models", "list-folder", folder, timeout=60.0)
     return _run_comfy("models", "list-folders", timeout=60.0)
@@ -1084,6 +1797,25 @@ def validate_workflow(workflow_path: str) -> Any:
     raises :class:`ComfyCliError` carrying comfy-cli's structured error code
     (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
     missing-model problem stays actionable instead of failing deep inside a run.
+
+    Known blind spots (upstream comfy-cli, fixes in progress): a passing result
+    does NOT currently guarantee the server will accept the workflow.
+
+    1. Missing required inputs are not detected — a node lacking a required
+       input (e.g. KSampler without ``seed``) validates clean, but the server
+       rejects it with ``required_input_missing``.
+    2. ``COMFY_DYNAMICCOMBO_V3`` inputs (e.g. ClaudeNode ``model``) are not
+       checked — invalid selection keys, missing required dotted sub-inputs
+       (``model.max_tokens``, …), and misspelled sub-keys all pass, yet the
+       server rejects with ``required_input_missing``.
+    3. Frontend/UI-export workflow files are not actually validated — wrapper
+       keys produce benign ``non_node_key`` warnings, zero nodes are checked,
+       and the result is vacuously valid. Ignore those ``non_node_key``
+       warnings (do not "fix" the file); export API format (or rely on
+       ``run_workflow``'s auto-conversion) if validation fidelity matters.
+
+    Treat ``valid:true`` as necessary-not-sufficient and rely on
+    ``run_workflow`` errors for final authority.
     """
     return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
 

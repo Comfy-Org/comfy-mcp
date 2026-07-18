@@ -1,0 +1,68 @@
+name: Bug report
+description: Report something that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please fill out the sections
+        below so we can reproduce and fix it.
+
+        For security vulnerabilities, **do not** open a public issue — follow
+        [SECURITY.md](https://github.com/Comfy-Org/comfy-local-mcp/blob/main/SECURITY.md)
+        instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: Calling `run_workflow` returned … but I expected …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The minimal sequence of tool calls (or the prompt you gave your agent) that triggers the bug.
+      placeholder: |
+        1. Call `server_info`
+        2. Call `run_workflow` with `...`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: |
+        Any error message, stack trace, or the tool's JSON response. This is
+        automatically formatted as code, so no need for backticks.
+
+        Please redact any secrets, tokens, or private paths before pasting.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: comfy-local-mcp version
+      description: "`pip show comfy-local-mcp` (or the commit SHA if installed from source)."
+      placeholder: 0.1.0
+    validations:
+      required: false
+  - type: input
+    id: comfy-cli-version
+    attributes:
+      label: comfy-cli version
+      description: "`comfy --version` — comfy-cli is the engine every tool wraps."
+      placeholder: e.g. 1.x.x
+    validations:
+      required: false
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and MCP client (Claude Code / Claude Desktop / Cursor / …).
+      placeholder: macOS 14, Python 3.12, Claude Code
+    validations:
+      required: false
