@@ -204,11 +204,17 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
             break
         action_parts.append(arg)
     text = " ".join(part.strip() for part in (stderr, stdout) if part.strip())
-    message = text or f"comfy {' '.join(args)} completed (exit 0)."
+    # Fallback echoes only the flag-free `action_parts`, never the raw args: a
+    # `model download` URL can carry a signed token / userinfo in its query
+    # string, and this message lands in the tool response and host-side logs.
+    message = text or f"comfy {' '.join(action_parts)} completed (exit 0)."
     return {
         "ok": True,
         "action": " ".join(action_parts),
-        "message": message[:1000],  # cap both real output and the fallback
+        # Keep the TAIL, not the front: `model download` streams verbose progress
+        # to stderr and the saved-path / `Done in …` metadata this payload exists
+        # to surface lands at the END, so a front slice would drop it as noise.
+        "message": message[-1000:],  # cap both real output and the fallback
         "note": (
             "comfy-cli emitted no JSON envelope for this command; "
             "a clean exit is treated as success."

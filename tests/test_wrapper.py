@@ -619,6 +619,41 @@ def test_download_model_still_honors_a_real_error_envelope(patched_run):
         server.download_model("https://hf.co/x.safetensors")
 
 
+def test_download_model_keeps_saved_path_tail_on_verbose_output(patched_plain_run):
+    """A verbose multi-GB fetch caps to the TAIL so the saved-path survives.
+
+    `comfy model download` streams progress noise ahead of the `Done in …` /
+    saved-path tail that the synthesized payload exists to surface. A front-slice
+    cap would drop that tail as noise, so the message must keep the last chars.
+    """
+    tail = "Done in 903.4s. Saved to /models/checkpoints/big.safetensors"
+    noise = "\n".join(f"Downloading... {i}% ({i * 40} MiB)" for i in range(100))
+    patched_plain_run(0, stderr=f"{noise}\n{tail}")
+
+    result = server.download_model("https://hf.co/big.safetensors")
+
+    assert result["ok"] is True
+    assert len(result["message"]) <= 1000
+    assert "Saved to /models/checkpoints/big.safetensors" in result["message"]
+
+
+def test_download_model_fallback_omits_url_when_no_output(patched_plain_run):
+    """The no-output fallback message must not echo the (possibly signed) URL.
+
+    A `model download` URL can carry a token / userinfo in its query string; the
+    synthesized fallback lands in the tool response and host logs, so it reports
+    only the flag-free `model download` action, never the raw args.
+    """
+    patched_plain_run(0)  # exit 0 with no stdout/stderr -> fallback message
+
+    result = server.download_model("https://hf.co/x.safetensors?sig=SECRETTOKEN")
+
+    assert result["ok"] is True
+    assert "SECRETTOKEN" not in result["message"]
+    assert "hf.co" not in result["message"]
+    assert "model download" in result["message"]
+
+
 def test_discover_maps_command_and_returns_data(patched_run):
     """discover wraps `comfy discover` and returns the envelope data verbatim."""
     surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
