@@ -9,6 +9,13 @@ authors = [{ name = "Comfy Org" }]
 dependencies = [
     "mcp>=1.2.0",
 ]
+# comfy-cli is intentionally NOT a declared dependency: this server shells out
+# to whatever `comfy` binary PATH/COMFY_BIN resolves to (which may differ from a
+# pip-installed one), and the envelope/discover contract it wraps is carried by a
+# specific comfy-cli build rather than a hard-pinnable PyPI release. Compatibility
+# is enforced at RUNTIME instead — `server_info` asserts the comfy-cli envelope
+# schema major and, when COMFY_CLI_MIN_VERSION is set, a minimum version. See
+# src/comfy_local_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.15,<0.16"]
