@@ -15,6 +15,7 @@ failure. Run it on a machine that has both with::
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import urllib.error
@@ -95,7 +96,11 @@ def test_no_model_round_trip(tmp_path):
     assert info, f"server_info() returned nothing usable: {info!r}"
 
     # 2. Run the checkpoint-free EmptyImage -> SaveImage workflow to completion.
-    result = server.run_workflow(str(_WORKFLOW), wait=True, timeout_seconds=180.0)
+    # run_workflow went async in #11 (MCP progress streaming); drive it to
+    # completion from this sync test the way a plain client would.
+    result = asyncio.run(
+        server.run_workflow(str(_WORKFLOW), wait=True, timeout_seconds=180.0)
+    )
     prompt_id = _extract_prompt_id(result)
     assert prompt_id, f"no prompt_id in run_workflow result: {result!r}"
 
