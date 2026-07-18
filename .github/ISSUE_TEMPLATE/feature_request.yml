@@ -1,0 +1,47 @@
+name: Feature request
+description: Suggest a new tool or an improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Before filing, please note the **thin-wrapper**
+        architecture rule: every tool is a passthrough to a `comfy` subcommand
+        (see [AGENTS.md](https://github.com/Comfy-Org/comfy-local-mcp/blob/main/AGENTS.md)).
+        If the capability you want doesn't exist
+        in [comfy-cli](https://github.com/Comfy-Org/comfy-cli) yet, the right
+        home for it is usually a comfy-cli change rather than this repo.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case or the gap you're hitting today.
+      placeholder: When I ask my agent to …, there's no tool that …
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What tool or behavior would you like? If it maps to a `comfy` subcommand, name it.
+      placeholder: A `foo` tool wrapping `comfy bar --baz`.
+    validations:
+      required: true
+  - type: dropdown
+    id: comfy-cli-support
+    attributes:
+      label: Does comfy-cli already support this?
+      description: Whether the underlying `comfy` subcommand exists today.
+      options:
+        - "Yes — comfy-cli already has the subcommand"
+        - "No — it would need a comfy-cli change first"
+        - "Not sure"
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you're using today, or other approaches you weighed.
+    validations:
+      required: false
