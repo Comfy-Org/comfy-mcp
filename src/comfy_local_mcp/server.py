@@ -1153,7 +1153,9 @@ def search_models(query: str = "", folder: str = "") -> Any:
 
     Thin passthrough with three modes, in precedence order:
 
-    - ``query`` given → ``comfy models search <query>`` (match model filenames).
+    - ``query`` given → ``comfy models search --text <query>`` (match model
+      filenames). ``--text`` is required: comfy-cli's ``search`` takes the query
+      as an option, not a positional (a positional exits 2 with a usage error).
     - else ``folder`` given → ``comfy models list-folder <folder>`` (list one
       model folder, e.g. ``checkpoints``, ``loras``).
     - else (both empty) → ``comfy models list-folders`` (list the folder names).
@@ -1164,7 +1166,7 @@ def search_models(query: str = "", folder: str = "") -> Any:
     "which model files does this install have?", not "tell me about this model".
     """
     if query:
-        return _run_comfy("models", "search", query, timeout=60.0)
+        return _run_comfy("models", "search", "--text", query, timeout=60.0)
     if folder:
         return _run_comfy("models", "list-folder", folder, timeout=60.0)
     return _run_comfy("models", "list-folders", timeout=60.0)
