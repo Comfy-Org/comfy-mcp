@@ -850,7 +850,7 @@ async def _run_comfy_streaming(
             # grandchild holding the fd — would otherwise block the read).
             if proc.poll() is None:
                 _kill_proc_tree(proc)
-                await asyncio.to_thread(_reap, proc)
+                await _in_pipe_pool(_reap, proc)
             stderr_tail = ""
             if stderr_future is not None:
                 try:
