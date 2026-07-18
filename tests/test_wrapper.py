@@ -93,6 +93,196 @@ def test_missing_binary_raises(monkeypatch):
         server._run_comfy("env")
 
 
+def test_error_envelope_carries_structured_code(patched_run):
+    """The raised ComfyCliError exposes the envelope's error.code (not just text)."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "down"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+
+    assert excinfo.value.code == "server_not_running"
+
+
+# --- comfy-cli version guard -------------------------------------------------
+
+
+def _fake_version(stdout: str, *, stderr: str = "", raises: Exception | None = None):
+    """A `subprocess.run` stand-in for `comfy --version`; records each call."""
+    calls: list[list[str]] = []
+
+    def fake(cmd, capture_output, text, timeout, check, errors=None):  # noqa: ARG001
+        calls.append(cmd)
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr=stderr)
+
+    return fake, calls
+
+
+def test_version_guard_raises_on_old_comfy_cli(monkeypatch):
+    """A comfy-cli below the floor raises an actionable upgrade error."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    fake, calls = _fake_version("comfy-cli, version 1.11.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match=r"too old.*1\.12\.0"):
+        server._check_comfy_version()
+
+    assert calls[0] == [server.COMFY_BIN, "--version"]
+    # A too-old verdict is NOT memoized, so a later retry re-checks.
+    assert server._version_checked is False
+
+
+def test_version_guard_blocks_run_comfy_on_old_cli(monkeypatch):
+    """The guard fires from inside `_run_comfy`, before any real subcommand runs."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    fake, _ = _fake_version("comfy version 1.9.9")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="too old"):
+        server._run_comfy("logs", "--tail", "10")
+
+
+def test_version_guard_allows_new_comfy_cli_and_memoizes(monkeypatch):
+    """A comfy-cli at/above the floor passes and shells out only once."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    fake, calls = _fake_version("comfy-cli, version 1.12.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()
+    assert server._version_checked is True
+
+    server._check_comfy_version()  # memoized: no second `comfy --version`
+    assert len(calls) == 1
+
+
+def test_version_guard_fails_open_on_unparseable_version(monkeypatch):
+    """An unreadable `--version` must not block an otherwise-working install."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    fake, _ = _fake_version("comfy-cli (dev build, no tag)")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+    assert server._version_checked is True
+
+
+def test_version_guard_fails_open_when_version_errors(monkeypatch):
+    """A `comfy --version` that can't be spawned fails OPEN, not closed —
+    and a transient spawn error is NOT latched, so a later call re-checks."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    fake, _ = _fake_version("", raises=OSError("boom"))
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+    assert server._version_checked is False  # transient error not latched
+
+
+def test_version_guard_latches_on_timeout(monkeypatch):
+    """A hung `--version` (timeout) fails OPEN and IS latched, so a later call
+    doesn't re-block on the same 30s wait."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    fake, _ = _fake_version(
+        "", raises=subprocess.TimeoutExpired(cmd="comfy --version", timeout=30.0)
+    )
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+    assert server._version_checked is True
+
+
+def test_parse_version_reads_two_and_three_part_and_none():
+    assert server._parse_version("comfy-cli, version 1.12") == (1, 12, 0)
+    assert server._parse_version("v2.0.5 extra") == (2, 0, 5)
+    assert server._parse_version("no version token here") is None
+
+
+def test_parse_version_prefers_token_after_version_keyword():
+    """A leading dotted token (a Python version) must not be mistaken for the
+    comfy-cli version when a `version X.Y.Z` token is present."""
+    assert server._parse_version("Python 3.10.2\ncomfy-cli, version 1.12.0") == (
+        1,
+        12,
+        0,
+    )
+
+
+# --- get_logs ---------------------------------------------------------------
+
+
+def test_get_logs_maps_command_and_returns_data(patched_run):
+    """get_logs wraps `comfy logs --tail <n>` and returns the envelope data."""
+    payload = {
+        "lines": ["boot ok", "listening on :8188"],
+        "path": "/ws/user/comfyui_8188.log",
+        "truncated": False,
+    }
+    calls = patched_run({"type": "envelope", "ok": True, "data": payload})
+
+    assert server.get_logs() == payload
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["logs", "--tail", "200"]  # default tail, stringified
+
+
+def test_get_logs_forwards_custom_tail(patched_run):
+    """A custom tail is stringified and forwarded to `--tail`."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"lines": []}})
+
+    server.get_logs(tail=50)
+
+    assert calls[0]["cmd"][4:] == ["logs", "--tail", "50"]
+
+
+def test_get_logs_clamps_negative_and_huge_tail(patched_run):
+    """A negative tail can't forward a malformed `--tail -N`, and an absurd tail
+    is capped so comfy-cli isn't asked for an enormous slice."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"lines": []}})
+
+    server.get_logs(tail=-5)
+    assert calls[-1]["cmd"][4:] == ["logs", "--tail", str(server._MIN_LOG_TAIL)]
+
+    server.get_logs(tail=10**9)
+    assert calls[-1]["cmd"][4:] == ["logs", "--tail", str(server._MAX_LOG_TAIL)]
+
+
+def test_get_logs_no_log_file_returned_not_raised(patched_run):
+    """A `no_log_file` error envelope is returned as data, not raised."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "no_log_file", "message": "no log file for local yet"},
+        }
+    )
+
+    result = server.get_logs()
+
+    assert result["error"] == "no_log_file"
+    assert "no log file" in result["message"]
+
+
+def test_get_logs_other_error_still_raises(patched_run):
+    """Any other error code keeps raising — only `no_log_file` is swallowed."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="server_not_running"):
+        server.get_logs()
+
+
 def test_cancel_job_maps_command_and_returns_data(patched_run):
     """cancel_job wraps `comfy jobs cancel <id>` and returns the envelope data."""
     calls = patched_run({"type": "envelope", "ok": True, "data": {"cancelled": "abc"}})
