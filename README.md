@@ -29,6 +29,30 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
   shell's `PATH` — so if `comfy` lives in a virtualenv or a non-standard location, set
   `COMFY_BIN` to its absolute path (e.g. `/path/to/venv/bin/comfy`). Every client example below
   shows where it goes.
+- **`COMFY_API_KEY` (optional — needed only for partner-API nodes).** Workflows that use
+  partner-API nodes (Seedream / Seedance / Nano Banana / Gemini / Veo / Kling / …) need a Comfy
+  credential, and — exactly like `COMFY_BIN` — an MCP client launches the server with its own
+  minimal environment, so a key from your shell won't reach it. Set `COMFY_API_KEY` in the
+  client registration `env` block. See **[Partner-API nodes](#partner-api-nodes)** below for the
+  full precedence chain; every client example shows where it goes.
+
+## Partner-API nodes
+
+Some ComfyUI nodes call out to Comfy's partner APIs (Seedream / Seedance / Nano Banana / Gemini /
+Veo / Kling / …). Running one **locally** still needs a Comfy credential, and comfy-cli resolves
+it in this order (first match wins):
+
+1. a per-call flag (not exposed by this server);
+2. a live Comfy Cloud OAuth session (`comfy cloud login`);
+3. the **`COMFY_API_KEY`** environment variable;
+4. a stored key set with `comfy auth set comfy-cloud-api-key --key <KEY>`.
+
+Because an MCP client spawns the server with its own minimal environment (the same reason
+`COMFY_BIN` exists), a `COMFY_API_KEY` from your interactive shell is **not** inherited — put it
+in the client registration `env` block (shown in every example below). If a run fails with
+`partner_node_requires_credential`, the error now carries comfy-cli's hint verbatim, including
+the `comfy auth set comfy-cloud-api-key --key …` fallback and the list of offending nodes; the
+server also retries a transient credential failure briefly before surfacing it.
 
 ## Install
 
@@ -50,14 +74,20 @@ server. Pick your client.
 
 > The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
 > environment your client launches the server with; keep it (pointing at the absolute path) if
-> it isn't.
+> it isn't. `COMFY_API_KEY` is also shown, commented as optional — keep it only if you use
+> [partner-API nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …); drop it
+> otherwise.
 
 ### Claude Code
 
 One command registers the server:
 
 ```bash
-claude mcp add comfy-local -e COMFY_BIN=/path/to/venv/bin/comfy -- comfy-local-mcp
+# COMFY_API_KEY is optional — add it only if you use partner-API nodes (see above).
+claude mcp add comfy-local \
+  -e COMFY_BIN=/path/to/venv/bin/comfy \
+  -e COMFY_API_KEY=<your-comfy-api-key> \
+  -- comfy-local-mcp
 ```
 
 Or, to check it into a project, add a `.mcp.json` at the repo root:
@@ -67,7 +97,10 @@ Or, to check it into a project, add a `.mcp.json` at the repo root:
   "mcpServers": {
     "comfy-local": {
       "command": "comfy-local-mcp",
-      "env": { "COMFY_BIN": "/path/to/venv/bin/comfy" }
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_API_KEY": "<your-comfy-api-key>"
+      }
     }
   }
 }
@@ -84,7 +117,10 @@ restart Claude Desktop:
   "mcpServers": {
     "comfy-local": {
       "command": "comfy-local-mcp",
-      "env": { "COMFY_BIN": "/path/to/venv/bin/comfy" }
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_API_KEY": "<your-comfy-api-key>"
+      }
     }
   }
 }
@@ -99,7 +135,10 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
   "mcpServers": {
     "comfy-local": {
       "command": "comfy-local-mcp",
-      "env": { "COMFY_BIN": "/path/to/venv/bin/comfy" }
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_API_KEY": "<your-comfy-api-key>"
+      }
     }
   }
 }

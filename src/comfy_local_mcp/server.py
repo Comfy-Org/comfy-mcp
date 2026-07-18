@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from typing import Any
@@ -70,7 +71,8 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   (canonical), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
   or (3) persist a key with `comfy cloud set-key` (avoid passing it inline as an
   argument, which leaks the key into shell history). Never put a key in a
-  workflow file.
+  workflow file. If a run still hits a credential error despite good
+  `auth_status`, it is retried briefly and surfaces a hint with alternatives.
 - After a detached `launch_comfyui`, read the background server's own output with
   `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
 
@@ -142,11 +144,12 @@ def _comfy_env() -> dict[str, str]:
 class ComfyCliError(RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope.
 
-    ``code`` carries comfy-cli's structured ``error.code`` when the failure came
-    from an error envelope (``None`` for local failures like a missing binary, a
-    timeout, or no-JSON output), so callers can branch on a specific code without
-    string-matching the message — e.g. ``get_logs`` swallows ``no_log_file`` but
-    re-raises the rest.
+    ``code`` carries the envelope's structured ``error.code`` when the failure
+    came from an error envelope (used to drive the bounded credential retry in
+    ``run_workflow``); it is ``None`` for local failures the wrapper raises
+    itself (missing binary, timeout, no-JSON output), so callers can branch on a
+    specific code without string-matching the message — e.g. ``get_logs``
+    swallows ``no_log_file`` but re-raises the rest.
     """
 
     def __init__(self, *args: object, code: str | None = None) -> None:
@@ -155,10 +158,11 @@ class ComfyCliError(RuntimeError):
 
 
 def _parse_version(text: str) -> tuple[int, int, int] | None:
-    """Extract the first dotted numeric version (e.g. ``1.12.0``) from ``text``.
+    """Extract a dotted numeric version (e.g. ``1.12.0``) from ``text``.
 
-    Returns a ``(major, minor, patch)`` tuple (a missing patch defaults to 0), or
-    ``None`` when no version-looking token is present.
+    Prefers a token that follows the word "version" (see below), else the first
+    dotted-numeric token. Returns a ``(major, minor, patch)`` tuple (a missing
+    patch defaults to 0), or ``None`` when no version-looking token is present.
     """
     # Prefer a version token that follows the word "version" (comfy-cli prints
     # "comfy-cli, version X.Y.Z"), so we don't latch onto an earlier dotted
@@ -271,8 +275,14 @@ def _run_comfy_raw(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        # subprocess.run attaches whatever the child wrote before being killed
+        # (capture_output=True) to the exception — surface it so a crashed,
+        # wedged comfy-cli (e.g. a traceback on stderr) is not indistinguishable
+        # from a genuinely slow one. See BE-3343.
         raise ComfyCliError(
-            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+            f"stderr tail: {_tail(exc.stderr) or '<empty>'}; "
+            f"stdout tail: {_tail(exc.stdout) or '<empty>'}"
         ) from exc
 
     return (
@@ -291,27 +301,35 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     for ``--json``, or an NDJSON stream whose final line is the envelope). We
     keep the last JSON object and unwrap ``ok`` / ``data`` / ``error``.
 
-    ``plain_ok`` relaxes the envelope requirement for the lifecycle commands
-    (``launch`` / ``stop``) that print human text and exit 0 WITHOUT emitting an
-    envelope (BE-2953): a clean exit with no JSON is treated as success and a
-    result dict is synthesized from the printed text, rather than raising the
-    "returned no JSON" error on an action that actually succeeded. A non-zero
-    exit, or a real error envelope, still raises as usual.
+    ``plain_ok`` relaxes the envelope requirement for the commands that print
+    human text and exit 0 WITHOUT emitting an envelope — the lifecycle verbs
+    ``launch`` / ``stop`` (BE-2953) and ``model download`` (BE-3345): a clean
+    exit with no JSON is treated as success and a result dict is synthesized
+    from the printed text, rather than raising the "returned no JSON" error on
+    an action that actually succeeded. A non-zero exit, or a real error
+    envelope, still raises as usual.
     """
     envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
-    # A lifecycle command that exits 0 without a *real* envelope is a success
-    # (BE-2953). `_last_json_object` may return a stray non-envelope JSON line
-    # (e.g. a diagnostic log that happens to parse), so key the fast-path off the
-    # absence of a `type==envelope` object rather than the absence of any JSON —
-    # otherwise one incidental JSON line on a successful launch/stop would be
-    # mis-unwrapped into a spurious "failed" raise. A real error envelope still
-    # has `type==envelope`, so it flows to `_unwrap_envelope` and raises as usual.
+    # A plain_ok command that exits 0 without a *real* envelope is a success
+    # (BE-2953 launch/stop, BE-3345 model download). `_last_json_object` may
+    # return a stray non-envelope JSON line (e.g. a diagnostic log that happens
+    # to parse), so key the fast-path off the absence of a `type==envelope`
+    # object rather than the absence of any JSON — otherwise one incidental JSON
+    # line on a successful run would be mis-unwrapped into a spurious "failed"
+    # raise. A real error envelope still has `type==envelope`, so it flows to
+    # `_unwrap_envelope` and raises as usual.
     real_envelope = (
         envelope if envelope and envelope.get("type") == "envelope" else None
     )
     if plain_ok and real_envelope is None and returncode == 0:
-        return _synthesize_lifecycle_result(args, stdout, stderr)
-    return _unwrap_envelope(envelope, args, returncode, stderr)
+        return _synthesize_plain_result(args, stdout, stderr)
+    # Enforce the envelope contract on the normal path too: pass `real_envelope`
+    # (not `envelope`) so a stray non-envelope JSON line — e.g. an incidental
+    # `{"ok": true, "data": ...}` diagnostic — can't be mis-unwrapped as a valid
+    # response for a non-`plain_ok` tool; it raises the "returned no JSON" error
+    # like any other missing envelope. A real error envelope still has
+    # `type==envelope`, so it flows through and raises with its code as usual.
+    return _unwrap_envelope(real_envelope, args, returncode, stderr)
 
 
 def _envelope_schema(envelope: dict) -> str | None:
@@ -335,6 +353,66 @@ def _envelope_major(envelope: dict) -> int | None:
         return None
     match = re.fullmatch(r"envelope/(\d+)", schema.strip())
     return int(match.group(1)) if match else None
+
+
+def _tail(text: str | bytes | None, limit: int = 500) -> str:
+    """Bounded tail of captured output; decodes bytes defensively.
+
+    On POSIX, ``TimeoutExpired.stdout``/``.stderr`` arrive as *bytes* even under
+    ``text=True`` (CPython quirk: ``communicate()`` raises with raw bytes; on
+    Windows ``run()`` re-communicates after the kill and returns ``str``), so
+    callers can hand us either. The ``limit`` hard-bounds the result so a chatty
+    child cannot inflate an error payload.
+    """
+    if not text or limit <= 0:
+        # ``[-0:]`` is ``[0:]`` (the whole string), so a non-positive limit would
+        # silently defeat the hard-bound; treat it as "no tail".
+        return ""
+    if isinstance(text, bytes):
+        # Slice the raw bytes before decoding so a huge capture doesn't incur a
+        # full decode+copy just to keep the last ``limit`` chars. UTF-8 is at
+        # most 4 bytes/char, so the last ``4 * limit`` bytes always contain
+        # enough to yield ``limit`` decoded chars (a leading byte may be dropped,
+        # which ``errors="replace"`` handles cleanly).
+        text = text[-4 * limit :].decode("utf-8", errors="replace")
+    return text.strip()[-limit:]
+
+
+def _kill_proc_tree(proc: subprocess.Popen) -> None:
+    """Kill the child *and* any grandchildren it spawned.
+
+    comfy-cli can fork a ComfyUI/helper grandchild that inherits the stderr
+    pipe's write-end; killing only the direct child leaves that fd open, so the
+    blocking ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees
+    EOF and the thread leaks — repeated timeouts then exhaust the default
+    ``to_thread`` pool and wedge the server. Killing the whole process group
+    (the child is spawned with ``start_new_session=True``, so it leads its own
+    group) closes every copy of the pipe. Falls back to a plain ``kill`` on
+    Windows / test fakes, where ``killpg`` is unavailable. (BE-3343)
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError, ValueError):
+        try:
+            proc.kill()
+        except (OSError, AttributeError):
+            pass
+
+
+def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Reap a (killed) child without blocking forever.
+
+    A child stuck in uninterruptible sleep (D state) can ignore ``SIGKILL``
+    indefinitely; ``Popen.wait(timeout=...)`` polls rather than blocking on it,
+    so the timeout handler returns promptly instead of leaking the reaper
+    thread. Best-effort: a still-unreaped child is left to the OS. (BE-3343)
+    """
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _unwrap_envelope(
@@ -369,42 +447,109 @@ def _unwrap_envelope(
             "Upgrade or pin comfy-cli to a version whose envelope contract matches."
         )
     if not envelope.get("ok", False):
+        # A malformed envelope may set `error` to a non-dict (e.g. a bare
+        # string); fall back to `{}` so `.get()` below can't raise AttributeError.
         err = envelope.get("error")
-        if not isinstance(err, dict):  # tolerate a malformed non-dict `error`
+        if not isinstance(err, dict):
             err = {}
-        code = err.get("code", "unknown")
-        raise ComfyCliError(
+        code = err.get("code")
+        # `error.code` can be any JSON type in a malformed envelope, including a
+        # non-hashable list/dict that would make the `in _RETRYABLE_...`
+        # membership test in run_workflow raise TypeError. Coerce to a string so
+        # the retry check and the rendered message both stay well-defined.
+        if code is not None and not isinstance(code, str):
+            code = str(code)
+        # Keep comfy-cli's actionable extras: `error.hint` (e.g. the working
+        # `comfy auth set comfy-cloud-api-key --key …` credential fallback) and
+        # useful `error.details` (e.g. the `partner_nodes` that lack a
+        # credential) — dropping them was the exact workaround testers needed.
+        # Each field is length-capped so a huge/malformed envelope can't bloat
+        # the message propagated to the MCP client.
+        message = err.get("message") or stderr.strip()[:_MAX_ERROR_FIELD_CHARS]
+        parts = [
             f"comfy {' '.join(args)} failed "
-            f"[{code}]: "
-            f"{err.get('message') or stderr.strip()[:500]}",
-            code=code,
-        )
+            f"[{code or 'unknown'}]: "
+            f"{str(message)[:_MAX_ERROR_FIELD_CHARS]}"
+        ]
+        hint = err.get("hint")
+        if hint:
+            parts.append(f"hint: {str(hint)[:_MAX_ERROR_FIELD_CHARS]}")
+        detail_str = _render_error_details(err.get("details"))
+        if detail_str:
+            parts.append(detail_str)
+        raise ComfyCliError("\n".join(parts), code=code)
     return envelope.get("data")
 
 
-def _synthesize_lifecycle_result(
-    args: tuple[str, ...], stdout: str, stderr: str
-) -> dict:
-    """Success payload for a lifecycle command that exited 0 without an envelope.
+def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) -> dict:
+    """Success payload for a ``plain_ok`` command that exited 0 without an envelope.
 
-    ``comfy launch --background`` and ``comfy stop`` print human-readable text and
-    exit 0 instead of emitting an ``envelope/1`` object (BE-2953). For those
-    commands a clean exit IS the success signal, so we return a result dict
-    carrying whatever text comfy-cli printed (preferring stderr, per the CLI's
-    logging) rather than raising on the absent envelope — a false negative that
-    would invite a retry of a non-idempotent lifecycle action.
+    Some comfy-cli commands print human-readable text and exit 0 instead of
+    emitting an ``envelope/1`` object: the lifecycle verbs ``launch`` / ``stop``
+    (BE-2953) and ``model download`` (BE-3345), whose stderr carries the progress
+    tail (e.g. ``Done in 55.8s``) and the saved-path text. For those a clean exit
+    IS the success signal, so we return a result dict carrying whatever text
+    comfy-cli printed (preferring stderr, per the CLI's logging) rather than
+    raising on the absent envelope — a false negative that would invite a retry
+    of an action that already succeeded (a non-idempotent lifecycle change, or a
+    bandwidth-expensive multi-GB refetch).
+
+    The synthesized ``message`` is the only result data available without an
+    envelope, so it carries the printed text verbatim (capped). This path is a
+    stopgap: once comfy-cli emits an envelope for a verb, a real envelope always
+    wins in the ``_run_comfy`` fast-path and this synthesis is bypassed.
     """
+    # `action` is the subcommand path: the leading non-flag tokens, so `launch
+    # --background` -> "launch", `stop` -> "stop", `model download --url ...` ->
+    # "model download". Stops at the first flag so option values never leak in.
+    action_parts: list[str] = []
+    for arg in args:
+        if arg.startswith("-"):
+            break
+        action_parts.append(arg)
     text = " ".join(part.strip() for part in (stderr, stdout) if part.strip())
-    message = text or f"comfy {' '.join(args)} completed (exit 0)."
+    # Fallback echoes only the flag-free `action_parts`, never the raw args: a
+    # `model download` URL can carry a signed token / userinfo in its query
+    # string, and this message lands in the tool response and host-side logs.
+    message = text or f"comfy {' '.join(action_parts)} completed (exit 0)."
     return {
         "ok": True,
-        "action": args[0] if args else "",
-        "message": message[:1000],  # cap both real output and the fallback
+        "action": " ".join(action_parts),
+        # Keep the TAIL, not the front: `model download` streams verbose progress
+        # to stderr and the saved-path / `Done in …` metadata this payload exists
+        # to surface lands at the END, so a front slice would drop it as noise.
+        "message": message[-1000:],  # cap both real output and the fallback
         "note": (
-            "comfy-cli emitted no JSON envelope for this lifecycle command; "
+            "comfy-cli emitted no JSON envelope for this command; "
             "a clean exit is treated as success."
         ),
     }
+
+
+# Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
+# message. ``partner_nodes`` names the offending nodes on a partner-credential
+# failure; keep the set small so a large envelope can't bloat the message.
+_SURFACED_DETAIL_KEYS = ("partner_nodes",)
+
+# Per-field cap for the rendered error message (mirrors the stderr cap) so a
+# multi-KB `message`/`hint` or a huge `partner_nodes` array can't produce an
+# unbounded error string in the MCP client / logs.
+_MAX_ERROR_FIELD_CHARS = 500
+
+
+def _render_error_details(details: Any) -> str | None:
+    """Render the useful keys of an envelope's ``error.details`` for the message."""
+    if not isinstance(details, dict):
+        return None
+    parts: list[str] = []
+    for key in _SURFACED_DETAIL_KEYS:
+        value = details.get(key)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value)
+        parts.append(f"{key}: {str(value)[:_MAX_ERROR_FIELD_CHARS]}")
+    return "; ".join(parts) if parts else None
 
 
 def _last_json_object(stdout: str) -> dict | None:
@@ -550,6 +695,11 @@ async def _run_comfy_streaming(
         # corrupt to mojibake before _parse_event/_last_json_object.
         encoding="utf-8",
         env=env,
+        # Own process group so a timeout can kill the whole tree (child +
+        # grandchildren) and close every copy of the stderr pipe — otherwise a
+        # grandchild that inherited the fd keeps the blocking stderr read (and
+        # its to_thread worker) alive forever. See _kill_proc_tree. (BE-3343)
+        start_new_session=True,
     )
     lines: list[str] = []
     tracker = _StreamProgress()
@@ -595,15 +745,38 @@ async def _run_comfy_streaming(
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
                 return {"timed_out": True, "status": tracker.snapshot()}
+            # Surface what the child wrote before the deadline (BE-3343). Kill
+            # the whole tree FIRST so every copy of the stderr pipe closes and
+            # the drain returns the buffered output (a wedged child — or a
+            # grandchild holding the fd — would otherwise block the read).
+            if proc.poll() is None:
+                _kill_proc_tree(proc)
+                await asyncio.to_thread(_reap, proc)
+            stderr_tail = ""
+            if stderr_future is not None:
+                try:
+                    stderr_tail = _tail(await asyncio.wait_for(stderr_future, 2.0))
+                except (Exception, asyncio.CancelledError):
+                    # Diagnostics are best-effort: never let gathering the tail
+                    # mask the timeout itself. CancelledError is a BaseException
+                    # (not caught by `except Exception`) and DOES fire here: the
+                    # outer wait_for cancels _drain while it awaits stderr_future,
+                    # which cancels the future too — so awaiting it below re-raises
+                    # CancelledError. Swallow it so we still raise ComfyCliError.
+                    stderr_tail = ""
             raise ComfyCliError(
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+                f"stderr tail: {stderr_tail or '<empty>'}; "
+                # Slice to the last lines before joining so a chatty child's full
+                # stdout history isn't copied just to keep the 500-char tail.
+                f"stdout tail: {_tail(''.join(lines[-500:])) or '<empty>'}"
             ) from exc
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion).
         if proc.poll() is None:
-            proc.kill()
-            await asyncio.to_thread(proc.wait)
+            _kill_proc_tree(proc)
+            await asyncio.to_thread(_reap, proc)
         if stderr_future is not None and not stderr_future.done():
             stderr_future.cancel()
 
@@ -712,6 +885,27 @@ def server_info() -> Any:
     return {"env": data, "compatibility": compat}
 
 
+# comfy-cli error codes worth a short bounded retry from ``run_workflow`` —
+# transient credential failures the run's PREFLIGHT raises BEFORE the job is
+# submitted, so re-invoking `comfy run` cannot double-submit. Verified against
+# comfy-cli source (BE-3344):
+#   * `partner_node_requires_credential` — raised in run preflight
+#     (`command/run/__init__.py`) BEFORE `execution.queue()`; safe to retry.
+#   * `cloud_unauthorized` — only raised on the CLOUD execute path; it never
+#     fires on `--where local` (all this server ever runs), so it is dormant
+#     here. Included defensively per the field request; it can't double-submit.
+# `transient_auth` is deliberately EXCLUDED: on the local path it is raised
+# from the execution watcher (`command/run/execution.py` `on_error`) AFTER
+# submission, so retrying it would re-run a job that already executed.
+_RETRYABLE_CREDENTIAL_CODES = frozenset(
+    {"partner_node_requires_credential", "cloud_unauthorized"}
+)
+
+# Backoff (seconds) before each RETRY attempt — so up to 2 extra attempts after
+# the initial one, at 1s then 2s.
+_CREDENTIAL_RETRY_BACKOFFS = (1.0, 2.0)
+
+
 @mcp.tool()
 def auth_status() -> Any:
     """Comfy Cloud credential status for partner-API nodes (read-only; never returns secrets).
@@ -762,18 +956,51 @@ async def run_workflow(
     as MCP progress notifications (per-node execution + sampler step counts) so
     a long generation is not a silent block; with ``wait=False`` it submits and
     returns immediately with a ``prompt_id`` to poll via ``job_status``.
+
+    Partner-API nodes (Seedream/Veo/Kling/Gemini/…) need a Comfy credential in
+    the server's environment (``COMFY_API_KEY`` in the client registration). A
+    transient credential failure is retried up to twice with a short backoff;
+    the surfaced error carries comfy-cli's hint (including the working
+    ``comfy auth set comfy-cloud-api-key`` fallback).
     """
-    if not wait:
-        # Fire-and-return: no stream to follow, so keep the plain --json path.
-        return _run_comfy("run", "--workflow", workflow_path, timeout=60.0)
-    return await _run_comfy_streaming(
-        "run",
-        "--workflow",
-        workflow_path,
-        "--wait",
-        ctx=ctx,
-        timeout=timeout_seconds,
-    )
+
+    async def _attempt() -> Any:
+        if not wait:
+            # Fire-and-return: no stream to follow, so keep the plain --json
+            # path — but run the blocking subprocess in a worker thread so the
+            # submit doesn't stall the event loop (and other concurrent MCP
+            # requests) for up to the 60s timeout.
+            return await asyncio.to_thread(
+                _run_comfy, "run", "--workflow", workflow_path, timeout=60.0
+            )
+        return await _run_comfy_streaming(
+            "run",
+            "--workflow",
+            workflow_path,
+            "--wait",
+            ctx=ctx,
+            timeout=timeout_seconds,
+        )
+
+    # Try once, then up to len(_CREDENTIAL_RETRY_BACKOFFS) more times on a
+    # transient credential code. ``backoff is None`` marks the final attempt.
+    for attempt, backoff in enumerate((*_CREDENTIAL_RETRY_BACKOFFS, None)):
+        try:
+            return await _attempt()
+        except ComfyCliError as exc:
+            retryable = exc.code in _RETRYABLE_CREDENTIAL_CODES
+            if backoff is None or not retryable:
+                if attempt and retryable:
+                    # Retries exhausted on a credential error: surface the
+                    # hint-bearing error, noting the retries already made.
+                    plural = "y" if attempt == 1 else "ies"
+                    raise ComfyCliError(
+                        f"{exc}\n(gave up after {attempt} retr{plural} on "
+                        f"transient `{exc.code}`)",
+                        code=exc.code,
+                    ) from exc
+                raise
+            await asyncio.sleep(backoff)
 
 
 @mcp.tool()
@@ -1311,6 +1538,14 @@ _NO_LOG_FILE_CODE = "no_log_file"
 _MIN_LOG_TAIL = 1
 _MAX_LOG_TAIL = 10000
 
+# Hard character cap on each returned log line. `_MAX_LOG_TAIL` bounds the line
+# COUNT, but a single pathological line — a base64 blob or tensor dump from a
+# buggy or hostile custom node — could still be megabytes and flood an agent's
+# context. Cap each line individually, mirroring the `_cap_text` guard on
+# get_execution_error's free-text fields. This is a TOTAL cap: the truncation
+# marker is charged against it (see get_logs) so a capped line never exceeds it.
+_MAX_LOG_LINE_CHARS = 4000
+
 
 @mcp.tool()
 def get_logs(tail: int = 200) -> Any:
@@ -1330,15 +1565,23 @@ def get_logs(tail: int = 200) -> Any:
 
     ``tail`` is clamped to ``[1, 10000]`` before forwarding, so a negative value
     can't produce a malformed ``--tail -N`` and an absurd value can't make
-    comfy-cli read back an enormous log slice.
+    comfy-cli read back an enormous log slice. Each returned line is also capped
+    to ``_MAX_LOG_LINE_CHARS`` so a single pathological line (a base64 blob or
+    tensor dump from a buggy node) can't flood the caller's context.
     """
     tail = max(_MIN_LOG_TAIL, min(int(tail), _MAX_LOG_TAIL))
     try:
-        return _run_comfy("logs", "--tail", str(tail), timeout=60.0)
+        data = _run_comfy("logs", "--tail", str(tail), timeout=60.0)
     except ComfyCliError as exc:
         if exc.code == _NO_LOG_FILE_CODE:
             return {"error": _NO_LOG_FILE_CODE, "message": str(exc)}
         raise
+    if isinstance(data, dict) and isinstance(data.get("lines"), list):
+        # Charge the truncation marker against the cap so a capped line's TOTAL
+        # length (content + marker) never exceeds `_MAX_LOG_LINE_CHARS`.
+        content_limit = _MAX_LOG_LINE_CHARS - len(_TRACEBACK_TRUNCATION_MARKER)
+        data["lines"] = [_cap_text(line, content_limit) for line in data["lines"]]
+    return data
 
 
 @mcp.tool()
@@ -1718,8 +1961,16 @@ def download_model(
 
     DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
     there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
-    such search), so the caller must already have the direct model URL. Returns
-    comfy-cli's envelope ``data`` (the saved path / download metadata).
+    such search), so the caller must already have the direct model URL.
+
+    ``comfy model download`` streams human progress text to stderr and exits 0
+    WITHOUT emitting an ``envelope/1`` object, so on that clean-exit success this
+    returns a synthesized payload — ``{"ok": True, "action": ..., "message":
+    ..., "note": ...}`` whose ``message`` carries the CLI's printed text (the
+    "Done in …" tail and saved-path line) — rather than envelope ``data``
+    (BE-3345). If comfy-cli starts emitting an envelope for this verb, that real
+    envelope wins and its ``data`` (the saved path / download metadata) is
+    returned instead. A non-zero exit still raises :class:`ComfyCliError`.
     """
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
@@ -1759,7 +2010,11 @@ def download_model(
     if filename:
         args += ["--filename", filename]
     # Generous timeout: multi-GB checkpoints can take a long time to fetch.
-    return _run_comfy(*args, timeout=1800.0)
+    # plain_ok=True: `comfy model download` exits 0 with human progress text and
+    # no envelope, so treat a clean exit as success instead of raising the
+    # "returned no JSON" false negative on a download that actually landed
+    # (BE-3345). A real error envelope or a non-zero exit still raises.
+    return _run_comfy(*args, timeout=1800.0, plain_ok=True)
 
 
 @mcp.tool()
