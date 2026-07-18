@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
@@ -73,6 +74,66 @@ _MAX_WATCH_TIMEOUT = 3600.0
 # its own, then fall through to the `finally` that kills it — never block on a
 # lingering child once the answer is already parsed.
 _POST_ENVELOPE_REAP_GRACE = 5.0
+
+# Dedicated, bounded thread pool for the blocking pipe reads / process waits in
+# `_run_comfy_streaming` (`stdout.readline`, `stderr.read`, `proc.wait`).
+#
+# Cancelling an `asyncio.to_thread` NEVER interrupts the underlying OS thread —
+# it stays parked on the pipe until the child is killed and its stdio closes.
+# On the success-envelope path the stderr reader is never awaited, only
+# cancelled, so it lingers until the `finally` kills the child (up to
+# `_POST_ENVELOPE_REAP_GRACE`). Running these on asyncio's shared *default*
+# executor means many concurrent `run_workflow(wait=True)` / `watch_job` calls
+# could pile parked readers/waiters onto that pool and starve unrelated
+# `to_thread` work for the grace window. Confining them to their own bounded
+# pool caps the blast radius to this pool; the `finally` block additionally
+# joins the stderr reader once the child is dead so it does not outlive the run.
+_PIPE_POOL_MAX_WORKERS = min(32, (os.cpu_count() or 1) + 4)
+_PIPE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_PIPE_POOL_MAX_WORKERS,
+    thread_name_prefix="comfy-pipe",
+)
+
+
+def _in_pipe_pool(func, *args):
+    """Off-load a blocking pipe read / process wait to the dedicated pool.
+
+    Mirrors :func:`asyncio.to_thread` but targets :data:`_PIPE_EXECUTOR`
+    instead of the loop's shared default executor, so subprocess pipe threads
+    can never saturate the pool other `to_thread` callers rely on.
+    """
+    return asyncio.get_running_loop().run_in_executor(_PIPE_EXECUTOR, func, *args)
+
+
+# Bound how long cleanup will block joining the parked stderr reader. `proc.kill`
+# reaps only the DIRECT comfy-cli child; a descendant that inherited the stderr
+# write fd keeps the pipe open, so the reader's `read()` never EOFs. Cap the join
+# so cleanup can never hang the tool call, and detach the reader on timeout.
+_STDERR_JOIN_GRACE = 5.0
+
+# Retain at most this many trailing chars of a child's stderr. The reader must
+# keep draining for the whole run (a chatty child would otherwise wedge on a full
+# stderr pipe), but retaining every byte lets a misbehaving child drive unbounded
+# allocation in this process — a memory-exhaustion DoS. Keep only the tail, where
+# the actual error / traceback that `_unwrap_envelope` falls back to usually is.
+_STDERR_MAX_CHARS = 64 * 1024
+_STDERR_READ_CHUNK = 64 * 1024
+
+
+def _drain_capped(stream: Any, limit: int) -> str:
+    """Read ``stream`` to EOF but keep only the trailing ``limit`` chars.
+
+    Draining to EOF keeps the child from blocking on a full stderr pipe; slicing
+    to the tail on every chunk bounds memory to ``limit`` + one chunk regardless
+    of how much the child spams.
+    """
+    tail = ""
+    while True:
+        chunk = stream.read(_STDERR_READ_CHUNK)
+        if not chunk:
+            break
+        tail = (tail + chunk)[-limit:]
+    return tail
 
 
 class ComfyCliError(RuntimeError):
@@ -359,7 +420,7 @@ async def _run_comfy_streaming(
         """
         assert proc.stdout is not None
         while True:
-            line = await asyncio.to_thread(proc.stdout.readline)
+            line = await _in_pipe_pool(proc.stdout.readline)
             if not line:  # EOF: comfy-cli closed stdout
                 return False
             lines.append(line)
@@ -377,9 +438,12 @@ async def _run_comfy_streaming(
                     return True
                 await tracker.report(ctx, event)
 
-    # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
+    # Drain stderr concurrently so a chatty child can't deadlock on a full pipe;
+    # retain only the tail so it can't drive unbounded allocation here.
     stderr_future = (
-        asyncio.ensure_future(asyncio.to_thread(proc.stderr.read))
+        asyncio.ensure_future(
+            _in_pipe_pool(_drain_capped, proc.stderr, _STDERR_MAX_CHARS)
+        )
         if proc.stderr is not None
         else None
     )
@@ -395,7 +459,7 @@ async def _run_comfy_streaming(
             return True, None
         # EOF: the child has closed stdout, so a plain wait is safe and its
         # stderr is collectible for the error message.
-        returncode = await asyncio.to_thread(proc.wait)
+        returncode = await _in_pipe_pool(proc.wait)
         stderr = (await stderr_future) if stderr_future is not None else ""
         return False, _unwrap_envelope(
             _last_json_object("".join(lines)), args, returncode, stderr
@@ -436,7 +500,7 @@ async def _run_comfy_streaming(
         child_reaped = True
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
+                _in_pipe_pool(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
             )
         except (asyncio.TimeoutError, TimeoutError):
             child_reaped = False  # lingering child; `finally` reaps it
@@ -450,16 +514,44 @@ async def _run_comfy_streaming(
             and stderr_future is not None
             and not (envelope or {}).get("ok", False)
         ):
-            stderr = await stderr_future
+            # The direct child exited during the grace, so its stderr pipe has
+            # normally EOF'd — but a descendant holding the write fd could still
+            # block this read. Bound it; `shield` keeps a timeout from cancelling
+            # the reader here so the `finally` join can still detach it.
+            try:
+                stderr = await asyncio.wait_for(
+                    asyncio.shield(stderr_future), _STDERR_JOIN_GRACE
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                stderr = ""
         return _unwrap_envelope(envelope, args, proc.returncode, stderr)
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion).
         if proc.poll() is None:
             proc.kill()
-            await asyncio.to_thread(proc.wait)
-        if stderr_future is not None and not stderr_future.done():
-            stderr_future.cancel()
+            await _in_pipe_pool(proc.wait)
+        # The direct child is now dead, so its stderr pipe SHOULD EOF and the
+        # parked reader return promptly — awaiting the future JOINS that thread
+        # back into the pool (a cancelled `run_in_executor` leaves the OS thread
+        # parked until the read unblocks, so cancel alone would not). But
+        # `proc.kill()` only reaps the direct comfy-cli child; if it left a
+        # descendant holding the stderr write fd the pipe never EOFs and an
+        # unbounded join would hang the tool call forever. Bound the join and, on
+        # timeout, fall back to cancelling (detaches our await — the caller
+        # unblocks; the OS thread frees when the fd finally closes). `wait_for`
+        # cancels its inner future when cancelled, so even a `CancelledError`
+        # here detaches the reader before propagating. Awaiting also consumes any
+        # exception the read raised, so cleanup never masks the real
+        # result/exception and no "Future exception was never retrieved" warning
+        # is emitted.
+        if stderr_future is not None and not stderr_future.cancelled():
+            try:
+                await asyncio.wait_for(stderr_future, _STDERR_JOIN_GRACE)
+            except (asyncio.TimeoutError, TimeoutError):
+                stderr_future.cancel()
+            except Exception:
+                pass
 
 
 @mcp.tool()
