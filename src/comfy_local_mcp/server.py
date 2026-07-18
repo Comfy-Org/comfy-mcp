@@ -69,10 +69,10 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   re-auth in that case. Only when BOTH are false, tell the USER to
   authenticate, in this order: (1) run `comfy cloud login` in a terminal
   (canonical), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
-  or (3) persist a key with `comfy cloud set-key` (avoid passing it inline as an
-  argument, which leaks the key into shell history). Never put a key in a
-  workflow file. If a run still hits a credential error despite good
-  `auth_status`, it is retried briefly and surfaces a hint with alternatives.
+  or (3) persist a key with `comfy auth set comfy-cloud-api-key --key <KEY>`.
+  Never put a key in a workflow file. If a run still hits a credential error
+  despite good `auth_status`, it is retried briefly and surfaces a hint with
+  alternatives.
 - After a detached `launch_comfyui`, read the background server's own output with
   `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
 

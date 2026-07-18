@@ -783,7 +783,7 @@ def test_server_instructions_cover_credential_steering():
     # The three credential steps must appear, in the canonical order.
     login = instructions.index("comfy cloud login")
     env_key = instructions.index("COMFY_API_KEY")
-    set_key = instructions.index("comfy cloud set-key")
+    set_key = instructions.index("comfy auth set comfy-cloud-api-key")
     assert login < env_key < set_key  # (1) login, (2) registration env, (3) set-key
 
 
