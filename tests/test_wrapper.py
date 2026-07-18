@@ -21,6 +21,7 @@ import subprocess
 import time
 
 import pytest
+from conftest import _OK_STREAM, _RecordingCtx
 
 from comfy_local_mcp import server
 
@@ -477,92 +478,6 @@ def test_which_maps_command_and_returns_data(patched_run):
 
 
 # --- streaming run_workflow(wait=True) -------------------------------------
-
-
-class _FakeProc:
-    """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
-
-    def __init__(self, cmd, stdout_text, stderr_text=""):
-        self.cmd = cmd
-        self.stdout = io.StringIO(stdout_text)
-        self.stderr = io.StringIO(stderr_text)
-        self.returncode = 0
-        self.killed = False
-
-    def poll(self):
-        return self.returncode  # already "finished" once the stream is drained
-
-    def wait(self):
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-
-
-class _RecordingCtx:
-    """A fake FastMCP Context that records each ``report_progress`` call."""
-
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    async def report_progress(self, progress, total=None, message=None):
-        self.calls.append({"progress": progress, "total": total, "message": message})
-
-
-@pytest.fixture
-def patched_stream(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.Popen`` for the streaming path.
-
-    Returns ``setup(stdout_text) -> procs`` — the list capturing each spawned
-    ``_FakeProc`` (so the test can assert the command line that was run).
-    """
-
-    def setup(stdout_text: str) -> list[_FakeProc]:
-        procs: list[_FakeProc] = []
-
-        def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text)
-            procs.append(proc)
-            return proc
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
-        return procs
-
-    return setup
-
-
-# A queued event (2-node manifest), a per-node step progress event, two
-# node-completion events, then the success envelope on the last line.
-_OK_STREAM = (
-    "\n".join(
-        json.dumps(evt)
-        for evt in [
-            {
-                "schema": "event/1",
-                "type": "queued",
-                "nodes": [{"node_id": "1"}, {"node_id": "2"}],
-            },
-            {"schema": "event/1", "type": "executing", "node": "1", "title": "Load"},
-            {
-                "schema": "event/1",
-                "type": "progress",
-                "node": "1",
-                "completed": 5,
-                "total": 10,
-            },
-            {"schema": "event/1", "type": "executed", "node": "1", "title": "Load"},
-            {"schema": "event/1", "type": "executed", "node": "2", "title": "Save"},
-            {
-                "schema": "envelope/1",
-                "type": "envelope",
-                "ok": True,
-                "data": {"outputs": ["/x.png"]},
-            },
-        ]
-    )
-    + "\n"
-)
 
 
 def test_run_workflow_streams_progress_and_returns_data(patched_stream):

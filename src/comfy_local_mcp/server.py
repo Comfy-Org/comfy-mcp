@@ -387,6 +387,61 @@ async def run_workflow(
 
 
 @mcp.tool()
+async def generate_image(
+    prompt: str,
+    checkpoint: str | None = None,
+    wait: bool = True,
+    timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
+) -> Any:
+    """Generate an image from a text prompt on the LOCAL ComfyUI — the fast on-ramp.
+
+    Wraps ``comfy generate --prompt <prompt>``: a single call that turns a text
+    prompt into an image, so an agent does not have to hand-assemble a workflow
+    graph. comfy-cli owns the text->workflow injection (which node/slot the
+    prompt fills, the default graph, checkpoint selection); this tool is a pure
+    passthrough to that verb. Returns the same envelope shape as
+    ``run_workflow`` (``prompt_id`` + outputs).
+
+    Pass ``checkpoint`` to pick a specific checkpoint model (forwarded to
+    ``comfy generate --checkpoint``); omit it to let comfy-cli choose a default.
+    With ``wait=True`` (default) this waits until the generation finishes and
+    streams live progress as MCP progress notifications (per-node execution +
+    sampler step counts) so a long generation is not a silent block; with
+    ``wait=False`` it submits and returns immediately with a ``prompt_id`` to
+    poll via ``job_status``. ``timeout_seconds`` only bounds the ``wait=True``
+    streaming path; the ``wait=False`` submit-and-return branch uses a fixed
+    short timeout, so callers should not expect it to govern that case.
+
+    This is the quickest path to an image. For full control — choosing a
+    template, editing its graph, or running a hand-authored workflow — use the
+    ``search_templates`` -> ``fetch_template`` -> ``run_workflow`` chain instead.
+
+    Everything targets the LOCAL server (``--where local`` is injected by
+    ``_run_comfy``), so there is no cloud reachability here.
+    """
+    # Pass the free-form text as ``--flag=value`` so a prompt (or checkpoint)
+    # that begins with ``-`` is read as the value rather than mis-parsed by
+    # comfy-cli as an option token. The leading-dash guards elsewhere reject
+    # such input, but a prompt legitimately can start with ``-``, so we keep it
+    # instead of rejecting it.
+    checkpoint_args = [f"--checkpoint={checkpoint}"] if checkpoint else []
+    if not wait:
+        # Fire-and-return: no stream to follow, so keep the plain --json path.
+        return _run_comfy(
+            "generate", f"--prompt={prompt}", *checkpoint_args, timeout=60.0
+        )
+    return await _run_comfy_streaming(
+        "generate",
+        f"--prompt={prompt}",
+        *checkpoint_args,
+        "--wait",
+        ctx=ctx,
+        timeout=timeout_seconds,
+    )
+
+
+@mcp.tool()
 def job_status(prompt_id: str) -> Any:
     """Check a submitted job's status (queued / running / completed / error).
 
