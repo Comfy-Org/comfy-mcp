@@ -50,6 +50,12 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
+- Before running a workflow whose nodes call partner APIs (Seedream / Veo /
+  Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials. If
+  it reports not signed in, tell the USER to authenticate, in this order:
+  (1) run `comfy cloud login` in a terminal (canonical), or (2) set
+  `COMFY_API_KEY` in the MCP client's registration env, or (3) persist a key
+  with `comfy cloud set-key --key …`. Never put a key in a workflow file.
 
 Everything targets the LOCAL server only — there is no cloud access here.
 """
@@ -329,6 +335,37 @@ def server_info() -> Any:
     confirm a local ComfyUI is up before running a workflow.
     """
     return _run_comfy("env", timeout=60.0)
+
+
+@mcp.tool()
+def auth_status() -> Any:
+    """Comfy Cloud credential status for partner-API nodes (read-only; never returns secrets).
+
+    Wraps ``comfy cloud whoami`` and returns comfy-cli's whoami payload as-is:
+    ``signed_in``, ``auth_method`` (``oauth`` / ``api_key`` / ``null``),
+    ``api_key_source`` (``env`` / ``store``), ``base_url``, plus
+    ``expired`` / ``session`` (already REDACTED by comfy-cli) / ``stale_base_url``
+    when a session exists. Secrets are pre-redacted upstream — this passes the
+    payload through unchanged and never re-derives or returns key material.
+
+    Call this before running a workflow whose nodes hit partner APIs
+    (Seedream / Veo / Kling / Gemini / …) to self-diagnose credentials; the
+    server instructions cover what to tell the user when not signed in.
+
+    BLIND SPOT: a ``COMFY_API_KEY`` set in the MCP client's registration env
+    (injected per-run for ``comfy run --api-key``) is NOT reflected in
+    ``api_key_source`` — whoami inspects only the cloud-purpose
+    ``COMFY_CLOUD_API_KEY`` / stored key slot. So this tool ALSO reports
+    ``registration_env_key_present`` (a local presence check — a bool, never
+    the value) so that path is at least visible.
+    """
+    data = _run_comfy("cloud", "whoami", timeout=30.0)
+    present = bool(os.environ.get("COMFY_API_KEY"))
+    # Add the local presence flag WITHOUT altering any whoami field comfy-cli
+    # returned (which stays redacted as-is); only augment the dict shape.
+    if isinstance(data, dict):
+        return {**data, "registration_env_key_present": present}
+    return data
 
 
 @mcp.tool()

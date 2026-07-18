@@ -416,6 +416,121 @@ def test_server_instructions_cover_canonical_flows():
         assert tool in instructions
 
 
+def test_auth_status_maps_command_and_passes_payload_through(patched_run, monkeypatch):
+    """auth_status wraps `comfy --json --where local cloud whoami`, payload unchanged."""
+    whoami = {
+        "signed_in": True,
+        "auth_method": "oauth",
+        "api_key_source": "store",
+        "base_url": "https://api.comfy.example",
+        "expired": False,
+    }
+    calls = patched_run({"type": "envelope", "ok": True, "data": whoami})
+    # No registration env key set -> the added flag is False, everything else as-is.
+    monkeypatch.delenv("COMFY_API_KEY", raising=False)
+
+    result = server.auth_status()
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == [
+        "cloud",
+        "whoami",
+    ]  # whoami is not target-routed; --where local is harmless
+    # Every whoami field passes through unchanged; only the local flag is added.
+    for key, value in whoami.items():
+        assert result[key] == value
+    assert result["registration_env_key_present"] is False
+
+
+def test_auth_status_signed_out_payload_passes_through(patched_run, monkeypatch):
+    """A signed-out whoami (signed_in false, auth_method null) passes through cleanly."""
+    whoami = {
+        "signed_in": False,
+        "auth_method": None,
+        "api_key_source": None,
+        "base_url": "https://api.comfy.example",
+    }
+    patched_run({"type": "envelope", "ok": True, "data": whoami})
+    monkeypatch.delenv("COMFY_API_KEY", raising=False)
+
+    result = server.auth_status()
+
+    assert result["signed_in"] is False
+    assert result["auth_method"] is None
+    assert result["registration_env_key_present"] is False
+
+
+def test_auth_status_reports_registration_env_presence_not_value(
+    patched_run, monkeypatch
+):
+    """The COMFY_API_KEY registration-env blind spot is reported as presence only."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"signed_in": False, "auth_method": None},
+        }
+    )
+    monkeypatch.setenv("COMFY_API_KEY", "sk-super-secret-value")
+
+    result = server.auth_status()
+
+    assert result["registration_env_key_present"] is True
+    # Presence only — the actual key material must never appear in the payload.
+    assert "sk-super-secret-value" not in json.dumps(result)
+
+
+def test_auth_status_never_returns_key_material(patched_run, monkeypatch):
+    """A realistic redacted whoami stays redacted — no key/token material leaks out."""
+    # comfy-cli pre-redacts secrets; the tool must pass them through, never re-derive.
+    whoami = {
+        "signed_in": True,
+        "auth_method": "api_key",
+        "api_key_source": "env",
+        "base_url": "https://api.comfy.example",
+        "expired": False,
+        "session": {"api_key": "***REDACTED***", "token": "***REDACTED***"},
+        "stale_base_url": False,
+    }
+    patched_run({"type": "envelope", "ok": True, "data": whoami})
+    monkeypatch.delenv("COMFY_API_KEY", raising=False)
+
+    dumped = json.dumps(server.auth_status())
+
+    assert "REDACTED" in dumped  # the redaction placeholder survives unchanged
+    # No un-redacted-looking key/token material in the returned dict.
+    assert "sk-" not in dumped
+    for token_word in ("secret", "bearer"):
+        assert token_word not in dumped.lower()
+
+
+def test_auth_status_error_envelope_raises(patched_run):
+    """A failing `comfy cloud whoami` surfaces comfy-cli's error envelope."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "not_signed_in", "message": "no credentials"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="not_signed_in"):
+        server.auth_status()
+
+
+def test_server_instructions_cover_credential_steering():
+    """Instructions steer an agent to auth_status + the three-step credential order."""
+    instructions = server.mcp.instructions
+
+    assert "auth_status" in instructions
+    # The three credential steps must appear, in the canonical order.
+    login = instructions.index("comfy cloud login")
+    env_key = instructions.index("COMFY_API_KEY")
+    set_key = instructions.index("comfy cloud set-key")
+    assert login < env_key < set_key  # (1) login, (2) registration env, (3) set-key
+
+
 def test_launch_comfyui_passes_background_flag(patched_run):
     """launch_comfyui must run `comfy … launch --background` (detached start)."""
     calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 42}})
