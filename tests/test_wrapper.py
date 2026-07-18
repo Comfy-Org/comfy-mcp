@@ -1957,3 +1957,23 @@ def test_overlapping_streaming_runs_confine_and_release_pipe_threads(monkeypatch
             assert parked == 0, f"{parked} pipe thread(s) still parked at baseline"
     finally:
         test_pool.shutdown(wait=True)
+
+
+def test_get_logs_caps_oversized_line(patched_run):
+    """A single pathological (megabyte) log line is truncated; normal lines pass through."""
+    blob = "x" * (server._MAX_LOG_LINE_CHARS + 5_000)
+    payload = {
+        "lines": ["startup ok\n", blob, "loaded checkpoint\n"],
+        "path": "/ws/user/comfyui_8188.log",
+        "truncated": False,
+    }
+    patched_run({"type": "envelope", "ok": True, "data": payload})
+
+    result = server.get_logs()
+    lines = result["lines"]
+
+    assert lines[0] == "startup ok\n"  # short line untouched
+    assert lines[2] == "loaded checkpoint\n"
+    # TOTAL length (content + marker) never exceeds the hard cap.
+    assert len(lines[1]) <= server._MAX_LOG_LINE_CHARS
+    assert lines[1].endswith(server._TRACEBACK_TRUNCATION_MARKER)
