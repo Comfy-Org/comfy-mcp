@@ -93,12 +93,19 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
 
 
-def _run_comfy(*args: str, timeout: float | None = None) -> Any:
+def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
     """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
 
     comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
     for ``--json``, or an NDJSON stream whose final line is the envelope). We
     keep the last JSON object and unwrap ``ok`` / ``data`` / ``error``.
+
+    ``plain_ok`` relaxes the envelope requirement for the lifecycle commands
+    (``launch`` / ``stop``) that print human text and exit 0 WITHOUT emitting an
+    envelope (BE-2953): a clean exit with no JSON is treated as success and a
+    result dict is synthesized from the printed text, rather than raising the
+    "returned no JSON" error on an action that actually succeeded. A non-zero
+    exit, or a real error envelope, still raises as usual.
     """
     if shutil.which(COMFY_BIN) is None:
         raise ComfyCliError(
@@ -124,9 +131,20 @@ def _run_comfy(*args: str, timeout: float | None = None) -> Any:
             f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
         ) from exc
 
-    return _unwrap_envelope(
-        _last_json_object(proc.stdout), args, proc.returncode, proc.stderr
+    envelope = _last_json_object(proc.stdout)
+    # A lifecycle command that exits 0 without a *real* envelope is a success
+    # (BE-2953). `_last_json_object` may return a stray non-envelope JSON line
+    # (e.g. a diagnostic log that happens to parse), so key the fast-path off the
+    # absence of a `type==envelope` object rather than the absence of any JSON —
+    # otherwise one incidental JSON line on a successful launch/stop would be
+    # mis-unwrapped into a spurious "failed" raise. A real error envelope still
+    # has `type==envelope`, so it flows to `_unwrap_envelope` and raises as usual.
+    real_envelope = (
+        envelope if envelope and envelope.get("type") == "envelope" else None
     )
+    if plain_ok and real_envelope is None and proc.returncode == 0:
+        return _synthesize_lifecycle_result(args, proc.stdout, proc.stderr)
+    return _unwrap_envelope(envelope, args, proc.returncode, proc.stderr)
 
 
 def _unwrap_envelope(
@@ -152,6 +170,31 @@ def _unwrap_envelope(
             code=err.get("code"),
         )
     return envelope.get("data")
+
+
+def _synthesize_lifecycle_result(
+    args: tuple[str, ...], stdout: str, stderr: str
+) -> dict:
+    """Success payload for a lifecycle command that exited 0 without an envelope.
+
+    ``comfy launch --background`` and ``comfy stop`` print human-readable text and
+    exit 0 instead of emitting an ``envelope/1`` object (BE-2953). For those
+    commands a clean exit IS the success signal, so we return a result dict
+    carrying whatever text comfy-cli printed (preferring stderr, per the CLI's
+    logging) rather than raising on the absent envelope — a false negative that
+    would invite a retry of a non-idempotent lifecycle action.
+    """
+    text = " ".join(part.strip() for part in (stderr, stdout) if part.strip())
+    message = text or f"comfy {' '.join(args)} completed (exit 0)."
+    return {
+        "ok": True,
+        "action": args[0] if args else "",
+        "message": message[:1000],  # cap both real output and the fallback
+        "note": (
+            "comfy-cli emitted no JSON envelope for this lifecycle command; "
+            "a clean exit is treated as success."
+        ),
+    }
 
 
 def _last_json_object(stdout: str) -> dict | None:
@@ -850,6 +893,11 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     Call ``server_info`` first if you only want to check whether a server is
     already running — launching a second one will fail on the port.
 
+    ``comfy launch --background`` prints human text and exits 0 without a JSON
+    envelope, so on success this returns a synthesized ``{"ok": True, ...}``
+    payload carrying that text (BE-2953); a launch failure (e.g. port in use)
+    exits non-zero and still raises a :class:`ComfyCliError`.
+
     NOTE (temporary upstream caveat): ``comfy launch --background`` currently
     crashes on Python 3.14 (comfy-cli asyncio ``get_event_loop`` issue; a fix is
     in review upstream). On affected comfy-cli versions the crash surfaces here
@@ -859,7 +907,7 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     args = ["launch", "--background"]
     if extra_args:
         args += ["--", *extra_args]
-    return _run_comfy(*args, timeout=180.0)
+    return _run_comfy(*args, timeout=180.0, plain_ok=True)
 
 
 @mcp.tool()
@@ -872,8 +920,12 @@ def stop_comfyui() -> Any:
     the desktop app or by hand — in that case comfy-cli reports it has no
     recorded server and this tool raises a :class:`ComfyCliError` carrying that
     message, rather than killing an unrelated process.
+
+    Like ``launch_comfyui``, ``comfy stop`` prints human text and exits 0 without
+    a JSON envelope, so a successful stop returns a synthesized
+    ``{"ok": True, ...}`` payload carrying that text (BE-2953).
     """
-    return _run_comfy("stop", timeout=60.0)
+    return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
 
 @mcp.tool()

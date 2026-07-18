@@ -456,6 +456,104 @@ def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
     assert calls[0]["cmd"][4:] == ["stop"]
 
 
+# --- lifecycle commands with no JSON envelope (BE-2953) --------------------
+
+
+def _fake_run_plain(returncode: int, stdout: str = "", stderr: str = ""):
+    """`subprocess.run` stand-in emitting HUMAN text (no envelope) + a returncode.
+
+    Mirrors ``launch``/``stop``: comfy-cli prints plain text and exits without
+    ever writing an ``envelope/1`` object.
+    """
+    calls: list[dict] = []
+
+    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
+        calls.append({"cmd": cmd, "env": env})
+        return subprocess.CompletedProcess(
+            cmd, returncode, stdout=stdout, stderr=stderr
+        )
+
+    return fake, calls
+
+
+@pytest.fixture
+def patched_plain_run(monkeypatch):
+    """`setup(returncode, stdout, stderr) -> calls` for the no-envelope path."""
+
+    def setup(returncode: int, stdout: str = "", stderr: str = "") -> list[dict]:
+        fake, calls = _fake_run_plain(returncode, stdout, stderr)
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        return calls
+
+    return setup
+
+
+def test_stop_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
+    """`comfy stop` prints text + exits 0 with no envelope -> synthesized success."""
+    patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "stop"
+    assert "Stopped ComfyUI server" in result["message"]
+
+
+def test_launch_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
+    """`comfy launch --background` exits 0 with no envelope -> synthesized success."""
+    patched_plain_run(0, stdout="Launched ComfyUI in the background.")
+
+    result = server.launch_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "launch"
+    assert "Launched ComfyUI" in result["message"]
+
+
+def test_launch_comfyui_nonzero_exit_still_raises(patched_plain_run):
+    """A real launch failure (non-zero exit, no envelope) must still raise."""
+    patched_plain_run(1, stderr="Address already in use: port 8188")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.launch_comfyui()
+
+
+def test_plain_ok_synthesizes_despite_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON line on a clean lifecycle exit is still success.
+
+    `_last_json_object` returns any JSON object (not just `type==envelope`), so a
+    diagnostic line that happens to parse must NOT be mistaken for a result
+    envelope and unwrapped into a spurious failure (BE-2953 edge case).
+    """
+    patched_plain_run(
+        0,
+        stdout='{"level": "info", "msg": "bound port 8188"}\n',
+        stderr="Launched ComfyUI in the background.",
+    )
+
+    result = server.launch_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "launch"
+    assert "Launched ComfyUI" in result["message"]
+
+
+def test_plain_ok_does_not_leak_to_other_commands(patched_plain_run):
+    """Without plain_ok, an exit-0 command with no JSON still raises (unchanged)."""
+    patched_plain_run(0, stdout="not json")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server._run_comfy("env")
+
+
+def test_plain_ok_still_honors_a_real_envelope(patched_run):
+    """When comfy-cli DOES emit an envelope, plain_ok unwraps it normally."""
+    patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
+
+    assert server._run_comfy("launch", "--background", plain_ok=True) == {"pid": 7}
+
+
 def test_discover_maps_command_and_returns_data(patched_run):
     """discover wraps `comfy discover` and returns the envelope data verbatim."""
     surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
