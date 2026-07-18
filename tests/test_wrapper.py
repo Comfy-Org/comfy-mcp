@@ -1354,3 +1354,24 @@ def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
     result = server.fetch_outputs("pid", str(tmp_path))
 
     assert result == {"downloaded": ["gen.png"]}  # dict, not a [data, ...] list
+
+
+def test_get_logs_caps_oversized_line(patched_run):
+    """A single pathological (megabyte) log line is truncated; normal lines pass through."""
+    blob = "x" * (server._MAX_LOG_LINE_CHARS + 5_000)
+    payload = {
+        "lines": ["startup ok\n", blob, "loaded checkpoint\n"],
+        "path": "/ws/user/comfyui_8188.log",
+        "truncated": False,
+    }
+    patched_run({"type": "envelope", "ok": True, "data": payload})
+
+    result = server.get_logs()
+    lines = result["lines"]
+
+    assert lines[0] == "startup ok\n"  # short line untouched
+    assert lines[2] == "loaded checkpoint\n"
+    assert len(lines[1]) <= server._MAX_LOG_LINE_CHARS + len(
+        server._TRACEBACK_TRUNCATION_MARKER
+    )
+    assert lines[1].endswith(server._TRACEBACK_TRUNCATION_MARKER)
