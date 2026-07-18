@@ -280,27 +280,35 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     for ``--json``, or an NDJSON stream whose final line is the envelope). We
     keep the last JSON object and unwrap ``ok`` / ``data`` / ``error``.
 
-    ``plain_ok`` relaxes the envelope requirement for the lifecycle commands
-    (``launch`` / ``stop``) that print human text and exit 0 WITHOUT emitting an
-    envelope (BE-2953): a clean exit with no JSON is treated as success and a
-    result dict is synthesized from the printed text, rather than raising the
-    "returned no JSON" error on an action that actually succeeded. A non-zero
-    exit, or a real error envelope, still raises as usual.
+    ``plain_ok`` relaxes the envelope requirement for the commands that print
+    human text and exit 0 WITHOUT emitting an envelope — the lifecycle verbs
+    ``launch`` / ``stop`` (BE-2953) and ``model download`` (BE-3345): a clean
+    exit with no JSON is treated as success and a result dict is synthesized
+    from the printed text, rather than raising the "returned no JSON" error on
+    an action that actually succeeded. A non-zero exit, or a real error
+    envelope, still raises as usual.
     """
     envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
-    # A lifecycle command that exits 0 without a *real* envelope is a success
-    # (BE-2953). `_last_json_object` may return a stray non-envelope JSON line
-    # (e.g. a diagnostic log that happens to parse), so key the fast-path off the
-    # absence of a `type==envelope` object rather than the absence of any JSON —
-    # otherwise one incidental JSON line on a successful launch/stop would be
-    # mis-unwrapped into a spurious "failed" raise. A real error envelope still
-    # has `type==envelope`, so it flows to `_unwrap_envelope` and raises as usual.
+    # A plain_ok command that exits 0 without a *real* envelope is a success
+    # (BE-2953 launch/stop, BE-3345 model download). `_last_json_object` may
+    # return a stray non-envelope JSON line (e.g. a diagnostic log that happens
+    # to parse), so key the fast-path off the absence of a `type==envelope`
+    # object rather than the absence of any JSON — otherwise one incidental JSON
+    # line on a successful run would be mis-unwrapped into a spurious "failed"
+    # raise. A real error envelope still has `type==envelope`, so it flows to
+    # `_unwrap_envelope` and raises as usual.
     real_envelope = (
         envelope if envelope and envelope.get("type") == "envelope" else None
     )
     if plain_ok and real_envelope is None and returncode == 0:
-        return _synthesize_lifecycle_result(args, stdout, stderr)
-    return _unwrap_envelope(envelope, args, returncode, stderr)
+        return _synthesize_plain_result(args, stdout, stderr)
+    # Enforce the envelope contract on the normal path too: pass `real_envelope`
+    # (not `envelope`) so a stray non-envelope JSON line — e.g. an incidental
+    # `{"ok": true, "data": ...}` diagnostic — can't be mis-unwrapped as a valid
+    # response for a non-`plain_ok` tool; it raises the "returned no JSON" error
+    # like any other missing envelope. A real error envelope still has
+    # `type==envelope`, so it flows through and raises with its code as usual.
+    return _unwrap_envelope(real_envelope, args, returncode, stderr)
 
 
 def _envelope_schema(envelope: dict) -> str | None:
@@ -371,26 +379,46 @@ def _unwrap_envelope(
     return envelope.get("data")
 
 
-def _synthesize_lifecycle_result(
-    args: tuple[str, ...], stdout: str, stderr: str
-) -> dict:
-    """Success payload for a lifecycle command that exited 0 without an envelope.
+def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) -> dict:
+    """Success payload for a ``plain_ok`` command that exited 0 without an envelope.
 
-    ``comfy launch --background`` and ``comfy stop`` print human-readable text and
-    exit 0 instead of emitting an ``envelope/1`` object (BE-2953). For those
-    commands a clean exit IS the success signal, so we return a result dict
-    carrying whatever text comfy-cli printed (preferring stderr, per the CLI's
-    logging) rather than raising on the absent envelope — a false negative that
-    would invite a retry of a non-idempotent lifecycle action.
+    Some comfy-cli commands print human-readable text and exit 0 instead of
+    emitting an ``envelope/1`` object: the lifecycle verbs ``launch`` / ``stop``
+    (BE-2953) and ``model download`` (BE-3345), whose stderr carries the progress
+    tail (e.g. ``Done in 55.8s``) and the saved-path text. For those a clean exit
+    IS the success signal, so we return a result dict carrying whatever text
+    comfy-cli printed (preferring stderr, per the CLI's logging) rather than
+    raising on the absent envelope — a false negative that would invite a retry
+    of an action that already succeeded (a non-idempotent lifecycle change, or a
+    bandwidth-expensive multi-GB refetch).
+
+    The synthesized ``message`` is the only result data available without an
+    envelope, so it carries the printed text verbatim (capped). This path is a
+    stopgap: once comfy-cli emits an envelope for a verb, a real envelope always
+    wins in the ``_run_comfy`` fast-path and this synthesis is bypassed.
     """
+    # `action` is the subcommand path: the leading non-flag tokens, so `launch
+    # --background` -> "launch", `stop` -> "stop", `model download --url ...` ->
+    # "model download". Stops at the first flag so option values never leak in.
+    action_parts: list[str] = []
+    for arg in args:
+        if arg.startswith("-"):
+            break
+        action_parts.append(arg)
     text = " ".join(part.strip() for part in (stderr, stdout) if part.strip())
-    message = text or f"comfy {' '.join(args)} completed (exit 0)."
+    # Fallback echoes only the flag-free `action_parts`, never the raw args: a
+    # `model download` URL can carry a signed token / userinfo in its query
+    # string, and this message lands in the tool response and host-side logs.
+    message = text or f"comfy {' '.join(action_parts)} completed (exit 0)."
     return {
         "ok": True,
-        "action": args[0] if args else "",
-        "message": message[:1000],  # cap both real output and the fallback
+        "action": " ".join(action_parts),
+        # Keep the TAIL, not the front: `model download` streams verbose progress
+        # to stderr and the saved-path / `Done in …` metadata this payload exists
+        # to surface lands at the END, so a front slice would drop it as noise.
+        "message": message[-1000:],  # cap both real output and the fallback
         "note": (
-            "comfy-cli emitted no JSON envelope for this lifecycle command; "
+            "comfy-cli emitted no JSON envelope for this command; "
             "a clean exit is treated as success."
         ),
     }
@@ -1688,8 +1716,16 @@ def download_model(
 
     DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
     there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
-    such search), so the caller must already have the direct model URL. Returns
-    comfy-cli's envelope ``data`` (the saved path / download metadata).
+    such search), so the caller must already have the direct model URL.
+
+    ``comfy model download`` streams human progress text to stderr and exits 0
+    WITHOUT emitting an ``envelope/1`` object, so on that clean-exit success this
+    returns a synthesized payload — ``{"ok": True, "action": ..., "message":
+    ..., "note": ...}`` whose ``message`` carries the CLI's printed text (the
+    "Done in …" tail and saved-path line) — rather than envelope ``data``
+    (BE-3345). If comfy-cli starts emitting an envelope for this verb, that real
+    envelope wins and its ``data`` (the saved path / download metadata) is
+    returned instead. A non-zero exit still raises :class:`ComfyCliError`.
     """
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
@@ -1729,7 +1765,11 @@ def download_model(
     if filename:
         args += ["--filename", filename]
     # Generous timeout: multi-GB checkpoints can take a long time to fetch.
-    return _run_comfy(*args, timeout=1800.0)
+    # plain_ok=True: `comfy model download` exits 0 with human progress text and
+    # no envelope, so treat a clean exit as success instead of raising the
+    # "returned no JSON" false negative on a download that actually landed
+    # (BE-3345). A real error envelope or a non-zero exit still raises.
+    return _run_comfy(*args, timeout=1800.0, plain_ok=True)
 
 
 @mcp.tool()

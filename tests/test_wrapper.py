@@ -788,11 +788,166 @@ def test_plain_ok_does_not_leak_to_other_commands(patched_plain_run):
         server._run_comfy("env")
 
 
+def test_non_plain_ok_rejects_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON on the NORMAL path must NOT satisfy the contract.
+
+    Without `plain_ok`, an incidental object like `{"ok": true, "data": ...}`
+    (no `type==envelope`) must not be mis-unwrapped as a valid response — the
+    normal path passes `real_envelope`, so a stray diagnostic line raises the
+    "returned no JSON" error like any other missing envelope (CodeRabbit review).
+    """
+    patched_plain_run(0, stdout='{"ok": true, "data": {"x": 1}}\n')
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server._run_comfy("env")
+
+
 def test_plain_ok_still_honors_a_real_envelope(patched_run):
     """When comfy-cli DOES emit an envelope, plain_ok unwraps it normally."""
     patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
 
     assert server._run_comfy("launch", "--background", plain_ok=True) == {"pid": 7}
+
+
+# --- download_model: no JSON envelope on a successful fetch (BE-3345) -------
+
+
+def test_download_model_synthesizes_success_on_plain_exit(patched_plain_run):
+    """`comfy model download` streams text + exits 0, no envelope -> success.
+
+    The download landed on disk (exit 0), so instead of raising the
+    "returned no JSON" false negative — which would invite a bandwidth-expensive
+    retry of a multi-GB fetch — a success payload is synthesized carrying the
+    CLI's printed tail (where "Done in …" and the saved path live).
+    """
+    patched_plain_run(
+        0,
+        stderr="Downloading x.safetensors...\nDone in 55.8s. Saved to /models/x.safetensors",
+    )
+
+    result = server.download_model("https://hf.co/x.safetensors")
+
+    assert result["ok"] is True
+    assert result["action"] == "model download"
+    assert "Done in 55.8s" in result["message"]
+
+
+def test_download_model_nonzero_exit_still_raises(patched_plain_run):
+    """A real download failure (non-zero exit, no envelope) must still raise."""
+    patched_plain_run(1, stderr="HTTP 404: model not found")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.download_model("https://hf.co/missing.safetensors")
+
+
+def test_download_model_synthesizes_despite_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON line on a clean download exit is still success.
+
+    `_last_json_object` returns any JSON object (not just `type==envelope`), so a
+    diagnostic line that happens to parse must NOT be mistaken for a result
+    envelope and unwrapped into a spurious failure (BE-3345 edge case).
+    """
+    patched_plain_run(
+        0,
+        stdout='{"level": "info", "msg": "connection reused"}\n',
+        stderr="Done in 12.3s. Saved to /models/x.safetensors",
+    )
+
+    result = server.download_model("https://hf.co/x.safetensors")
+
+    assert result["ok"] is True
+    assert result["action"] == "model download"
+    assert "Done in 12.3s" in result["message"]
+
+
+def test_download_model_envelope_then_diagnostic_keeps_envelope_data(patched_plain_run):
+    """A real envelope FOLLOWED BY a diagnostic JSON line still wins (BE-3345).
+
+    `_last_json_object` prefers a `type==envelope` object over a later plain JSON
+    line, so a trailing diagnostic must NOT null out `real_envelope` and demote a
+    genuine success into the synthesized fast-path — the envelope's `data` (the
+    real saved-path metadata) must be returned, not the printed-text stopgap.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            '{"type": "envelope", "ok": true, "data": {"saved": "/models/x"}}\n'
+            '{"level": "info", "msg": "cleanup done"}\n'
+        ),
+    )
+
+    result = server.download_model("https://hf.co/x.safetensors")
+
+    assert result == {"saved": "/models/x"}
+
+
+def test_download_model_error_envelope_then_diagnostic_still_raises(patched_plain_run):
+    """An error envelope followed by a diagnostic line still raises, not synthesized.
+
+    Even on exit 0, a trailing diagnostic JSON line must not mask an earlier
+    error envelope as a synthesized success — the error envelope is preferred and
+    propagates its code (BE-3345).
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            '{"type": "envelope", "ok": false, '
+            '"error": {"code": "download_failed", "message": "checksum mismatch"}}\n'
+            '{"level": "info", "msg": "cleanup done"}\n'
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError, match=r"download_failed"):
+        server.download_model("https://hf.co/x.safetensors")
+
+
+def test_download_model_still_honors_a_real_error_envelope(patched_run):
+    """A real error envelope on download still raises with its code (not synthesized)."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "download_failed", "message": "checksum mismatch"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match=r"download_failed"):
+        server.download_model("https://hf.co/x.safetensors")
+
+
+def test_download_model_keeps_saved_path_tail_on_verbose_output(patched_plain_run):
+    """A verbose multi-GB fetch caps to the TAIL so the saved-path survives.
+
+    `comfy model download` streams progress noise ahead of the `Done in …` /
+    saved-path tail that the synthesized payload exists to surface. A front-slice
+    cap would drop that tail as noise, so the message must keep the last chars.
+    """
+    tail = "Done in 903.4s. Saved to /models/checkpoints/big.safetensors"
+    noise = "\n".join(f"Downloading... {i}% ({i * 40} MiB)" for i in range(100))
+    patched_plain_run(0, stderr=f"{noise}\n{tail}")
+
+    result = server.download_model("https://hf.co/big.safetensors")
+
+    assert result["ok"] is True
+    assert len(result["message"]) <= 1000
+    assert "Saved to /models/checkpoints/big.safetensors" in result["message"]
+
+
+def test_download_model_fallback_omits_url_when_no_output(patched_plain_run):
+    """The no-output fallback message must not echo the (possibly signed) URL.
+
+    A `model download` URL can carry a token / userinfo in its query string; the
+    synthesized fallback lands in the tool response and host logs, so it reports
+    only the flag-free `model download` action, never the raw args.
+    """
+    patched_plain_run(0)  # exit 0 with no stdout/stderr -> fallback message
+
+    result = server.download_model("https://hf.co/x.safetensors?sig=SECRETTOKEN")
+
+    assert result["ok"] is True
+    assert "SECRETTOKEN" not in result["message"]
+    assert "hf.co" not in result["message"]
+    assert "model download" in result["message"]
 
 
 def test_discover_maps_command_and_returns_data(patched_run):
