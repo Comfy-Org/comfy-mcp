@@ -788,6 +788,20 @@ def test_plain_ok_does_not_leak_to_other_commands(patched_plain_run):
         server._run_comfy("env")
 
 
+def test_non_plain_ok_rejects_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON on the NORMAL path must NOT satisfy the contract.
+
+    Without `plain_ok`, an incidental object like `{"ok": true, "data": ...}`
+    (no `type==envelope`) must not be mis-unwrapped as a valid response — the
+    normal path passes `real_envelope`, so a stray diagnostic line raises the
+    "returned no JSON" error like any other missing envelope (CodeRabbit review).
+    """
+    patched_plain_run(0, stdout='{"ok": true, "data": {"x": 1}}\n')
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server._run_comfy("env")
+
+
 def test_plain_ok_still_honors_a_real_envelope(patched_run):
     """When comfy-cli DOES emit an envelope, plain_ok unwraps it normally."""
     patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})

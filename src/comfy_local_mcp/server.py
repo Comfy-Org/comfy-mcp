@@ -302,7 +302,13 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     )
     if plain_ok and real_envelope is None and returncode == 0:
         return _synthesize_plain_result(args, stdout, stderr)
-    return _unwrap_envelope(envelope, args, returncode, stderr)
+    # Enforce the envelope contract on the normal path too: pass `real_envelope`
+    # (not `envelope`) so a stray non-envelope JSON line — e.g. an incidental
+    # `{"ok": true, "data": ...}` diagnostic — can't be mis-unwrapped as a valid
+    # response for a non-`plain_ok` tool; it raises the "returned no JSON" error
+    # like any other missing envelope. A real error envelope still has
+    # `type==envelope`, so it flows through and raises with its code as usual.
+    return _unwrap_envelope(real_envelope, args, returncode, stderr)
 
 
 def _envelope_schema(envelope: dict) -> str | None:
