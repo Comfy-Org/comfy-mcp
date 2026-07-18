@@ -70,7 +70,7 @@ def test_unwrap_rejects_incompatible_major_even_on_error_envelope():
 def test_incompatible_envelope_propagates_through_run_comfy(monkeypatch):
     """The assertion guards every tool: a bad-schema envelope raises via _run_comfy."""
 
-    def fake(cmd, **kwargs):  # noqa: ARG001
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
         import json
 
         out = json.dumps({"schema": "envelope/99", "type": "envelope", "ok": True})
@@ -220,7 +220,7 @@ def patched_env(monkeypatch):
 
         calls: list[dict] = []
 
-        def fake(cmd, **kwargs):  # noqa: ARG001
+        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
             calls.append({"cmd": cmd})
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=json.dumps(envelope), stderr=""
