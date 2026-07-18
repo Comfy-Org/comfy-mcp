@@ -1405,6 +1405,25 @@ def validate_workflow(workflow_path: str) -> Any:
     raises :class:`ComfyCliError` carrying comfy-cli's structured error code
     (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
     missing-model problem stays actionable instead of failing deep inside a run.
+
+    Known blind spots (upstream comfy-cli, fixes in progress): a passing result
+    does NOT currently guarantee the server will accept the workflow.
+
+    1. Missing required inputs are not detected — a node lacking a required
+       input (e.g. KSampler without ``seed``) validates clean, but the server
+       rejects it with ``required_input_missing``.
+    2. ``COMFY_DYNAMICCOMBO_V3`` inputs (e.g. ClaudeNode ``model``) are not
+       checked — invalid selection keys, missing required dotted sub-inputs
+       (``model.max_tokens``, …), and misspelled sub-keys all pass, yet the
+       server rejects with ``required_input_missing``.
+    3. Frontend/UI-export workflow files are not actually validated — wrapper
+       keys produce benign ``non_node_key`` warnings, zero nodes are checked,
+       and the result is vacuously valid. Ignore those ``non_node_key``
+       warnings (do not "fix" the file); export API format (or rely on
+       ``run_workflow``'s auto-conversion) if validation fidelity matters.
+
+    Treat ``valid:true`` as necessary-not-sufficient and rely on
+    ``run_workflow`` errors for final authority.
     """
     return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
 
