@@ -213,5 +213,6 @@ vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 Apache-2.0 (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)). It wraps the
 GPL-3.0 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) by shelling out to
-the `comfy` binary as a separate process — no GPL code is imported or linked, so
-no copyleft obligation carries over.
+the `comfy` binary as a separate process — no GPL code is imported or linked.
+`comfy-cli` remains GPL-3.0-licensed and is distributed separately; how its
+copyleft applies depends on how the programs interact.
