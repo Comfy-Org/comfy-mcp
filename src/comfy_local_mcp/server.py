@@ -597,14 +597,6 @@ async def _run_comfy_streaming(
             stderr_future.cancel()
 
 
-def _parse_version(text: str) -> tuple[int, int, int] | None:
-    """Extract a ``(major, minor, patch)`` tuple from a version string, or None."""
-    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
-    if match is None:
-        return None
-    return tuple(int(part) if part else 0 for part in match.groups())  # type: ignore[return-value]
-
-
 def _detect_comfy_cli_version() -> str | None:
     """Best-effort comfy-cli version via ``comfy --version`` (None if undetermined).
 
