@@ -1371,7 +1371,6 @@ def test_get_logs_caps_oversized_line(patched_run):
 
     assert lines[0] == "startup ok\n"  # short line untouched
     assert lines[2] == "loaded checkpoint\n"
-    assert len(lines[1]) <= server._MAX_LOG_LINE_CHARS + len(
-        server._TRACEBACK_TRUNCATION_MARKER
-    )
+    # TOTAL length (content + marker) never exceeds the hard cap.
+    assert len(lines[1]) <= server._MAX_LOG_LINE_CHARS
     assert lines[1].endswith(server._TRACEBACK_TRUNCATION_MARKER)
