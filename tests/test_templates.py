@@ -29,7 +29,7 @@ def _fake_run(envelope: dict):
     """Return a subprocess.run stand-in that captures the call and emits an envelope."""
     calls: list[dict] = []
 
-    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
         calls.append({"cmd": cmd, "env": env})
         return subprocess.CompletedProcess(
             cmd, 0, stdout=json.dumps(envelope), stderr=""
