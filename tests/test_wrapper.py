@@ -1123,3 +1123,153 @@ def test_run_workflow_error_envelope_empty_message_falls_back_to_stderr(monkeypa
     msg = str(excinfo.value)
     assert "execution_error" in msg  # the envelope's error code
     assert "kaboom" in msg  # the stderr fallback filled the empty message
+
+
+# --- bounded pipe-read pool: threads don't accumulate on the default executor -
+
+
+def test_pipe_executor_is_dedicated_and_bounded():
+    """The subprocess pipe reads run on their own bounded pool, not the default.
+
+    A dedicated `ThreadPoolExecutor` with a finite `max_workers` is what keeps
+    parked pipe-reader/waiter threads off asyncio's shared default executor, so
+    they can never starve unrelated `to_thread` work.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    assert isinstance(server._PIPE_EXECUTOR, ThreadPoolExecutor)
+    assert server._PIPE_EXECUTOR._max_workers == server._PIPE_POOL_MAX_WORKERS
+    assert server._PIPE_POOL_MAX_WORKERS >= 1  # bounded, non-zero
+
+
+def test_overlapping_streaming_runs_confine_and_release_pipe_threads(monkeypatch):
+    """N overlapping streaming runs keep their blocking pipe reads on the
+    dedicated pool and drain back to baseline once each run returns.
+
+    Each fake child emits its envelope then lingers with a blocked stderr pipe
+    (``read()`` never EOFs until the child is killed) — the exact shape that
+    parks a reader thread. This asserts the two halves of the fix together:
+
+    1. Isolation — every blocking ``readline`` / ``read`` / ``wait`` runs on a
+       ``_PIPE_EXECUTOR`` worker (``comfy-pipe`` prefix), NOT the loop's shared
+       default executor (whose threads are named ``asyncio_*``). On the old
+       ``asyncio.to_thread`` code these would land on the default pool and the
+       name assertion fails.
+    2. Baseline — after every run returns, no reader/waiter thread is still
+       parked: the ``finally`` joins the stderr reader once the child is dead
+       instead of leaving it parked on a cancelled future.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    n_runs = 6
+    parked = 0  # threads currently blocked in a fake pipe read / wait
+    peak_parked = 0
+    seen_thread_names: set[str] = set()
+    lock = threading.Lock()
+
+    # A generously sized dedicated pool so the test never deadlocks on a
+    # low-core host (a persistent stderr reader holds a slot for the whole run);
+    # the `comfy-pipe` prefix mirrors the real `_PIPE_EXECUTOR`.
+    test_pool = ThreadPoolExecutor(
+        max_workers=4 * n_runs, thread_name_prefix="comfy-pipe"
+    )
+    monkeypatch.setattr(server, "_PIPE_EXECUTOR", test_pool)
+
+    class _InstrumentedProc:
+        def __init__(self, cmd, lines):
+            self.cmd = cmd
+            self._lines = list(lines)
+            self.stdout = self
+            self.stderr = self
+            self.returncode = None
+            self.killed = False
+            self._dead = threading.Event()
+
+        def _record_thread(self):
+            with lock:
+                seen_thread_names.add(threading.current_thread().name)
+
+        def _block_until_dead(self):
+            nonlocal parked, peak_parked
+            self._record_thread()
+            with lock:
+                parked += 1
+                peak_parked = max(peak_parked, parked)
+            try:
+                self._dead.wait(timeout=10.0)  # real exit is kill(); bound as a guard
+            finally:
+                with lock:
+                    parked -= 1
+
+        def readline(self):
+            self._record_thread()
+            if self._lines:
+                return self._lines.pop(0)
+            self._block_until_dead()
+            return ""
+
+        def read(self):  # stderr.read — parks until the child is killed
+            self._block_until_dead()
+            return ""
+
+        def poll(self):
+            return self.returncode if self._dead.is_set() else None
+
+        def wait(self):
+            self._block_until_dead()
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self._dead.set()
+
+    procs: list[_InstrumentedProc] = []
+
+    def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
+        proc = _InstrumentedProc(cmd, list(_ENVELOPE_THEN_LINGER))
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.2)
+
+    async def _run_many():
+        return await asyncio.gather(
+            *[
+                server.run_workflow(f"wf{i}.json", wait=True, timeout_seconds=30.0)
+                for i in range(n_runs)
+            ]
+        )
+
+    try:
+        results = asyncio.run(_run_many())
+
+        assert results == [{"outputs": ["/x.png"]}] * n_runs
+        assert len(procs) == n_runs
+        assert all(p.killed for p in procs)  # every child reaped
+
+        # The runs genuinely overlapped: at least the N stderr readers were
+        # parked at once (proves this isn't trivially serialized).
+        assert peak_parked >= n_runs
+
+        # (1) Isolation: everything ran on the dedicated pool, never the default.
+        assert seen_thread_names, "expected pipe reads to run on worker threads"
+        assert all(name.startswith("comfy-pipe") for name in seen_thread_names), (
+            seen_thread_names
+        )
+
+        # (2) Baseline: no pipe thread stays parked after the runs return. The
+        # only laggard is each timed-out reap `wait`, released by kill(); poll
+        # briefly so a sub-millisecond unwind race isn't read as a leak.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with lock:
+                if parked == 0:
+                    break
+            time.sleep(0.01)
+        with lock:
+            assert parked == 0, f"{parked} pipe thread(s) still parked at baseline"
+    finally:
+        test_pool.shutdown(wait=True)

@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
@@ -69,6 +70,35 @@ _MAX_WATCH_TIMEOUT = 3600.0
 # its own, then fall through to the `finally` that kills it — never block on a
 # lingering child once the answer is already parsed.
 _POST_ENVELOPE_REAP_GRACE = 5.0
+
+# Dedicated, bounded thread pool for the blocking pipe reads / process waits in
+# `_run_comfy_streaming` (`stdout.readline`, `stderr.read`, `proc.wait`).
+#
+# Cancelling an `asyncio.to_thread` NEVER interrupts the underlying OS thread —
+# it stays parked on the pipe until the child is killed and its stdio closes.
+# On the success-envelope path the stderr reader is never awaited, only
+# cancelled, so it lingers until the `finally` kills the child (up to
+# `_POST_ENVELOPE_REAP_GRACE`). Running these on asyncio's shared *default*
+# executor means many concurrent `run_workflow(wait=True)` / `watch_job` calls
+# could pile parked readers/waiters onto that pool and starve unrelated
+# `to_thread` work for the grace window. Confining them to their own bounded
+# pool caps the blast radius to this pool; the `finally` block additionally
+# joins the stderr reader once the child is dead so it does not outlive the run.
+_PIPE_POOL_MAX_WORKERS = min(32, (os.cpu_count() or 1) + 4)
+_PIPE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_PIPE_POOL_MAX_WORKERS,
+    thread_name_prefix="comfy-pipe",
+)
+
+
+def _in_pipe_pool(func, *args):
+    """Off-load a blocking pipe read / process wait to the dedicated pool.
+
+    Mirrors :func:`asyncio.to_thread` but targets :data:`_PIPE_EXECUTOR`
+    instead of the loop's shared default executor, so subprocess pipe threads
+    can never saturate the pool other `to_thread` callers rely on.
+    """
+    return asyncio.get_running_loop().run_in_executor(_PIPE_EXECUTOR, func, *args)
 
 
 class ComfyCliError(RuntimeError):
@@ -287,7 +317,7 @@ async def _run_comfy_streaming(
         """
         assert proc.stdout is not None
         while True:
-            line = await asyncio.to_thread(proc.stdout.readline)
+            line = await _in_pipe_pool(proc.stdout.readline)
             if not line:  # EOF: comfy-cli closed stdout
                 return False
             lines.append(line)
@@ -307,7 +337,7 @@ async def _run_comfy_streaming(
 
     # Drain stderr concurrently so a chatty child can't deadlock on a full pipe.
     stderr_future = (
-        asyncio.ensure_future(asyncio.to_thread(proc.stderr.read))
+        asyncio.ensure_future(_in_pipe_pool(proc.stderr.read))
         if proc.stderr is not None
         else None
     )
@@ -323,7 +353,7 @@ async def _run_comfy_streaming(
             return True, None
         # EOF: the child has closed stdout, so a plain wait is safe and its
         # stderr is collectible for the error message.
-        returncode = await asyncio.to_thread(proc.wait)
+        returncode = await _in_pipe_pool(proc.wait)
         stderr = (await stderr_future) if stderr_future is not None else ""
         return False, _unwrap_envelope(
             _last_json_object("".join(lines)), args, returncode, stderr
@@ -364,7 +394,7 @@ async def _run_comfy_streaming(
         child_reaped = True
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
+                _in_pipe_pool(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
             )
         except (asyncio.TimeoutError, TimeoutError):
             child_reaped = False  # lingering child; `finally` reaps it
@@ -385,9 +415,18 @@ async def _run_comfy_streaming(
         # (timeout, a report_progress error, or normal completion).
         if proc.poll() is None:
             proc.kill()
-            await asyncio.to_thread(proc.wait)
+            await _in_pipe_pool(proc.wait)
+        # The child is now dead, so its stderr pipe has EOF'd and the parked
+        # reader's `read()` returns promptly. Awaiting the future JOINS that
+        # thread back into the pool before we return — cancelling alone would
+        # not (a cancelled `to_thread`/`run_in_executor` leaves the OS thread
+        # parked until the read actually unblocks). Guard against the read
+        # having raised so cleanup never masks the real result/exception.
         if stderr_future is not None and not stderr_future.done():
-            stderr_future.cancel()
+            try:
+                await stderr_future
+            except Exception:
+                pass
 
 
 @mcp.tool()
