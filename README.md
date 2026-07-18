@@ -9,7 +9,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Twenty-two tools, core loop validated end-to-end against a live local
+> **Status:** beta. Twenty-two tools, core loop validated end-to-end against a live local
 > ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -199,6 +199,14 @@ It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`
 **and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
 rather than fails, so it's safe to run anywhere — and the plain `pytest` gate stays
 green on CI runners that have neither.
+
+## Contributing
+
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
+setup (`pip install -e '.[dev]'`, `pytest`, `ruff`) and the thin-wrapper
+architecture rule, and [`AGENTS.md`](AGENTS.md) for the full guidelines. This
+project follows a [Code of Conduct](CODE_OF_CONDUCT.md). To report a
+vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License
 
