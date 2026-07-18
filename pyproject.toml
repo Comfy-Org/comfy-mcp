@@ -1,6 +1,6 @@
 [project]
 name = "comfy-local-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local MCP server for ComfyUI — a thin wrapper over comfy-cli."
 readme = "README.md"
 requires-python = ">=3.10"
