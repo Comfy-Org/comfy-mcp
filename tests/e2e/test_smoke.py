@@ -96,8 +96,8 @@ def test_no_model_round_trip(tmp_path):
     assert info, f"server_info() returned nothing usable: {info!r}"
 
     # 2. Run the checkpoint-free EmptyImage -> SaveImage workflow to completion.
-    # run_workflow became async when MCP progress streaming landed (PR #11), so
-    # drive its coroutine to completion here.
+    # run_workflow went async in #11 (MCP progress streaming); drive it to
+    # completion from this sync test the way a plain client would.
     result = asyncio.run(
         server.run_workflow(str(_WORKFLOW), wait=True, timeout_seconds=180.0)
     )

@@ -21,6 +21,7 @@ import subprocess
 import time
 
 import pytest
+from conftest import _OK_STREAM, _RecordingCtx
 
 from comfy_local_mcp import server
 
@@ -506,6 +507,104 @@ def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
     assert calls[0]["cmd"][4:] == ["stop"]
 
 
+# --- lifecycle commands with no JSON envelope (BE-2953) --------------------
+
+
+def _fake_run_plain(returncode: int, stdout: str = "", stderr: str = ""):
+    """`subprocess.run` stand-in emitting HUMAN text (no envelope) + a returncode.
+
+    Mirrors ``launch``/``stop``: comfy-cli prints plain text and exits without
+    ever writing an ``envelope/1`` object.
+    """
+    calls: list[dict] = []
+
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        calls.append({"cmd": cmd, "env": env})
+        return subprocess.CompletedProcess(
+            cmd, returncode, stdout=stdout, stderr=stderr
+        )
+
+    return fake, calls
+
+
+@pytest.fixture
+def patched_plain_run(monkeypatch):
+    """`setup(returncode, stdout, stderr) -> calls` for the no-envelope path."""
+
+    def setup(returncode: int, stdout: str = "", stderr: str = "") -> list[dict]:
+        fake, calls = _fake_run_plain(returncode, stdout, stderr)
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        return calls
+
+    return setup
+
+
+def test_stop_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
+    """`comfy stop` prints text + exits 0 with no envelope -> synthesized success."""
+    patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "stop"
+    assert "Stopped ComfyUI server" in result["message"]
+
+
+def test_launch_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
+    """`comfy launch --background` exits 0 with no envelope -> synthesized success."""
+    patched_plain_run(0, stdout="Launched ComfyUI in the background.")
+
+    result = server.launch_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "launch"
+    assert "Launched ComfyUI" in result["message"]
+
+
+def test_launch_comfyui_nonzero_exit_still_raises(patched_plain_run):
+    """A real launch failure (non-zero exit, no envelope) must still raise."""
+    patched_plain_run(1, stderr="Address already in use: port 8188")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.launch_comfyui()
+
+
+def test_plain_ok_synthesizes_despite_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON line on a clean lifecycle exit is still success.
+
+    `_last_json_object` returns any JSON object (not just `type==envelope`), so a
+    diagnostic line that happens to parse must NOT be mistaken for a result
+    envelope and unwrapped into a spurious failure (BE-2953 edge case).
+    """
+    patched_plain_run(
+        0,
+        stdout='{"level": "info", "msg": "bound port 8188"}\n',
+        stderr="Launched ComfyUI in the background.",
+    )
+
+    result = server.launch_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "launch"
+    assert "Launched ComfyUI" in result["message"]
+
+
+def test_plain_ok_does_not_leak_to_other_commands(patched_plain_run):
+    """Without plain_ok, an exit-0 command with no JSON still raises (unchanged)."""
+    patched_plain_run(0, stdout="not json")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server._run_comfy("env")
+
+
+def test_plain_ok_still_honors_a_real_envelope(patched_run):
+    """When comfy-cli DOES emit an envelope, plain_ok unwraps it normally."""
+    patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
+
+    assert server._run_comfy("launch", "--background", plain_ok=True) == {"pid": 7}
+
+
 def test_discover_maps_command_and_returns_data(patched_run):
     """discover wraps `comfy discover` and returns the envelope data verbatim."""
     surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
@@ -528,94 +627,6 @@ def test_which_maps_command_and_returns_data(patched_run):
 
 
 # --- streaming run_workflow(wait=True) -------------------------------------
-
-
-class _FakeProc:
-    """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
-
-    def __init__(self, cmd, stdout_text, stderr_text="", env=None, encoding=None):
-        self.cmd = cmd
-        self.env = env
-        self.encoding = encoding
-        self.stdout = io.StringIO(stdout_text)
-        self.stderr = io.StringIO(stderr_text)
-        self.returncode = 0
-        self.killed = False
-
-    def poll(self):
-        return self.returncode  # already "finished" once the stream is drained
-
-    def wait(self):
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-
-
-class _RecordingCtx:
-    """A fake FastMCP Context that records each ``report_progress`` call."""
-
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    async def report_progress(self, progress, total=None, message=None):
-        self.calls.append({"progress": progress, "total": total, "message": message})
-
-
-@pytest.fixture
-def patched_stream(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.Popen`` for the streaming path.
-
-    Returns ``setup(stdout_text) -> procs`` — the list capturing each spawned
-    ``_FakeProc`` (so the test can assert the command line that was run).
-    """
-
-    def setup(stdout_text: str) -> list[_FakeProc]:
-        procs: list[_FakeProc] = []
-
-        def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding)
-            procs.append(proc)
-            return proc
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
-        return procs
-
-    return setup
-
-
-# A queued event (2-node manifest), a per-node step progress event, two
-# node-completion events, then the success envelope on the last line.
-_OK_STREAM = (
-    "\n".join(
-        json.dumps(evt)
-        for evt in [
-            {
-                "schema": "event/1",
-                "type": "queued",
-                "nodes": [{"node_id": "1"}, {"node_id": "2"}],
-            },
-            {"schema": "event/1", "type": "executing", "node": "1", "title": "Load"},
-            {
-                "schema": "event/1",
-                "type": "progress",
-                "node": "1",
-                "completed": 5,
-                "total": 10,
-            },
-            {"schema": "event/1", "type": "executed", "node": "1", "title": "Load"},
-            {"schema": "event/1", "type": "executed", "node": "2", "title": "Save"},
-            {
-                "schema": "envelope/1",
-                "type": "envelope",
-                "ok": True,
-                "data": {"outputs": ["/x.png"]},
-            },
-        ]
-    )
-    + "\n"
-)
 
 
 def test_run_workflow_streams_progress_and_returns_data(patched_stream):
@@ -867,3 +878,289 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == ("run", "--workflow", "wf.json")  # no --wait
     assert seen["timeout"] == 60.0
+
+
+# --- restart_comfyui (stop -> launch composition) --------------------------
+
+
+def test_restart_comfyui_runs_stop_then_launch(patched_run):
+    """restart is a thin `comfy stop` then `comfy launch --background` composition."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
+
+    # patched_run's fake emits the same envelope for every call, so launch's
+    # data ({"pid": 7}) is what restart returns.
+    assert server.restart_comfyui() == {"pid": 7}
+
+    assert len(calls) == 2  # exactly stop then launch, nothing else
+    assert calls[0]["cmd"][4:] == ["stop"]
+    assert calls[1]["cmd"][4:] == ["launch", "--background"]
+
+
+def test_restart_comfyui_forwards_extra_args_to_launch(patched_run):
+    """extra_args ride the launch step after the `--` separator, not the stop."""
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    server.restart_comfyui(["--port", "8189"])
+
+    assert calls[0]["cmd"][4:] == ["stop"]  # stop takes no extras
+    assert calls[1]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
+
+
+def test_restart_comfyui_tolerates_no_recorded_server(monkeypatch):
+    """A failed stop (nothing recorded to stop) is swallowed; launch still runs."""
+    launched: list = []
+
+    def fake_stop():
+        raise server.ComfyCliError("comfy stop failed [no_recorded_server]: none")
+
+    def fake_launch(extra_args=None):
+        launched.append(extra_args)
+        return {"pid": 1}
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    assert server.restart_comfyui(["--cpu"]) == {"pid": 1}
+    assert launched == [["--cpu"]]  # launch happened despite the stop error
+
+
+def test_restart_comfyui_reraises_genuine_stop_failure(monkeypatch):
+    """A stop failure that ISN'T 'no recorded server' propagates — launch is skipped."""
+    launched: list = []
+
+    def fake_stop():
+        raise server.ComfyCliError(
+            "comfy stop failed [permission_denied]: cannot kill pid 7",
+            code="permission_denied",
+        )
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="permission_denied"):
+        server.restart_comfyui()
+    assert launched == []  # genuine failure is not masked by a relaunch
+
+
+def test_error_envelope_populates_structured_code(patched_run):
+    """ComfyCliError from an error envelope carries the code as an attribute, not just text."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+    assert excinfo.value.code == "server_not_running"
+
+
+def test_restart_comfyui_returns_new_server_status(monkeypatch):
+    """restart returns launch_comfyui's data (the fresh server status), not stop's."""
+    monkeypatch.setattr(server, "stop_comfyui", lambda: {"stopped": True})
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: {"pid": 42, "port": 8188}
+    )
+
+    assert server.restart_comfyui() == {"pid": 42, "port": 8188}
+
+
+# --- fetch_outputs inline image return -------------------------------------
+
+# A few bytes standing in for a PNG — Image just base64-encodes the file, it
+# does not decode/validate the pixels, so any bytes exercise the round-trip.
+_FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
+
+
+def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path):
+    """inline_images=True returns [metadata, Image...] for each downloaded image."""
+    (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert isinstance(result, list)
+    assert result[0] == {"downloaded": ["gen.png"]}  # metadata preserved first
+    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    assert len(images) == 1
+
+    content = images[0].to_image_content()
+    assert content.type == "image"
+    assert content.mimeType == "image/png"
+    import base64
+
+    assert base64.b64decode(content.data) == _FAKE_PNG  # the real file bytes
+
+
+def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
+    patched_run, tmp_path
+):
+    """Absolute image paths nested anywhere in the data (under out_dir) are found."""
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"jpeg-bytes")
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"files": [{"path": str(img), "node": "SaveImage"}]},
+        }
+    )
+
+    # The absolute path the data carries lives inside out_dir (comfy download -o
+    # writes there), so it is inlined.
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    assert len(images) == 1
+    assert images[0].to_image_content().mimeType == "image/jpeg"
+
+
+def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
+    patched_run, tmp_path
+):
+    """A real image referenced by the data but living OUTSIDE out_dir is not inlined.
+
+    comfy download only writes into out_dir, so an absolute/`..` path escaping it
+    is an input reference or a traversal, never a file this job produced.
+    """
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(_FAKE_PNG)  # a real image, but outside out_dir
+
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            # both an absolute escape and a ../ traversal that resolve outside
+            "data": {"abs": str(outside), "rel": "../elsewhere.png"},
+        }
+    )
+
+    result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
+
+    assert not any(isinstance(r, server.Image) for r in result)
+
+
+def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
+    patched_run, tmp_path, monkeypatch
+):
+    """A bare filename binds to the copy in out_dir, not a same-named file in the CWD."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "gen.png").write_bytes(_FAKE_PNG)  # the real output
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "gen.png").write_bytes(b"cwd-decoy-not-this-one")  # a CWD shadow
+    monkeypatch.chdir(cwd)
+
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+
+    result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    assert len(images) == 1
+    import base64
+
+    # the out_dir copy, never the CWD decoy
+    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+
+
+def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
+    """url_only downloads no bytes, so inline_images can't surface stale out_dir files."""
+    # A stale image from a prior run whose basename the emitted URL echoes.
+    (tmp_path / "old.png").write_bytes(_FAKE_PNG)
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"urls": ["http://localhost:8188/view/old.png"]},
+        }
+    )
+
+    result = server.fetch_outputs(
+        "pid", str(tmp_path), url_only=True, inline_images=True
+    )
+
+    # Bare envelope data — no [data, Image...] wrapping, no stale file inlined.
+    assert result == {"urls": ["http://localhost:8188/view/old.png"]}
+
+
+def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
+    """No more than _INLINE_IMAGE_MAX_COUNT images are inlined, however many exist."""
+    names = [f"g{i}.png" for i in range(server._INLINE_IMAGE_MAX_COUNT + 5)]
+    for name in names:
+        (tmp_path / name).write_bytes(_FAKE_PNG)
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": names}})
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    assert len(images) == server._INLINE_IMAGE_MAX_COUNT
+
+
+def test_fetch_outputs_inline_images_caps_aggregate_bytes(
+    patched_run, tmp_path, monkeypatch
+):
+    """Inlining stops once the aggregate byte budget would be exceeded."""
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 10)
+    for name in ("a.png", "b.png", "c.png"):
+        (tmp_path / name).write_bytes(b"1234567")  # 7 bytes each
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"downloaded": ["a.png", "b.png", "c.png"]},
+        }
+    )
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    images = [r for r in result if isinstance(r, server.Image)]
+    # first (7B) fits; second would push to 14B > 10B budget -> stop.
+    assert len(images) == 1
+
+
+def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tmp_path):
+    """Non-image outputs and dangling references yield no inline images."""
+    (tmp_path / "notes.txt").write_bytes(b"hello")
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {"downloaded": ["notes.txt", "ghost.png"]},
+        }
+    )
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert result[0] == {"downloaded": ["notes.txt", "ghost.png"]}
+    assert not any(isinstance(r, server.Image) for r in result)  # neither qualifies
+
+
+def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
+    """Inline return is additive: the `comfy download -o` copy command is unchanged."""
+    (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
+    calls = patched_run(
+        {"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}}
+    )
+
+    server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    # Same passthrough argv as the plain path — no --url-only, still copies bytes.
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", str(tmp_path)]
+
+
+def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
+    """Without inline_images the bare envelope data is returned (no list wrapping)."""
+    (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
+    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+
+    result = server.fetch_outputs("pid", str(tmp_path))
+
+    assert result == {"downloaded": ["gen.png"]}  # dict, not a [data, ...] list

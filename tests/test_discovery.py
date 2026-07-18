@@ -169,9 +169,11 @@ def test_nodes_categories_argv(monkeypatch):
 
 
 def test_search_models_query_uses_search(monkeypatch):
+    # BE-2952: comfy-cli 1.12's `models search` takes the query as `--text`,
+    # not a positional — a positional exits 2 ("returned no JSON (exit 2)").
     calls = _stub_comfy(monkeypatch, _ok(["sd_xl_base.safetensors"]))
     assert server.search_models(query="xl") == ["sd_xl_base.safetensors"]
-    assert calls[0][4:] == ["models", "search", "xl"]
+    assert calls[0][4:] == ["models", "search", "--text", "xl"]
 
 
 def test_search_models_folder_uses_list_folder(monkeypatch):
@@ -189,7 +191,7 @@ def test_search_models_empty_lists_folders(monkeypatch):
 def test_search_models_query_takes_precedence_over_folder(monkeypatch):
     calls = _stub_comfy(monkeypatch, _ok([]))
     server.search_models(query="xl", folder="checkpoints")
-    assert calls[0][4:] == ["models", "search", "xl"]
+    assert calls[0][4:] == ["models", "search", "--text", "xl"]
 
 
 def test_discovery_surfaces_error_envelope(monkeypatch):

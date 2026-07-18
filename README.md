@@ -9,7 +9,7 @@ It is a small, standalone codebase. Each tool shells out to the `comfy` command 
 `--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
 client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** early POC. Twenty-two tools, core loop validated end-to-end against a live local
+> **Status:** beta. Twenty-two tools, core loop validated end-to-end against a live local
 > ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -155,12 +155,13 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
-| `fetch_outputs(prompt_id, out_dir, url_only=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
+| `restart_comfyui(extra_args=None)` | `comfy stop` then `comfy launch --background [-- <extras>]` | Stop-then-launch the local ComfyUI (best-effort stop); forwards `extra_args` to the fresh server. Handy for relaunching with different flags. |
 | `discover()` | `comfy discover` | comfy-cli's self-describing surface (commands, arg schemas, error codes) — learn the CLI's own contract at runtime. |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
-| `search_templates(query="")` | `comfy templates ls` (filtered client-side) | Find a built-in workflow template by name/description; empty `query` lists all. |
+| `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type}]}`. |
 | `get_template(name)` | `comfy templates show <name>` | Show one template's details/schema before fetching it. |
 | `fetch_template(name, out_path)` | `comfy templates fetch <name> --out <path>` | Write a template's runnable workflow JSON to `out_path`; returns the absolute path for `run_workflow`. |
 | `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
@@ -199,6 +200,14 @@ It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`
 **and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
 rather than fails, so it's safe to run anywhere — and the plain `pytest` gate stays
 green on CI runners that have neither.
+
+## Contributing
+
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
+setup (`pip install -e '.[dev]'`, `pytest`, `ruff`) and the thin-wrapper
+architecture rule, and [`AGENTS.md`](AGENTS.md) for the full guidelines. This
+project follows a [Code of Conduct](CODE_OF_CONDUCT.md). To report a
+vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License
 
