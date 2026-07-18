@@ -605,6 +605,47 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(patched_plai
     assert "Done in 12.3s" in result["message"]
 
 
+def test_download_model_envelope_then_diagnostic_keeps_envelope_data(patched_plain_run):
+    """A real envelope FOLLOWED BY a diagnostic JSON line still wins (BE-3345).
+
+    `_last_json_object` prefers a `type==envelope` object over a later plain JSON
+    line, so a trailing diagnostic must NOT null out `real_envelope` and demote a
+    genuine success into the synthesized fast-path — the envelope's `data` (the
+    real saved-path metadata) must be returned, not the printed-text stopgap.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            '{"type": "envelope", "ok": true, "data": {"saved": "/models/x"}}\n'
+            '{"level": "info", "msg": "cleanup done"}\n'
+        ),
+    )
+
+    result = server.download_model("https://hf.co/x.safetensors")
+
+    assert result == {"saved": "/models/x"}
+
+
+def test_download_model_error_envelope_then_diagnostic_still_raises(patched_plain_run):
+    """An error envelope followed by a diagnostic line still raises, not synthesized.
+
+    Even on exit 0, a trailing diagnostic JSON line must not mask an earlier
+    error envelope as a synthesized success — the error envelope is preferred and
+    propagates its code (BE-3345).
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            '{"type": "envelope", "ok": false, '
+            '"error": {"code": "download_failed", "message": "checksum mismatch"}}\n'
+            '{"level": "info", "msg": "cleanup done"}\n'
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError, match=r"download_failed"):
+        server.download_model("https://hf.co/x.safetensors")
+
+
 def test_download_model_still_honors_a_real_error_envelope(patched_run):
     """A real error envelope on download still raises with its code (not synthesized)."""
     patched_run(
