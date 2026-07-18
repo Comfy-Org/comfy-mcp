@@ -554,6 +554,71 @@ def test_plain_ok_still_honors_a_real_envelope(patched_run):
     assert server._run_comfy("launch", "--background", plain_ok=True) == {"pid": 7}
 
 
+# --- download_model: no JSON envelope on a successful fetch (BE-3345) -------
+
+
+def test_download_model_synthesizes_success_on_plain_exit(patched_plain_run):
+    """`comfy model download` streams text + exits 0, no envelope -> success.
+
+    The download landed on disk (exit 0), so instead of raising the
+    "returned no JSON" false negative — which would invite a bandwidth-expensive
+    retry of a multi-GB fetch — a success payload is synthesized carrying the
+    CLI's printed tail (where "Done in …" and the saved path live).
+    """
+    patched_plain_run(
+        0,
+        stderr="Downloading x.safetensors...\nDone in 55.8s. Saved to /models/x.safetensors",
+    )
+
+    result = server.download_model("https://hf.co/x.safetensors")
+
+    assert result["ok"] is True
+    assert result["action"] == "model download"
+    assert "Done in 55.8s" in result["message"]
+
+
+def test_download_model_nonzero_exit_still_raises(patched_plain_run):
+    """A real download failure (non-zero exit, no envelope) must still raise."""
+    patched_plain_run(1, stderr="HTTP 404: model not found")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.download_model("https://hf.co/missing.safetensors")
+
+
+def test_download_model_synthesizes_despite_stray_non_envelope_json(patched_plain_run):
+    """A stray non-envelope JSON line on a clean download exit is still success.
+
+    `_last_json_object` returns any JSON object (not just `type==envelope`), so a
+    diagnostic line that happens to parse must NOT be mistaken for a result
+    envelope and unwrapped into a spurious failure (BE-3345 edge case).
+    """
+    patched_plain_run(
+        0,
+        stdout='{"level": "info", "msg": "connection reused"}\n',
+        stderr="Done in 12.3s. Saved to /models/x.safetensors",
+    )
+
+    result = server.download_model("https://hf.co/x.safetensors")
+
+    assert result["ok"] is True
+    assert result["action"] == "model download"
+    assert "Done in 12.3s" in result["message"]
+
+
+def test_download_model_still_honors_a_real_error_envelope(patched_run):
+    """A real error envelope on download still raises with its code (not synthesized)."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "download_failed", "message": "checksum mismatch"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match=r"download_failed"):
+        server.download_model("https://hf.co/x.safetensors")
+
+
 def test_discover_maps_command_and_returns_data(patched_run):
     """discover wraps `comfy discover` and returns the envelope data verbatim."""
     surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
