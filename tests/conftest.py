@@ -33,8 +33,10 @@ def _skip_version_guard(monkeypatch):
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
-    def __init__(self, cmd, stdout_text, stderr_text=""):
+    def __init__(self, cmd, stdout_text, stderr_text="", env=None, encoding=None):
         self.cmd = cmd
+        self.env = env
+        self.encoding = encoding
         self.stdout = io.StringIO(stdout_text)
         self.stderr = io.StringIO(stderr_text)
         self.returncode = 0
@@ -71,8 +73,8 @@ def patched_stream(monkeypatch):
     def setup(stdout_text: str) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
-        def fake_popen(cmd, stdout, stderr, text, env):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text)
+        def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
+            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding)
             procs.append(proc)
             return proc
 

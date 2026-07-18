@@ -19,7 +19,7 @@ def _stub_comfy(monkeypatch, envelope: dict):
     """Stub shutil.which + subprocess.run; return the list that records each argv."""
     calls: list[list[str]] = []
 
-    def fake(cmd, capture_output, text, timeout, env, check):  # noqa: ARG001
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
         calls.append(cmd)
         return subprocess.CompletedProcess(
             cmd, 0, stdout=json.dumps(envelope), stderr=""
