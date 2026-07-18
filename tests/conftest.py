@@ -45,7 +45,7 @@ class _FakeProc:
     def poll(self):
         return self.returncode  # already "finished" once the stream is drained
 
-    def wait(self):
+    def wait(self, timeout=None):  # noqa: ARG002
         return self.returncode
 
     def kill(self):
@@ -73,7 +73,7 @@ def patched_stream(monkeypatch):
     def setup(stdout_text: str) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
-        def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
+        def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
             proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding)
             procs.append(proc)
             return proc

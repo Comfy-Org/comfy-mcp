@@ -1119,7 +1119,7 @@ class _BlockingProc:
     def poll(self):
         return None if self._alive else self.returncode
 
-    def wait(self):
+    def wait(self, timeout=None):  # noqa: ARG002
         self._alive = False
         return self.returncode
 
@@ -1135,7 +1135,7 @@ def test_watch_job_times_out_returns_payload(monkeypatch):
     )
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
+    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
         proc = _BlockingProc(cmd, [queued + "\n"])
         procs.append(proc)
         return proc
@@ -1163,7 +1163,7 @@ def test_watch_job_times_out_reports_progress_without_ctx(monkeypatch):
     executed = json.dumps({"type": "executed", "node": "1"})
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env):  # noqa: ARG001
+    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
         proc = _BlockingProc(cmd, [queued + "\n", executed + "\n"])
         procs.append(proc)
         return proc
@@ -1223,6 +1223,238 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == ("run", "--workflow", "wf.json")  # no --wait
     assert seen["timeout"] == 60.0
+
+
+# --- BE-3343: timeout errors must surface the captured stdout/stderr tails ---
+# A crashed-and-wedged comfy-cli (e.g. the BE-3328 Windows UnicodeEncodeError)
+# wrote its diagnosis on stderr before being killed; the timeout handler used to
+# discard it, so the failure looked identical to a genuinely slow run.
+
+
+def test_tail_bounds_and_decodes():
+    """`_tail` hard-bounds length and decodes bytes defensively (never raises)."""
+    assert server._tail(None) == ""
+    assert server._tail("") == ""
+    assert server._tail(b"") == ""
+    assert server._tail("  hello  ") == "hello"  # stripped
+    # bytes decoded, invalid utf-8 replaced rather than raising
+    assert server._tail(b"cafe\xff") == "cafe\ufffd"
+    # a chatty child cannot inflate the payload past the bound (str and bytes)
+    assert server._tail("x" * 999, limit=500) == "x" * 500
+    assert len(server._tail(b"y" * 5000)) == 500
+    # limit<=0 must NOT return the whole string (the `[-0:]` trap), it means "none"
+    assert server._tail("anything", limit=0) == ""
+    assert server._tail(b"anything", limit=0) == ""
+    # slicing the raw bytes before decoding still yields the true tail
+    assert server._tail(b"z" * 100 + b"tail-marker", limit=20) == (
+        "z" * 9 + "tail-marker"
+    )
+
+
+def _timeout_run(stderr, stdout):
+    """A `subprocess.run` stand-in that raises TimeoutExpired with given captures."""
+
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+
+    return fake
+
+
+def test_sync_timeout_surfaces_bytes_stderr(monkeypatch):
+    """POSIX shape: TimeoutExpired carries bytes; the stderr traceback reaches the message."""
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        _timeout_run(
+            stderr=b"Traceback (most recent call last):\nUnicodeEncodeError: 'charmap'",
+            stdout=b"partial stdout",
+        ),
+    )
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("discover", timeout=60.0)
+    msg = str(exc.value)
+    assert "comfy-cli timed out after 60.0s" in msg  # prefix preserved verbatim
+    assert "UnicodeEncodeError" in msg  # the diagnosis is no longer discarded
+    assert "partial stdout" in msg
+
+
+def test_sync_timeout_surfaces_str_stderr(monkeypatch):
+    """Windows shape: run() re-communicates after the kill and returns str captures."""
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        _timeout_run(stderr="boom on stderr", stdout="half a line"),
+    )
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("discover", timeout=60.0)
+    msg = str(exc.value)
+    assert "boom on stderr" in msg
+    assert "half a line" in msg
+
+
+def test_sync_timeout_with_no_captures_is_sane(monkeypatch):
+    """None captures (nothing written before the kill) must not crash and read sanely."""
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess, "run", _timeout_run(stderr=None, stdout=None)
+    )
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("discover", timeout=60.0)
+    msg = str(exc.value)
+    assert "comfy-cli timed out after 60.0s" in msg
+    assert "stderr tail: <empty>" in msg
+    assert "stdout tail: <empty>" in msg
+
+
+class _BlockingProcWithStderr:
+    """A blocking Popen fake that also carries buffered stderr (a crashed child's traceback)."""
+
+    def __init__(self, cmd, first_lines, stderr_text):
+        self.cmd = cmd
+        self._lines = list(first_lines)
+        self.stdout = self  # readline lives on the proc itself
+        self.stderr = io.StringIO(stderr_text)
+        self.returncode = 0
+        self.killed = False
+        self._alive = True
+
+    def readline(self):
+        if self._lines:
+            return self._lines.pop(0)
+        time.sleep(1.0)  # outlives the test's tiny timeout, never yields the envelope
+        return ""
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+    def wait(self, timeout=None):  # noqa: ARG002
+        self._alive = False
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+
+def test_streaming_timeout_surfaces_stdout_and_stderr_tails(monkeypatch):
+    """A raising streaming timeout appends the NDJSON stdout tail and the child's stderr tail."""
+    queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
+    procs: list[_BlockingProcWithStderr] = []
+
+    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+        proc = _BlockingProcWithStderr(
+            cmd, [queued + "\n"], "Traceback ...\nUnicodeEncodeError: boom"
+        )
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run", "--workflow", "wf.json", timeout=0.25, ctx=_RecordingCtx()
+            )
+        )
+    msg = str(exc.value)
+    assert "comfy-cli timed out after 0.25s" in msg  # prefix preserved
+    assert "UnicodeEncodeError" in msg  # stderr tail surfaced after the kill
+    assert queued in msg  # the one NDJSON line the child emitted (stdout tail)
+    assert procs[0].killed  # child cleaned up
+
+
+def test_streaming_timeout_stdout_tail_is_bounded(monkeypatch):
+    """Even a chatty streaming child cannot inflate the raised message past the tail bound."""
+    noisy = [("x" * 100 + "\n") for _ in range(50)]  # 5000+ chars of NDJSON
+    procs: list[_BlockingProcWithStderr] = []
+
+    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+        proc = _BlockingProcWithStderr(cmd, noisy, "")
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run", "--workflow", "wf.json", timeout=0.25, ctx=_RecordingCtx()
+            )
+        )
+    msg = str(exc.value)
+    # only the bounded (<=500 char) tail of the 5000+ char stream is embedded
+    expected_tail = server._tail("".join(noisy))
+    assert len(expected_tail) == 500
+    assert expected_tail in msg
+    assert "".join(noisy).strip() not in msg  # the full blob never made it in
+
+
+class _StderrBlockingProc:
+    """stdout hits EOF fast; ``stderr.read()`` blocks past the timeout.
+
+    Reproduces the cancellation path: ``_drain`` finishes ``_pump`` + ``wait``
+    and then suspends at ``await stderr_future``, so the outer ``wait_for``
+    timeout cancels the future. Awaiting it in the handler re-raises
+    ``CancelledError`` (a ``BaseException``) — which must NOT escape and mask the
+    intended ``ComfyCliError``.
+    """
+
+    def __init__(self, cmd, stdout_lines):
+        self.cmd = cmd
+        self._lines = list(stdout_lines)
+        self.stdout = self  # readline lives on the proc
+        self.stderr = self  # read lives on the proc
+        self.returncode = 0
+        self.killed = False
+        self._alive = True
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else ""  # EOF -> _pump breaks
+
+    def read(self):
+        time.sleep(1.0)  # outlives the tiny timeout; suspends _drain at stderr_future
+        return ""
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+    def wait(self, timeout=None):  # noqa: ARG002
+        self._alive = False
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+
+def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
+    """A timeout that cancels the stderr read must still raise ComfyCliError, not CancelledError."""
+    queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
+
+    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+        return _StderrBlockingProc(cmd, [queued + "\n"])
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run", "--workflow", "wf.json", timeout=0.25, ctx=_RecordingCtx()
+            )
+        )
+    msg = str(exc.value)
+    assert (
+        "comfy-cli timed out after 0.25s" in msg
+    )  # the real error, not a masked cancel
+    assert queued in msg  # stdout tail still surfaced
+    assert (
+        "stderr tail: <empty>" in msg
+    )  # tail gathering was cancelled -> empty, best-effort
 
 
 # --- restart_comfyui (stop -> launch composition) --------------------------

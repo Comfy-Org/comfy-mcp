@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from typing import Any
@@ -144,10 +145,11 @@ class ComfyCliError(RuntimeError):
 
 
 def _parse_version(text: str) -> tuple[int, int, int] | None:
-    """Extract the first dotted numeric version (e.g. ``1.12.0``) from ``text``.
+    """Extract a dotted numeric version (e.g. ``1.12.0``) from ``text``.
 
-    Returns a ``(major, minor, patch)`` tuple (a missing patch defaults to 0), or
-    ``None`` when no version-looking token is present.
+    Prefers a token that follows the word "version" (see below), else the first
+    dotted-numeric token. Returns a ``(major, minor, patch)`` tuple (a missing
+    patch defaults to 0), or ``None`` when no version-looking token is present.
     """
     # Prefer a version token that follows the word "version" (comfy-cli prints
     # "comfy-cli, version X.Y.Z"), so we don't latch onto an earlier dotted
@@ -260,8 +262,14 @@ def _run_comfy_raw(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        # subprocess.run attaches whatever the child wrote before being killed
+        # (capture_output=True) to the exception — surface it so a crashed,
+        # wedged comfy-cli (e.g. a traceback on stderr) is not indistinguishable
+        # from a genuinely slow one. See BE-3343.
         raise ComfyCliError(
-            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+            f"stderr tail: {_tail(exc.stderr) or '<empty>'}; "
+            f"stdout tail: {_tail(exc.stdout) or '<empty>'}"
         ) from exc
 
     return (
@@ -332,6 +340,66 @@ def _envelope_major(envelope: dict) -> int | None:
         return None
     match = re.fullmatch(r"envelope/(\d+)", schema.strip())
     return int(match.group(1)) if match else None
+
+
+def _tail(text: str | bytes | None, limit: int = 500) -> str:
+    """Bounded tail of captured output; decodes bytes defensively.
+
+    On POSIX, ``TimeoutExpired.stdout``/``.stderr`` arrive as *bytes* even under
+    ``text=True`` (CPython quirk: ``communicate()`` raises with raw bytes; on
+    Windows ``run()`` re-communicates after the kill and returns ``str``), so
+    callers can hand us either. The ``limit`` hard-bounds the result so a chatty
+    child cannot inflate an error payload.
+    """
+    if not text or limit <= 0:
+        # ``[-0:]`` is ``[0:]`` (the whole string), so a non-positive limit would
+        # silently defeat the hard-bound; treat it as "no tail".
+        return ""
+    if isinstance(text, bytes):
+        # Slice the raw bytes before decoding so a huge capture doesn't incur a
+        # full decode+copy just to keep the last ``limit`` chars. UTF-8 is at
+        # most 4 bytes/char, so the last ``4 * limit`` bytes always contain
+        # enough to yield ``limit`` decoded chars (a leading byte may be dropped,
+        # which ``errors="replace"`` handles cleanly).
+        text = text[-4 * limit :].decode("utf-8", errors="replace")
+    return text.strip()[-limit:]
+
+
+def _kill_proc_tree(proc: subprocess.Popen) -> None:
+    """Kill the child *and* any grandchildren it spawned.
+
+    comfy-cli can fork a ComfyUI/helper grandchild that inherits the stderr
+    pipe's write-end; killing only the direct child leaves that fd open, so the
+    blocking ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees
+    EOF and the thread leaks — repeated timeouts then exhaust the default
+    ``to_thread`` pool and wedge the server. Killing the whole process group
+    (the child is spawned with ``start_new_session=True``, so it leads its own
+    group) closes every copy of the pipe. Falls back to a plain ``kill`` on
+    Windows / test fakes, where ``killpg`` is unavailable. (BE-3343)
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError, ValueError):
+        try:
+            proc.kill()
+        except (OSError, AttributeError):
+            pass
+
+
+def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Reap a (killed) child without blocking forever.
+
+    A child stuck in uninterruptible sleep (D state) can ignore ``SIGKILL``
+    indefinitely; ``Popen.wait(timeout=...)`` polls rather than blocking on it,
+    so the timeout handler returns promptly instead of leaking the reaper
+    thread. Best-effort: a still-unreaped child is left to the OS. (BE-3343)
+    """
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _unwrap_envelope(
@@ -567,6 +635,11 @@ async def _run_comfy_streaming(
         # corrupt to mojibake before _parse_event/_last_json_object.
         encoding="utf-8",
         env=env,
+        # Own process group so a timeout can kill the whole tree (child +
+        # grandchildren) and close every copy of the stderr pipe — otherwise a
+        # grandchild that inherited the fd keeps the blocking stderr read (and
+        # its to_thread worker) alive forever. See _kill_proc_tree. (BE-3343)
+        start_new_session=True,
     )
     lines: list[str] = []
     tracker = _StreamProgress()
@@ -612,15 +685,38 @@ async def _run_comfy_streaming(
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
                 return {"timed_out": True, "status": tracker.snapshot()}
+            # Surface what the child wrote before the deadline (BE-3343). Kill
+            # the whole tree FIRST so every copy of the stderr pipe closes and
+            # the drain returns the buffered output (a wedged child — or a
+            # grandchild holding the fd — would otherwise block the read).
+            if proc.poll() is None:
+                _kill_proc_tree(proc)
+                await asyncio.to_thread(_reap, proc)
+            stderr_tail = ""
+            if stderr_future is not None:
+                try:
+                    stderr_tail = _tail(await asyncio.wait_for(stderr_future, 2.0))
+                except (Exception, asyncio.CancelledError):
+                    # Diagnostics are best-effort: never let gathering the tail
+                    # mask the timeout itself. CancelledError is a BaseException
+                    # (not caught by `except Exception`) and DOES fire here: the
+                    # outer wait_for cancels _drain while it awaits stderr_future,
+                    # which cancels the future too — so awaiting it below re-raises
+                    # CancelledError. Swallow it so we still raise ComfyCliError.
+                    stderr_tail = ""
             raise ComfyCliError(
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}"
+                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+                f"stderr tail: {stderr_tail or '<empty>'}; "
+                # Slice to the last lines before joining so a chatty child's full
+                # stdout history isn't copied just to keep the 500-char tail.
+                f"stdout tail: {_tail(''.join(lines[-500:])) or '<empty>'}"
             ) from exc
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion).
         if proc.poll() is None:
-            proc.kill()
-            await asyncio.to_thread(proc.wait)
+            _kill_proc_tree(proc)
+            await asyncio.to_thread(_reap, proc)
         if stderr_future is not None and not stderr_future.done():
             stderr_future.cancel()
 
