@@ -1,17 +1,41 @@
 # comfy-local-mcp
 
+[![CI](https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Comfy-Org/comfy-local-mcp)](https://github.com/Comfy-Org/comfy-local-mcp/releases/latest)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.10-blue.svg)](https://www.python.org/downloads/)
+
 A local [MCP](https://modelcontextprotocol.io) server for **ComfyUI** — a thin wrapper over
 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) that lets AI agents (Claude Code, Claude
-Desktop, Cursor, …) drive your **local** ComfyUI: run workflows, wait on jobs, collect the
-resulting images, and inspect the nodes/models/templates your install actually has.
+Desktop, Cursor, …) drive your **local** ComfyUI.
 
-It is a small, standalone codebase. Each tool shells out to the `comfy` command with
-`--where local --json`, parses comfy-cli's `envelope/1` output, and returns it. There is no HTTP
-client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engine.
+**What it does:**
 
-> **Status:** beta. Twenty-two tools, core loop validated end-to-end against a live local
-> ComfyUI (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
+- 🖼️ **Generate** — run a workflow JSON (API-format or UI export), or go text-prompt → image in one call.
+- ⏱️ **Monitor jobs** — submit async, then wait / watch / cancel, read the failure verdict, and collect the output PNGs.
+- 🔍 **Introspect your live install** — search the nodes, models, and templates your ComfyUI *actually* has (custom nodes included), not a static catalog.
+- 🧩 **Build workflows** — validate a graph, edit a template's slots, and fan one workflow into variants.
+- ♻️ **Manage ComfyUI** — launch / stop / restart the server, tail its logs, and stage input assets.
+
+Each tool shells out to the `comfy` command with `--where local --json`, parses comfy-cli's
+`envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
+Cloud MCP** — comfy-cli is the engine.
+
+> **Status:** beta. 35 tools; core loop validated end-to-end against a live local ComfyUI
+> (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
+
+## Table of contents
+
+- [Prerequisites](#prerequisites)
+- [Partner-API nodes](#partner-api-nodes)
+- [Install](#install)
+- [Configure your AI client](#configure-your-ai-client)
+- [Quickstart](#quickstart)
+- [Tools](#tools)
+- [Smoke test](#smoke-test)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Prerequisites
 
@@ -24,6 +48,12 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
 - **A running ComfyUI.** ComfyUI must be **started before you use the tools** — launch it with
   `comfy launch` (or, from an agent, the `launch_comfyui` tool), and confirm it is up with
   `server_info`. Nothing here starts ComfyUI implicitly.
+
+<details>
+<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>)</summary>
+
+<br>
+
 - **`COMFY_BIN` override (optional).** By default the server calls `comfy` from `PATH`. MCP
   clients launch the server with their own environment, which often does **not** include your
   shell's `PATH` — so if `comfy` lives in a virtualenv or a non-standard location, set
@@ -35,6 +65,8 @@ client and **no code shared with the Comfy Cloud MCP** — comfy-cli is the engi
   minimal environment, so a key from your shell won't reach it. Set `COMFY_API_KEY` in the
   client registration `env` block. See **[Partner-API nodes](#partner-api-nodes)** below for the
   full precedence chain; every client example shows where it goes.
+
+</details>
 
 ## Partner-API nodes
 
@@ -183,26 +215,46 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-Thirty-two tools. Every tool runs `comfy` with the global `--json --where local` flags, unwraps
-comfy-cli's `envelope/1`, and returns its `data`.
+35 tools, grouped below by what they do. Every tool runs `comfy` with the global
+`--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
-| Tool | Wraps | Purpose |
+### Run and monitor
+
+| Tool | Wraps | What it does |
 |---|---|---|
-| `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. **Call first.** |
-| `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
+| `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy generate --prompt <prompt> [--checkpoint <ckpt>]` | Text prompt → image in one call — comfy-cli owns the graph/checkpoint injection, so no hand-assembled workflow needed. Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
+| `get_execution_error(prompt_id)` | `comfy jobs status <prompt_id>` | Compact failure verdict for a failed run — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; returns `error: None` on a healthy prompt. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
-| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Wraps `comfy download --where local` to write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
-| `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
-| `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
-| `restart_comfyui(extra_args=None)` | `comfy stop` then `comfy launch --background [-- <extras>]` | Stop-then-launch the local ComfyUI (best-effort stop); forwards `extra_args` to the fresh server. Handy for relaunching with different flags. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+
+### Diagnostics
+
+| Tool | Wraps | What it does |
+|---|---|---|
+| `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. **Call first.** |
+| `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
+| `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
 | `get_logs(tail=200)` | `comfy logs --tail <tail>` | Tail the background ComfyUI's captured log (`<workspace>/user/comfyui_<port>.log`) — closes the debugging loop after a detached `launch_comfyui`. Returns `{lines, path, truncated}`; a missing log file returns `{"error": "no_log_file", …}` rather than raising. |
 | `discover()` | `comfy discover` | comfy-cli's self-describing surface (commands, arg schemas, error codes) — learn the CLI's own contract at runtime. |
-| `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
+
+### Workflow building
+
+| Tool | Wraps | What it does |
+|---|---|---|
+| `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
+| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
+| `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
+| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
+
+### Discovery and templates
+
+| Tool | Wraps | What it does |
+|---|---|---|
 | `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type}]}`. |
 | `get_template(name)` | `comfy templates show <name>` | Show one template's details/schema before fetching it. |
 | `fetch_template(name, out_path)` | `comfy templates fetch <name> --out <path>` | Write a template's runnable workflow JSON to `out_path`; returns the absolute path for `run_workflow`. |
@@ -215,11 +267,16 @@ comfy-cli's `envelope/1`, and returns its `data`.
 | `nodes_types()` | `comfy nodes types` | All connection types (`MODEL`, `IMAGE`, …) ranked by connectivity. Reads the **live install**. |
 | `nodes_categories()` | `comfy nodes categories` | The node category tree. Reads the **live install**. |
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
+
+### Lifecycle and assets
+
+| Tool | Wraps | What it does |
+|---|---|---|
+| `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
+| `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
+| `restart_comfyui(extra_args=None)` | `comfy stop` then `comfy launch --background [-- <extras>]` | Stop-then-launch the local ComfyUI (best-effort stop); forwards `extra_args` to the fresh server. Handy for relaunching with different flags. |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
-| `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
-| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
-| `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
-| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
+| `download_model(url, relative_path=None, filename=None)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>]` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. |
 
 Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream` /
 `nodes_downstream` / `nodes_path` / `nodes_types` / `nodes_categories`) and `search_models`
