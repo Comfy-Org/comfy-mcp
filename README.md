@@ -1,13 +1,32 @@
-# comfy-local-mcp
+<div align="center">
 
-[![CI](https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Comfy-Org/comfy-local-mcp)](https://github.com/Comfy-Org/comfy-local-mcp/releases/latest)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.10-blue.svg)](https://www.python.org/downloads/)
+<img src="assets/logo.svg" alt="Comfy" width="160"/>
 
-A local [MCP](https://modelcontextprotocol.io) server for **ComfyUI** — a thin wrapper over
-[`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) that lets AI agents (Claude Code, Claude
-Desktop, Cursor, …) drive your **local** ComfyUI.
+<h1>Comfy Local MCP</h1>
+
+**Drive your local [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any MCP-speaking AI agent — a local [MCP](https://modelcontextprotocol.io) server built on [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).**
+
+<p>
+  <a href="https://github.com/comfyanonymous/ComfyUI"><img src="https://img.shields.io/badge/ComfyUI-local-blue?style=for-the-badge" alt="ComfyUI local"></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-Compatible-green?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiPjxwYXRoIGQ9Ik0xMiAyTDIgN2wxMCA1IDEwLTUtMTAtNXoiLz48cGF0aCBkPSJNMiAxN2wxMCA1IDEwLTUiLz48cGF0aCBkPSJNMiAxMmwxMCA1IDEwLTUiLz48L3N2Zz4=" alt="MCP"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-%E2%89%A5%203.10-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python"></a>
+</p>
+
+<p>
+  <a href="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml"><img src="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Comfy-Org/comfy-local-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/Comfy-Org/comfy-local-mcp" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+</p>
+
+<p>
+  <a href="#install"><strong>Install</strong></a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#tools">Tools</a> ·
+  <a href="#configure-your-ai-client">Configure your client</a> ·
+  <a href="#contributing">Contributing</a>
+</p>
+
+</div>
 
 **What it does:**
 
