@@ -30,6 +30,19 @@ def _skip_version_guard(monkeypatch):
     monkeypatch.setattr(server, "_version_checked", True)
 
 
+@pytest.fixture(autouse=True)
+def _clear_comfyui_target_env(monkeypatch):
+    """Default every test to the LOCAL target (no configured remote ComfyUI).
+
+    The run/queue tools forward ``--host`` / ``--port`` when ``COMFYUI_URL`` /
+    ``COMFYUI_HOST`` is set (see ``server._comfy_target``). A stray value in the
+    ambient environment would perturb the exact-argv assertions across the suite,
+    so clear all three here; the remote-targeting tests set them explicitly.
+    """
+    for var in ("COMFYUI_URL", "COMFYUI_HOST", "COMFYUI_PORT"):
+        monkeypatch.delenv(var, raising=False)
+
+
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
