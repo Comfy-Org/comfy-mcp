@@ -117,8 +117,12 @@ By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at 
 **elsewhere** — e.g. a GPU box reachable over a private network (Tailscale) — by setting one of:
 
 - **`COMFYUI_URL`** — a full URL, e.g. `http://gpu-box:8188` (host-only is fine; port defaults to
-  `8188`). Takes precedence over the pair below.
+  `8188`). Takes precedence over the pair below. Only the **host and port** are forwarded to
+  comfy-cli, so the URL must be plain `http://` with **no base path**: an `https://` scheme or a
+  reverse-proxy path (`http://gpu-box:8188/comfyui`) is rejected rather than silently downgraded to
+  http / dropped. Front a TLS/base-path proxy locally if you need one.
 - **`COMFYUI_HOST`** (+ optional **`COMFYUI_PORT`**, default `8188`) — e.g. `COMFYUI_HOST=gpu-box`.
+  A port without a host (setting only `COMFYUI_PORT`) is rejected — set the host too.
 
 Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set,
 behavior is unchanged (local `127.0.0.1:8188`).

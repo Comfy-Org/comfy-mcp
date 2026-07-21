@@ -129,6 +129,79 @@ def test_target_port_out_of_range_raises(monkeypatch):
         server._comfy_target()
 
 
+def test_target_url_https_scheme_rejected(monkeypatch):
+    """https:// can't be forwarded (comfy-cli speaks http) -> reject, don't downgrade."""
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example:8188")
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        server._comfy_target()
+
+
+def test_target_url_with_path_rejected(monkeypatch):
+    """A reverse-proxy base path can't be forwarded -> reject, don't silently drop."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/comfyui")
+    with pytest.raises(server.ComfyCliError, match="path"):
+        server._comfy_target()
+
+
+def test_target_url_root_path_allowed(monkeypatch):
+    """A bare trailing slash is not a real base path -> accepted."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001/")
+    assert server._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
+
+
+def test_target_url_port_zero_rejected(monkeypatch):
+    """`:0` must not silently collapse to 8188 (the COMFYUI_PORT path rejects 0)."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:0")
+    with pytest.raises(server.ComfyCliError, match="out of range"):
+        server._comfy_target()
+
+
+def test_target_url_unbalanced_ipv6_raises_comfy_error(monkeypatch):
+    """A malformed URL (`http://[::1`) surfaces as ComfyCliError, not raw ValueError."""
+    monkeypatch.setenv("COMFYUI_URL", "http://[::1")
+    with pytest.raises(server.ComfyCliError, match="malformed"):
+        server._comfy_target()
+
+
+def test_target_url_redacts_userinfo_in_error(monkeypatch):
+    """A credential embedded in COMFYUI_URL is not echoed raw in the error message."""
+    monkeypatch.setenv("COMFYUI_URL", "https://user:sekret@gpu.example:8188")
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._comfy_target()
+    assert "sekret" not in str(excinfo.value)
+    assert "***@gpu.example" in str(excinfo.value)
+
+
+def test_target_host_strips_ipv6_brackets(monkeypatch):
+    """A bracketed COMFYUI_HOST is normalized bare, matching the URL path's hostname."""
+    monkeypatch.setenv("COMFYUI_HOST", "[::1]")
+    assert server._comfy_target() == (
+        "::1",
+        server.DEFAULT_COMFYUI_PORT,
+        "COMFYUI_HOST",
+    )
+
+
+def test_target_port_without_host_raises(monkeypatch):
+    """COMFYUI_PORT alone must not silently fall back to the local default."""
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    with pytest.raises(server.ComfyCliError, match="COMFYUI_HOST is not"):
+        server._comfy_target()
+
+
+def test_local_only_verb_survives_malformed_config(patched_run, monkeypatch):
+    """A malformed COMFYUI_URL must not brick local-only verbs (env/download/...)."""
+    monkeypatch.setenv(
+        "COMFYUI_URL", "https://gpu.example"
+    )  # scheme rejected by _comfy_target
+    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+
+    # `env` never touches the remote, so it must run despite the bad config.
+    server._run_comfy("env")
+
+    assert calls[0]["cmd"][4:] == ["env"]
+
+
 # --- forwarding into _run_comfy (plain --json path) ------------------------
 
 
@@ -284,3 +357,14 @@ def test_server_info_omits_target_when_local(monkeypatch):
     result = server.server_info()
 
     assert "comfy_target" not in result  # no remote configured -> no block
+
+
+def test_server_info_reports_malformed_target_as_data(monkeypatch):
+    """A malformed remote config surfaces as a diagnostic field, not a hard failure."""
+    _patch_env_for_server_info(monkeypatch)
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")
+
+    result = server.server_info()
+
+    assert "error" in result["comfy_target"]
+    assert result["running"] is False  # local `comfy env` data still returned

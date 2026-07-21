@@ -333,6 +333,40 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
 
 
+def _redact_url(url: str) -> str:
+    """Return ``url`` with any ``user:pass@`` userinfo masked to ``***@``.
+
+    :class:`ComfyCliError` messages echo the offending config value and may reach
+    the MCP client or logs, so a credential embedded in ``COMFYUI_URL`` (e.g.
+    ``http://user:token@host``) must not be surfaced raw. Only the netloc
+    (scheme-separator up to the first path/query/fragment delimiter) is inspected
+    so a stray ``@`` in a path can't confuse the masking.
+    """
+    scheme_sep = url.find("://")
+    start = scheme_sep + 3 if scheme_sep != -1 else 0
+    end = len(url)
+    for delim in ("/", "?", "#"):
+        i = url.find(delim, start)
+        if i != -1:
+            end = min(end, i)
+    netloc = url[start:end]
+    if "@" in netloc:
+        return url[:start] + "***@" + netloc.rsplit("@", 1)[1] + url[end:]
+    return url
+
+
+def _strip_brackets(host: str) -> str:
+    """Strip surrounding ``[...]`` from a bracketed IPv6 host for consistency.
+
+    ``urlparse`` already returns an IPv6 ``.hostname`` bracket-free, so normalize
+    a bracketed ``COMFYUI_HOST`` (``[::1]``) the same way — both config paths then
+    forward a bare host to comfy-cli, which re-brackets it when building its URL.
+    """
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
 def _comfy_target() -> tuple[str, int, str] | None:
     """Resolve the configured ComfyUI ``(host, port, source)``, or None for local.
 
@@ -342,32 +376,66 @@ def _comfy_target() -> tuple[str, int, str] | None:
     tools stay byte-identical to the local-only default (no ``--host`` forwarded,
     comfy-cli's own 127.0.0.1:8188). Raises :class:`ComfyCliError` on a set but
     malformed value rather than silently retargeting to the wrong place.
+
+    comfy-cli's ``--host`` / ``--port`` carry only a host and port, so a
+    ``COMFYUI_URL`` that also names a non-``http`` scheme (``https://``) or a base
+    path (``/comfyui``) is REJECTED rather than silently dropped — otherwise a
+    user asking for TLS or a reverse-proxy path would be quietly downgraded.
     """
     url = os.environ.get("COMFYUI_URL", "").strip()
     if url:
         # urlparse needs a scheme to populate .hostname/.port; a bare
         # "host:port" is otherwise read as scheme:path. Prefix "//" so a
-        # scheme-less value parses as a netloc.
-        parsed = urlparse(url if "://" in url else f"//{url}")
+        # scheme-less value parses as a netloc. urlparse itself raises
+        # ValueError on a malformed value (e.g. an unbalanced IPv6 bracket
+        # "http://[::1"), so it lives inside the try alongside the .port access.
         try:
+            parsed = urlparse(url if "://" in url else f"//{url}")
             host, port = parsed.hostname, parsed.port
-        except ValueError as exc:  # out-of-range / non-numeric port in the URL
+        except ValueError as exc:  # bad port, or malformed URL (IPv6 brackets)
             raise ComfyCliError(
-                f"COMFYUI_URL has an invalid port: {url!r} ({exc})."
+                f"COMFYUI_URL is malformed: {_redact_url(url)!r} ({exc})."
             ) from exc
+        if parsed.scheme and parsed.scheme != "http":
+            raise ComfyCliError(
+                f"COMFYUI_URL scheme {parsed.scheme!r} is not supported "
+                f"({_redact_url(url)!r}): comfy-cli's --host/--port speak plain "
+                "http only, so an https:// target would be silently downgraded. "
+                "Use http://<host>:<port>."
+            )
+        if parsed.path not in ("", "/"):
+            raise ComfyCliError(
+                f"COMFYUI_URL must not include a path ({_redact_url(url)!r}): "
+                "comfy-cli forwards only host/port, so a reverse-proxy base path "
+                "would be dropped. Point COMFYUI_URL at the bare host:port."
+            )
         if not host:
             raise ComfyCliError(
-                f"COMFYUI_URL is set but names no host: {url!r}. "
+                f"COMFYUI_URL is set but names no host: {_redact_url(url)!r}. "
                 "Use e.g. http://<host>:8188 (or set COMFYUI_HOST/COMFYUI_PORT)."
             )
-        return host, port or DEFAULT_COMFYUI_PORT, "COMFYUI_URL"
+        # `port or DEFAULT` alone would treat an explicit :0 as absent and
+        # silently target 8188; reject it to match the COMFYUI_PORT path.
+        if port == 0:
+            raise ComfyCliError(
+                f"COMFYUI_URL port is out of range (1-65535): {_redact_url(url)!r}."
+            )
+        return _strip_brackets(host), port or DEFAULT_COMFYUI_PORT, "COMFYUI_URL"
 
     host = os.environ.get("COMFYUI_HOST", "").strip()
-    if not host:
-        return None
     raw_port = os.environ.get("COMFYUI_PORT", "").strip()
+    if not host:
+        # A port alone does not select a remote; raise rather than silently
+        # ignoring it and defaulting back to the local 127.0.0.1:8188.
+        if raw_port:
+            raise ComfyCliError(
+                "COMFYUI_PORT is set but COMFYUI_HOST is not; a port alone does "
+                "not select a remote. Set COMFYUI_HOST (or COMFYUI_URL) to "
+                "target a remote ComfyUI."
+            )
+        return None
     if not raw_port:
-        return host, DEFAULT_COMFYUI_PORT, "COMFYUI_HOST"
+        return _strip_brackets(host), DEFAULT_COMFYUI_PORT, "COMFYUI_HOST"
     try:
         port = int(raw_port)
     except ValueError as exc:
@@ -376,7 +444,7 @@ def _comfy_target() -> tuple[str, int, str] | None:
         ) from exc
     if not (1 <= port <= 65535):
         raise ComfyCliError(f"COMFYUI_PORT is out of range (1-65535): {port}.")
-    return host, port, "COMFYUI_HOST"
+    return _strip_brackets(host), port, "COMFYUI_HOST"
 
 
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
@@ -389,8 +457,15 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     subcommand that doesn't accept the flags (see :data:`_TARGET_AWARE_SUBCOMMANDS`),
     so unconfigured behavior is byte-identical to today.
     """
+    # Check the verb FIRST, then resolve the target. A malformed
+    # COMFYUI_URL/PORT must not brick local-only verbs (server_info's `env`,
+    # download, the stop/logs lifecycle) that never touch the remote — they'd
+    # otherwise raise ComfyCliError here despite ignoring the target entirely,
+    # breaking the "local behavior unchanged" contract (BE-3869 review).
+    if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
+        return args
     target = _comfy_target()
-    if target is None or not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
+    if target is None:
         return args
     host, port, _source = target
     return (*args, "--host", host, "--port", str(port))
@@ -1141,18 +1216,31 @@ def server_info() -> Any:
     compat["envelope_schema"] = _envelope_schema(envelope)
     report = dict(data) if isinstance(data, dict) else {"env": data}
     report["compatibility"] = compat
-    target = _comfy_target()
-    if target is not None:
-        host, port, source = target
+    # server_info is the "call first" diagnostic, so surface a malformed remote
+    # config as a data field rather than raising — an agent debugging its env
+    # then sees WHAT is wrong instead of an opaque failure of the whole tool.
+    try:
+        target = _comfy_target()
+    except ComfyCliError as exc:
         report["comfy_target"] = {
-            "host": host,
-            "port": port,
-            "source": source,
+            "error": str(exc),
             "note": (
-                "run/queue tools target this remote ComfyUI via --host/--port; "
-                "the env fields above describe the LOCAL comfy-cli install."
+                "COMFYUI_URL/COMFYUI_HOST is set but malformed; the run/queue "
+                "tools will raise this same error until it is fixed."
             ),
         }
+    else:
+        if target is not None:
+            host, port, source = target
+            report["comfy_target"] = {
+                "host": host,
+                "port": port,
+                "source": source,
+                "note": (
+                    "run/queue tools target this remote ComfyUI via --host/--port; "
+                    "the env fields above describe the LOCAL comfy-cli install."
+                ),
+            }
     return report
 
 
