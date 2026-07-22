@@ -1182,6 +1182,28 @@ def _check_comfy_cli_version() -> dict:
     return report
 
 
+def _freshness_report() -> Any:
+    """Best-effort installed-vs-latest report via ``comfy outdated``.
+
+    Returns the ``comfy outdated`` payload (``core`` install status, one row per
+    custom node ``packs`` entry, ``checked_at``) on success. On ANY
+    :class:`ComfyCliError` — the verb missing on an older comfy-cli, the network
+    lookup down, a timeout — returns ``{"error": "<reason>"}`` instead of
+    raising, so the probe can never take ``server_info`` down with it.
+    ``OSError`` is caught for the same reason: a spawn failure on this second
+    subprocess (the env probe already succeeded) is still just the freshness
+    probe failing, never grounds to fail ``server_info``. ``UnicodeDecodeError``
+    is caught too: ``_run_comfy_raw`` decodes the child's stdout with strict
+    ``encoding="utf-8"`` (no ``errors="replace"``), so non-UTF-8 bytes in a
+    pack name/path from the user's live custom-node install can raise it here,
+    same as the other probe failures above.
+    """
+    try:
+        return _run_comfy("outdated", timeout=15.0)
+    except (ComfyCliError, OSError, UnicodeDecodeError) as exc:
+        return {"error": str(exc)}
+
+
 @mcp.tool()
 def server_info() -> Any:
     """Report the local ComfyUI / comfy-cli environment and verify compatibility.
@@ -1199,6 +1221,17 @@ def server_info() -> Any:
     ``compatibility`` block (detected version, floor, envelope schema, warnings)
     alongside the ``comfy env`` data.
 
+    Also attaches a ``freshness`` block (``comfy outdated``): ``core``
+    (installed vs latest ComfyUI, with an ``outdated`` bool) and ``packs`` (one
+    row per installed custom node pack). If ``freshness.core.outdated`` is true
+    or any pack row has ``outdated: true``, the install is STALE — when a model,
+    node, or template seems missing, tell the user to update FIRST
+    (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
+    before concluding the catalog lacks it; silent staleness is the usual
+    culprit. The probe is best-effort: on a comfy-cli without the ``outdated``
+    verb, a network failure, or a timeout, ``freshness`` degrades to
+    ``{"error": "<reason>"}`` — ``server_info`` itself still succeeds.
+
     Remote target: when a remote ComfyUI is configured (``COMFYUI_URL`` or
     ``COMFYUI_HOST`` — see :func:`_comfy_target`), a ``comfy_target`` block is
     attached reporting the ``host`` / ``port`` the run/queue tools drive, so an
@@ -1214,8 +1247,10 @@ def server_info() -> Any:
     data = _unwrap_envelope(envelope, args, returncode, stderr)
     compat = _check_comfy_cli_version()
     compat["envelope_schema"] = _envelope_schema(envelope)
+    freshness = _freshness_report()
     report = dict(data) if isinstance(data, dict) else {"env": data}
     report["compatibility"] = compat
+    report["freshness"] = freshness
     # server_info is the "call first" diagnostic, so surface a malformed remote
     # config as a data field rather than raising — an agent debugging its env
     # then sees WHAT is wrong instead of an opaque failure of the whole tool.
