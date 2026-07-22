@@ -61,6 +61,9 @@ Cloud MCP** — comfy-cli is the engine.
 - **Python ≥ 3.10.**
 - **comfy-cli ≥ 1.12.0** on your `PATH`: `pip install 'comfy-cli>=1.12.0'`. This is the engine
   every tool wraps; the server refuses to run against an older comfy-cli with an upgrade message.
+  The `server_info` `freshness` block additionally needs the first comfy-cli release **after**
+  1.12.0 that ships the `comfy outdated` verb; on a comfy-cli without it the block degrades to
+  `freshness: {"error": …}` and everything else works unchanged.
 - **A ComfyUI workspace.** If you don't have one, `comfy-cli` can create it: `comfy install`
   sets up a ComfyUI workspace it will point at. (An existing ComfyUI checkout works too — see
   `comfy set-default <path>`.)
@@ -255,7 +258,7 @@ the originals stay in the ComfyUI workspace.
 
 | Tool | Wraps | What it does |
 |---|---|---|
-| `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. **Call first.** |
+| `server_info()` | `comfy env` + `comfy outdated` | Is a local ComfyUI running, where, and which workspace. **Call first.** Also attaches a `freshness` block (`comfy outdated`): installed-vs-latest for ComfyUI core and each custom node pack, so a stale install is flagged before it masquerades as a missing model/node. On a comfy-cli without the `outdated` verb (or a network failure) the block degrades to `freshness: {"error": …}` — the tool itself still succeeds. |
 | `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
 | `get_logs(tail=200)` | `comfy logs --tail <tail>` | Tail the background ComfyUI's captured log (`<workspace>/user/comfyui_<port>.log`) — closes the debugging loop after a detached `launch_comfyui`. Returns `{lines, path, truncated}`; a missing log file returns `{"error": "no_log_file", …}` rather than raising. |

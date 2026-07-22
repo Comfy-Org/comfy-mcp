@@ -1007,6 +1007,24 @@ def _check_comfy_cli_version() -> dict:
     return report
 
 
+def _freshness_report() -> Any:
+    """Best-effort installed-vs-latest report via ``comfy outdated``.
+
+    Returns the ``comfy outdated`` payload (``core`` install status, one row per
+    custom node ``packs`` entry, ``checked_at``) on success. On ANY
+    :class:`ComfyCliError` — the verb missing on an older comfy-cli, the network
+    lookup down, a timeout — returns ``{"error": "<reason>"}`` instead of
+    raising, so the probe can never take ``server_info`` down with it.
+    ``OSError`` is caught for the same reason: a spawn failure on this second
+    subprocess (the env probe already succeeded) is still just the freshness
+    probe failing, never grounds to fail ``server_info``.
+    """
+    try:
+        return _run_comfy("outdated", timeout=15.0)
+    except (ComfyCliError, OSError) as exc:
+        return {"error": str(exc)}
+
+
 @mcp.tool()
 def server_info() -> Any:
     """Report the local ComfyUI / comfy-cli environment and verify compatibility.
@@ -1023,15 +1041,27 @@ def server_info() -> Any:
     rather than deep inside a later tool. On success it attaches a
     ``compatibility`` block (detected version, floor, envelope schema, warnings)
     alongside the ``comfy env`` data.
+
+    Also attaches a ``freshness`` block (``comfy outdated``): ``core``
+    (installed vs latest ComfyUI, with an ``outdated`` bool) and ``packs`` (one
+    row per installed custom node pack). If ``freshness.core.outdated`` is true
+    or any pack row has ``outdated: true``, the install is STALE — when a model,
+    node, or template seems missing, tell the user to update FIRST
+    (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
+    before concluding the catalog lacks it; silent staleness is the usual
+    culprit. The probe is best-effort: on a comfy-cli without the ``outdated``
+    verb, a network failure, or a timeout, ``freshness`` degrades to
+    ``{"error": "<reason>"}`` — ``server_info`` itself still succeeds.
     """
     envelope, _stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
     # _unwrap_envelope has already raised if envelope was None, so it is non-None here.
     data = _unwrap_envelope(envelope, args, returncode, stderr)
     compat = _check_comfy_cli_version()
     compat["envelope_schema"] = _envelope_schema(envelope)
+    freshness = _freshness_report()
     if isinstance(data, dict):
-        return {**data, "compatibility": compat}
-    return {"env": data, "compatibility": compat}
+        return {**data, "compatibility": compat, "freshness": freshness}
+    return {"env": data, "compatibility": compat, "freshness": freshness}
 
 
 # comfy-cli error codes worth a short bounded retry from ``run_workflow`` —

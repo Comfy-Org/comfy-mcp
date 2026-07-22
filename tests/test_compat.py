@@ -288,3 +288,153 @@ def test_server_info_wraps_non_dict_env_data(patched_env, monkeypatch):
 
     assert result["env"] == "raw"
     assert result["compatibility"]["envelope_schema"] == "envelope/1"
+
+
+# --- server_info freshness block (`comfy outdated`) --------------------------
+
+
+_ENV_ENVELOPE = {
+    "schema": "envelope/1",
+    "type": "envelope",
+    "ok": True,
+    "data": {"running": True, "url": "http://127.0.0.1:8188"},
+}
+
+_OUTDATED_DATA = {
+    "core": {
+        "installed": "v0.3.40",
+        "commit": "abc1234",
+        "latest": "v0.3.41",
+        "outdated": True,
+    },
+    "packs": [
+        {
+            "name": "comfyui-seedream",
+            "source": "registry",
+            "installed": "1.0.0",
+            "latest": "1.2.0",
+            "outdated": True,
+        }
+    ],
+    "checked_at": "2026-07-22T00:00:00Z",
+}
+
+
+@pytest.fixture
+def patched_env_then_outdated(monkeypatch):
+    """Patch comfy-cli so ``server_info``'s two runs each see their own reply.
+
+    ``server_info`` shells out twice — ``comfy env`` then ``comfy outdated`` —
+    so unlike ``patched_env`` (same envelope every call) this queues ONE reply
+    per call: each entry is a ``CompletedProcess``-shaping tuple
+    ``(returncode, stdout, stderr)`` or an exception instance to raise.
+    """
+
+    def setup(replies: list) -> list[dict]:
+        calls: list[dict] = []
+
+        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+            calls.append({"cmd": cmd, "timeout": timeout})
+            reply = replies[len(calls) - 1]
+            if isinstance(reply, BaseException):
+                raise reply
+            returncode, stdout, stderr = reply
+            return subprocess.CompletedProcess(
+                cmd, returncode, stdout=stdout, stderr=stderr
+            )
+
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+        monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
+        return calls
+
+    return setup
+
+
+def test_server_info_attaches_freshness_block(patched_env_then_outdated):
+    """The `comfy outdated` payload passes through as the `freshness` key."""
+    import json
+
+    outdated_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": True,
+        "data": _OUTDATED_DATA,
+    }
+    calls = patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (0, json.dumps(outdated_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True  # comfy env data preserved
+    assert result["freshness"] == _OUTDATED_DATA  # verbatim passthrough
+    assert result["freshness"]["core"]["outdated"] is True
+    # Second spawn is `comfy --json --where local outdated` with the 15s budget.
+    assert calls[1]["cmd"][4:] == ["outdated"]
+    assert calls[1]["timeout"] == 15.0
+
+
+def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdated):
+    """An older comfy-cli without `outdated` -> freshness.error, tool still succeeds."""
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Usage: comfy [OPTIONS] COMMAND\nNo such command 'outdated'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True  # env data intact — the probe never breaks it
+    assert "compatibility" in result
+    assert set(result["freshness"]) == {"error"}
+    assert "No such command 'outdated'" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_degrades_on_error_envelope(patched_env_then_outdated):
+    """A structured `comfy outdated` failure (e.g. network) -> freshness.error."""
+    import json
+
+    error_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": "network_error", "message": "registry lookup failed"},
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (1, json.dumps(error_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True
+    assert "registry lookup failed" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_degrades_on_timeout(patched_env_then_outdated):
+    """A hung `comfy outdated` -> freshness.error, not a server_info timeout raise."""
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            subprocess.TimeoutExpired(cmd=["comfy", "outdated"], timeout=15.0),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True
+    assert "timed out" in result["freshness"]["error"]
+
+
+def test_server_info_docstring_teaches_freshness_and_update_commands():
+    """The tool docstring documents `freshness` + the exact update commands."""
+    doc = server.server_info.__doc__ or ""
+    assert "freshness" in doc
+    assert "comfy update comfy" in doc
+    assert "comfy node update" in doc
