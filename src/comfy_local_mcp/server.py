@@ -1192,11 +1192,15 @@ def _freshness_report() -> Any:
     raising, so the probe can never take ``server_info`` down with it.
     ``OSError`` is caught for the same reason: a spawn failure on this second
     subprocess (the env probe already succeeded) is still just the freshness
-    probe failing, never grounds to fail ``server_info``.
+    probe failing, never grounds to fail ``server_info``. ``UnicodeDecodeError``
+    is caught too: ``_run_comfy_raw`` decodes the child's stdout with strict
+    ``encoding="utf-8"`` (no ``errors="replace"``), so non-UTF-8 bytes in a
+    pack name/path from the user's live custom-node install can raise it here,
+    same as the other probe failures above.
     """
     try:
         return _run_comfy("outdated", timeout=15.0)
-    except (ComfyCliError, OSError) as exc:
+    except (ComfyCliError, OSError, UnicodeDecodeError) as exc:
         return {"error": str(exc)}
 
 

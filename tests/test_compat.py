@@ -432,6 +432,30 @@ def test_server_info_freshness_degrades_on_timeout(patched_env_then_outdated):
     assert "timed out" in result["freshness"]["error"]
 
 
+def test_server_info_freshness_degrades_on_decode_error(patched_env_then_outdated):
+    """Non-UTF-8 bytes from `comfy outdated` -> freshness.error, not a raise.
+
+    `_run_comfy_raw` decodes the child's stdout with strict `encoding="utf-8"`
+    (no `errors="replace"`), so a pack name/path with non-UTF-8 bytes in the
+    user's live custom-node install can make `subprocess.run` itself raise
+    `UnicodeDecodeError` — a `ValueError` subclass, not `OSError`/`ComfyCliError`.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True  # env data intact — the probe never breaks it
+    assert set(result["freshness"]) == {"error"}
+    assert "invalid start byte" in result["freshness"]["error"]
+
+
 def test_server_info_docstring_teaches_freshness_and_update_commands():
     """The tool docstring documents `freshness` + the exact update commands."""
     doc = server.server_info.__doc__ or ""
