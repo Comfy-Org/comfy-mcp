@@ -69,7 +69,7 @@ Cloud MCP** — comfy-cli is the engine.
   `server_info`. Nothing here starts ComfyUI implicitly.
 
 <details>
-<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>)</summary>
+<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>)</summary>
 
 <br>
 
@@ -84,6 +84,12 @@ Cloud MCP** — comfy-cli is the engine.
   minimal environment, so a key from your shell won't reach it. Set `COMFY_API_KEY` in the
   client registration `env` block. See **[Partner-API nodes](#partner-api-nodes)** below for the
   full precedence chain; every client example shows where it goes.
+- **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a *remote* ComfyUI).** By
+  default every tool targets the local `127.0.0.1:8188`. Set `COMFYUI_URL`
+  (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`, default `8188`)
+  pair — to point the **run / job** tools at a ComfyUI running elsewhere, e.g. a GPU box reachable
+  over a private network (Tailscale). See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)**
+  for what is and isn't remoted. Unset ⇒ local behavior is unchanged.
 
 </details>
 
@@ -104,6 +110,44 @@ in the client registration `env` block (shown in every example below). If a run 
 `partner_node_requires_credential`, the error now carries comfy-cli's hint verbatim, including
 the `comfy auth set comfy-cloud-api-key --key …` fallback and the list of offending nodes; the
 server also retries a transient credential failure briefly before surfacing it.
+
+## Driving a remote ComfyUI
+
+By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at a ComfyUI running
+**elsewhere** — e.g. a GPU box reachable over a private network (Tailscale) — by setting one of:
+
+- **`COMFYUI_URL`** — a full URL, e.g. `http://gpu-box:8188` (host-only is fine; port defaults to
+  `8188`). Takes precedence over the pair below. Only the **host and port** are forwarded to
+  comfy-cli, so the URL must be plain `http://` with **no base path**: an `https://` scheme or a
+  reverse-proxy path (`http://gpu-box:8188/comfyui`) is rejected rather than silently downgraded to
+  http / dropped. Front a TLS/base-path proxy locally if you need one.
+- **`COMFYUI_HOST`** (+ optional **`COMFYUI_PORT`**, default `8188`) — e.g. `COMFYUI_HOST=gpu-box`.
+  A port without a host (setting only `COMFYUI_PORT`) is rejected — set the host too.
+
+Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set,
+behavior is unchanged (local `127.0.0.1:8188`).
+
+When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
+accept them — `comfy run` and `comfy jobs …` — so the **run and job tools** target the remote:
+`run_workflow`, `job_status`, `wait_for_job`, `watch_job`, `cancel_job`, `get_queue`. `server_info`
+reports the configured target under a `comfy_target` block.
+
+**Not remoted (this repo is a thin wrapper and never opens its own socket):**
+
+- **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `get_logs`) — these manage a
+  **local** ComfyUI process and stay local-only; they cannot start/stop or read logs from a remote
+  box. Start ComfyUI on the remote host yourself.
+- **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
+  / `generate_image` — the underlying comfy-cli verbs take **no** `--host`/`--port`, so they run
+  against comfy-cli's local default. Against a remote target, prefer `run_workflow(wait=True)` /
+  `job_status` (which return the remote job's `/view` output URLs) to retrieve results.
+- **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`) — their comfy-cli
+  verbs *do* accept `--host`/`--port`, but this version forwards only to the run/job tools (the
+  ticket's scope), so they still target local. Remoting them is a planned follow-up; until then,
+  author/validate against a local ComfyUI matching the remote's node set.
+- The remote ComfyUI must be reachable and **unauthenticated** on that network (the private network
+  is the boundary); the server does not authenticate to it. `server_info` does not live-probe the
+  remote — reachability surfaces on the first run/job call.
 
 ## Install
 
@@ -255,7 +299,7 @@ the originals stay in the ComfyUI workspace.
 
 | Tool | Wraps | What it does |
 |---|---|---|
-| `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. **Call first.** |
+| `server_info()` | `comfy env` | Is a local ComfyUI running, where, and which workspace. **Call first.** Reports the configured remote under a `comfy_target` block when `COMFYUI_URL`/`COMFYUI_HOST` is set (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)). |
 | `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
 | `get_logs(tail=200)` | `comfy logs --tail <tail>` | Tail the background ComfyUI's captured log (`<workspace>/user/comfyui_<port>.log`) — closes the debugging loop after a detached `launch_comfyui`. Returns `{lines, path, truncated}`; a missing log file returns `{"error": "no_log_file", …}` rather than raising. |
