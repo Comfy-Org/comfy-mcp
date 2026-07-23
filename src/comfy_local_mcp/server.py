@@ -77,6 +77,9 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
+  For a one-shot run, `run_template(name, params=...)` does fetch + fill + run in a
+  single call; a template that embeds partner (paid) nodes spends credits and is
+  gated by the same `confirm_spend` flag as `partner_generate` (free templates ignore it).
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
@@ -255,6 +258,10 @@ def _in_pipe_pool(func, *args):
 # other `to_thread` caller in the process. Confining them here caps the blast
 # radius to partner generation itself, exactly as `_PIPE_EXECUTOR` does for the
 # streaming pipe reads.
+#
+# Shared with `run_template`, which is the same class of call: a blocking
+# comfy-cli run bounded only by the hour-long ceiling, on a tool that is async
+# for its own spend-consent round-trip.
 #
 # Sized like the pipe pool. Saturating it queues further partner runs rather
 # than growing threads without bound — deliberate backpressure on a paid,
@@ -1820,25 +1827,16 @@ def _display_model(model: str) -> str:
     return cleaned or "<unnamed model>"
 
 
-async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
-    """Ask the USER to approve this one credit-spending call. True = approved.
+async def _elicit_spend_approval(ctx: Context, message: str, schema: type) -> bool:
+    """Raise one spend-confirmation prompt and report whether it was approved.
 
-    The MCP-native spend confirmation: one prompt per call, answered by the
-    human, never remembered. A decline, a cancel, an accept that did not
-    actually say yes, a client that errors on the request, a client that answers
-    with something malformed, and a prompt left unanswered past
-    :data:`_SPEND_ELICIT_TIMEOUT` all fail closed — the caller spends nothing.
+    The shared body behind every spend prompt (``partner_generate``'s and
+    ``run_template``'s): only the wording and the answer schema differ, while the
+    fail-closed handling below must not. True = the user affirmatively approved.
     """
     try:
         result = await asyncio.wait_for(
-            ctx.elicit(
-                message=(
-                    f"Run the hosted partner model `{_display_model(model)}`? "
-                    "This SPENDS Comfy credits from the account this machine is "
-                    "signed into. Running a workflow on the local ComfyUI is free."
-                ),
-                schema=SpendApproval,
-            ),
+            ctx.elicit(message=message, schema=schema),
             timeout=_SPEND_ELICIT_TIMEOUT,
         )
     except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -1867,6 +1865,26 @@ async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
     if getattr(result, "action", None) != "accept":
         return False
     return getattr(getattr(result, "data", None), "approve", False) is True
+
+
+async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
+    """Ask the USER to approve this one credit-spending call. True = approved.
+
+    The MCP-native spend confirmation: one prompt per call, answered by the
+    human, never remembered. A decline, a cancel, an accept that did not
+    actually say yes, a client that errors on the request, a client that answers
+    with something malformed, and a prompt left unanswered past
+    :data:`_SPEND_ELICIT_TIMEOUT` all fail closed — the caller spends nothing.
+    """
+    return await _elicit_spend_approval(
+        ctx,
+        (
+            f"Run the hosted partner model `{_display_model(model)}`? "
+            "This SPENDS Comfy credits from the account this machine is "
+            "signed into. Running a workflow on the local ComfyUI is free."
+        ),
+        SpendApproval,
+    )
 
 
 async def _resolve_spend_consent(
@@ -2093,6 +2111,294 @@ async def partner_generate(
         *args,
         timeout=timeout_seconds + _GENERATE_TIMEOUT_GRACE,
         plain_ok=True,
+    )
+
+
+# Hard ceiling for one template run (video templates are the slow end), so a
+# `float('inf')` / absurd value can't hold the `comfy run-template` child open
+# effectively forever. Matches partner_generate's ceiling.
+_MAX_RUN_TEMPLATE_TIMEOUT = 3600.0
+
+# comfy-cli's own default for `run-template --timeout`. That flag is a PER-EVENT
+# bound (the same semantics as `comfy run --timeout`) rather than a whole-run
+# deadline, and it also bounds the engine's initial "is ComfyUI up?" probe.
+_RUN_TEMPLATE_EVENT_TIMEOUT = 120
+
+# Wall-clock budget for a `wait=False` submit: fetch the template, fill slots,
+# enqueue, return the prompt_id. Not a run deadline — the run outlives the call.
+_RUN_TEMPLATE_ASYNC_TIMEOUT = 60.0
+
+# Slack the parent allows beyond the budget handed to the engine, so comfy-cli
+# gets to report its OWN error (`server_not_running`, a per-event stall) instead
+# of being SIGKILLed mid-write. Mirrors `_GENERATE_TIMEOUT_GRACE`.
+_RUN_TEMPLATE_TIMEOUT_GRACE = 30.0
+
+
+class TemplateSpendApproval(BaseModel):
+    """What the client returns from the template spend-confirmation prompt.
+
+    Separate from :class:`SpendApproval` only for its wording: a template MAY
+    spend (most are free OSS graphs) where a partner model always does, and the
+    prompt should not overstate. The affirmative-answer design is the same — an
+    accept that never answered lands on ``False`` and reads as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Allow this template to spend Comfy credits?",
+        description=(
+            "Yes lets the run proceed even if the template contains "
+            "partner-API (paid) nodes, spending credits from the Comfy account "
+            "this machine is signed into. No cancels it and spends nothing; a "
+            "template with no paid nodes runs free either way."
+        ),
+    )
+
+
+async def _resolve_template_spend_consent(
+    name: str, confirm_spend: bool, ctx: Context | None
+) -> bool:
+    """Decide whether to forward ``--allow-spend`` for this template run.
+
+    The same principle as :func:`_resolve_spend_consent` — an agent's own
+    ``confirm_spend=True`` is not the user's consent to spend money, so on a
+    client that can elicit, the human is asked — but the shape differs on two
+    points that are specific to this verb:
+
+    1. **No prompt when nothing can be spent.** ``confirm_spend=False`` forwards
+       nothing, so comfy-cli's gate fails closed and a paid template cannot
+       spend; there is nothing to consent to. Most gallery templates are free
+       OSS graphs, so prompting on every call would train the user to click
+       through the one prompt that matters. The prompt is raised only when the
+       caller is actually asking to unlock spending.
+    2. **comfy-cli's durable always-proceed does NOT apply here.** ``run-template``
+       never reads ``spend.auto_confirm`` — the setting is scoped to
+       ``comfy generate`` (it is that gate's own configuration surface, and its
+       own status line says so). Unlike :func:`_resolve_spend_consent`, there is
+       therefore no branch that lets the engine consent to itself: it would send
+       no flag and the run would fail closed anyway, having asked nobody.
+
+    Returns True to append ``--allow-spend``. Raises :class:`ComfyCliError` —
+    before any child is spawned — when the user actively declined.
+    """
+    if not confirm_spend:
+        return False
+    # `None` (the probe itself errored) counts as "ask", for the same reason as
+    # on the generate path: guessing "cannot elicit" would silently demote a
+    # capable client onto the caller's own say-so and spend without a human.
+    if _client_elicitation_support(ctx) is not False:
+        if await _elicit_template_spend_consent(ctx, name):
+            return True
+        raise ComfyCliError(
+            f"spend not confirmed: the user declined to let the template "
+            f"{name!r} spend Comfy credits. Nothing was spent and no run was "
+            "started. (A template with no partner-API nodes runs for free — "
+            "call again with confirm_spend=False to run it without spending.)"
+        )
+    # Client cannot elicit: `confirm_spend` is the documented fallback.
+    return True
+
+
+async def _elicit_template_spend_consent(ctx: Context, name: str) -> bool:
+    """Ask the USER to approve credit spend for this one template run."""
+    return await _elicit_spend_approval(
+        ctx,
+        (
+            f"Run the gallery template `{_display_model(name)}` with credit "
+            "spending ALLOWED? Most templates are free graphs that run on this "
+            "machine, but one containing partner-API nodes SPENDS Comfy credits "
+            "from the account this machine is signed into."
+        ),
+        TemplateSpendApproval,
+    )
+
+
+def _reject_nul_deep(label: str, value: Any) -> None:
+    """Reject an embedded NUL anywhere inside a JSON-shaped param value.
+
+    Slot values are JSON-encoded, so ``json.dumps`` escapes a NUL to ``\\u0000``
+    and no raw NUL ever reaches argv — this is not an injection guard. It exists
+    because a NUL in a template slot is never intentional, and rejecting it only
+    at the top level (``{"a": "\\0"}``) while silently forwarding it one level
+    down (``{"a": ["\\0"]}``) is the worse of the two behaviors: the nested case
+    lands a literal ``\\u0000`` in the filled graph. Recurses into lists/dicts —
+    including dict KEYS, which are slot-internal JSON, not the ``--param`` key.
+
+    Depth is bounded by the same recursion limit the MCP layer's own JSON parse
+    already survived, so this adds no new failure mode.
+    """
+    if isinstance(value, str):
+        _reject_nul(label, value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                _reject_nul(label, key)
+            _reject_nul_deep(label, item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_nul_deep(label, item)
+
+
+def _run_template_param_args(params: dict[str, Any]) -> list[str]:
+    """Marshal template ``params`` into ``comfy run-template`` ``--param=KEY=VALUE`` tokens.
+
+    ``comfy run-template`` fills a template's parameterized slots: KEY is a slot
+    address (``6.text``) or a unique slot name (``prompt``), and VALUE parses as
+    JSON with a string fallback. Each value is JSON-encoded so its Python type
+    round-trips exactly — ``42`` stays an int, the string ``"42"`` stays a
+    string, ``True`` becomes ``true``, and lists/dicts become JSON arrays/objects
+    — rather than leaning on the bare-string fallback, which would coerce a
+    numeric-looking string to a number. ``None`` drops the pair entirely. The
+    single ``--param=KEY=VALUE`` token (comfy-cli splits on the FIRST ``=``)
+    keeps a value that contains ``=`` or begins with ``-`` intact.
+    """
+    argv: list[str] = []
+    for key, value in params.items():
+        if not key or key.startswith("-"):
+            raise ComfyCliError(
+                f"invalid param key: {key!r} — expected a slot address (e.g. "
+                "'6.text') or a slot name (e.g. 'prompt'), not an empty or "
+                "option-like value."
+            )
+        # `=` is the load-bearing one: comfy-cli splits the `--param` value on
+        # its FIRST `=` to separate slot key from value, so a key carrying its
+        # own `=` mis-splits. Refuse the shape rather than out-parse the
+        # splitter. Whitespace is refused for a weaker reason — KEY rides inside
+        # the single `--param=KEY=VALUE` token, so it is never argv-ambiguous,
+        # but comfy-cli `.strip()`s the key and slot names come from node input
+        # names (0 of the 574 gallery templates carry whitespace or a leading
+        # dash in one). A clear error here beats the engine's "matches no slot".
+        if "=" in key or any(ch.isspace() for ch in key):
+            raise ComfyCliError(
+                f"invalid param key: {key!r} — a slot key cannot contain '=' or "
+                "whitespace. Pass the value as the dict value, not in the key."
+            )
+        _reject_nul(f"param key {key!r}", key)
+        if value is None:
+            continue
+        # json.dumps escapes a NUL inside a string value (so it can't crash
+        # subprocess the way a raw NUL in the KEY would), but a NUL slot value is
+        # never intentional — refuse it explicitly, matching partner_generate.
+        # Checked recursively: a NUL nested in a list/dict is the same mistake
+        # and would otherwise land as a literal `\u0000` in the filled graph.
+        _reject_nul_deep(f"value for param {key!r}", value)
+        rendered = json.dumps(value)
+        argv.append(f"--param={key}={rendered}")
+    return argv
+
+
+@mcp.tool()
+async def run_template(
+    name: str,
+    params: dict[str, Any] | None = None,
+    confirm_spend: bool = False,
+    wait: bool = True,
+    timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
+) -> Any:
+    """Run a gallery template on the LOCAL ComfyUI — fetch, fill params, execute.
+
+    Thin passthrough to ``comfy run-template <name> [--param=KEY=VALUE]…`` (the
+    engine fetches the template graph, fills its parameterized slots, and runs it
+    through the same local run path as ``run_workflow``). Named ``run_template``
+    for contract parity with the cloud MCP's ``run_template(name, params)``; this
+    is the one-command alternative to the manual ``search_templates`` →
+    ``fetch_template`` → ``run_workflow`` chain.
+
+    ``params`` fills the template's parameterized slots — ``{slot: value}`` where
+    a slot is an address (``"6.text"``) or a unique name (``"prompt"``). List a
+    template's slots by fetching it (``fetch_template``) and inspecting the graph.
+    Values are forwarded verbatim for comfy-cli to accept or reject.
+
+    SPEND CONSENT — most gallery templates are free OSS graphs that run entirely
+    on the user's own machine. SOME embed partner-API (paid) nodes, and running
+    one spends the user's Comfy credits. comfy-cli gates that path and this
+    wrapper only passes consent through (see
+    :func:`_resolve_template_spend_consent`):
+
+    - ``confirm_spend=False`` (the default) forwards nothing, so a paid template
+      fails CLOSED (``spend_consent_required``, nothing spent) while a free
+      template runs normally. Nothing can be spent, so the user is NOT prompted —
+      free template runs stay a single, silent call.
+    - ``confirm_spend=True`` asks to unlock spending, and on a client that
+      supports MCP **elicitation** the USER is prompted per call before anything
+      runs. Approve and ``--allow-spend`` is forwarded; decline and this raises
+      :class:`ComfyCliError` without starting comfy-cli. Only on a client that
+      cannot elicit does the argument stand on its own, as the fallback.
+
+    So ``confirm_spend=True`` is a REQUEST to spend, not the consent itself: set
+    it only when the user has actually agreed, never merely to clear the error
+    you just hit. Spend consent is not tool permission — a host's "always allow
+    this tool" toggle authorizes calling this tool, never spending the user's
+    money, and is never read as consent here. This mirrors ``partner_generate``,
+    with two differences that verb's shape forces: it always spends so it always
+    prompts, and comfy-cli's durable ``comfy generate consent always`` is scoped
+    to ``comfy generate`` — ``run-template`` does not read it, so it grants
+    nothing here.
+
+    Unlike ``partner_generate``, this does NOT probe for the interlock first. It
+    does not need to: ``partner_generate``'s gate landed in comfy-cli *after* the
+    verb it guards, so the presence of ``comfy generate`` could not prove the gate
+    was there and :func:`_require_spend_gate` had to ask. Here the gate is inline
+    in ``run-template``'s own command body and shipped in the same change as the
+    verb, so THE VERB IS THE CAPABILITY SIGNAL — a comfy-cli with ``run-template``
+    but without the gate does not exist, and one without ``run-template`` exits
+    non-zero (raising :class:`ComfyCliError`) having spent nothing. Probing
+    ``comfy generate consent`` here would test an unrelated subsystem and would
+    wrongly refuse FREE, local-only template runs on a CLI that lacks it.
+
+    ``timeout_seconds`` bounds this call's wall clock. comfy-cli's own
+    ``--timeout`` for this verb is PER-EVENT rather than a whole-run deadline, so
+    it is forwarded only to tighten the engine's bound when ``timeout_seconds``
+    is shorter than comfy-cli's 120s default — that way a short deadline surfaces
+    the engine's own error instead of a signal kill. For a long (e.g. video) run,
+    prefer ``wait=False`` over a large ``timeout_seconds``: a run killed at the
+    deadline may already be queued, and only the async path hands back the
+    ``prompt_id`` needed to track it rather than re-running it.
+
+    With ``wait=True`` (default) this waits until the run finishes and returns the
+    result (``prompt_id`` + outputs); with ``wait=False`` it submits ``--async``
+    and returns immediately with a ``prompt_id`` to poll via ``job_status`` /
+    ``wait_for_job`` / ``watch_job`` — use that for long (e.g. video) runs that
+    may exceed your MCP client's tool timeout. OSS templates need their referenced
+    models installed locally; a missing model surfaces the run path's per-node
+    error (see ``search_models`` / ``download_model``). Everything targets the
+    LOCAL server (``--where local`` is injected by ``_run_comfy``).
+    """
+    if not name or name.startswith("-"):
+        # A leading-dash name is read by comfy-cli as an option, not the template
+        # positional (the same guard partner_generate applies to its model).
+        raise ComfyCliError(
+            f"invalid template name: {name!r} — expected a template name "
+            "(e.g. 'image_flux2'), not an empty or option-like value."
+        )
+    _reject_nul("template name", name)
+    timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
+    args = ["run-template", name, *_run_template_param_args(params or {})]
+    # Hand the engine a deadline it can act on. Unlike `comfy generate
+    # --timeout`, this one is PER-EVENT, not a whole-run bound, so the caller's
+    # total budget cannot simply be forwarded; it is used only to LOWER the
+    # engine's bound when that budget is smaller than comfy-cli's 120s default.
+    # Without it a short `timeout_seconds` is consumed entirely inside the
+    # engine's own 120s server probe and the child is SIGKILLed with no
+    # diagnostic — e.g. `wait=False` had a 60s budget against a 120s probe.
+    # Never RAISED above the default: that would blunt stall detection on long
+    # runs. comfy-cli types this flag as an int, so a float is a parse error.
+    budget = timeout_seconds if wait else _RUN_TEMPLATE_ASYNC_TIMEOUT
+    args.append(f"--timeout={max(1, int(min(budget, _RUN_TEMPLATE_EVENT_TIMEOUT)))}")
+    if await _resolve_template_spend_consent(name, confirm_spend, ctx):
+        # comfy-cli's paid-node consent for run-template; a bare boolean flag.
+        args.append("--allow-spend")
+    if not wait:
+        # Fire-and-return: submit and hand back a prompt_id to poll.
+        args.append("--async")
+    # The parent stays the backstop only: a little slack past the budget so
+    # comfy-cli reports its own error rather than dying to a signal. Runs off
+    # the event loop in the dedicated pool for the same reason
+    # `partner_generate` does: this blocks for as long as the template takes (up
+    # to an hour) and the tool is async for the consent round-trip above.
+    return await _in_generate_pool(
+        _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
     )
 
 

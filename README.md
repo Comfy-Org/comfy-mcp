@@ -40,7 +40,7 @@ Each tool shells out to the `comfy` command with `--where local --json`, parses 
 `envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
 Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** beta. 35 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 37 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -169,6 +169,27 @@ Two things the server deliberately will **not** do:
 - **Run against a comfy-cli with no spend gate.** The fail-closed guarantee is the engine's, so if
   `comfy generate consent` is missing the tool refuses up front rather than spending on the
   assumption something would have stopped it. `pip install -U comfy-cli` to fix.
+
+### Templates that spend — `run_template`
+
+`run_template` is the other tool that *can* spend, and it is confirmed the same way, with the
+differences the verb forces. Most gallery templates are free OSS graphs that run on your machine;
+some embed partner-API nodes and bill through them.
+
+- **`confirm_spend=False` (the default) never prompts.** Nothing is forwarded, so comfy-cli's gate
+  fails closed on a paid template — there is nothing to consent to. A free template just runs. This
+  is deliberate: prompting on every template run would train you to click through the one prompt
+  that matters.
+- **`confirm_spend=True` asks you first**, naming the template, on any client that can elicit.
+  Approve → `--allow-spend` is forwarded. Decline → the tool errors and comfy-cli is never started.
+  As with `partner_generate`, an agent setting the argument for itself is *not* your consent; on a
+  client that cannot elicit it stands alone as the fallback.
+- **`comfy generate consent always` does not apply here.** That setting is scoped to
+  `comfy generate` — `comfy run-template` never reads it — so it grants nothing for templates and
+  the prompt is raised regardless.
+
+Unlike `partner_generate`, there is no up-front gate probe: `run-template` carries its spend gate
+inside the verb itself, so a comfy-cli that has the verb has the gate.
 
 ## Driving a remote ComfyUI
 
@@ -399,7 +420,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-35 tools, grouped below by what they do. Every tool runs `comfy` with the global
+37 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 ### Run and monitor
@@ -409,6 +430,7 @@ the originals stay in the ComfyUI workspace.
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy generate --prompt <prompt> [--checkpoint <ckpt>]` | Text prompt → image in one call — comfy-cli owns the graph/checkpoint injection, so no hand-assembled workflow needed. Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
 | `partner_generate(model, params=None, confirm_spend=False, download=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--timeout=<s>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits**, unlike the local `run_workflow` / `generate_image` paths. Every call confirms the spend with you first — see [Spending credits](#spending-credits-on-partner-models) below. `params` are the model's own schema-driven inputs, forwarded verbatim (discover them with `comfy generate schema <model>` / `comfy generate list`). `timeout_seconds` becomes comfy-cli's own `--timeout` so the engine — not a parent kill — owns the deadline on a job the partner may already have charged for. |
+| `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on local ComfyUI (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
