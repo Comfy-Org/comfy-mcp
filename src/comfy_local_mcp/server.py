@@ -1850,10 +1850,16 @@ async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
             "Nothing was spent."
         ) from exc
     except Exception as exc:
+        # Name the way out. Because an errored capability probe now routes here
+        # rather than to `confirm_spend`, a client this server cannot prompt
+        # would otherwise dead-end with no route to a generation it is entitled
+        # to run — and the user's own durable consent is exactly that route.
         raise ComfyCliError(
             "could not confirm the credit spend with the user: the client "
             f"failed to answer the confirmation prompt ({exc}). Nothing was "
-            "spent."
+            "spent. If this client cannot show prompts, record your consent "
+            "with comfy-cli directly — `comfy generate consent always` — and "
+            "this tool will honor it without asking."
         ) from exc
     # Every read is a `getattr`: a non-conforming client can return an object
     # with no `.action`/`.data`, and an AttributeError here would escape as an
