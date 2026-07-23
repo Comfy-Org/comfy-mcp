@@ -195,8 +195,21 @@ address. Seeing `:8189` there (and the server reported running) confirms the ove
 
 **Requires a comfy-cli newer than 1.12.0.** `COMFY_LOCAL_URL` landed after the 1.12.0 release and
 is not in a published version yet — install comfy-cli from `main` to use it. On 1.12.0 or older the
-variable is simply ignored (no error) and every tool keeps targeting `127.0.0.1:8188`, so
-`server_info` still reporting `:8188` is the symptom of too old a comfy-cli.
+variable is simply ignored (no error) and every tool keeps targeting `127.0.0.1:8188`.
+
+**Still reporting `:8188`?** Three causes, all silent, in the order worth checking:
+
+1. **The value never reached comfy-cli** — it's in the wrong `env` block, or the client wasn't
+   restarted after the edit. The workspace/Python fields `server_info` reports confirm which
+   comfy-cli install you're actually talking to.
+2. **The value is malformed** — comfy-cli ignores it and falls back to `127.0.0.1:8188`, emitting
+   only a one-line stderr warning that this server's success path discards, so a typo
+   (`https://…` — only `http` is accepted; a non-numeric port; a port outside 1–65535) looks
+   exactly like the other two causes from the MCP side. Confirm by running
+   `COMFY_LOCAL_URL=<your value> comfy env` in a terminal and reading stderr; see
+   **Accepted values** above.
+3. **comfy-cli is too old** — it predates the variable and ignored it. `server_info`'s
+   `compatibility.comfy_cli_version` reports the detected version.
 
 **Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port` flag →
 `COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.

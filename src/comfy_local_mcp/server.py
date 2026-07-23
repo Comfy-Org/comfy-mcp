@@ -1229,9 +1229,15 @@ def server_info() -> Any:
     default: ``COMFY_LOCAL_URL`` wins, else a background record, else
     ``127.0.0.1:8188`` (``comfy env`` itself takes no ``--host``). So this is
     also the right first call to verify a ``COMFY_LOCAL_URL`` override took
-    effect. A URL still reading ``:8188`` after setting it means the value did
-    not reach comfy-cli, or the comfy-cli on ``PATH`` predates the variable and
-    ignored it.
+    effect. A URL still reading ``:8188`` after setting it has three causes,
+    all silent and indistinguishable from here: the value did not reach
+    comfy-cli, the comfy-cli on ``PATH`` predates the variable and ignored it,
+    or the value was MALFORMED — comfy-cli then falls back to the default and
+    emits only a one-line stderr warning, which the success path of this
+    wrapper discards. Do not send the user straight to reinstalling comfy-cli:
+    have them re-check the value's syntax (see the README's *Accepted values*)
+    and, to see the dropped warning, run ``COMFY_LOCAL_URL=<value> comfy env``
+    in a terminal.
 
     Also the compatibility gate for the unpinned comfy-cli this server shells
     out to: it asserts comfy-cli's envelope schema major matches the
