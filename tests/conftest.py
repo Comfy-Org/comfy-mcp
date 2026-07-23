@@ -6,6 +6,8 @@ The comfy-cli version guard (`server._check_comfy_version`) shells out to
 `comfy --version` call would consume that stub and pollute those assertions. So
 by default we mark the guard "already checked" for every test; the dedicated
 guard tests (`test_wrapper.py`) re-enable it explicitly and mock `--version`.
+``partner_generate``'s spend-gate probe is a second such once-per-process
+shell-out and is neutralized the same way.
 
 This module also holds the shared test helpers for the streaming
 (``--json-stream``) tool paths. ``run_workflow``, ``watch_job`` and
@@ -28,6 +30,18 @@ from comfy_local_mcp import server
 def _skip_version_guard(monkeypatch):
     """Neutralize the once-per-process comfy-cli version guard for unit tests."""
     monkeypatch.setattr(server, "_version_checked", True)
+
+
+@pytest.fixture(autouse=True)
+def _skip_spend_gate_probe(monkeypatch):
+    """Neutralize ``partner_generate``'s once-per-process spend-gate probe.
+
+    Same reason as the version guard above: the probe shells out to
+    ``comfy generate consent show`` before the first spending call, which would
+    consume the stubbed ``subprocess.run`` and shift every exact-argv assertion.
+    The dedicated probe tests (`test_partner_generate.py`) re-enable it.
+    """
+    monkeypatch.setattr(server, "_spend_gate_probed", True)
 
 
 @pytest.fixture(autouse=True)
