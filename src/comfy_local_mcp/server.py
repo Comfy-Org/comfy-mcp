@@ -1461,6 +1461,62 @@ async def generate_image(
 
 
 @mcp.tool()
+def partner_generate(
+    model: str,
+    params: dict[str, str] | None = None,
+    wait: bool = True,
+    timeout_seconds: float = 600.0,
+) -> Any:
+    """Run a partner / hosted-API model (Flux, Ideogram, Veo, Kling, …) via
+    comfy-cli's partner-API proxy. **This spends Comfy credits.**
+
+    Wraps ``comfy generate <model> [--<param>=<value> …]`` — a pure passthrough
+    to that verb through ``_run_comfy`` (per the thin-wrapper rule; the proxy
+    call, credential resolution, and the model catalog all live in comfy-cli,
+    not here). Same partner mechanism the cloud MCP's ``partner_generate`` uses.
+
+    Spend gate — this tool never spends on its own: because the MCP always
+    drives comfy-cli in ``--json`` mode, comfy-cli's spend interlock
+    **fails closed** (errors, spends nothing) unless the user has already
+    granted standing consent with ``comfy generate consent always`` (persisted
+    ``spend.auto_confirm`` in comfy-cli config). This tool deliberately does
+    **not** send ``--yes``: spend consent is never inferred from an agent host's
+    "always allow this tool" permission. A denied call surfaces as an error and
+    costs nothing.
+
+    Args:
+        model: A model alias (e.g. ``flux-pro``, ``ideogram-edit``, ``dalle``).
+            List what's available with comfy-cli's ``comfy generate list``; see
+            a model's inputs with ``comfy generate schema <model>``.
+        params: Model-specific inputs as ``{name: value}``, forwarded verbatim
+            as ``--name=value`` (values are strings; comfy-cli coerces each per
+            the model's schema). The ``=`` form keeps a value that begins with
+            ``-`` from being misread as a flag.
+        wait: ``True`` (default) blocks until the partner job finishes and
+            returns its outputs; ``False`` submits with ``--async`` and returns
+            a job reference immediately.
+        timeout_seconds: Upper bound on the ``wait=True`` call. Very long
+            generations can still exceed an MCP client's own tool timeout.
+
+    Everything targets the LOCAL stack (``--where local`` is injected by
+    ``_run_comfy``); there is no direct cloud reachability here.
+    """
+    # A model that begins with ``-`` would be read as an option, not the
+    # positional alias comfy-cli's ``generate`` expects — reject it up front
+    # rather than shell out to a misparsed command.
+    if not model or model.startswith("-"):
+        raise ComfyCliError(
+            "partner_generate: `model` must be a model alias "
+            "(e.g. flux-pro), not empty and not a flag."
+        )
+    param_args = [f"--{key}={value}" for key, value in (params or {}).items()]
+    if wait:
+        return _run_comfy("generate", model, *param_args, timeout=timeout_seconds)
+    # Fire-and-return: comfy-cli's --async submits and prints the job reference.
+    return _run_comfy("generate", model, *param_args, "--async", timeout=60.0)
+
+
+@mcp.tool()
 def job_status(prompt_id: str) -> Any:
     """Check a submitted job's status (queued / running / completed / error).
 

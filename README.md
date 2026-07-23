@@ -281,7 +281,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-35 tools, grouped below by what they do. Every tool runs `comfy` with the global
+36 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 ### Run and monitor
@@ -290,6 +290,7 @@ the originals stay in the ComfyUI workspace.
 |---|---|---|
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy generate --prompt <prompt> [--checkpoint <ckpt>]` | Text prompt → image in one call — comfy-cli owns the graph/checkpoint injection, so no hand-assembled workflow needed. Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
+| `partner_generate(model, params=None, wait=True, timeout_seconds=600.0)` | `comfy generate <model> [--<param>=<value> …]` | Run a partner / hosted-API model (Flux, Ideogram, Veo, Kling, …) via comfy-cli's partner-API proxy. **Spends Comfy credits.** Never sends `--yes`; because the MCP runs in `--json` mode, comfy-cli's spend gate **fails closed** (errors, spends nothing) unless the user granted standing consent with `comfy generate consent always`. `wait=False` submits with `--async`. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
