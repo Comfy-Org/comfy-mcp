@@ -79,8 +79,14 @@ def test_run_template_argv_is_a_local_json_passthrough(patched_run):
     cmd = calls[0]["cmd"]
     assert cmd[0] == server.COMFY_BIN
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
-    assert cmd[4:] == ["run-template", "image_flux2", '--param=prompt="a red fox"']
-    assert calls[0]["timeout"] == 600.0  # wait=True: bounded by timeout_seconds
+    assert cmd[4:] == [
+        "run-template",
+        "image_flux2",
+        '--param=prompt="a red fox"',
+        "--timeout=120",  # engine per-event bound, left at comfy-cli's default
+    ]
+    # wait=True: the caller's budget plus the parent's backstop slack.
+    assert calls[0]["timeout"] == 600.0 + server._RUN_TEMPLATE_TIMEOUT_GRACE
 
 
 def test_run_template_marshals_param_types_as_json(patched_run):
@@ -113,6 +119,7 @@ def test_run_template_marshals_param_types_as_json(patched_run):
         "--param=tiled=false",
         "--param=sizes=[512, 768]",
         '--param=opts={"a": 1}',
+        "--timeout=120",
     ]
 
 
@@ -126,7 +133,12 @@ def test_run_template_param_value_with_equals_and_dash_stays_intact(patched_run)
 
     server.run_template("t", params={"expr": "a=b-c"})
 
-    assert calls[0]["cmd"][4:] == ["run-template", "t", '--param=expr="a=b-c"']
+    assert calls[0]["cmd"][4:] == [
+        "run-template",
+        "t",
+        '--param=expr="a=b-c"',
+        "--timeout=120",
+    ]
 
 
 def test_run_template_omits_params_when_none(patched_run):
@@ -135,7 +147,7 @@ def test_run_template_omits_params_when_none(patched_run):
 
     server.run_template("image_flux2")
 
-    assert calls[0]["cmd"][4:] == ["run-template", "image_flux2"]
+    assert calls[0]["cmd"][4:] == ["run-template", "image_flux2", "--timeout=120"]
 
 
 # --- spend consent ----------------------------------------------------------
@@ -160,6 +172,7 @@ def test_run_template_forwards_consent_when_confirmed(patched_run):
         "run-template",
         "api_seedance",
         '--param=prompt="a cat"',
+        "--timeout=120",
         "--allow-spend",
     ]
 
@@ -195,9 +208,15 @@ def test_run_template_wait_false_submits_async(patched_run):
         "run-template",
         "image_flux2",
         '--param=prompt="x"',
+        # The 60s submit budget is handed to the engine too, so its 120s server
+        # probe can no longer outlive the parent and eat the whole call.
+        "--timeout=60",
         "--async",
     ]
-    assert calls[0]["timeout"] == 60.0
+    assert (
+        calls[0]["timeout"]
+        == server._RUN_TEMPLATE_ASYNC_TIMEOUT + server._RUN_TEMPLATE_TIMEOUT_GRACE
+    )
 
 
 # --- input guards -----------------------------------------------------------
@@ -242,6 +261,11 @@ def test_run_template_rejects_param_keys_with_equals_or_whitespace(patched_run, 
         ({"name": "t\0mpl"}, "invalid template name"),
         ({"name": "t", "params": {"pro\0mpt": "a"}}, "param key"),
         ({"name": "t", "params": {"prompt": "a\0b"}}, "value for param"),
+        # Nested in a container: json.dumps would escape it to a literal
+        # `\u0000` and quietly fill it into the graph rather than crash.
+        ({"name": "t", "params": {"sizes": ["a\0b"]}}, "value for param"),
+        ({"name": "t", "params": {"opts": {"k": ["deep\0"]}}}, "value for param"),
+        ({"name": "t", "params": {"opts": {"k\0": "v"}}}, "value for param"),
     ],
 )
 def test_run_template_rejects_embedded_nul(patched_run, kwargs, match):
@@ -264,7 +288,49 @@ def test_run_template_clamps_timeout(patched_run):
 
     server.run_template("t", timeout_seconds=float("inf"))
 
-    assert calls[0]["timeout"] == server._MAX_RUN_TEMPLATE_TIMEOUT
+    assert (
+        calls[0]["timeout"]
+        == server._MAX_RUN_TEMPLATE_TIMEOUT + server._RUN_TEMPLATE_TIMEOUT_GRACE
+    )
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [
+        (30.0, "--timeout=30"),  # below comfy-cli's default -> tightened
+        (0.5, "--timeout=1"),  # int() floors to 0; the engine needs >= 1
+        (120.0, "--timeout=120"),  # exactly the default
+        (600.0, "--timeout=120"),  # above it -> never RAISED past the default
+    ],
+)
+def test_run_template_hands_engine_a_deadline_within_the_caller_budget(
+    patched_run, budget, expected
+):
+    """The engine's per-event bound is lowered to a short budget, never raised.
+
+    comfy-cli's own default is 120s and also bounds its "is ComfyUI up?" probe,
+    so without this a `timeout_seconds` under 120 was spent entirely inside that
+    probe and the child was SIGKILLed by the parent with no diagnostic. Raising
+    it past the default would instead blunt stall detection on long runs.
+    """
+    calls = patched_run()
+
+    server.run_template("t", timeout_seconds=budget)
+
+    assert expected in calls[0]["cmd"]
+    # The parent stays a backstop only: strictly later than the engine's bound.
+    assert calls[0]["timeout"] == budget + server._RUN_TEMPLATE_TIMEOUT_GRACE
+
+
+def test_run_template_engine_timeout_is_an_int(patched_run):
+    """comfy-cli types `--timeout` as an int, so a float would be a parse error."""
+    calls = patched_run()
+
+    server.run_template("t", timeout_seconds=45.7)
+
+    flag = next(a for a in calls[0]["cmd"] if a.startswith("--timeout="))
+    assert flag == "--timeout=45"
+    assert "." not in flag
 
 
 @pytest.mark.parametrize("bad", [float("nan"), 0.0, -5.0])

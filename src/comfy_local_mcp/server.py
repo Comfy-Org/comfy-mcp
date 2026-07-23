@@ -2104,6 +2104,46 @@ async def partner_generate(
 # effectively forever. Matches partner_generate's ceiling.
 _MAX_RUN_TEMPLATE_TIMEOUT = 3600.0
 
+# comfy-cli's own default for `run-template --timeout`. That flag is a PER-EVENT
+# bound (the same semantics as `comfy run --timeout`) rather than a whole-run
+# deadline, and it also bounds the engine's initial "is ComfyUI up?" probe.
+_RUN_TEMPLATE_EVENT_TIMEOUT = 120
+
+# Wall-clock budget for a `wait=False` submit: fetch the template, fill slots,
+# enqueue, return the prompt_id. Not a run deadline — the run outlives the call.
+_RUN_TEMPLATE_ASYNC_TIMEOUT = 60.0
+
+# Slack the parent allows beyond the budget handed to the engine, so comfy-cli
+# gets to report its OWN error (`server_not_running`, a per-event stall) instead
+# of being SIGKILLed mid-write. Mirrors `_GENERATE_TIMEOUT_GRACE`.
+_RUN_TEMPLATE_TIMEOUT_GRACE = 30.0
+
+
+def _reject_nul_deep(label: str, value: Any) -> None:
+    """Reject an embedded NUL anywhere inside a JSON-shaped param value.
+
+    Slot values are JSON-encoded, so ``json.dumps`` escapes a NUL to ``\\u0000``
+    and no raw NUL ever reaches argv — this is not an injection guard. It exists
+    because a NUL in a template slot is never intentional, and rejecting it only
+    at the top level (``{"a": "\\0"}``) while silently forwarding it one level
+    down (``{"a": ["\\0"]}``) is the worse of the two behaviors: the nested case
+    lands a literal ``\\u0000`` in the filled graph. Recurses into lists/dicts —
+    including dict KEYS, which are slot-internal JSON, not the ``--param`` key.
+
+    Depth is bounded by the same recursion limit the MCP layer's own JSON parse
+    already survived, so this adds no new failure mode.
+    """
+    if isinstance(value, str):
+        _reject_nul(label, value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                _reject_nul(label, key)
+            _reject_nul_deep(label, item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_nul_deep(label, item)
+
 
 def _run_template_param_args(params: dict[str, Any]) -> list[str]:
     """Marshal template ``params`` into ``comfy run-template`` ``--param=KEY=VALUE`` tokens.
@@ -2126,9 +2166,14 @@ def _run_template_param_args(params: dict[str, Any]) -> list[str]:
                 "'6.text') or a slot name (e.g. 'prompt'), not an empty or "
                 "option-like value."
             )
-        # comfy-cli splits the `--param` value on its FIRST `=` to separate slot
-        # key from value, so a key carrying its own `=` (or whitespace) would
-        # mis-split. Refuse the shape rather than out-parse the splitter.
+        # `=` is the load-bearing one: comfy-cli splits the `--param` value on
+        # its FIRST `=` to separate slot key from value, so a key carrying its
+        # own `=` mis-splits. Refuse the shape rather than out-parse the
+        # splitter. Whitespace is refused for a weaker reason — KEY rides inside
+        # the single `--param=KEY=VALUE` token, so it is never argv-ambiguous,
+        # but comfy-cli `.strip()`s the key and slot names come from node input
+        # names (0 of the 574 gallery templates carry whitespace or a leading
+        # dash in one). A clear error here beats the engine's "matches no slot".
         if "=" in key or any(ch.isspace() for ch in key):
             raise ComfyCliError(
                 f"invalid param key: {key!r} — a slot key cannot contain '=' or "
@@ -2140,8 +2185,9 @@ def _run_template_param_args(params: dict[str, Any]) -> list[str]:
         # json.dumps escapes a NUL inside a string value (so it can't crash
         # subprocess the way a raw NUL in the KEY would), but a NUL slot value is
         # never intentional — refuse it explicitly, matching partner_generate.
-        if isinstance(value, str):
-            _reject_nul(f"value for param {key!r}", value)
+        # Checked recursively: a NUL nested in a list/dict is the same mistake
+        # and would otherwise land as a literal `\u0000` in the filled graph.
+        _reject_nul_deep(f"value for param {key!r}", value)
         rendered = json.dumps(value)
         argv.append(f"--param={key}={rendered}")
     return argv
@@ -2179,6 +2225,26 @@ def run_template(
     this run, never merely to clear the error. (This mirrors ``partner_generate``;
     the flag is a no-op for free templates.)
 
+    Unlike ``partner_generate``, this does NOT probe for the interlock first. It
+    does not need to: ``partner_generate``'s gate landed in comfy-cli *after* the
+    verb it guards, so the presence of ``comfy generate`` could not prove the gate
+    was there and :func:`_require_spend_gate` had to ask. Here the gate is inline
+    in ``run-template``'s own command body and shipped in the same change as the
+    verb, so THE VERB IS THE CAPABILITY SIGNAL — a comfy-cli with ``run-template``
+    but without the gate does not exist, and one without ``run-template`` exits
+    non-zero (raising :class:`ComfyCliError`) having spent nothing. Probing
+    ``comfy generate consent`` here would test an unrelated subsystem and would
+    wrongly refuse FREE, local-only template runs on a CLI that lacks it.
+
+    ``timeout_seconds`` bounds this call's wall clock. comfy-cli's own
+    ``--timeout`` for this verb is PER-EVENT rather than a whole-run deadline, so
+    it is forwarded only to tighten the engine's bound when ``timeout_seconds``
+    is shorter than comfy-cli's 120s default — that way a short deadline surfaces
+    the engine's own error instead of a signal kill. For a long (e.g. video) run,
+    prefer ``wait=False`` over a large ``timeout_seconds``: a run killed at the
+    deadline may already be queued, and only the async path hands back the
+    ``prompt_id`` needed to track it rather than re-running it.
+
     With ``wait=True`` (default) this waits until the run finishes and returns the
     result (``prompt_id`` + outputs); with ``wait=False`` it submits ``--async``
     and returns immediately with a ``prompt_id`` to poll via ``job_status`` /
@@ -2198,14 +2264,26 @@ def run_template(
     _reject_nul("template name", name)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
     args = ["run-template", name, *_run_template_param_args(params or {})]
+    # Hand the engine a deadline it can act on. Unlike `comfy generate
+    # --timeout`, this one is PER-EVENT, not a whole-run bound, so the caller's
+    # total budget cannot simply be forwarded; it is used only to LOWER the
+    # engine's bound when that budget is smaller than comfy-cli's 120s default.
+    # Without it a short `timeout_seconds` is consumed entirely inside the
+    # engine's own 120s server probe and the child is SIGKILLed with no
+    # diagnostic — e.g. `wait=False` had a 60s budget against a 120s probe.
+    # Never RAISED above the default: that would blunt stall detection on long
+    # runs. comfy-cli types this flag as an int, so a float is a parse error.
+    budget = timeout_seconds if wait else _RUN_TEMPLATE_ASYNC_TIMEOUT
+    args.append(f"--timeout={max(1, int(min(budget, _RUN_TEMPLATE_EVENT_TIMEOUT)))}")
     if confirm_spend:
         # comfy-cli's paid-node consent for run-template; a bare boolean flag.
         args.append("--allow-spend")
     if not wait:
         # Fire-and-return: submit and hand back a prompt_id to poll.
         args.append("--async")
-        return _run_comfy(*args, timeout=60.0)
-    return _run_comfy(*args, timeout=timeout_seconds)
+    # The parent stays the backstop only: a little slack past the budget so
+    # comfy-cli reports its own error rather than dying to a signal.
+    return _run_comfy(*args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE)
 
 
 @mcp.tool()
