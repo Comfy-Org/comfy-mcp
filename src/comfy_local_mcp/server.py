@@ -77,6 +77,9 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
+  For a one-shot run, `run_template(name, params=...)` does fetch + fill + run in a
+  single call; a template that embeds partner (paid) nodes spends credits and is
+  gated by the same `confirm_spend` flag as `partner_generate` (free templates ignore it).
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
@@ -2094,6 +2097,115 @@ async def partner_generate(
         timeout=timeout_seconds + _GENERATE_TIMEOUT_GRACE,
         plain_ok=True,
     )
+
+
+# Hard ceiling for one template run (video templates are the slow end), so a
+# `float('inf')` / absurd value can't hold the `comfy run-template` child open
+# effectively forever. Matches partner_generate's ceiling.
+_MAX_RUN_TEMPLATE_TIMEOUT = 3600.0
+
+
+def _run_template_param_args(params: dict[str, Any]) -> list[str]:
+    """Marshal template ``params`` into ``comfy run-template`` ``--param=KEY=VALUE`` tokens.
+
+    ``comfy run-template`` fills a template's parameterized slots: KEY is a slot
+    address (``6.text``) or a unique slot name (``prompt``), and VALUE parses as
+    JSON with a string fallback. Each value is JSON-encoded so its Python type
+    round-trips exactly — ``42`` stays an int, the string ``"42"`` stays a
+    string, ``True`` becomes ``true``, and lists/dicts become JSON arrays/objects
+    — rather than leaning on the bare-string fallback, which would coerce a
+    numeric-looking string to a number. ``None`` drops the pair entirely. The
+    single ``--param=KEY=VALUE`` token (comfy-cli splits on the FIRST ``=``)
+    keeps a value that contains ``=`` or begins with ``-`` intact.
+    """
+    argv: list[str] = []
+    for key, value in params.items():
+        if not key or key.startswith("-"):
+            raise ComfyCliError(
+                f"invalid param key: {key!r} — expected a slot address (e.g. "
+                "'6.text') or a slot name (e.g. 'prompt'), not an empty or "
+                "option-like value."
+            )
+        # comfy-cli splits the `--param` value on its FIRST `=` to separate slot
+        # key from value, so a key carrying its own `=` (or whitespace) would
+        # mis-split. Refuse the shape rather than out-parse the splitter.
+        if "=" in key or any(ch.isspace() for ch in key):
+            raise ComfyCliError(
+                f"invalid param key: {key!r} — a slot key cannot contain '=' or "
+                "whitespace. Pass the value as the dict value, not in the key."
+            )
+        _reject_nul(f"param key {key!r}", key)
+        if value is None:
+            continue
+        # json.dumps escapes a NUL inside a string value (so it can't crash
+        # subprocess the way a raw NUL in the KEY would), but a NUL slot value is
+        # never intentional — refuse it explicitly, matching partner_generate.
+        if isinstance(value, str):
+            _reject_nul(f"value for param {key!r}", value)
+        rendered = json.dumps(value)
+        argv.append(f"--param={key}={rendered}")
+    return argv
+
+
+@mcp.tool()
+def run_template(
+    name: str,
+    params: dict[str, Any] | None = None,
+    confirm_spend: bool = False,
+    wait: bool = True,
+    timeout_seconds: float = 600.0,
+) -> Any:
+    """Run a gallery template on the LOCAL ComfyUI — fetch, fill params, execute.
+
+    Thin passthrough to ``comfy run-template <name> [--param=KEY=VALUE]…`` (the
+    engine fetches the template graph, fills its parameterized slots, and runs it
+    through the same local run path as ``run_workflow``). Named ``run_template``
+    for contract parity with the cloud MCP's ``run_template(name, params)``; this
+    is the one-command alternative to the manual ``search_templates`` →
+    ``fetch_template`` → ``run_workflow`` chain.
+
+    ``params`` fills the template's parameterized slots — ``{slot: value}`` where
+    a slot is an address (``"6.text"``) or a unique name (``"prompt"``). List a
+    template's slots by fetching it (``fetch_template``) and inspecting the graph.
+    Values are forwarded verbatim for comfy-cli to accept or reject.
+
+    SPEND CONSENT — most gallery templates are free OSS graphs that run entirely
+    on the user's own machine. SOME embed partner-API (paid) nodes, and running
+    one spends the user's Comfy credits. comfy-cli gates that path and this
+    wrapper only passes consent through: with ``confirm_spend=False`` (the
+    default) a paid template fails CLOSED (``spend_consent_required``, nothing
+    spent), while a free template runs normally. ``confirm_spend=True`` forwards
+    ``--allow-spend`` — set it ONLY when the USER has agreed to spend credits on
+    this run, never merely to clear the error. (This mirrors ``partner_generate``;
+    the flag is a no-op for free templates.)
+
+    With ``wait=True`` (default) this waits until the run finishes and returns the
+    result (``prompt_id`` + outputs); with ``wait=False`` it submits ``--async``
+    and returns immediately with a ``prompt_id`` to poll via ``job_status`` /
+    ``wait_for_job`` / ``watch_job`` — use that for long (e.g. video) runs that
+    may exceed your MCP client's tool timeout. OSS templates need their referenced
+    models installed locally; a missing model surfaces the run path's per-node
+    error (see ``search_models`` / ``download_model``). Everything targets the
+    LOCAL server (``--where local`` is injected by ``_run_comfy``).
+    """
+    if not name or name.startswith("-"):
+        # A leading-dash name is read by comfy-cli as an option, not the template
+        # positional (the same guard partner_generate applies to its model).
+        raise ComfyCliError(
+            f"invalid template name: {name!r} — expected a template name "
+            "(e.g. 'image_flux2'), not an empty or option-like value."
+        )
+    _reject_nul("template name", name)
+    timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
+    args = ["run-template", name, *_run_template_param_args(params or {})]
+    if confirm_spend:
+        # comfy-cli's paid-node consent for run-template; a bare boolean flag.
+        args.append("--allow-spend")
+    if not wait:
+        # Fire-and-return: submit and hand back a prompt_id to poll.
+        args.append("--async")
+        return _run_comfy(*args, timeout=60.0)
+    return _run_comfy(*args, timeout=timeout_seconds)
 
 
 @mcp.tool()
