@@ -141,7 +141,7 @@ reports the configured target under a `comfy_target` block.
   **local** ComfyUI process and stay local-only; they cannot start/stop or read logs from a remote
   box. Start ComfyUI on the remote host yourself.
 - **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
-  / `generate_image` — the underlying comfy-cli verbs take **no** `--host`/`--port`, so they run
+  / `generate_image` / `partner_generate` — the underlying comfy-cli verbs take **no** `--host`/`--port`, so they run
   against comfy-cli's local default. Against a remote target, prefer `run_workflow(wait=True)` /
   `job_status` (which return the remote job's `/view` output URLs) to retrieve results.
 - **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`) — their comfy-cli
@@ -290,6 +290,7 @@ the originals stay in the ComfyUI workspace.
 |---|---|---|
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy generate --prompt <prompt> [--checkpoint <ckpt>]` | Text prompt → image in one call — comfy-cli owns the graph/checkpoint injection, so no hand-assembled workflow needed. Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
+| `partner_generate(model, params=None, confirm_spend=False, download=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits**, unlike the local `run_workflow` / `generate_image` paths. comfy-cli owns the spend interlock and fails closed with no TTY, so the call errors unless `confirm_spend=True` forwards its `--yes`; `params` are the model's own schema-driven inputs, forwarded verbatim (discover them with `comfy generate schema <model>` / `comfy generate list`). |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |

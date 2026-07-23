@@ -16,6 +16,9 @@ Tools so far: the run -> get-output core loop plus job management
 detached launch's captured output, and the
 ``discover`` / ``which`` introspection pair (``comfy discover`` /
 ``comfy which``) that lets an agent learn the CLI's own contract and selection.
+``partner_generate`` (``comfy generate <model>``) reaches the hosted PARTNER
+models; it spends credits, so comfy-cli's own consent interlock gates it and
+this wrapper only passes that consent through (``--yes``) when asked to.
 
 Requires comfy-cli >= 1.12.0 (the ``comfy logs`` verb + the ``envelope/1``
 contract): :func:`_run_comfy` guards this once, up front, with an actionable
@@ -79,6 +82,11 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   alternatives.
 - After a detached `launch_comfyui`, read the background server's own output with
   `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
+- Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
+  which SPENDS the user's Comfy credits — local `run_workflow` / `generate_image`
+  runs are free. comfy-cli gates the spend and fails closed, so the call errors
+  unless you pass `confirm_spend=True`. Set that ONLY when the user has actually
+  agreed to spend credits for that call — never just to clear the error.
 
 Everything targets the LOCAL server only — there is no cloud access here.
 """
@@ -1458,6 +1466,149 @@ async def generate_image(
         ctx=ctx,
         timeout=timeout_seconds,
     )
+
+
+# comfy-cli reserves these words as `comfy generate` SUB-ACTIONS (its own
+# list / schema / refresh / upload / resume / consent verbs) rather than model
+# aliases. This tool's contract is "run this partner MODEL", so a reserved word
+# is refused instead of silently dispatching a different verb — `consent` in
+# particular is the spend gate's own configuration surface.
+_GENERATE_RESERVED_TARGETS = frozenset(
+    {"list", "schema", "refresh", "upload", "resume", "consent"}
+)
+
+# comfy-cli treats these `comfy generate` flags as RUN-level rather than model
+# inputs (its `_separate_meta_flags`): they change how the call runs, not what
+# is generated. They are refused inside `params` so a "model parameter" can
+# never silently retarget the run — above all `yes`, which would otherwise be a
+# second, undocumented way to grant spend consent behind `confirm_spend`'s back,
+# and `json` / `async`, which would break this tool's result contract.
+_GENERATE_META_FLAGS = frozenset(
+    {
+        "download",
+        "async",
+        "json",
+        "timeout",
+        "api-key",
+        "emit-workflow",
+        "output-prefix",
+        "yes",
+    }
+)
+
+# Hard ceiling for one partner generation, so `float('inf')` / an absurd value
+# can't hold the `comfy generate` child open effectively forever (1 hour).
+# Partner VIDEO models are the slow end of the range, hence an hour not minutes.
+_MAX_GENERATE_TIMEOUT = 3600.0
+
+
+def _generate_param_args(params: dict[str, Any]) -> list[str]:
+    """Marshal per-model ``params`` into ``comfy generate`` ``--name=value`` tokens.
+
+    ``comfy generate`` takes a model's inputs as schema-driven flags whose names
+    and types come from that model's OWN schema, so this wrapper neither knows
+    nor validates them: each pair is forwarded verbatim for comfy-cli to accept
+    or reject. The ``--name=value`` form (rather than two argv tokens) means a
+    value that begins with ``-`` is read as the value instead of being
+    mis-parsed as the next option.
+
+    Conversions are spelling-only, so comfy-cli's parser sees the form it
+    expects: ``None`` drops the flag entirely (rather than sending the string
+    "None"), bools become ``true`` / ``false``, and list / dict values are
+    JSON-encoded — what its array parser accepts. Everything else is
+    ``str()``-rendered.
+    """
+    argv: list[str] = []
+    for name, value in params.items():
+        if not name or name.startswith("-"):
+            raise ComfyCliError(
+                f"invalid parameter name: {name!r} — expected a model parameter "
+                "name (e.g. 'prompt'), not an empty or option-like value."
+            )
+        # Compare hyphen-normalized so `api_key` / `emit_workflow` are caught
+        # too; agents naturally spell CLI flags with underscores.
+        if name.replace("_", "-") in _GENERATE_META_FLAGS:
+            raise ComfyCliError(
+                f"`{name}` is a run-level `comfy generate` flag, not a model "
+                "parameter. Use this tool's own arguments where they cover it "
+                "(confirm_spend for --yes, download, timeout_seconds); the "
+                "remaining run-level flags are not forwarded by this tool, so "
+                "use comfy-cli directly for those."
+            )
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (list, dict)):
+            rendered = json.dumps(value)
+        else:
+            rendered = str(value)
+        argv.append(f"--{name}={rendered}")
+    return argv
+
+
+@mcp.tool()
+def partner_generate(
+    model: str,
+    params: dict[str, Any] | None = None,
+    confirm_spend: bool = False,
+    download: str | None = None,
+    timeout_seconds: float = 600.0,
+) -> Any:
+    """Run a hosted PARTNER model (Flux / Ideogram / DALL·E / Recraft / …) — SPENDS CREDITS.
+
+    Thin passthrough to ``comfy generate <model> [--param=value]…``. Unlike
+    ``generate_image`` / ``run_workflow``, which execute on the user's own
+    machine for free, this calls a hosted partner API through comfy-cli and so
+    **spends the user's Comfy credits**.
+
+    SPEND CONSENT — read before calling. comfy-cli puts the credit-spending call
+    behind a consent interlock, and this wrapper does not implement, weaken, or
+    reimplement it: the engine decides. An MCP server has no interactive
+    terminal, so there is no prompt to answer — with ``confirm_spend=False``
+    (the default) comfy-cli fails CLOSED and this raises :class:`ComfyCliError`
+    having spent nothing. ``confirm_spend=True`` forwards ``--yes``, comfy-cli's
+    explicit non-interactive consent. Only set it when the USER has actually
+    agreed to spend credits on this call — never merely to clear the error you
+    just hit. (A user who ran ``comfy generate consent always`` has
+    pre-authorized spending in comfy-cli's own config; that is their choice and
+    it applies here too.)
+
+    ``params`` carries the model's OWN inputs (``prompt``, ``aspect_ratio``,
+    ``seed``, …). These are schema-driven per model and are forwarded verbatim;
+    discover a model's real parameters, and the available aliases, with
+    comfy-cli directly: ``comfy generate schema <model>`` / ``comfy generate
+    list``. ``download`` forwards ``--download <path>`` so comfy-cli saves the
+    generated asset there. ``timeout_seconds`` bounds the whole call (clamped to
+    an hour) — partner video models are the slow end.
+
+    NOTE: ``comfy generate`` prints its result as human-readable text and exits
+    0 WITHOUT emitting an ``envelope/1``, so this runs through the same
+    ``plain_ok`` stopgap as ``launch`` / ``stop`` / ``model download``: a clean
+    exit is the success signal and the payload carries the printed text. A
+    non-zero exit — including the consent refusal — still raises.
+    """
+    if not model or model.startswith("-"):
+        # A leading-dash target is read by comfy-cli as an option rather than a
+        # model (the same guard watch_job applies to prompt_id).
+        raise ComfyCliError(
+            f"invalid model: {model!r} — expected a partner model alias "
+            "(e.g. 'flux-pro'), not an empty or option-like value."
+        )
+    if model in _GENERATE_RESERVED_TARGETS:
+        raise ComfyCliError(
+            f"invalid model: {model!r} is a `comfy generate` sub-action, not a "
+            "partner model. Use comfy-cli directly for those verbs."
+        )
+    timeout_seconds = min(max(timeout_seconds, 0.0), _MAX_GENERATE_TIMEOUT)
+    args = ["generate", model, *_generate_param_args(params or {})]
+    if download:
+        # `--flag=value` so a path beginning with `-` stays the value.
+        args.append(f"--download={download}")
+    if confirm_spend:
+        # comfy-cli's non-interactive spend consent; a bare boolean meta flag.
+        args.append("--yes")
+    return _run_comfy(*args, timeout=timeout_seconds, plain_ok=True)
 
 
 @mcp.tool()
