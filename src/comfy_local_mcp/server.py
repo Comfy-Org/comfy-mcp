@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -140,6 +141,51 @@ MIN_COMFY_CLI_VERSION = os.environ.get("COMFY_CLI_MIN_VERSION") or None
 # Hard ceiling for a single bounded watch so `float('inf')` / an absurd value
 # can't hold a `comfy jobs watch` child open effectively forever (1 hour).
 _MAX_WATCH_TIMEOUT = 3600.0
+
+
+def _bounded_timeout(timeout_seconds: float, ceiling: float) -> float:
+    """Bound a caller-supplied timeout to ``(0, ceiling]``, rejecting NaN.
+
+    ``min(max(t, 0.0), ceiling)`` looks like it does this and does not: every
+    NaN comparison is False, so ``max(nan, 0.0)`` returns ``nan``, ``min`` keeps
+    it, and it reaches ``subprocess.run(timeout=nan)`` — where the selector
+    raises a bare :class:`ValueError` that no caller catches (only
+    ``TimeoutExpired`` is handled). The one value the ceiling exists to stop was
+    the one that slipped through, and NaN is reachable because JSON and pydantic
+    accept it. ``inf`` clamps down to ``ceiling`` as before.
+
+    A non-positive timeout is rejected rather than floored to ``0.0``, which
+    would fire an immediate, baffling "timed out after 0.0s" on a call that
+    never really ran.
+    """
+    if math.isnan(timeout_seconds):
+        raise ComfyCliError(
+            "invalid timeout_seconds: NaN — expected a positive number of seconds."
+        )
+    if timeout_seconds <= 0:
+        raise ComfyCliError(
+            f"invalid timeout_seconds: {timeout_seconds!r} — expected a positive "
+            "number of seconds."
+        )
+    return min(timeout_seconds, ceiling)
+
+
+def _reject_nul(label: str, value: str) -> str:
+    """Reject an embedded NUL, which ``subprocess`` cannot carry in argv.
+
+    A NUL is a valid character in a JSON (and so MCP) string, but
+    ``subprocess.run`` raises a bare ``ValueError: embedded null byte`` on one —
+    uncaught here, so it would surface as an internal error rather than the
+    :class:`ComfyCliError` every other bad input produces. Only NUL is refused:
+    values are free-form model input (a prompt legitimately spans lines).
+    """
+    if "\0" in value:
+        raise ComfyCliError(
+            f"invalid {label}: embedded NUL character — a command argument "
+            "cannot contain one."
+        )
+    return value
+
 
 # Once the terminal envelope is read the authoritative result is in hand, but
 # comfy-cli can outlive its own envelope under a pipe (observed with
@@ -1501,6 +1547,58 @@ _GENERATE_META_FLAGS = frozenset(
 # Partner VIDEO models are the slow end of the range, hence an hour not minutes.
 _MAX_GENERATE_TIMEOUT = 3600.0
 
+# Head-room between the deadline comfy-cli is given (`--timeout`) and the one
+# this process enforces by killing the child. The ENGINE must be the side that
+# gives up: it ends the run cleanly, reports why, and — for a job the partner
+# already accepted (and charged for) — leaves a resumable handle behind. A
+# parent SIGKILL at the same instant would instead destroy that handle and
+# surface as a generic failure, inviting a retry that spends the credits twice.
+# The parent timeout is only the backstop for a child that ignores its own
+# deadline. (comfy-cli applies its deadline per phase — request, then poll — so
+# a pathologically slow request followed by a full poll can still reach this
+# backstop; it is a floor on engine-owned failure, not a proof of it.)
+_GENERATE_TIMEOUT_GRACE = 60.0
+
+# Whether the installed comfy-cli carries the credit-spend interlock. Latched
+# only on success: a probe that fails for a transient reason must not wedge the
+# tool for the life of the process.
+_spend_gate_probed = False
+
+
+def _require_spend_gate() -> None:
+    """Refuse to run a spending call unless comfy-cli's spend gate is installed.
+
+    This tool's core safety claim is that ``confirm_spend=False`` spends nothing
+    because comfy-cli fails CLOSED. That interlock landed in comfy-cli AFTER the
+    ``>= 1.12.0`` floor :data:`_MIN_COMFY_CLI` enforces (which was chosen for
+    ``comfy logs`` / ``envelope/1``), so the version check cannot prove it is
+    present — and against a comfy-cli without it the default call would silently
+    charge the user's card.
+
+    ``comfy generate consent`` is the gate's OWN configuration surface and ships
+    with it, so a clean exit is the capability signal; on an older CLI
+    ``consent`` falls through to the model lookup and exits non-zero. It is a
+    local, read-only config query (no network, no spend).
+
+    Unlike :func:`_check_comfy_version`, which fails OPEN so an unreadable
+    ``--version`` can never wedge a working install, this fails CLOSED: the cost
+    of guessing wrong here is the user's money, not an error message.
+    """
+    global _spend_gate_probed
+    if _spend_gate_probed:
+        return
+    try:
+        _run_comfy("generate", "consent", "show", timeout=30.0, plain_ok=True)
+    except ComfyCliError as exc:
+        raise ComfyCliError(
+            "this comfy-cli has no `comfy generate` spend gate, so a generation "
+            "would spend Comfy credits with no consent interlock — refusing. "
+            "Upgrade comfy-cli (`pip install -U comfy-cli`) to a release that "
+            "includes `comfy generate consent`, or run `comfy generate` yourself "
+            f"if you intend to spend. (probe: {exc})"
+        ) from exc
+    _spend_gate_probed = True
+
 
 def _generate_param_args(params: dict[str, Any]) -> list[str]:
     """Marshal per-model ``params`` into ``comfy generate`` ``--name=value`` tokens.
@@ -1525,8 +1623,26 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
                 f"invalid parameter name: {name!r} — expected a model parameter "
                 "name (e.g. 'prompt'), not an empty or option-like value."
             )
+        # A name carrying its own `=` (or whitespace) is not a parameter name:
+        # comfy-cli splits `--<body>` at the FIRST `=`, so `{"output-prefix=/tmp/x":
+        # v}` renders `--output-prefix=/tmp/x=v` and lands as the run-level
+        # `output-prefix` flag — smuggling past the meta-flag check below, which
+        # only ever sees the whole key. Refuse the shape instead of trying to
+        # out-parse comfy-cli's splitter.
+        if "=" in name or any(ch.isspace() for ch in name):
+            raise ComfyCliError(
+                f"invalid parameter name: {name!r} — a parameter name cannot "
+                "contain '=' or whitespace. Pass the value as the dict value, "
+                "not inside the key."
+            )
+        _reject_nul(f"parameter name {name!r}", name)
         # Compare hyphen-normalized so `api_key` / `emit_workflow` are caught
-        # too; agents naturally spell CLI flags with underscores.
+        # too; agents naturally spell CLI flags with underscores. Case is NOT
+        # normalized: comfy-cli matches its run-level flags case-sensitively in
+        # lower case, so `Json` can never reach one, while a model's schema
+        # flags come verbatim from its OpenAPI property names and may legitimately
+        # be capitalized — folding case here would refuse a real parameter to
+        # block an unreachable one.
         if name.replace("_", "-") in _GENERATE_META_FLAGS:
             raise ComfyCliError(
                 f"`{name}` is a run-level `comfy generate` flag, not a model "
@@ -1543,6 +1659,7 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
             rendered = json.dumps(value)
         else:
             rendered = str(value)
+        _reject_nul(f"value for parameter {name!r}", rendered)
         argv.append(f"--{name}={rendered}")
     return argv
 
@@ -1567,7 +1684,9 @@ def partner_generate(
     reimplement it: the engine decides. An MCP server has no interactive
     terminal, so there is no prompt to answer — with ``confirm_spend=False``
     (the default) comfy-cli fails CLOSED and this raises :class:`ComfyCliError`
-    having spent nothing. ``confirm_spend=True`` forwards ``--yes``, comfy-cli's
+    having spent nothing. Because that guarantee is the engine's, this refuses to
+    run at all against a comfy-cli that predates the gate (see
+    :func:`_require_spend_gate`). ``confirm_spend=True`` forwards ``--yes``, comfy-cli's
     explicit non-interactive consent. Only set it when the USER has actually
     agreed to spend credits on this call — never merely to clear the error you
     just hit. (A user who ran ``comfy generate consent always`` has
@@ -1579,8 +1698,11 @@ def partner_generate(
     discover a model's real parameters, and the available aliases, with
     comfy-cli directly: ``comfy generate schema <model>`` / ``comfy generate
     list``. ``download`` forwards ``--download <path>`` so comfy-cli saves the
-    generated asset there. ``timeout_seconds`` bounds the whole call (clamped to
-    an hour) — partner video models are the slow end.
+    generated asset there. ``timeout_seconds`` is forwarded as comfy-cli's own
+    ``--timeout`` (clamped to an hour; partner video models are the slow end),
+    so the ENGINE owns the deadline and can report a resumable job rather than
+    being killed mid-flight; this process only enforces a slightly later
+    backstop.
 
     NOTE: ``comfy generate`` prints its result as human-readable text and exits
     0 WITHOUT emitting an ``envelope/1``, so this runs through the same
@@ -1600,15 +1722,33 @@ def partner_generate(
             f"invalid model: {model!r} is a `comfy generate` sub-action, not a "
             "partner model. Use comfy-cli directly for those verbs."
         )
-    timeout_seconds = min(max(timeout_seconds, 0.0), _MAX_GENERATE_TIMEOUT)
+    _reject_nul("model", model)
+    timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_GENERATE_TIMEOUT)
     args = ["generate", model, *_generate_param_args(params or {})]
-    if download:
+    if download is not None:
+        if not download:
+            # Distinguish "no path given" (None -> comfy-cli's default location)
+            # from an empty string, which is a caller mistake: silently dropping
+            # it saves the asset somewhere the caller did not ask for.
+            raise ComfyCliError(
+                "invalid download: empty path — omit `download` to let comfy-cli "
+                "choose the default location, or pass a real path."
+            )
+        _reject_nul("download", download)
         # `--flag=value` so a path beginning with `-` stays the value.
         args.append(f"--download={download}")
+    # Hand the deadline to the engine so IT owns giving up (see
+    # `_GENERATE_TIMEOUT_GRACE`); the parent timeout below is only the backstop.
+    # This is also what makes `timeout_seconds` real: comfy-cli's own default is
+    # 300s, so before this a caller asking for longer silently got five minutes.
+    args.append(f"--timeout={timeout_seconds}")
     if confirm_spend:
         # comfy-cli's non-interactive spend consent; a bare boolean meta flag.
         args.append("--yes")
-    return _run_comfy(*args, timeout=timeout_seconds, plain_ok=True)
+    _require_spend_gate()
+    return _run_comfy(
+        *args, timeout=timeout_seconds + _GENERATE_TIMEOUT_GRACE, plain_ok=True
+    )
 
 
 @mcp.tool()
@@ -1842,7 +1982,7 @@ async def watch_job(
         # comfy-cli parses a leading-dash positional as an option/flag; reject
         # it rather than let `jobs watch` misread the id (argument injection).
         raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
-    timeout_seconds = min(max(timeout_seconds, 0.0), _MAX_WATCH_TIMEOUT)
+    timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
     return await _run_comfy_streaming(
         "jobs",
         "watch",

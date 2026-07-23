@@ -1332,6 +1332,29 @@ def test_watch_job_clamps_oversized_timeout(monkeypatch):
     assert seen["timeout"] == server._MAX_WATCH_TIMEOUT
 
 
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
+def test_watch_job_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
+    """NaN slips through `min(max(...))` — it must not reach the child at all.
+
+    Shares `_bounded_timeout` with `partner_generate`: `max(nan, 0.0)` is `nan`,
+    which would land as `timeout=nan` and raise a bare ValueError out of the
+    selector instead of a ComfyCliError.
+    """
+    started = False
+
+    async def fake_stream(*args, ctx=None, timeout=None, raise_on_timeout=True):
+        nonlocal started
+        started = True
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+
+    with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
+        asyncio.run(server.watch_job("pid", timeout_seconds=bad))
+
+    assert started is False
+
+
 def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
     """wait=False keeps the plain --json _run_comfy path (no streaming, no --wait)."""
     seen: dict = {}

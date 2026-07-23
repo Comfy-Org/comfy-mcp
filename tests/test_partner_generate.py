@@ -67,7 +67,7 @@ def test_partner_generate_argv_is_a_local_json_passthrough(patched_plain_run):
     cmd = calls[0]["cmd"]
     assert cmd[0] == server.COMFY_BIN
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
-    assert cmd[4:] == ["generate", "flux-pro", "--prompt=a red fox"]
+    assert cmd[4:] == ["generate", "flux-pro", "--prompt=a red fox", "--timeout=600.0"]
     assert calls[0]["env"]["COMFY_WHERE"] == "local"  # belt-and-suspenders pin
 
 
@@ -97,6 +97,7 @@ def test_partner_generate_marshals_param_types(patched_plain_run):
         "--raw=true",
         "--tiled=false",
         "--sizes=[512, 768]",
+        "--timeout=600.0",
     ]
 
 
@@ -112,6 +113,7 @@ def test_partner_generate_param_value_with_leading_dash_stays_a_value(
         "generate",
         "flux-pro",
         "--prompt=--not-a-flag, just text",
+        "--timeout=600.0",
     ]
 
 
@@ -121,7 +123,12 @@ def test_partner_generate_forwards_download_path(patched_plain_run):
 
     server.partner_generate("flux-pro", download="/tmp/out.png")
 
-    assert calls[0]["cmd"][4:] == ["generate", "flux-pro", "--download=/tmp/out.png"]
+    assert calls[0]["cmd"][4:] == [
+        "generate",
+        "flux-pro",
+        "--download=/tmp/out.png",
+        "--timeout=600.0",
+    ]
 
 
 def test_partner_generate_omits_params_when_none(patched_plain_run):
@@ -130,7 +137,7 @@ def test_partner_generate_omits_params_when_none(patched_plain_run):
 
     server.partner_generate("flux-pro")
 
-    assert calls[0]["cmd"][4:] == ["generate", "flux-pro"]
+    assert calls[0]["cmd"][4:] == ["generate", "flux-pro", "--timeout=600.0"]
 
 
 # --- spend consent ----------------------------------------------------------
@@ -151,7 +158,13 @@ def test_partner_generate_forwards_consent_when_confirmed(patched_plain_run):
 
     server.partner_generate("flux-pro", params={"prompt": "a cat"}, confirm_spend=True)
 
-    assert calls[0]["cmd"][4:] == ["generate", "flux-pro", "--prompt=a cat", "--yes"]
+    assert calls[0]["cmd"][4:] == [
+        "generate",
+        "flux-pro",
+        "--prompt=a cat",
+        "--timeout=600.0",
+        "--yes",
+    ]
 
 
 def test_partner_generate_consent_refusal_raises_and_surfaces_the_reason(
@@ -237,13 +250,153 @@ def test_partner_generate_rejects_option_like_param_name(patched_plain_run):
     assert calls == []
 
 
+def test_partner_generate_rejects_param_names_that_smuggle_a_value(
+    patched_plain_run,
+):
+    """A `=` inside the KEY would land as a run-level flag comfy-cli honors.
+
+    comfy-cli splits `--<body>` at the FIRST `=`, so `{"output-prefix=/tmp/x": v}`
+    renders `--output-prefix=/tmp/x=v` and sets the blocked run-level
+    `output-prefix` — the meta-flag check above never matches because it only
+    sees the whole key.
+    """
+    calls = patched_plain_run(0, stdout="done")
+
+    with pytest.raises(server.ComfyCliError, match="cannot contain"):
+        server.partner_generate("flux-pro", params={"output-prefix=/tmp/x": "v"})
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"model": "flux\0pro"}, "invalid model"),
+        ({"model": "flux-pro", "params": {"pro\0mpt": "a cat"}}, "parameter name"),
+        ({"model": "flux-pro", "params": {"prompt": "a\0cat"}}, "value for parameter"),
+        ({"model": "flux-pro", "download": "/tmp/\0.png"}, "invalid download"),
+    ],
+)
+def test_partner_generate_rejects_embedded_nul(patched_plain_run, kwargs, match):
+    """A NUL is legal in a JSON string but `subprocess` raises a bare ValueError.
+
+    Uncaught, that surfaces as an internal error instead of a ComfyCliError, so
+    catch the shape here — before any child is spawned.
+    """
+    calls = patched_plain_run(0, stdout="done")
+
+    with pytest.raises(server.ComfyCliError, match=match):
+        server.partner_generate(**kwargs)
+
+    assert calls == []
+
+
+def test_partner_generate_rejects_an_empty_download_path(patched_plain_run):
+    """`download=""` is a caller mistake, not "use the default location"."""
+    calls = patched_plain_run(0, stdout="done")
+
+    with pytest.raises(server.ComfyCliError, match="invalid download"):
+        server.partner_generate("flux-pro", download="")
+
+    assert calls == []
+
+
 def test_partner_generate_clamps_timeout(patched_plain_run):
     """An absurd timeout is clamped, so no `comfy generate` child runs forever."""
     calls = patched_plain_run(0, stdout="done")
 
     server.partner_generate("flux-pro", timeout_seconds=float("inf"))
 
-    assert calls[0]["timeout"] == server._MAX_GENERATE_TIMEOUT
+    assert f"--timeout={server._MAX_GENERATE_TIMEOUT}" in calls[0]["cmd"]
+    assert (
+        calls[0]["timeout"]
+        == server._MAX_GENERATE_TIMEOUT + server._GENERATE_TIMEOUT_GRACE
+    )
+
+
+def test_partner_generate_lets_the_engine_own_the_deadline(patched_plain_run):
+    """`timeout_seconds` becomes comfy-cli's own `--timeout`; we only backstop it.
+
+    Without the forwarded flag comfy-cli falls back to its 300s default, so a
+    caller asking for longer silently got five minutes — and a parent kill at
+    the same moment would destroy the resumable handle for a job the partner had
+    already accepted and CHARGED for, inviting a double-spending retry.
+    """
+    calls = patched_plain_run(0, stdout="done")
+
+    server.partner_generate("flux-pro", timeout_seconds=900.0)
+
+    assert "--timeout=900.0" in calls[0]["cmd"]
+    assert calls[0]["timeout"] == 900.0 + server._GENERATE_TIMEOUT_GRACE
+    assert calls[0]["timeout"] > 900.0  # the engine gives up first
+
+
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -5.0])
+def test_partner_generate_rejects_a_non_positive_or_nan_timeout(patched_plain_run, bad):
+    """NaN survives `min(max(...))` — and reaches `subprocess.run` as a ValueError.
+
+    Every NaN comparison is False, so the old clamp returned it unchanged,
+    defeating the ceiling with the one value it most needed to stop. A
+    non-positive timeout is refused rather than floored to an instant timeout.
+    """
+    calls = patched_plain_run(0, stdout="done")
+
+    with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
+        server.partner_generate("flux-pro", timeout_seconds=bad)
+
+    assert calls == []
+
+
+# --- the engine's spend gate must actually be installed ---------------------
+
+
+def test_partner_generate_refuses_when_comfy_cli_has_no_spend_gate(monkeypatch):
+    """No `comfy generate consent` -> no interlock -> refuse BEFORE spending.
+
+    The fail-closed guarantee is comfy-cli's, and it landed after the >= 1.12.0
+    floor this server enforces, so the version check cannot prove it is there.
+    Against an older CLI a default `confirm_spend=False` call would charge the
+    user with nothing to stop it.
+    """
+    monkeypatch.setattr(server, "_spend_gate_probed", False)
+    calls: list[list[str]] = []
+
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        calls.append(cmd)
+        # An older comfy-cli reads `consent` as a model name and exits non-zero.
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such model")
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError, match="no `comfy generate` spend gate"):
+        server.partner_generate("flux-pro", params={"prompt": "a cat"})
+
+    assert len(calls) == 1  # only the probe ran
+    assert calls[0][4:] == ["generate", "consent", "show"]  # never the generation
+    assert server._spend_gate_probed is False  # a failed probe is not latched
+
+
+def test_partner_generate_probes_the_spend_gate_once_then_generates(monkeypatch):
+    """A CLI that HAS the gate is probed once, then the generation goes through."""
+    monkeypatch.setattr(server, "_spend_gate_probed", False)
+    calls: list[list[str]] = []
+
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="done", stderr="")
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server.partner_generate("flux-pro", confirm_spend=True)
+    server.partner_generate("flux-pro", confirm_spend=True)
+
+    assert [c[4:6] for c in calls] == [
+        ["generate", "consent"],  # probed once...
+        ["generate", "flux-pro"],
+        ["generate", "flux-pro"],  # ...not again on the second call
+    ]
 
 
 # --- result contract (no envelope on the generate path) ---------------------
