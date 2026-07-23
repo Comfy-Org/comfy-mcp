@@ -5,8 +5,13 @@ target (``--where local``, defaulting to ComfyUI on ``127.0.0.1:8188``), asks
 for JSON, parses comfy-cli's versioned ``envelope/1`` result, and returns its
 ``data``. The run/queue tools can be pointed at a ComfyUI running ELSEWHERE by
 setting ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see ``_comfy_target``), which
-forwards ``--host`` / ``--port`` to comfy-cli. There is deliberately no HTTP
-client and no code shared with the Comfy Cloud MCP — comfy-cli is the engine.
+forwards ``--host`` / ``--port`` to comfy-cli. A LOCAL ComfyUI on a non-default
+address (e.g. ``:8189``) instead needs no code here at all: ``COMFY_LOCAL_URL``
+rides the environment passthrough (see ``_comfy_env``) and is resolved by
+comfy-cli, which ranks a ``--host``/``--port`` flag above ``COMFY_LOCAL_URL``,
+that above a background record, and ``127.0.0.1:8188`` last. There is
+deliberately no HTTP client and no code shared with the Comfy Cloud MCP —
+comfy-cli is the engine.
 
 Tools so far: the run -> get-output core loop plus job management
 (``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
@@ -85,7 +90,11 @@ Everything targets the LOCAL server only — there is no cloud access here.
 
 mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
 
-# Allow overriding the binary (e.g. a venv path) without touching code.
+# Allow overriding the binary (e.g. a venv path) without touching code. The
+# companion address override needs no constant here: a LOCAL ComfyUI on a
+# non-default address is selected with ``COMFY_LOCAL_URL``, which comfy-cli
+# reads straight off the environment ``_comfy_env`` forwards (precedence:
+# comfy-cli flags > env > background record > ``127.0.0.1:8188``).
 COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 
 # Optional: point the run/queue tools at a ComfyUI running ELSEWHERE (e.g. a GPU
@@ -217,8 +226,12 @@ def _comfy_env() -> dict[str, str]:
     """Child-process environment for every comfy-cli spawn.
 
     Single source of truth so the two spawn sites (``_run_comfy`` /
-    ``_run_comfy_streaming``) cannot drift. Injected keys are placed AFTER
-    ``os.environ`` so they win over any inherited values:
+    ``_run_comfy_streaming``) cannot drift. The inherited ``os.environ`` is
+    forwarded WHOLESALE on purpose — that passthrough is what lets a variable
+    set in the MCP client's ``env`` block configure comfy-cli without any code
+    here, e.g. ``COMFY_LOCAL_URL`` to target a local ComfyUI on a non-default
+    address (``:8189``) or ``COMFY_API_KEY`` for partner-API nodes. Injected
+    keys are placed AFTER ``os.environ`` so they win over any inherited values:
 
     - ``COMFY_WHERE=local`` — belt-and-suspenders pin so we never touch cloud.
     - ``COMFY_NO_WATCH=1`` — suppress comfy-cli's file watcher for agentic
@@ -1211,6 +1224,14 @@ def server_info() -> Any:
     Wraps ``comfy env``. Returns whether a local ComfyUI server is running and
     its URL, plus the selected workspace and Python info. Call this first to
     confirm a local ComfyUI is up before running a workflow.
+
+    The reported server URL is the address comfy-cli RESOLVED, not a fixed
+    default: ``COMFY_LOCAL_URL`` wins, else a background record, else
+    ``127.0.0.1:8188`` (``comfy env`` itself takes no ``--host``). So this is
+    also the right first call to verify a ``COMFY_LOCAL_URL`` override took
+    effect. A URL still reading ``:8188`` after setting it means the value did
+    not reach comfy-cli, or the comfy-cli on ``PATH`` predates the variable and
+    ignored it.
 
     Also the compatibility gate for the unpinned comfy-cli this server shells
     out to: it asserts comfy-cli's envelope schema major matches the

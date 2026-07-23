@@ -48,6 +48,8 @@ Cloud MCP** — comfy-cli is the engine.
 
 - [Prerequisites](#prerequisites)
 - [Partner-API nodes](#partner-api-nodes)
+- [Driving a remote ComfyUI](#driving-a-remote-comfyui)
+- [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
 - [Install](#install)
 - [Configure your AI client](#configure-your-ai-client)
 - [Quickstart](#quickstart)
@@ -72,7 +74,7 @@ Cloud MCP** — comfy-cli is the engine.
   `server_info`. Nothing here starts ComfyUI implicitly.
 
 <details>
-<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>)</summary>
+<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_LOCAL_URL</code>)</summary>
 
 <br>
 
@@ -93,6 +95,11 @@ Cloud MCP** — comfy-cli is the engine.
   pair — to point the **run / job** tools at a ComfyUI running elsewhere, e.g. a GPU box reachable
   over a private network (Tailscale). See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)**
   for what is and isn't remoted. Unset ⇒ local behavior is unchanged.
+- **`COMFY_LOCAL_URL` (optional — a local ComfyUI on a non-default port).** For a ComfyUI on
+  *this* machine that isn't on `127.0.0.1:8188` (e.g. `:8189` because Docker Desktop's ComfyUI
+  holds `:8188`). Read by comfy-cli, not by this server — it rides the environment passthrough,
+  so setting it in the client `env` block re-points every tool. See
+  **[Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)**.
 
 </details>
 
@@ -151,6 +158,55 @@ reports the configured target under a `comfy_target` block.
 - The remote ComfyUI must be reachable and **unauthenticated** on that network (the private network
   is the boundary); the server does not authenticate to it. `server_info` does not live-probe the
   remote — reachability surfaces on the first run/job call.
+
+## Targeting a non-default ComfyUI address
+
+The section above drives a ComfyUI on **another machine**. This one is for a ComfyUI on **this**
+machine that simply isn't on the default `127.0.0.1:8188` — most often a port clash, e.g. Docker
+Desktop's ComfyUI already holds `:8188` so yours came up on `:8189`.
+
+That address is resolved by **comfy-cli**, not by this server. Every tool shells out to `comfy`
+with the server's full environment, so a `COMFY_LOCAL_URL` set in your MCP client's `env` block
+reaches comfy-cli and re-points *every* local-targeting verb. Nothing to change here — set it
+alongside `COMFY_BIN` in the client registration:
+
+```json
+{
+  "mcpServers": {
+    "comfy-local": {
+      "command": "comfy-local-mcp",
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_LOCAL_URL": "http://127.0.0.1:8189"
+      }
+    }
+  }
+}
+```
+
+**Accepted values.** `http://host:port`, `host:port`, or `http://host` (port defaults to `8188`;
+the scheme is optional and, if present, must be `http`). IPv6 literals are bracketed:
+`http://[::1]:8189`. A malformed value is ignored with a one-line stderr warning rather than
+breaking the call.
+
+**Verify it took effect — call `server_info` first.** `server_info` wraps `comfy env`, which
+resolves the local address by the same rules, so the server URL it reports *is* the resolved
+address. Seeing `:8189` there (and the server reported running) confirms the override is live.
+
+**Requires a comfy-cli newer than 1.12.0.** `COMFY_LOCAL_URL` landed after the 1.12.0 release and
+is not in a published version yet — install comfy-cli from `main` to use it. On 1.12.0 or older the
+variable is simply ignored (no error) and every tool keeps targeting `127.0.0.1:8188`, so
+`server_info` still reporting `:8188` is the symptom of too old a comfy-cli.
+
+**Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port` flag →
+`COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.
+
+> **Use this *or* `COMFYUI_URL`, not both.** [`COMFYUI_URL`/`COMFYUI_HOST`](#driving-a-remote-comfyui)
+> makes this server forward explicit `--host`/`--port` flags for `comfy run` / `comfy jobs`, and an
+> explicit flag **outranks** `COMFY_LOCAL_URL` — so with both set the run/job tools would follow
+> `COMFYUI_URL` while every other verb followed `COMFY_LOCAL_URL`. For a non-default address on
+> *this* machine prefer `COMFY_LOCAL_URL` alone: it also covers the verbs that accept no
+> `--host`/`--port` (`comfy env`, templates, models, download), which `COMFYUI_URL` cannot reach.
 
 ## Install
 
