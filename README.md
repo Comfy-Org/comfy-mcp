@@ -124,9 +124,16 @@ server also retries a transient credential failure briefly before surfacing it.
 
 ## Spending credits on partner models
 
-Everything else this server does runs on **your** machine and is free. `partner_generate` is the
-exception: it wraps `comfy generate <model>`, which calls a hosted partner API and **spends your
-Comfy credits**. So every call is confirmed with you first.
+`partner_generate` is the one tool whose *whole purpose* is to spend: it wraps `comfy generate
+<model>`, which calls a hosted partner API and **spends your Comfy credits**. So every call is
+confirmed with you first.
+
+The other tools execute on **your** machine, and on their own they cost nothing — but that is a
+property of the tool, not a guarantee about the workflow you hand it. A workflow run through
+`run_workflow` / `generate_image` can itself contain the partner-API nodes described just above
+(Seedream, Veo, Kling, …), or any other node that bills a hosted service, and **those still spend
+your credits** — they bill through the workflow, below this server, with no confirmation prompt.
+Check what a workflow contains before running one you did not build.
 
 **On a client that supports [MCP elicitation](https://modelcontextprotocol.io/specification/server/elicitation)**
 (Claude Code and Claude Desktop do), the call raises a confirmation prompt naming the model and
@@ -135,6 +142,8 @@ saying that it spends credits:
 - **Approve** → the server forwards comfy-cli's `--yes` and the generation runs.
 - **Decline** (or dismiss it) → the tool returns an error, and comfy-cli is never started. No
   credits are spent.
+- **Leave it unanswered** → after five minutes the prompt lapses into a refusal, so a forgotten
+  call never sits pending forever. Nothing is spent; call the tool again to get a fresh prompt.
 
 **Don't want to be asked every time?** Persist it in comfy-cli, not here:
 

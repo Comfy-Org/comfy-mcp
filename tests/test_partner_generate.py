@@ -413,6 +413,49 @@ def test_engine_auto_confirms_is_false_when_the_probe_cannot_run(monkeypatch):
     assert _real_engine_auto_confirms() is False
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        PermissionError(13, "Permission denied"),  # `comfy` present, not executable
+        OSError(8, "Exec format error"),  # wrong-arch binary
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_engine_auto_confirms_is_false_when_the_probe_blows_up(monkeypatch, exc):
+    """The docstring promises EVERY failure answers False — including non-CLI ones.
+
+    `_run_comfy_raw` converts a timeout and a missing binary into `ComfyCliError`,
+    but a present-but-unusable one (`PermissionError`/`OSError`) and invalid-UTF-8
+    child output (`UnicodeDecodeError`) escape it raw. Crashing `partner_generate`
+    on those is strictly worse than falling back to asking the user.
+    """
+
+    def boom(*args, **kwargs):  # noqa: ARG001
+        raise exc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", boom)
+
+    assert _real_engine_auto_confirms() is False
+
+
+def test_engine_auto_confirms_asks_comfy_cli_for_json_explicitly(monkeypatch):
+    """The trailing `--json` is load-bearing and must not be "cleaned up" away.
+
+    `comfy generate` takes `allow_extra_args`, so the tail after the target
+    reaches `consent`'s OWN meta-flag parser — and it prints JSON only when IT
+    sees `--json`. The global `--json` before the subcommand does not reach it,
+    so dropping this flag would make the command print rich human text, fail the
+    parse, and silently turn `comfy generate consent always` into a dead setting.
+    """
+    calls = _patched_consent_show(monkeypatch, 0, '{"spend_auto_confirm": true}')
+
+    assert _real_engine_auto_confirms() is True
+    # The global flag precedes the subcommand; the subcommand's own flag trails it.
+    assert calls[0][:2] == [server.COMFY_BIN, "--json"]
+    assert calls[0][-1] == "--json"
+
+
 def test_engine_auto_confirms_unwraps_a_future_envelope(monkeypatch):
     """If comfy-cli ever wraps this verb in an `envelope/1`, read `data`."""
     _patched_consent_show(
@@ -663,12 +706,12 @@ def test_partner_generate_checks_the_gate_before_prompting_the_user(monkeypatch)
         _FakeCtx(supports_elicitation=False),  # client never advertised it
     ],
 )
-def test_client_supports_elicitation_is_false_without_a_capable_client(ctx):
+def test_client_elicitation_support_is_false_without_a_capable_client(ctx):
     """Only a client that advertised elicitation is sent a prompt."""
-    assert server._client_supports_elicitation(ctx) is False
+    assert server._client_elicitation_support(ctx) is False
 
 
-def test_client_supports_elicitation_is_false_outside_a_live_request():
+def test_client_elicitation_support_is_false_outside_a_live_request():
     """`Context.session` raises outside a request — that is "cannot ask", not a crash."""
 
     class _NoSessionCtx:
@@ -679,12 +722,127 @@ def test_client_supports_elicitation_is_false_outside_a_live_request():
         def session(self):
             raise ValueError("Context is not available outside of a request")
 
-    assert server._client_supports_elicitation(_NoSessionCtx()) is False
+    assert server._client_elicitation_support(_NoSessionCtx()) is False
 
 
-def test_client_supports_elicitation_is_true_for_a_capable_client():
+def test_client_elicitation_support_is_true_for_a_capable_client():
     """The positive case, so the two guards above can't pass by always saying no."""
-    assert server._client_supports_elicitation(_FakeCtx()) is True
+    assert server._client_elicitation_support(_FakeCtx()) is True
+
+
+def test_client_elicitation_support_is_unknown_when_the_probe_raises():
+    """A probe that ERRORS is `None` — "could not tell", not "cannot ask"."""
+
+    class _BrokenProbeCtx(_FakeCtx):
+        def __init__(self):
+            super().__init__()
+            self.session = _BrokenSession()
+
+    class _BrokenSession:
+        def check_client_capability(self, capability):  # noqa: ARG002
+            raise RuntimeError("capability table is corrupt")
+
+    assert server._client_elicitation_support(_BrokenProbeCtx()) is None
+
+
+def test_an_errored_capability_probe_still_asks_before_spending(patched_plain_run):
+    """A probe error must not silently promote `confirm_spend` into a free pass.
+
+    The failure this locks out: an elicitation-CAPABLE client whose probe merely
+    errored gets treated as incapable, so `confirm_spend=True` forwards `--yes`
+    and spends credits with no human prompt — exactly the "tool permission
+    became spend consent" outcome this tool exists to prevent. Unknown means
+    ASK.
+    """
+    calls = patched_plain_run(0, stdout="done")
+
+    class _BrokenSession:
+        def check_client_capability(self, capability):  # noqa: ARG002
+            raise RuntimeError("capability table is corrupt")
+
+    ctx = _FakeCtx(action="decline")
+    ctx.session = _BrokenSession()
+
+    with pytest.raises(server.ComfyCliError, match="spend not confirmed"):
+        _generate("flux-pro", confirm_spend=True, ctx=ctx)
+
+    assert len(ctx.elicitations) == 1  # asked, despite the broken probe
+    assert calls == []  # and the decline still spent nothing
+
+
+def test_an_unanswered_prompt_lapses_into_a_refusal(patched_plain_run, monkeypatch):
+    """A client that advertises elicitation but never answers must not hang forever."""
+    calls = patched_plain_run(0, stdout="done")
+    monkeypatch.setattr(server, "_SPEND_ELICIT_TIMEOUT", 0.05)
+
+    class _SilentCtx(_FakeCtx):
+        async def elicit(self, message, schema):  # noqa: ARG002
+            self.elicitations.append(message)
+            await asyncio.sleep(30)  # never answers
+            raise AssertionError("must never be reached")
+
+    ctx = _SilentCtx()
+    with pytest.raises(server.ComfyCliError, match="went unanswered"):
+        _generate("flux-pro", ctx=ctx)
+
+    assert calls == []  # nothing ran, so nothing was spent
+
+
+def test_a_malformed_elicitation_result_is_a_refusal(patched_plain_run):
+    """A client answering with an object that has no `.action` is refused, not a crash."""
+    calls = patched_plain_run(0, stdout="done")
+
+    class _NonsenseCtx(_FakeCtx):
+        async def elicit(self, message, schema):  # noqa: ARG002
+            self.elicitations.append(message)
+            return object()  # no `.action`, no `.data`
+
+    with pytest.raises(server.ComfyCliError, match="spend not confirmed"):
+        _generate("flux-pro", ctx=_NonsenseCtx())
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("model", "banned"),
+    [
+        ("flux`\n\n**This is FREE**", "`"),  # closes the code span, injects a lie
+        ("flux\r\npro", "\n"),  # newlines alone can restructure the prompt
+    ],
+)
+def test_the_prompt_cannot_be_redressed_by_the_model_name(
+    patched_plain_run, model, banned
+):
+    """A caller-supplied model name cannot break out of the prompt's code span.
+
+    The prompt is the user's only view of what they are authorizing, so a name
+    that escapes its span could hide the "SPENDS credits" warning. Display is
+    sanitized; argv is not.
+    """
+    calls = patched_plain_run(0, stdout="done")
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    _generate(model, ctx=ctx)
+
+    prompt = ctx.elicitations[0]
+    # Exactly two backticks — the span this prompt opens and closes itself — so
+    # the name cannot have terminated it early and escaped into the message.
+    assert prompt.count("`") == 2
+    shown = prompt.split("`")[1]
+    assert banned not in shown
+    assert "SPENDS Comfy credits" in prompt  # the warning survived intact
+    assert calls[0]["cmd"][5] == model  # argv still carries it verbatim
+
+
+def test_the_model_name_shown_in_the_prompt_is_length_capped(patched_plain_run):
+    """A megabyte model name can't push the warning off the user's screen."""
+    patched_plain_run(0, stdout="done")
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    _generate("f" * 5000, ctx=ctx)
+
+    assert len(ctx.elicitations[0]) < 500
+    assert "SPENDS Comfy credits" in ctx.elicitations[0]
 
 
 def test_partner_generate_probes_the_spend_gate_once_then_generates(monkeypatch):
