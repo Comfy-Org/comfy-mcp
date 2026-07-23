@@ -48,6 +48,7 @@ Cloud MCP** — comfy-cli is the engine.
 
 - [Prerequisites](#prerequisites)
 - [Partner-API nodes](#partner-api-nodes)
+- [Spending credits on partner models](#spending-credits-on-partner-models)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
 - [Install](#install)
@@ -120,6 +121,54 @@ in the client registration `env` block (shown in every example below). If a run 
 `partner_node_requires_credential`, the error now carries comfy-cli's hint verbatim, including
 the `comfy auth set comfy-cloud-api-key --key …` fallback and the list of offending nodes; the
 server also retries a transient credential failure briefly before surfacing it.
+
+## Spending credits on partner models
+
+`partner_generate` is the one tool whose *whole purpose* is to spend: it wraps `comfy generate
+<model>`, which calls a hosted partner API and **spends your Comfy credits**. So every call is
+confirmed with you first.
+
+The other tools execute on **your** machine, and on their own they cost nothing — but that is a
+property of the tool, not a guarantee about the workflow you hand it. A workflow run through
+`run_workflow` / `generate_image` can itself contain the partner-API nodes described just above
+(Seedream, Veo, Kling, …), or any other node that bills a hosted service, and **those still spend
+your credits** — they bill through the workflow, below this server, with no confirmation prompt.
+Check what a workflow contains before running one you did not build.
+
+**On a client that supports [MCP elicitation](https://modelcontextprotocol.io/specification/server/elicitation)**
+(Claude Code and Claude Desktop do), the call raises a confirmation prompt naming the model and
+saying that it spends credits:
+
+- **Approve** → the server forwards comfy-cli's `--yes` and the generation runs.
+- **Decline** (or dismiss it) → the tool returns an error, and comfy-cli is never started. No
+  credits are spent.
+- **Leave it unanswered** → after five minutes the prompt lapses into a refusal, so a forgotten
+  call never sits pending forever. Nothing is spent; call the tool again to get a fresh prompt.
+
+**Don't want to be asked every time?** Persist it in comfy-cli, not here:
+
+```bash
+comfy generate consent always   # spend without prompting
+comfy generate consent show     # what is it set to?
+comfy generate consent ask      # back to confirming each call
+```
+
+The server reads that setting per call and skips its own prompt when it is on — the durable
+"always proceed" lives in comfy-cli's config, and this server keeps no spend state of its own.
+
+**On a client that cannot elicit**, there is no prompt to raise, so consent has to be explicit in
+the call: `confirm_spend=True` forwards `--yes`. Without it comfy-cli's gate fails closed (an MCP
+server has no terminal to prompt at) and the call errors having spent nothing. On a client that
+*can* elicit you are asked anyway — `confirm_spend=True` is not a way around the prompt.
+
+Two things the server deliberately will **not** do:
+
+- **Treat tool permission as spend consent.** Your agent host's "always allow this tool" toggle
+  authorizes *calling* `partner_generate`; it never authorizes spending your money, and is never
+  read as consent. Only the prompt you answered, or the comfy-cli setting you persisted, is.
+- **Run against a comfy-cli with no spend gate.** The fail-closed guarantee is the engine's, so if
+  `comfy generate consent` is missing the tool refuses up front rather than spending on the
+  assumption something would have stopped it. `pip install -U comfy-cli` to fix.
 
 ## Driving a remote ComfyUI
 
@@ -359,7 +408,7 @@ the originals stay in the ComfyUI workspace.
 |---|---|---|
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
 | `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy generate --prompt <prompt> [--checkpoint <ckpt>]` | Text prompt → image in one call — comfy-cli owns the graph/checkpoint injection, so no hand-assembled workflow needed. Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
-| `partner_generate(model, params=None, confirm_spend=False, download=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--timeout=<s>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits**, unlike the local `run_workflow` / `generate_image` paths. comfy-cli owns the spend interlock and fails closed with no TTY, so the call errors unless `confirm_spend=True` forwards its `--yes`; the tool refuses outright against a comfy-cli too old to have that interlock (probed via `comfy generate consent`). `params` are the model's own schema-driven inputs, forwarded verbatim (discover them with `comfy generate schema <model>` / `comfy generate list`). `timeout_seconds` becomes comfy-cli's own `--timeout` so the engine — not a parent kill — owns the deadline on a job the partner may already have charged for. |
+| `partner_generate(model, params=None, confirm_spend=False, download=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--timeout=<s>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits**, unlike the local `run_workflow` / `generate_image` paths. Every call confirms the spend with you first — see [Spending credits](#spending-credits-on-partner-models) below. `params` are the model's own schema-driven inputs, forwarded verbatim (discover them with `comfy generate schema <model>` / `comfy generate list`). `timeout_seconds` becomes comfy-cli's own `--timeout` so the engine — not a parent kill — owns the deadline on a job the partner may already have charged for. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
