@@ -38,13 +38,22 @@ Hard guardrails — a PR that breaks any of these should be rejected:
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
-spend confirmation on `partner_generate`: comfy-cli owns the credit-spend
-interlock and the durable "always proceed" (`comfy generate consent always`),
-and this server only raises the confirmation over MCP **elicitation** — the
-protocol's equivalent of the CLI's y/N prompt — then forwards the answer as
-`--yes`. It stores no consent of its own. Adding *product* behavior here is
-still a guardrail breach; adapting comfy-cli's contract to an MCP primitive is
-this repo's job.
+spend confirmation on the two tools that can spend, `partner_generate` and
+`run_template`: comfy-cli owns the credit-spend interlock and the durable
+"always proceed" (`comfy generate consent always`), and this server only raises
+the confirmation over MCP **elicitation** — the protocol's equivalent of the
+CLI's y/N prompt — then forwards the answer as `--yes` / `--allow-spend`. It
+stores no consent of its own. Adding *product* behavior here is still a
+guardrail breach; adapting comfy-cli's contract to an MCP primitive is this
+repo's job.
+
+The two differ where the engine's own shape differs, and those differences are
+load-bearing rather than incidental: `comfy generate` always spends so it always
+prompts and honors `spend.auto_confirm`, while `comfy run-template` is usually
+free and never reads that setting — so `run_template` prompts only when
+`confirm_spend=True` asks to unlock spending, and treats the generate-scoped
+always-proceed as granting nothing. Mirror the engine's contract; do not
+generalize one tool's consent rules onto the other.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via

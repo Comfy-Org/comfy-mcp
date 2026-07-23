@@ -259,6 +259,10 @@ def _in_pipe_pool(func, *args):
 # radius to partner generation itself, exactly as `_PIPE_EXECUTOR` does for the
 # streaming pipe reads.
 #
+# Shared with `run_template`, which is the same class of call: a blocking
+# comfy-cli run bounded only by the hour-long ceiling, on a tool that is async
+# for its own spend-consent round-trip.
+#
 # Sized like the pipe pool. Saturating it queues further partner runs rather
 # than growing threads without bound — deliberate backpressure on a paid,
 # hour-long call, and far beyond any realistic concurrent use of one local
@@ -1823,25 +1827,16 @@ def _display_model(model: str) -> str:
     return cleaned or "<unnamed model>"
 
 
-async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
-    """Ask the USER to approve this one credit-spending call. True = approved.
+async def _elicit_spend_approval(ctx: Context, message: str, schema: type) -> bool:
+    """Raise one spend-confirmation prompt and report whether it was approved.
 
-    The MCP-native spend confirmation: one prompt per call, answered by the
-    human, never remembered. A decline, a cancel, an accept that did not
-    actually say yes, a client that errors on the request, a client that answers
-    with something malformed, and a prompt left unanswered past
-    :data:`_SPEND_ELICIT_TIMEOUT` all fail closed — the caller spends nothing.
+    The shared body behind every spend prompt (``partner_generate``'s and
+    ``run_template``'s): only the wording and the answer schema differ, while the
+    fail-closed handling below must not. True = the user affirmatively approved.
     """
     try:
         result = await asyncio.wait_for(
-            ctx.elicit(
-                message=(
-                    f"Run the hosted partner model `{_display_model(model)}`? "
-                    "This SPENDS Comfy credits from the account this machine is "
-                    "signed into. Running a workflow on the local ComfyUI is free."
-                ),
-                schema=SpendApproval,
-            ),
+            ctx.elicit(message=message, schema=schema),
             timeout=_SPEND_ELICIT_TIMEOUT,
         )
     except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -1870,6 +1865,26 @@ async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
     if getattr(result, "action", None) != "accept":
         return False
     return getattr(getattr(result, "data", None), "approve", False) is True
+
+
+async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
+    """Ask the USER to approve this one credit-spending call. True = approved.
+
+    The MCP-native spend confirmation: one prompt per call, answered by the
+    human, never remembered. A decline, a cancel, an accept that did not
+    actually say yes, a client that errors on the request, a client that answers
+    with something malformed, and a prompt left unanswered past
+    :data:`_SPEND_ELICIT_TIMEOUT` all fail closed — the caller spends nothing.
+    """
+    return await _elicit_spend_approval(
+        ctx,
+        (
+            f"Run the hosted partner model `{_display_model(model)}`? "
+            "This SPENDS Comfy credits from the account this machine is "
+            "signed into. Running a workflow on the local ComfyUI is free."
+        ),
+        SpendApproval,
+    )
 
 
 async def _resolve_spend_consent(
@@ -2119,6 +2134,85 @@ _RUN_TEMPLATE_ASYNC_TIMEOUT = 60.0
 _RUN_TEMPLATE_TIMEOUT_GRACE = 30.0
 
 
+class TemplateSpendApproval(BaseModel):
+    """What the client returns from the template spend-confirmation prompt.
+
+    Separate from :class:`SpendApproval` only for its wording: a template MAY
+    spend (most are free OSS graphs) where a partner model always does, and the
+    prompt should not overstate. The affirmative-answer design is the same — an
+    accept that never answered lands on ``False`` and reads as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Allow this template to spend Comfy credits?",
+        description=(
+            "Yes lets the run proceed even if the template contains "
+            "partner-API (paid) nodes, spending credits from the Comfy account "
+            "this machine is signed into. No cancels it and spends nothing; a "
+            "template with no paid nodes runs free either way."
+        ),
+    )
+
+
+async def _resolve_template_spend_consent(
+    name: str, confirm_spend: bool, ctx: Context | None
+) -> bool:
+    """Decide whether to forward ``--allow-spend`` for this template run.
+
+    The same principle as :func:`_resolve_spend_consent` — an agent's own
+    ``confirm_spend=True`` is not the user's consent to spend money, so on a
+    client that can elicit, the human is asked — but the shape differs on two
+    points that are specific to this verb:
+
+    1. **No prompt when nothing can be spent.** ``confirm_spend=False`` forwards
+       nothing, so comfy-cli's gate fails closed and a paid template cannot
+       spend; there is nothing to consent to. Most gallery templates are free
+       OSS graphs, so prompting on every call would train the user to click
+       through the one prompt that matters. The prompt is raised only when the
+       caller is actually asking to unlock spending.
+    2. **comfy-cli's durable always-proceed does NOT apply here.** ``run-template``
+       never reads ``spend.auto_confirm`` — the setting is scoped to
+       ``comfy generate`` (it is that gate's own configuration surface, and its
+       own status line says so). Unlike :func:`_resolve_spend_consent`, there is
+       therefore no branch that lets the engine consent to itself: it would send
+       no flag and the run would fail closed anyway, having asked nobody.
+
+    Returns True to append ``--allow-spend``. Raises :class:`ComfyCliError` —
+    before any child is spawned — when the user actively declined.
+    """
+    if not confirm_spend:
+        return False
+    # `None` (the probe itself errored) counts as "ask", for the same reason as
+    # on the generate path: guessing "cannot elicit" would silently demote a
+    # capable client onto the caller's own say-so and spend without a human.
+    if _client_elicitation_support(ctx) is not False:
+        if await _elicit_template_spend_consent(ctx, name):
+            return True
+        raise ComfyCliError(
+            f"spend not confirmed: the user declined to let the template "
+            f"{name!r} spend Comfy credits. Nothing was spent and no run was "
+            "started. (A template with no partner-API nodes runs for free — "
+            "call again with confirm_spend=False to run it without spending.)"
+        )
+    # Client cannot elicit: `confirm_spend` is the documented fallback.
+    return True
+
+
+async def _elicit_template_spend_consent(ctx: Context, name: str) -> bool:
+    """Ask the USER to approve credit spend for this one template run."""
+    return await _elicit_spend_approval(
+        ctx,
+        (
+            f"Run the gallery template `{_display_model(name)}` with credit "
+            "spending ALLOWED? Most templates are free graphs that run on this "
+            "machine, but one containing partner-API nodes SPENDS Comfy credits "
+            "from the account this machine is signed into."
+        ),
+        TemplateSpendApproval,
+    )
+
+
 def _reject_nul_deep(label: str, value: Any) -> None:
     """Reject an embedded NUL anywhere inside a JSON-shaped param value.
 
@@ -2194,12 +2288,13 @@ def _run_template_param_args(params: dict[str, Any]) -> list[str]:
 
 
 @mcp.tool()
-def run_template(
+async def run_template(
     name: str,
     params: dict[str, Any] | None = None,
     confirm_spend: bool = False,
     wait: bool = True,
     timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
 ) -> Any:
     """Run a gallery template on the LOCAL ComfyUI — fetch, fill params, execute.
 
@@ -2218,12 +2313,28 @@ def run_template(
     SPEND CONSENT — most gallery templates are free OSS graphs that run entirely
     on the user's own machine. SOME embed partner-API (paid) nodes, and running
     one spends the user's Comfy credits. comfy-cli gates that path and this
-    wrapper only passes consent through: with ``confirm_spend=False`` (the
-    default) a paid template fails CLOSED (``spend_consent_required``, nothing
-    spent), while a free template runs normally. ``confirm_spend=True`` forwards
-    ``--allow-spend`` — set it ONLY when the USER has agreed to spend credits on
-    this run, never merely to clear the error. (This mirrors ``partner_generate``;
-    the flag is a no-op for free templates.)
+    wrapper only passes consent through (see
+    :func:`_resolve_template_spend_consent`):
+
+    - ``confirm_spend=False`` (the default) forwards nothing, so a paid template
+      fails CLOSED (``spend_consent_required``, nothing spent) while a free
+      template runs normally. Nothing can be spent, so the user is NOT prompted —
+      free template runs stay a single, silent call.
+    - ``confirm_spend=True`` asks to unlock spending, and on a client that
+      supports MCP **elicitation** the USER is prompted per call before anything
+      runs. Approve and ``--allow-spend`` is forwarded; decline and this raises
+      :class:`ComfyCliError` without starting comfy-cli. Only on a client that
+      cannot elicit does the argument stand on its own, as the fallback.
+
+    So ``confirm_spend=True`` is a REQUEST to spend, not the consent itself: set
+    it only when the user has actually agreed, never merely to clear the error
+    you just hit. Spend consent is not tool permission — a host's "always allow
+    this tool" toggle authorizes calling this tool, never spending the user's
+    money, and is never read as consent here. This mirrors ``partner_generate``,
+    with two differences that verb's shape forces: it always spends so it always
+    prompts, and comfy-cli's durable ``comfy generate consent always`` is scoped
+    to ``comfy generate`` — ``run-template`` does not read it, so it grants
+    nothing here.
 
     Unlike ``partner_generate``, this does NOT probe for the interlock first. It
     does not need to: ``partner_generate``'s gate landed in comfy-cli *after* the
@@ -2275,15 +2386,20 @@ def run_template(
     # runs. comfy-cli types this flag as an int, so a float is a parse error.
     budget = timeout_seconds if wait else _RUN_TEMPLATE_ASYNC_TIMEOUT
     args.append(f"--timeout={max(1, int(min(budget, _RUN_TEMPLATE_EVENT_TIMEOUT)))}")
-    if confirm_spend:
+    if await _resolve_template_spend_consent(name, confirm_spend, ctx):
         # comfy-cli's paid-node consent for run-template; a bare boolean flag.
         args.append("--allow-spend")
     if not wait:
         # Fire-and-return: submit and hand back a prompt_id to poll.
         args.append("--async")
     # The parent stays the backstop only: a little slack past the budget so
-    # comfy-cli reports its own error rather than dying to a signal.
-    return _run_comfy(*args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE)
+    # comfy-cli reports its own error rather than dying to a signal. Runs off
+    # the event loop in the dedicated pool for the same reason
+    # `partner_generate` does: this blocks for as long as the template takes (up
+    # to an hour) and the tool is async for the consent round-trip above.
+    return await _in_generate_pool(
+        _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+    )
 
 
 @mcp.tool()

@@ -6,8 +6,13 @@ lives in comfy-cli. These lock in what the wrapper owns:
 1. The passthrough argv: global flags before the subcommand, the template name as
    the first positional, slot fills as ``--param=KEY=VALUE`` (JSON-encoded, so
    Python types round-trip), and ``--async`` only on ``wait=False``.
-2. The SPEND CONSENT posture — ``--allow-spend`` is sent only when the caller
-   sets ``confirm_spend=True``; the engine still owns the fail-closed interlock.
+2. The SPEND CONSENT posture — ``--allow-spend`` is sent only when the USER
+   granted consent for that call (the per-call elicitation prompt, or the
+   explicit ``confirm_spend`` fallback on a client that cannot elicit), a
+   free-by-default run is never prompted at all, and an agent's own
+   ``confirm_spend=True`` is not a way around the prompt. The engine still owns
+   the fail-closed interlock; these only prove what we forward, and that a
+   decline spawns no child.
 3. The result contract: ``comfy run-template`` emits an ``envelope/1`` (unlike the
    ``comfy generate`` path), so its ``data`` is unwrapped and an error envelope
    (e.g. the gate's ``spend_consent_required``) raises.
@@ -17,12 +22,62 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 
 import pytest
+from mcp.server.elicitation import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    DeclinedElicitation,
+)
 
 from comfy_local_mcp import server
+
+
+def _run_template(*args, **kwargs):
+    """Drive the async ``run_template`` tool from a sync test.
+
+    Matches the ``asyncio.run`` convention the other async tools' tests use; the
+    tool went async in order to raise the per-call spend-confirmation
+    elicitation before unlocking ``--allow-spend``.
+    """
+    return asyncio.run(server.run_template(*args, **kwargs))
+
+
+class _FakeSession:
+    """Stand-in for the MCP ``ServerSession`` capability probe."""
+
+    def __init__(self, supports_elicitation: bool):
+        self._supports = supports_elicitation
+
+    def check_client_capability(self, capability):
+        return self._supports and capability.elicitation is not None
+
+
+class _FakeCtx:
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
+
+    Deliberately a local copy of ``test_partner_generate``'s fake rather than a
+    shared one: the two tools' consent paths are asserted independently, so a
+    change to one tool's prompt must not be able to silently retune the other's
+    tests.
+    """
+
+    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+        self.session = _FakeSession(supports_elicitation)
+        self._action = action
+        self._approve = approve
+        self.elicitations: list[str] = []
+
+    async def elicit(self, message, schema):
+        self.elicitations.append(message)
+        if self._action == "accept":
+            return AcceptedElicitation(data=schema(approve=self._approve))
+        if self._action == "decline":
+            return DeclinedElicitation()
+        return CancelledElicitation()
 
 
 def _envelope(*, ok: bool = True, data=None, error=None) -> str:
@@ -70,7 +125,7 @@ def test_run_template_argv_is_a_local_json_passthrough(patched_run):
     """`comfy --json --where local run-template <name> --param=k=v` (flags first)."""
     calls = patched_run()
 
-    result = server.run_template("image_flux2", params={"prompt": "a red fox"})
+    result = _run_template("image_flux2", params={"prompt": "a red fox"})
 
     assert result == {
         "prompt_id": "p1",
@@ -93,7 +148,7 @@ def test_run_template_marshals_param_types_as_json(patched_run):
     """Each value is JSON-encoded so its Python type round-trips through the slot."""
     calls = patched_run()
 
-    server.run_template(
+    _run_template(
         "image_flux2",
         params={
             "prompt": "a cat",  # str -> quoted JSON string (stays a string)
@@ -131,7 +186,7 @@ def test_run_template_param_value_with_equals_and_dash_stays_intact(patched_run)
     """
     calls = patched_run()
 
-    server.run_template("t", params={"expr": "a=b-c"})
+    _run_template("t", params={"expr": "a=b-c"})
 
     assert calls[0]["cmd"][4:] == [
         "run-template",
@@ -145,7 +200,7 @@ def test_run_template_omits_params_when_none(patched_run):
     """No params -> a bare `run-template <name>`."""
     calls = patched_run()
 
-    server.run_template("image_flux2")
+    _run_template("image_flux2")
 
     assert calls[0]["cmd"][4:] == ["run-template", "image_flux2", "--timeout=120"]
 
@@ -157,7 +212,7 @@ def test_run_template_withholds_consent_by_default(patched_run):
     """The default sends NO `--allow-spend`: a paid template is left to fail closed."""
     calls = patched_run()
 
-    server.run_template("api_seedance", params={"prompt": "a cat"})
+    _run_template("api_seedance", params={"prompt": "a cat"})
 
     assert "--allow-spend" not in calls[0]["cmd"]
 
@@ -166,7 +221,7 @@ def test_run_template_forwards_consent_when_confirmed(patched_run):
     """`confirm_spend=True` forwards `--allow-spend`, comfy-cli's paid-node consent."""
     calls = patched_run()
 
-    server.run_template("api_seedance", params={"prompt": "a cat"}, confirm_spend=True)
+    _run_template("api_seedance", params={"prompt": "a cat"}, confirm_spend=True)
 
     assert calls[0]["cmd"][4:] == [
         "run-template",
@@ -175,6 +230,115 @@ def test_run_template_forwards_consent_when_confirmed(patched_run):
         "--timeout=120",
         "--allow-spend",
     ]
+
+
+def test_run_template_free_run_is_never_prompted(patched_run):
+    """`confirm_spend=False` can't spend, so the user is not asked anything.
+
+    Most gallery templates are free OSS graphs. Prompting on every call would
+    train the user to click through the one prompt that actually matters, and
+    there is nothing to consent to: with no `--allow-spend` the engine's gate
+    fails closed on a paid template.
+    """
+    patched_run()
+    ctx = _FakeCtx()
+
+    _run_template("image_flux2", params={"prompt": "a cat"}, ctx=ctx)
+
+    assert ctx.elicitations == []
+
+
+def test_run_template_asks_the_user_before_unlocking_spend(patched_run):
+    """`confirm_spend=True` is a REQUEST to spend; the human grants it per call."""
+    calls = patched_run()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=ctx
+    )
+
+    assert len(ctx.elicitations) == 1
+    assert "api_seedance" in ctx.elicitations[0]
+    assert "SPENDS Comfy credits" in ctx.elicitations[0]
+    assert "--allow-spend" in calls[0]["cmd"]
+
+
+@pytest.mark.parametrize(
+    ("action", "approve"),
+    [
+        ("decline", False),  # said no
+        ("cancel", False),  # dismissed the prompt
+        ("accept", False),  # accepted without actually answering yes
+    ],
+)
+def test_run_template_declined_spend_spawns_no_child(patched_run, action, approve):
+    """A refusal is enforced HERE — comfy-cli is never started, nothing is spent."""
+    calls = patched_run()
+    ctx = _FakeCtx(action=action, approve=approve)
+
+    with pytest.raises(server.ComfyCliError, match="spend not confirmed"):
+        _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+
+    assert calls == []
+
+
+def test_run_template_confirm_spend_is_not_a_way_around_the_prompt(patched_run):
+    """An agent setting `confirm_spend=True` itself does not authorize the spend.
+
+    The hole this closes: a host's blanket "always allow this tool" toggle lets
+    an agent set the argument for itself, which would otherwise be standing
+    authority over the user's credits — the same reason `partner_generate`
+    prompts even when it is passed.
+    """
+    calls = patched_run()
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError, match="spend not confirmed"):
+        _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+
+    assert calls == []
+
+
+def test_run_template_falls_back_to_confirm_spend_when_client_cannot_elicit(
+    patched_run,
+):
+    """On a client with no elicitation, `confirm_spend` is the documented fallback."""
+    calls = patched_run()
+    ctx = _FakeCtx(supports_elicitation=False)
+
+    _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+
+    assert ctx.elicitations == []
+    assert "--allow-spend" in calls[0]["cmd"]
+
+
+def test_run_template_does_not_consult_the_generate_auto_confirm(monkeypatch):
+    """comfy-cli scopes `spend.auto_confirm` to `comfy generate`.
+
+    `run-template` never reads it, so treating it as consent here would forward
+    nothing (the engine cannot consent to itself for this verb) and fail closed
+    having asked nobody. The template path must not call it at all.
+    """
+    monkeypatch.setattr(
+        server,
+        "_engine_auto_confirms",
+        lambda: pytest.fail("run_template must not read the generate auto-confirm"),
+    )
+    ctx = _FakeCtx()
+
+    # A free run: no consent machinery should be reached at all.
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(
+            [], 0, stdout=_envelope(data={"prompt_id": "p1"}), stderr=""
+        ),
+    )
+
+    _run_template("image_flux2", confirm_spend=True, ctx=ctx)
+
+    assert len(ctx.elicitations) == 1
 
 
 def test_run_template_spend_refusal_raises_with_code(patched_run):
@@ -191,7 +355,7 @@ def test_run_template_spend_refusal_raises_with_code(patched_run):
     )
 
     with pytest.raises(server.ComfyCliError, match="spend_consent_required"):
-        server.run_template("api_seedance", params={"prompt": "a cat"})
+        _run_template("api_seedance", params={"prompt": "a cat"})
 
 
 # --- wait / async -----------------------------------------------------------
@@ -201,7 +365,7 @@ def test_run_template_wait_false_submits_async(patched_run):
     """`wait=False` appends `--async` and uses the short fire-and-return timeout."""
     calls = patched_run(stdout=_envelope(data={"prompt_id": "p9"}))
 
-    result = server.run_template("image_flux2", params={"prompt": "x"}, wait=False)
+    result = _run_template("image_flux2", params={"prompt": "x"}, wait=False)
 
     assert result == {"prompt_id": "p9"}
     assert calls[0]["cmd"][4:] == [
@@ -228,7 +392,7 @@ def test_run_template_rejects_option_like_name(patched_run, name):
     calls = patched_run()
 
     with pytest.raises(server.ComfyCliError, match="invalid template name"):
-        server.run_template(name)
+        _run_template(name)
 
     assert calls == []  # never reached comfy-cli
 
@@ -239,7 +403,7 @@ def test_run_template_rejects_option_like_param_key(patched_run, key):
     calls = patched_run()
 
     with pytest.raises(server.ComfyCliError, match="invalid param key"):
-        server.run_template("t", params={key: "v"})
+        _run_template("t", params={key: "v"})
 
     assert calls == []
 
@@ -250,7 +414,7 @@ def test_run_template_rejects_param_keys_with_equals_or_whitespace(patched_run, 
     calls = patched_run()
 
     with pytest.raises(server.ComfyCliError, match="cannot contain"):
-        server.run_template("t", params={key: "v"})
+        _run_template("t", params={key: "v"})
 
     assert calls == []
 
@@ -277,7 +441,7 @@ def test_run_template_rejects_embedded_nul(patched_run, kwargs, match):
     calls = patched_run()
 
     with pytest.raises(server.ComfyCliError, match=match):
-        server.run_template(**kwargs)
+        _run_template(**kwargs)
 
     assert calls == []
 
@@ -286,7 +450,7 @@ def test_run_template_clamps_timeout(patched_run):
     """An absurd timeout is clamped, so no `comfy run-template` child runs forever."""
     calls = patched_run()
 
-    server.run_template("t", timeout_seconds=float("inf"))
+    _run_template("t", timeout_seconds=float("inf"))
 
     assert (
         calls[0]["timeout"]
@@ -315,7 +479,7 @@ def test_run_template_hands_engine_a_deadline_within_the_caller_budget(
     """
     calls = patched_run()
 
-    server.run_template("t", timeout_seconds=budget)
+    _run_template("t", timeout_seconds=budget)
 
     assert expected in calls[0]["cmd"]
     # The parent stays a backstop only: strictly later than the engine's bound.
@@ -326,7 +490,7 @@ def test_run_template_engine_timeout_is_an_int(patched_run):
     """comfy-cli types `--timeout` as an int, so a float would be a parse error."""
     calls = patched_run()
 
-    server.run_template("t", timeout_seconds=45.7)
+    _run_template("t", timeout_seconds=45.7)
 
     flag = next(a for a in calls[0]["cmd"] if a.startswith("--timeout="))
     assert flag == "--timeout=45"
@@ -339,7 +503,7 @@ def test_run_template_rejects_non_positive_or_nan_timeout(patched_run, bad):
     calls = patched_run()
 
     with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
-        server.run_template("t", timeout_seconds=bad)
+        _run_template("t", timeout_seconds=bad)
 
     assert calls == []
 
