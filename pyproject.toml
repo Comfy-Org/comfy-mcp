@@ -7,7 +7,15 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "Comfy Org" }]
 dependencies = [
-    "mcp>=1.2.0",
+    # >= 1.10 for elicitation (`Context.elicit`, used by `partner_generate` to
+    # confirm a credit spend per call); >= 1.14 because earlier FastMCP builds
+    # crash at import on this server's `ctx: Context | None` tool parameters
+    # (`issubclass() arg 1 must be a class`). Verified by running the suite
+    # against each release; the floor was previously understated at 1.2.0.
+    "mcp>=1.14.0",
+    # Already an mcp dependency; declared explicitly because this server now
+    # imports it directly for the elicitation response schema.
+    "pydantic>=2",
 ]
 # comfy-cli is intentionally NOT a declared dependency: this server shells out
 # to whatever `comfy` binary PATH/COMFY_BIN resolves to (which may differ from a

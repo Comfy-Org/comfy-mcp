@@ -23,7 +23,10 @@ detached launch's captured output, and the
 ``comfy which``) that lets an agent learn the CLI's own contract and selection.
 ``partner_generate`` (``comfy generate <model>``) reaches the hosted PARTNER
 models; it spends credits, so comfy-cli's own consent interlock gates it and
-this wrapper only passes that consent through (``--yes``) when asked to.
+this wrapper only passes that consent through (``--yes``) when the USER granted
+it for that call — asked per call over MCP elicitation, or pre-authorized in
+comfy-cli's own config. The durable "always proceed" stays engine-side, so this
+server holds no spend state of its own.
 
 Requires comfy-cli >= 1.12.0 (the ``comfy logs`` verb + the ``envelope/1``
 contract): :func:`_run_comfy` guards this once, up front, with an actionable
@@ -48,7 +51,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
+from mcp import types
 from mcp.server.fastmcp import Context, FastMCP, Image
+from pydantic import BaseModel, Field
 
 # Rides every client handshake — teach an agent the canonical flows up front so
 # it does not have to rediscover them tool-by-tool. Keep this short.
@@ -90,9 +95,14 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
 - Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
   which SPENDS the user's Comfy credits — local `run_workflow` / `generate_image`
-  runs are free. comfy-cli gates the spend and fails closed, so the call errors
-  unless you pass `confirm_spend=True`. Set that ONLY when the user has actually
-  agreed to spend credits for that call — never just to clear the error.
+  runs are free. Every call confirms the spend with the USER first: on a client
+  that supports MCP elicitation you will be shown a confirmation prompt, and a
+  decline cancels the call without spending. On a client that cannot elicit,
+  comfy-cli's gate fails closed and the call errors unless you pass
+  `confirm_spend=True` — set that ONLY when the user has actually agreed to
+  spend credits for that call, never just to clear the error, and never because
+  the host granted blanket permission to call the tool. A user who prefers not
+  to be asked persists it engine-side with `comfy generate consent always`.
 
 Everything targets the LOCAL server only — there is no cloud access here.
 """
@@ -1627,6 +1637,163 @@ def _require_spend_gate() -> None:
     _spend_gate_probed = True
 
 
+def _engine_auto_confirms() -> bool:
+    """True when comfy-cli's persisted ``spend.auto_confirm`` is on.
+
+    The DURABLE "always proceed" for credit spending lives in comfy-cli's own
+    config (``comfy generate consent always``), not here — this server stays
+    stateless and remembers nothing between calls. When the user has set it, the
+    engine consents to its own spending call and there is nothing left to ask,
+    so :func:`partner_generate` skips the per-call prompt and forwards no
+    ``--yes``: the consent is the engine's, and it stays the engine's.
+
+    ``comfy generate consent show --json`` prints the setting as a JSON object
+    (a pretty-printed one, so it is read from the whole of stdout rather than
+    the line-oriented envelope parser). Read fresh on every call — a latched
+    answer would keep prompting after the user turned the setting on, or worse,
+    keep NOT prompting after they turned it off.
+
+    Best-effort, and every failure answers ``False``: an unreadable setting must
+    fall through to ASKING the user, never to assuming they already said yes.
+    :func:`_require_spend_gate` — not this — is what refuses a comfy-cli with no
+    interlock at all, so a ``False`` here is never mistaken for "no gate".
+    """
+    try:
+        _, stdout, _, returncode, _ = _run_comfy_raw(
+            "generate", "consent", "show", "--json", timeout=30.0
+        )
+    except ComfyCliError:
+        return False
+    if returncode != 0:
+        return False
+    try:
+        payload = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    # Tolerate comfy-cli one day wrapping this verb in an `envelope/1` the way
+    # the other verbs are: read the setting out of `data` when it does.
+    if isinstance(payload, dict) and payload.get("type") == "envelope":
+        payload = payload.get("data")
+    # `is True` on purpose: only a real JSON `true` authorizes spending. A
+    # string, a 1, or a missing key is not consent.
+    return isinstance(payload, dict) and payload.get("spend_auto_confirm") is True
+
+
+class SpendApproval(BaseModel):
+    """What the client returns from the per-call spend-confirmation prompt.
+
+    Deliberately one boolean rather than a bare accept/decline: consent has to
+    be an AFFIRMATIVE answer to the question "spend credits?", so a client (or
+    an agent host) that accepts the elicitation without actually answering it
+    lands on the ``False`` default and is treated as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Spend Comfy credits on this generation?",
+        description=(
+            "Yes runs the hosted partner model and spends credits from the "
+            "Comfy account this machine is signed into. No cancels it and "
+            "spends nothing."
+        ),
+    )
+
+
+def _client_supports_elicitation(ctx: Context | None) -> bool:
+    """True when the connected MCP client advertised the elicitation capability.
+
+    Elicitation is optional in MCP, so the prompt can only be raised on a client
+    that declared it at handshake. Anything else — no context (a direct call, or
+    a host that injects none), a session predating elicitation, a capability
+    probe that raises — answers ``False`` so the caller falls back to the
+    explicit ``confirm_spend`` argument instead of hanging on a request the
+    client will never answer.
+    """
+    if ctx is None or not callable(getattr(ctx, "elicit", None)):
+        return False
+    try:
+        session = ctx.session
+    except (AttributeError, ValueError):
+        # `Context.session` raises ValueError outside a live request.
+        return False
+    check = getattr(session, "check_client_capability", None)
+    if check is None:
+        return False
+    try:
+        return bool(
+            check(types.ClientCapabilities(elicitation=types.ElicitationCapability()))
+        )
+    except Exception:
+        return False
+
+
+async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
+    """Ask the USER to approve this one credit-spending call. True = approved.
+
+    The MCP-native spend confirmation: one prompt per call, answered by the
+    human, never remembered. A decline, a cancel, an accept that did not
+    actually say yes, and a client that errors on the request all answer
+    ``False`` — the caller then spends nothing.
+    """
+    try:
+        result = await ctx.elicit(
+            message=(
+                f"Run the hosted partner model `{model}`? This SPENDS Comfy "
+                "credits from the account this machine is signed into. "
+                "Running a workflow on the local ComfyUI is free."
+            ),
+            schema=SpendApproval,
+        )
+    except Exception as exc:
+        raise ComfyCliError(
+            "could not confirm the credit spend with the user: the client "
+            f"failed to answer the confirmation prompt ({exc}). Nothing was "
+            "spent."
+        ) from exc
+    return result.action == "accept" and getattr(result.data, "approve", False) is True
+
+
+async def _resolve_spend_consent(
+    model: str, confirm_spend: bool, ctx: Context | None
+) -> bool:
+    """Decide whether this call may spend, and whether to forward ``--yes``.
+
+    Returns True to forward ``--yes`` (comfy-cli's explicit non-interactive
+    consent) and False to forward nothing. Raises :class:`ComfyCliError` — with
+    no child process ever spawned — when consent was actively refused.
+
+    The precedence, and the reason for it:
+
+    1. **The engine's durable always-proceed** (``spend.auto_confirm``) wins. The
+       user pre-authorized spending in comfy-cli's own config, so there is
+       nothing to ask and no ``--yes`` to add: the engine consents to itself.
+    2. **Elicitation**, when the client supports it — the per-call human
+       confirmation this tool is built around. Approve forwards ``--yes``;
+       decline raises here, so the refusal is enforced BEFORE comfy-cli runs
+       rather than relying on the engine to fail closed afterwards.
+    3. **The explicit ``confirm_spend`` argument**, only as the fallback for a
+       client that cannot elicit. Left ``False`` (the default) nothing is
+       forwarded and comfy-cli's own gate fails closed.
+
+    Note what is NOT in that list: the agent host's permission to CALL this
+    tool. Spend consent and tool permission are different questions, and an
+    "always allow this tool" toggle answers only the second — so on an
+    elicitation-capable client the prompt is raised even when the caller passed
+    ``confirm_spend=True``. Otherwise a host-level convenience setting would
+    quietly become standing authority over the user's credits.
+    """
+    if await asyncio.to_thread(_engine_auto_confirms):
+        return False
+    if _client_supports_elicitation(ctx):
+        if await _elicit_spend_consent(ctx, model):
+            return True
+        raise ComfyCliError(
+            f"spend not confirmed: the user declined to spend Comfy credits on "
+            f"`{model}`. Nothing was spent and no generation was started."
+        )
+    return confirm_spend
+
+
 def _generate_param_args(params: dict[str, Any]) -> list[str]:
     """Marshal per-model ``params`` into ``comfy generate`` ``--name=value`` tokens.
 
@@ -1692,12 +1859,13 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
 
 
 @mcp.tool()
-def partner_generate(
+async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
     confirm_spend: bool = False,
     download: str | None = None,
     timeout_seconds: float = 600.0,
+    ctx: Context | None = None,
 ) -> Any:
     """Run a hosted PARTNER model (Flux / Ideogram / DALL·E / Recraft / …) — SPENDS CREDITS.
 
@@ -1708,17 +1876,32 @@ def partner_generate(
 
     SPEND CONSENT — read before calling. comfy-cli puts the credit-spending call
     behind a consent interlock, and this wrapper does not implement, weaken, or
-    reimplement it: the engine decides. An MCP server has no interactive
-    terminal, so there is no prompt to answer — with ``confirm_spend=False``
-    (the default) comfy-cli fails CLOSED and this raises :class:`ComfyCliError`
-    having spent nothing. Because that guarantee is the engine's, this refuses to
-    run at all against a comfy-cli that predates the gate (see
-    :func:`_require_spend_gate`). ``confirm_spend=True`` forwards ``--yes``, comfy-cli's
-    explicit non-interactive consent. Only set it when the USER has actually
-    agreed to spend credits on this call — never merely to clear the error you
-    just hit. (A user who ran ``comfy generate consent always`` has
-    pre-authorized spending in comfy-cli's own config; that is their choice and
-    it applies here too.)
+    reimplement it: the engine decides whether a call may spend, and this only
+    reports the consent it was actually given. Where that consent comes from,
+    in precedence order (see :func:`_resolve_spend_consent`):
+
+    - The user's DURABLE always-proceed in comfy-cli's own config
+      (``comfy generate consent always``). It stays engine-side — this server
+      remembers nothing between calls — so when it is set there is nothing to
+      ask and no ``--yes`` to send; the engine consents to itself.
+    - A PER-CALL confirmation raised on the client through MCP **elicitation**,
+      the same primitive an interactive terminal's y/N prompt serves. Approve
+      and ``--yes`` is forwarded; decline and this raises :class:`ComfyCliError`
+      without ever starting comfy-cli, so nothing is spent.
+    - ``confirm_spend=True``, the fallback for a client that cannot elicit: it
+      forwards ``--yes`` directly. Set it ONLY when the user has actually agreed
+      to spend credits on this call — never merely to clear the error you just
+      hit. On a client that CAN elicit the user is asked anyway, so it is not a
+      way around the prompt.
+
+    Spend consent is not tool permission: a host's "always allow this tool"
+    setting authorizes CALLING this tool, never spending the user's money, and
+    is never read as consent here.
+
+    With none of the three, comfy-cli fails CLOSED (an MCP server has no TTY for
+    its own prompt) and this raises having spent nothing. Because that
+    fail-closed guarantee is the engine's, this refuses to run at all against a
+    comfy-cli that predates the gate (see :func:`_require_spend_gate`).
 
     ``params`` carries the model's OWN inputs (``prompt``, ``aspect_ratio``,
     ``seed``, …). These are schema-driven per model and are forwarded verbatim;
@@ -1769,12 +1952,20 @@ def partner_generate(
     # This is also what makes `timeout_seconds` real: comfy-cli's own default is
     # 300s, so before this a caller asking for longer silently got five minutes.
     args.append(f"--timeout={timeout_seconds}")
-    if confirm_spend:
+    # Prove the engine's interlock exists BEFORE asking the user to approve a
+    # spend — there is no point prompting for a call this would refuse anyway.
+    await asyncio.to_thread(_require_spend_gate)
+    if await _resolve_spend_consent(model, confirm_spend, ctx):
         # comfy-cli's non-interactive spend consent; a bare boolean meta flag.
         args.append("--yes")
-    _require_spend_gate()
-    return _run_comfy(
-        *args, timeout=timeout_seconds + _GENERATE_TIMEOUT_GRACE, plain_ok=True
+    # `_run_comfy` blocks for as long as the generation takes (up to an hour),
+    # so it runs off the event loop — this tool is async for the elicitation
+    # round-trip above and must not wedge the server while a partner model runs.
+    return await asyncio.to_thread(
+        _run_comfy,
+        *args,
+        timeout=timeout_seconds + _GENERATE_TIMEOUT_GRACE,
+        plain_ok=True,
     )
 
 

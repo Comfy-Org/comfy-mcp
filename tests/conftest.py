@@ -45,6 +45,20 @@ def _skip_spend_gate_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _skip_engine_auto_confirm_probe(monkeypatch):
+    """Answer ``partner_generate``'s per-call ``spend.auto_confirm`` read as OFF.
+
+    Third once-per-call shell-out on the spending path (``comfy generate consent
+    show --json``); it would consume the stubbed ``subprocess.run`` and shift the
+    exact-argv assertions the same way the two guards above would. ``False`` is
+    also the default posture under test — the engine has no durable
+    always-proceed, so consent has to come from the call itself. The dedicated
+    auto-confirm tests (`test_partner_generate.py`) restore the real function.
+    """
+    monkeypatch.setattr(server, "_engine_auto_confirms", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _clear_comfyui_target_env(monkeypatch):
     """Default every test to the LOCAL target (no configured remote ComfyUI).
 

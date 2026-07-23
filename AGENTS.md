@@ -35,6 +35,17 @@ Hard guardrails — a PR that breaks any of these should be rejected:
   — none of which apply here. This repo is local-only, single-process, and has no
   filesystem/multi-tenancy concerns to design around.
 
+The one thing that legitimately lives here rather than in comfy-cli is **MCP
+protocol surface** — capabilities that only exist between this server and its
+client, and that comfy-cli has no way to express. Today that is the per-call
+spend confirmation on `partner_generate`: comfy-cli owns the credit-spend
+interlock and the durable "always proceed" (`comfy generate consent always`),
+and this server only raises the confirmation over MCP **elicitation** — the
+protocol's equivalent of the CLI's y/N prompt — then forwards the answer as
+`--yes`. It stores no consent of its own. Adding *product* behavior here is
+still a guardrail breach; adapting comfy-cli's contract to an MCP primitive is
+this repo's job.
+
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via
 comfy-cli, not a bundled static catalog.
