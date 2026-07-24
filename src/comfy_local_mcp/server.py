@@ -2655,6 +2655,39 @@ def cancel_job(prompt_id: str) -> Any:
     return _run_comfy("jobs", "cancel", prompt_id, timeout=60.0)
 
 
+def _drop_cloud_jobs(data: Any) -> Any:
+    """Return ``comfy jobs ls`` data with cloud-tracked rows removed.
+
+    comfy-cli merges its on-disk job state files into ``jobs ls`` without
+    scoping them to the requested ``--where``, so a listing this server asked
+    for as ``--where local`` can still carry rows from a prior CLOUD run. This
+    server is local-only, so those rows are noise at best and misleading at
+    worst — drop them here rather than let the caller reason about jobs it
+    cannot act on. Once comfy-cli scopes the merge itself this becomes a no-op.
+
+    Deliberately defensive: this filter never raises and never reshapes a
+    payload it does not recognize. Only a ``dict`` carrying a ``list`` of jobs
+    is touched, only rows POSITIVELY marked ``"cloud"`` are dropped (a row with
+    no ``where`` is a legacy local row and is kept), and the input object is
+    returned unchanged when nothing was dropped.
+    """
+    if not isinstance(data, dict):
+        return data
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list):
+        return data
+    kept = [
+        row
+        for row in jobs
+        if not (isinstance(row, dict) and row.get("where") == "cloud")
+    ]
+    if len(kept) == len(jobs):
+        return data
+    # Shallow copy: the caller's ``count`` must match the rows we return, and
+    # mutating comfy-cli's parsed payload in place is not this helper's call.
+    return {**data, "jobs": kept, "count": len(kept)}
+
+
 @mcp.tool()
 def get_queue() -> Any:
     """List known LOCAL jobs with their status (pending / running / completed).
@@ -2663,8 +2696,14 @@ def get_queue() -> Any:
     running ComfyUI server's queue, so this returns both jobs still in the queue
     and recently completed ones — call it to find a ``prompt_id`` to inspect with
     ``job_status`` or cancel with ``cancel_job``.
+
+    LOCAL ONLY: jobs comfy-cli tracks in its state store from a CLOUD run are
+    filtered out of the listing, because this server drives the user's local
+    ComfyUI and nothing else. Passing a cloud job's ``prompt_id`` to
+    ``job_status`` / ``cancel_job`` would route locally regardless, so listing
+    those ids here would only invite calls that cannot work.
     """
-    return _run_comfy("jobs", "ls", timeout=60.0)
+    return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
 
 
 # Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
