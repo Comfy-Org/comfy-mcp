@@ -436,7 +436,7 @@ the originals stay in the ComfyUI workspace.
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
 | `get_execution_error(prompt_id)` | `comfy jobs status <prompt_id>` | Compact failure verdict for a failed run — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; returns `error: None` on a healthy prompt. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
-| `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed). |
+| `get_queue()` | `comfy jobs ls` | List known **local** jobs with status (pending/running/completed); cloud-tracked rows are filtered out. |
 | `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
 
 ### Diagnostics

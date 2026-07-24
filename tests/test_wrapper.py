@@ -385,6 +385,98 @@ def test_get_queue_error_envelope_raises(patched_run):
         server.get_queue()
 
 
+def test_get_queue_drops_cloud_rows(patched_run):
+    """Cloud-tracked rows are filtered out — this server is local-only.
+
+    comfy-cli merges its on-disk job state into `jobs ls` without scoping it to
+    the `--where local` this server always passes, so a listing can carry rows
+    from a prior cloud run.
+    """
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {
+                "host": "127.0.0.1",
+                "port": 8188,
+                "where": "local",
+                "count": 3,
+                "jobs": [
+                    {"prompt_id": "a", "status": "running", "where": "local"},
+                    {"prompt_id": "b", "status": "completed", "where": "cloud"},
+                    {"prompt_id": "c", "status": "completed", "where": "local"},
+                ],
+            },
+        }
+    )
+
+    result = server.get_queue()
+
+    assert [job["prompt_id"] for job in result["jobs"]] == ["a", "c"]
+    assert result["count"] == 2
+    assert result["where"] == "local"  # rest of the payload is untouched
+
+
+def test_get_queue_keeps_rows_without_a_where(patched_run):
+    """A row with no `where` is a legacy LOCAL row — kept, not dropped."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {
+                "count": 2,
+                "jobs": [
+                    {"prompt_id": "a", "status": "running"},
+                    {"prompt_id": "b", "status": "completed", "where": None},
+                ],
+            },
+        }
+    )
+
+    assert [job["prompt_id"] for job in server.get_queue()["jobs"]] == ["a", "b"]
+
+
+def test_get_queue_keeps_rows_that_are_not_dicts(patched_run):
+    """An unknown ROW shape passes through — only positively-cloud rows drop."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": {
+                "count": 3,
+                "jobs": ["a-bare-id", None, {"prompt_id": "b", "where": "cloud"}],
+            },
+        }
+    )
+
+    result = server.get_queue()
+
+    assert result["jobs"] == ["a-bare-id", None]
+    assert result["count"] == 2
+
+
+def test_get_queue_passes_through_foreign_payload_shapes(patched_run):
+    """An unrecognized payload (older/newer comfy-cli) is returned untouched."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": True,
+            "data": [{"prompt_id": "a", "where": "cloud"}],  # a bare list
+        }
+    )
+
+    assert server.get_queue() == [{"prompt_id": "a", "where": "cloud"}]
+
+
+def test_get_queue_passes_through_payload_without_jobs(patched_run):
+    """A dict with no `jobs` list is returned untouched (no `count` invented)."""
+    patched_run(
+        {"type": "envelope", "ok": True, "data": {"host": "127.0.0.1", "port": 8188}}
+    )
+
+    assert server.get_queue() == {"host": "127.0.0.1", "port": 8188}
+
+
 def test_upload_file_passes_paths_and_overwrite(patched_run):
     """upload_file forwards every path and appends --overwrite when asked."""
     calls = patched_run({"type": "envelope", "ok": True, "data": {"uploaded": 2}})
