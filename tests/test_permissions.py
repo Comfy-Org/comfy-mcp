@@ -72,6 +72,18 @@ def test_protected_dir_ignores_unprotected_and_prefix_collisions():
     assert server._macos_protected_dir(None) is None
 
 
+def test_protected_dir_matches_case_insensitively():
+    """macOS volumes are case-insensitive by default: ~/downloads IS ~/Downloads."""
+    path = os.path.join(os.path.expanduser("~"), "downloads", "ComfyUI")
+    assert server._macos_protected_dir(path) == "Downloads"
+
+
+def test_protected_dir_accepts_a_bytes_path():
+    """An OSError from a bytes-path syscall carries a bytes `filename`."""
+    path = os.path.join(os.path.expanduser("~"), "Documents", "ComfyUI")
+    assert server._macos_protected_dir(os.fsencode(path)) == "Documents"
+
+
 def test_guidance_names_the_folder_when_the_path_is_known(on_macos):
     message = server._tcc_guidance(_DENIED_PATH)
     assert "~/Documents" in message
@@ -112,9 +124,33 @@ def test_denial_survives_a_localized_strerror(on_macos):
     )
 
 
+def test_eperm_alone_is_not_enough_to_claim_tcc(on_macos):
+    """macOS raises EPERM for SIP, sandboxing and more — don't rewrite those.
+
+    Without either corroborating signal (the startup-crash marker, or a denied
+    path that really is under a protected folder) the original message stands.
+    """
+    sip = "OSError: [Errno 1] Operation not permitted: '/usr/lib/dyld'"
+    assert server._looks_like_tcc_denial(sip) is False
+    assert server._looks_like_tcc_denial("Operation not permitted") is False
+    # …but a denied path inside a protected folder needs no startup marker.
+    mid_run = f"OSError: [Errno 1] Operation not permitted: '{_DENIED_PATH}'"
+    assert server._looks_like_tcc_denial(mid_run) is True
+
+
 def test_denied_path_is_parsed_out_of_the_traceback():
     assert server._tcc_path_from(_FATAL_STDERR) == _DENIED_PATH
     assert server._tcc_path_from("no path here") is None
+
+
+def test_denied_path_is_parsed_when_repr_used_double_quotes(on_macos):
+    """`repr` switches to double quotes for a path containing an apostrophe."""
+    path = os.path.join(
+        os.path.expanduser("~"), "Documents", "Conan's App", "venv", "pyvenv.cfg"
+    )
+    text = f'PermissionError: [Errno 1] Operation not permitted: "{path}"'
+    assert server._tcc_path_from(text) == path
+    assert server._looks_like_tcc_denial(text) is True
 
 
 # --- binary resolution -------------------------------------------------------
@@ -138,7 +174,56 @@ def test_unreadable_comfy_bin_reports_the_permission_not_a_missing_install(
     _assert_actionable(message)
 
 
+def test_bare_comfy_bin_is_resolved_against_path_not_the_cwd(on_macos, monkeypatch):
+    """The default `COMFY_BIN` is a bare name: a plain stat() would check $PWD.
+
+    A `comfy` installed on PATH *inside* a protected folder is exactly the case
+    this feature exists for, so it must be found by walking PATH.
+    """
+    protected_bin_dir = os.path.join(
+        os.path.expanduser("~"), "Documents", "ComfyUI", "venv", "bin"
+    )
+    monkeypatch.setattr(server, "COMFY_BIN", "comfy")
+    monkeypatch.setattr(server.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        server.os, "get_exec_path", lambda: ["/usr/bin", protected_bin_dir]
+    )
+
+    def fake_stat(path):
+        if path == os.path.join(protected_bin_dir, "comfy"):
+            raise PermissionError(1, "Operation not permitted", path)
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(server.os, "stat", fake_stat)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._require_comfy_bin()
+
+    message = str(excinfo.value)
+    assert "not found on PATH" not in message
+    assert "~/Documents" in message
+    _assert_actionable(message)
+
+
+def test_an_unprotected_permission_failure_is_not_called_tcc(on_macos, monkeypatch):
+    """A restrictive mode/ACL on a COMFY_BIN elsewhere is not a Full Disk Access
+    problem — mislabelling it sends the user off fixing the wrong setting."""
+    monkeypatch.setattr(server, "COMFY_BIN", "/opt/comfy/bin/comfy")
+    monkeypatch.setattr(server.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        server.os,
+        "stat",
+        lambda p: (_ for _ in ()).throw(PermissionError(13, "Permission denied", p)),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._require_comfy_bin()
+
+    assert "Full Disk Access" not in str(excinfo.value)
+
+
 def test_genuinely_missing_comfy_bin_keeps_the_install_message(on_macos, monkeypatch):
+    monkeypatch.setattr(server, "COMFY_BIN", _DENIED_PATH)
     monkeypatch.setattr(server.shutil, "which", lambda _: None)
     monkeypatch.setattr(
         server.os, "stat", lambda _: (_ for _ in ()).throw(FileNotFoundError())
@@ -184,6 +269,46 @@ def test_version_guard_translates_the_fatal_startup_error(on_macos, monkeypatch)
     assert "init_import_site" in message
     # Not memoized: granting access and retrying in-process must re-check.
     assert server._version_checked is False
+
+
+def test_version_guard_translates_a_denied_spawn(on_macos, monkeypatch):
+    """The probe can be denied at exec time, never reaching a returncode.
+
+    The generic OSError handler would fail open here and let the raw EPERM
+    escape unexplained from the real spawn a moment later.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda cmd, **kw: (_ for _ in ()).throw(  # noqa: ARG005
+            PermissionError(1, "Operation not permitted", _DENIED_PATH)
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._check_comfy_version()
+
+    _assert_actionable(str(excinfo.value))
+    assert "~/Documents" in str(excinfo.value)
+    assert server._version_checked is False
+
+
+def test_version_guard_fails_open_on_an_unrelated_denied_spawn(on_macos, monkeypatch):
+    """A non-TCC permission failure keeps the pre-existing fail-OPEN behavior."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda cmd, **kw: (_ for _ in ()).throw(  # noqa: ARG005
+            PermissionError(13, "Permission denied", "/opt/comfy/bin/comfy")
+        ),
+    )
+
+    server._check_comfy_version()  # no raise
+    assert server._version_checked is False  # not latched, exactly as before
 
 
 def test_version_guard_leaves_a_non_macos_failure_alone(on_linux, monkeypatch):
@@ -286,6 +411,22 @@ def test_main_reports_a_startup_denial_instead_of_a_traceback(
     message = capsys.readouterr().err
     _assert_actionable(message)
     assert "~/Documents" in message
+
+
+def test_main_handles_a_bytes_filename(on_macos, monkeypatch, capsys):
+    """A denial on a bytes path carries a bytes `filename` — decode, don't crash."""
+
+    def boom():
+        raise PermissionError(1, "Operation not permitted", os.fsencode(_DENIED_PATH))
+
+    monkeypatch.setattr(server.mcp, "run", boom)
+
+    with pytest.raises(SystemExit):
+        server.main()
+
+    message = capsys.readouterr().err
+    assert "~/Documents" in message
+    assert _DENIED_PATH in message  # decoded, not rendered as b'...'
 
 
 def test_main_propagates_an_unrelated_permission_error(on_macos, monkeypatch):

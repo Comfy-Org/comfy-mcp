@@ -374,20 +374,26 @@ def _comfy_env() -> dict[str, str]:
 _MACOS_PROTECTED_DIRS = ("Documents", "Desktop", "Downloads")
 
 # The denied path as CPython prints it in the OSError above. CPython's format is
-# ``[Errno 1] <strerror>: '<path>'`` and macOS can localize ``<strerror>``, so
-# match on the errno marker first and fall back to the English phrase for a
-# denial reported without one.
+# ``[Errno 1] <strerror>: <repr(path)>`` and macOS can localize ``<strerror>``,
+# so match on the errno marker first and fall back to the English phrase for a
+# denial reported without one. `repr` quotes with `'` unless the path itself
+# contains one (then `"`), so accept either; the capture stops at a newline and
+# is bounded well past macOS's PATH_MAX so a garbled stderr line cannot drag an
+# unbounded blob into the message.
 _TCC_PATH_RE = re.compile(
-    r"(?:\[Errno 1\][^:\n]*|Operation not permitted):[ \t]*'([^'\n]*)'"
+    r"(?:\[Errno 1\][^:\n]*|Operation not permitted):[ \t]*"
+    r"b?(?:'([^'\n]{0,1024})'|\"([^\"\n]{0,1024})\")"
 )
 
-# Substrings that mark a TCC denial in captured stderr. `init_import_site` is
-# the venv-startup form above; the errno markers cover a denial raised once the
-# interpreter is already up. `[errno 1]` is there because the strerror text next
-# to it comes from libc and macOS translates it under a non-English
+# EPERM as it reaches us in text. `[errno 1]` is here because the strerror text
+# next to it comes from libc and macOS translates it under a non-English
 # `LC_MESSAGES` — the bracketed errno is what stays constant. It cannot collide
 # with another errno: the closing bracket rules out `[Errno 13]` and friends.
-_TCC_SIGNATURES = ("operation not permitted", "[errno 1]", "init_import_site")
+_EPERM_MARKERS = ("operation not permitted", "[errno 1]")
+
+# CPython's own marker for "the interpreter died before `site` was imported",
+# which is the shape a venv under a protected folder takes.
+_STARTUP_CRASH_MARKER = "init_import_site"
 
 
 def _is_macos() -> bool:
@@ -395,14 +401,22 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
-def _macos_protected_dir(path: str | None) -> str | None:
-    """Name of the protected home folder ``path`` sits under, else ``None``."""
+def _macos_protected_dir(path: str | bytes | None) -> str | None:
+    """Name of the protected home folder ``path`` sits under, else ``None``.
+
+    Compared case-insensitively: macOS volumes are case-insensitive by default,
+    so ``~/downloads/ComfyUI`` is the very same TCC-protected folder as
+    ``~/Downloads/ComfyUI`` and must be named as such rather than silently
+    falling through to the generic wording.
+    """
     if not path:
         return None
-    resolved = os.path.abspath(os.path.expanduser(path))
+    # An OSError raised on a bytes path carries a bytes `filename`; decode it
+    # rather than let a str/bytes comparison raise TypeError below.
+    resolved = os.path.abspath(os.path.expanduser(os.fsdecode(path))).lower()
     home = os.path.expanduser("~")
     for name in _MACOS_PROTECTED_DIRS:
-        root = os.path.join(home, name)
+        root = os.path.join(home, name).lower()
         if resolved == root or resolved.startswith(root + os.sep):
             return name
     return None
@@ -414,28 +428,46 @@ def _looks_like_tcc_denial(text: str | None) -> bool:
     macOS-only by design: EPERM ("operation not permitted") means something
     else entirely on Linux, and the guidance below is System-Settings-specific,
     so a non-macOS failure must keep its original message.
+
+    EPERM alone is NOT enough even on macOS — SIP, the app sandbox and signalling
+    a protected process all raise it, and rewriting one of those with Full Disk
+    Access guidance would send the user off fixing the wrong thing. Require
+    corroboration: either CPython's startup-crash marker (the venv-under-a-
+    protected-folder shape this exists for) or a denied path that really does
+    resolve under one of the three folders. Anything else keeps its own message.
     """
     if not text or not _is_macos():
         return False
     lowered = text.lower()
-    return any(signature in lowered for signature in _TCC_SIGNATURES)
+    if not any(marker in lowered for marker in _EPERM_MARKERS):
+        return False
+    return (
+        _STARTUP_CRASH_MARKER in lowered
+        or _macos_protected_dir(_tcc_path_from(text)) is not None
+    )
 
 
 def _tcc_path_from(text: str | None) -> str | None:
     """The denied path CPython named in ``text``, when it named one."""
     match = _TCC_PATH_RE.search(text or "")
-    return match.group(1) if match else None
+    if match is None:
+        return None
+    # Exactly one of the two quote-style alternatives captured.
+    return match.group(1) if match.group(1) is not None else match.group(2)
 
 
-def _tcc_guidance(path: str | None = None) -> str:
+def _tcc_guidance(path: str | bytes | None = None) -> str:
     """Actionable fix for a macOS protected-folder denial, as one message.
 
     ``path`` is the denied file when we know it (parsed out of the child's
     stderr, or an unreadable ``COMFY_BIN``); naming its protected folder makes
     the message concrete. Without one — or with one outside the protected set —
     the wording stays general rather than asserting a location we haven't
-    verified.
+    verified. A ``bytes`` path (what an ``OSError`` from a bytes-path syscall
+    carries) is decoded, so it reads as a path rather than as ``b'...'``.
     """
+    if path is not None:
+        path = os.fsdecode(path)
     folder = _macos_protected_dir(path)
     if folder:
         where = (
@@ -479,26 +511,57 @@ class ComfyCliError(RuntimeError):
         self.code = code
 
 
+def _comfy_bin_candidates() -> list[str]:
+    """Every filesystem location ``COMFY_BIN`` could name, as ``which`` would look.
+
+    A ``COMFY_BIN`` carrying a directory separator names exactly one file. A bare
+    name (the default, ``comfy``) is resolved against ``PATH`` — NOT against the
+    current working directory, which is what a plain ``os.stat(COMFY_BIN)`` would
+    do and which would miss a `comfy` that lives on ``PATH`` inside a protected
+    folder: precisely the install this diagnostic exists for.
+    """
+    if os.path.dirname(COMFY_BIN):
+        return [COMFY_BIN]
+    return [os.path.join(entry, COMFY_BIN) for entry in os.get_exec_path() if entry]
+
+
+def _tcc_blocked_comfy_bin() -> str | None:
+    """The candidate ``comfy`` path macOS is denying us, if that's what's wrong.
+
+    Only a candidate that BOTH sits under a protected folder and refuses to be
+    stat'ed counts. The protected-folder test is what keeps an ordinary EACCES —
+    a restrictive mode or ACL on a ``COMFY_BIN`` somewhere else entirely — from
+    being mislabelled as a Full Disk Access problem it isn't.
+    """
+    for candidate in _comfy_bin_candidates():
+        if _macos_protected_dir(candidate) is None:
+            continue
+        try:
+            os.stat(candidate)
+        except PermissionError:
+            return candidate
+        except OSError:
+            continue  # absent, a broken link, an unresolvable name — not ours
+    return None
+
+
 def _require_comfy_bin() -> None:
     """Resolve the ``comfy`` binary, raising an actionable error when it can't be.
 
     Shared by both spawn sites (:func:`_run_comfy_raw` / :func:`_run_comfy_streaming`)
-    so their missing-binary behavior cannot drift. On macOS a ``COMFY_BIN`` that
-    exists but cannot even be stat'ed is a protected-folder denial, not a missing
-    install — ``shutil.which`` reports both as ``None``, so say which one it is
-    instead of the misleading "not found on PATH".
+    so their missing-binary behavior cannot drift. On macOS a ``comfy`` that exists
+    but cannot even be stat'ed is a protected-folder denial, not a missing install
+    — ``shutil.which`` reports both as ``None``, so say which one it is instead of
+    the misleading "not found on PATH".
     """
     if shutil.which(COMFY_BIN) is not None:
         return
     if _is_macos():
-        try:
-            os.stat(COMFY_BIN)
-        except PermissionError:
+        blocked = _tcc_blocked_comfy_bin()
+        if blocked is not None:
             raise ComfyCliError(
-                f"`{COMFY_BIN}` could not be read.\n\n{_tcc_guidance(COMFY_BIN)}"
-            ) from None
-        except OSError:
-            pass  # genuinely absent (or an unresolvable name) -> the message below
+                f"`{COMFY_BIN}` could not be read.\n\n{_tcc_guidance(blocked)}"
+            )
     raise ComfyCliError(
         f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
         "(`pip install comfy-cli`) or set the COMFY_BIN env var."
@@ -554,6 +617,21 @@ def _check_comfy_version() -> None:
         # the same 30s wait; fail OPEN for the rest of the process.
         _version_checked = True
         return
+    except PermissionError as exc:
+        # The spawn ITSELF was denied (not the child exiting non-zero) — e.g. a
+        # `comfy` launcher whose interpreter sits in a protected folder. Without
+        # this branch the generic handler below fails open and the raw EPERM
+        # escapes from the real spawn a moment later, unexplained. Must precede
+        # the OSError handler: PermissionError is a subclass of it.
+        denied = getattr(exc, "filename", None) or _tcc_path_from(str(exc))
+        if _is_macos() and (
+            _looks_like_tcc_denial(str(exc)) or _macos_protected_dir(denied) is not None
+        ):
+            raise ComfyCliError(
+                f"`{COMFY_BIN}` could not be started.\n\n{_tcc_guidance(denied)}\n\n"
+                f"Original error: {exc}"
+            ) from exc
+        return  # any other permission problem: fail OPEN, exactly as before
     except (OSError, subprocess.SubprocessError):
         # A transient spawn failure fails OPEN for THIS call but is NOT latched —
         # a later call re-checks rather than permanently disabling the guard.
@@ -3683,9 +3761,14 @@ def main() -> None:
     try:
         mcp.run()
     except PermissionError as exc:
-        if not _looks_like_tcc_denial(str(exc)):
-            raise
+        # Prefer the exception's structured `filename` over re-parsing its text:
+        # it is the authoritative path, and it is present for errnos the text
+        # signature alone would not claim (TCC can surface as EACCES too).
         path = getattr(exc, "filename", None) or _tcc_path_from(str(exc))
+        if not _is_macos() or not (
+            _looks_like_tcc_denial(str(exc)) or _macos_protected_dir(path) is not None
+        ):
+            raise
         print(
             f"comfy-local-mcp: {exc}\n\n{_tcc_guidance(path)}",
             file=sys.stderr,
