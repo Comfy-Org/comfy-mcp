@@ -504,7 +504,7 @@ local differentiator from the cloud MCP's equivalents. The graph-wiring verbs (`
 **Symptom.** Setup fails with a raw Python startup crash naming a file under `~/Documents`,
 `~/Desktop` or `~/Downloads` — most often the ComfyUI venv's `pyvenv.cfg`:
 
-```
+```text
 Fatal Python error: init_import_site: Failed to import the site module
 PermissionError: [Errno 1] Operation not permitted: '/Users/you/Documents/ComfyUI/venv/pyvenv.cfg'
 ```

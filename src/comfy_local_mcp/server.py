@@ -373,13 +373,21 @@ def _comfy_env() -> dict[str, str]:
 # Python traceback the user can do nothing with.
 _MACOS_PROTECTED_DIRS = ("Documents", "Desktop", "Downloads")
 
-# The denied path as CPython prints it in the OSError above.
-_TCC_PATH_RE = re.compile(r"Operation not permitted:\s*'([^']*)'")
+# The denied path as CPython prints it in the OSError above. CPython's format is
+# ``[Errno 1] <strerror>: '<path>'`` and macOS can localize ``<strerror>``, so
+# match on the errno marker first and fall back to the English phrase for a
+# denial reported without one.
+_TCC_PATH_RE = re.compile(
+    r"(?:\[Errno 1\][^:\n]*|Operation not permitted):[ \t]*'([^'\n]*)'"
+)
 
 # Substrings that mark a TCC denial in captured stderr. `init_import_site` is
-# the venv-startup form above; the bare errno text covers a denial raised once
-# the interpreter is already up.
-_TCC_SIGNATURES = ("operation not permitted", "init_import_site")
+# the venv-startup form above; the errno markers cover a denial raised once the
+# interpreter is already up. `[errno 1]` is there because the strerror text next
+# to it comes from libc and macOS translates it under a non-English
+# `LC_MESSAGES` — the bracketed errno is what stays constant. It cannot collide
+# with another errno: the closing bracket rules out `[Errno 13]` and friends.
+_TCC_SIGNATURES = ("operation not permitted", "[errno 1]", "init_import_site")
 
 
 def _is_macos() -> bool:

@@ -95,6 +95,23 @@ def test_denial_signature_is_macos_only(on_macos, monkeypatch):
     assert server._looks_like_tcc_denial(_FATAL_STDERR) is False
 
 
+def test_denial_survives_a_localized_strerror(on_macos):
+    """`Operation not permitted` is libc text macOS translates; `[Errno 1]` isn't."""
+    localized = (
+        "Fatal Python error: init_import_site: Failed to import the site module\n"
+        f"PermissionError: [Errno 1] Opération non permise: '{_DENIED_PATH}'\n"
+    )
+    assert server._looks_like_tcc_denial(localized) is True
+    # …and the path still resolves, so the message names the folder.
+    assert server._tcc_path_from(localized) == _DENIED_PATH
+    assert "~/Documents" in server._tcc_guidance(server._tcc_path_from(localized))
+    # A different errno must not be swept in by the `[Errno 1]` marker.
+    assert (
+        server._looks_like_tcc_denial("PermissionError: [Errno 13] Accès refusé")
+        is False
+    )
+
+
 def test_denied_path_is_parsed_out_of_the_traceback():
     assert server._tcc_path_from(_FATAL_STDERR) == _DENIED_PATH
     assert server._tcc_path_from("no path here") is None
