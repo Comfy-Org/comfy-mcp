@@ -55,6 +55,7 @@ Cloud MCP** — comfy-cli is the engine.
 - [Configure your AI client](#configure-your-ai-client)
 - [Quickstart](#quickstart)
 - [Tools](#tools)
+- [Troubleshooting](#troubleshooting)
 - [Smoke test](#smoke-test)
 - [Contributing](#contributing)
 - [License](#license)
@@ -315,6 +316,11 @@ server. Pick your client.
 > [partner-API nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …); drop it
 > otherwise.
 
+> **On macOS, keep ComfyUI out of `~/Documents`, `~/Desktop` and `~/Downloads`** — or grant your
+> client Full Disk Access. macOS blocks apps (and everything they launch) from reading those
+> folders, so an install there fails with `Operation not permitted` before anything runs. See
+> [Troubleshooting](#troubleshooting).
+
 ### Claude Code
 
 One command registers the server:
@@ -490,6 +496,38 @@ Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream
 read the **user's live install** (custom nodes included), not a static catalog — that's the
 local differentiator from the cloud MCP's equivalents. The graph-wiring verbs (`upstream` /
 `downstream` / `path`) are what an agent authoring a workflow uses to find compatible nodes.
+
+## Troubleshooting
+
+### macOS: `PermissionError: [Errno 1] Operation not permitted` / `Fatal Python error`
+
+**Symptom.** Setup fails with a raw Python startup crash naming a file under `~/Documents`,
+`~/Desktop` or `~/Downloads` — most often the ComfyUI venv's `pyvenv.cfg`:
+
+```text
+Fatal Python error: init_import_site: Failed to import the site module
+PermissionError: [Errno 1] Operation not permitted: '/Users/you/Documents/ComfyUI/venv/pyvenv.cfg'
+```
+
+**Cause.** macOS protects those three folders with TCC (Transparency, Consent & Control). An app
+without **Full Disk Access** cannot read them — and neither can the processes it spawns. So when
+your ComfyUI install (and its `venv`) lives under one of them, the `comfy` binary your MCP client
+launches dies before it executes a single line. Nothing is wrong with ComfyUI, comfy-cli, or this
+server: it is a macOS privacy setting.
+
+**Fix — either one works:**
+
+1. **Grant your MCP client Full Disk Access.** System Settings → Privacy & Security → Full Disk
+   Access → add the app (Claude Desktop, Cursor, or the terminal you launch the client from), then
+   **quit and reopen it** so the new permission takes effect.
+2. **Or move the ComfyUI folder somewhere unprotected** — e.g. `~/ComfyUI` — and re-point comfy-cli
+   at it with `comfy set-default <path>`. Update `COMFY_BIN` in your client config too if it names
+   a path inside the old location.
+
+Where it can, the server says this for you: a tool call blocked this way returns the guidance above
+instead of the raw traceback. The one case it cannot catch is **its own** interpreter startup (this
+server installed under a protected folder) — Python dies before any of its code runs, so that one
+surfaces as the raw traceback in your client's MCP logs. Same fix.
 
 ## Smoke test
 
