@@ -250,11 +250,20 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
       ``slots`` / ``out_dir`` need no guard to be injection-safe.
 
     Where a call site guards an option value anyway (``search_templates``'s
-    filters, ``download_model``'s ``relative_path`` / ``filename``), that is input
-    hygiene rather than injection defense: a dash-leading provider filter or output
-    filename is a caller mistake, and a named error beats comfy-cli matching zero
-    rows or writing a file named ``-x``. Read those as belt-and-braces, not as
-    evidence that option values are unsafe.
+    filters, ``download_model``'s ``relative_path`` / ``filename``,
+    ``fetch_template``'s ``out_path``), that is input hygiene rather than injection
+    defense: a dash-leading provider filter or output filename is a caller mistake,
+    and a named error beats comfy-cli matching zero rows or writing a file named
+    ``-x``. Read those as belt-and-braces, not as evidence that option values are
+    unsafe.
+
+    That hygiene guard is a judgement per call site, not a default — apply it only
+    where a leading dash cannot be real DATA for that value. It does **not** fit a
+    free-form search term: ``search_models``'s ``--text`` matches model filenames,
+    where ``-fp16`` / ``-fp8`` / ``-turbo`` are ordinary substrings, so guarding it
+    would refuse a working search that has no other spelling. The hygiene sites
+    above all leave an escape hatch (``./-x`` names the same file as ``-x``); a
+    search term does not.
     """
     if value.startswith("-"):
         hint = f" — expected {expected}" if expected else ""
@@ -3951,7 +3960,8 @@ def fetch_template(name: str, out_path: str) -> str:
     """
     # `name` is a bare positional (mandatory guard); `out_path` rides as the
     # `--out` value, where the leading-dash check is input hygiene rather than
-    # injection defense — a file named `-x` is a caller mistake, not a flag.
+    # injection defense — a file named `-x` is a caller mistake, not a flag, and
+    # a caller who really wants one can spell it `./-x` (same file, no guard).
     # See `_reject_option_like` for why the two cases differ.
     _reject_option_like(
         "template name", name, expected="a template name (e.g. 'flux_dev')"
@@ -4132,13 +4142,21 @@ def search_models(query: str = "", folder: str = "") -> Any:
     download metadata). Agents should set expectations accordingly: it answers
     "which model files does this install have?", not "tell me about this model".
     """
-    # Both guards sit INSIDE their branch so an empty value keeps meaning "mode
+    # The guards sit INSIDE their branch so an empty value keeps meaning "mode
     # not selected" (the precedence above) rather than becoming an error.
     if query:
-        # `--text` value: the leading-dash check is input hygiene (Click reads
-        # the token after a value-taking option verbatim), the NUL check is not
-        # optional — see `_reject_option_like` / `_reject_nul`.
-        _reject_option_like("query", query)
+        # NUL only — deliberately NO `_reject_option_like` here, unlike the other
+        # option values this module guards for hygiene. `--text` is a free-form
+        # substring match over model FILENAMES, and a leading dash is legitimate
+        # data in that position: the `-fp16` / `-fp8` / `-turbo` suffixes are
+        # ordinary in model filenames, so `query="-fp16"` is a real search that
+        # matches real rows. Click takes the token after a value-taking option
+        # verbatim, so comfy-cli accepts it and there is no other way to spell
+        # that substring — guarding it would refuse a working search rather than
+        # catch a mistake. Contrast the hygiene sites (`search_templates`'s
+        # enumerated filters, `download_model`'s output names, `fetch_template`'s
+        # `--out`), where a dash-leading value really is a caller slip and an
+        # escape hatch exists. See `_reject_option_like`.
         _reject_nul("query", query)
         return _run_comfy("models", "search", "--text", query, timeout=60.0)
     if folder:

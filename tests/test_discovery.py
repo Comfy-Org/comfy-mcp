@@ -208,18 +208,28 @@ def test_search_models_query_takes_precedence_over_folder(patched_run):
     assert calls[0]["cmd"][4:] == ["models", "search", "--text", "xl"]
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [{"query": "--help"}, {"query": "-x"}, {"folder": "--pack"}, {"folder": "-c"}],
-    ids=lambda kw: f"{next(iter(kw))}-{next(iter(kw.values()))}",
-)
-def test_search_models_rejects_leading_dash(patched_run, kwargs):
-    """`folder` is a bare positional; the `--text` value is guarded for hygiene."""
+@pytest.mark.parametrize("folder", ["--pack", "-c"])
+def test_search_models_rejects_leading_dash_folder(patched_run, folder):
+    """`folder` is a bare positional — comfy-cli reads a leading dash as an option."""
     calls = patched_run(envelope(data=[]))
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        server.search_models(**kwargs)
+        server.search_models(folder=folder)
     # refused before the spawn, not after
     assert calls == []
+
+
+@pytest.mark.parametrize("query", ["-fp16", "-fp8-e4m3fn", "--help"])
+def test_search_models_allows_leading_dash_query(patched_run, query):
+    """`--text` is free-form filename matching: a leading dash is data, not a flag.
+
+    Click takes the token after a value-taking option verbatim, so comfy-cli
+    receives these as the search term — and `-fp16` / `-fp8` are ordinary model
+    filename substrings with no other spelling. Guarding here would refuse a
+    working search. Contrast `folder` above, which really is a positional.
+    """
+    calls = patched_run(envelope(data=[]))
+    server.search_models(query=query)
+    assert calls[0]["cmd"][4:] == ["models", "search", "--text", query]
 
 
 @pytest.mark.parametrize(
