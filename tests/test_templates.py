@@ -312,3 +312,53 @@ def test_fetch_template_resolves_relative_path(monkeypatch):
     result = server.fetch_template("flux_dev", "flux.json")
     assert result == os.path.abspath("flux.json")
     assert os.path.isabs(result)
+
+
+def test_get_template_rejects_option_like_name(monkeypatch):
+    """A leading-dash name is refused before any child spawns.
+
+    ``name`` is a bare positional on ``templates show``, so comfy-cli reads a
+    dash-leading value as an option rather than the template to show.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.get_template("--help")
+
+
+def test_fetch_template_rejects_option_like_name_and_out_path(monkeypatch):
+    """Both the ``name`` positional and the ``--out`` value are guarded."""
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.fetch_template("--help", "/tmp/flux.json")
+
+    # The escape hatch is named in the error, so a genuinely dash-leading
+    # filename stays reachable as `./-flux.json`.
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        server.fetch_template("flux_dev", "--help")
+
+
+def test_template_tools_reject_embedded_nul(monkeypatch):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    for call in (
+        lambda: server.get_template("flux\0dev"),
+        lambda: server.fetch_template("flux\0dev", "/tmp/flux.json"),
+        lambda: server.fetch_template("flux_dev", "/tmp/f\0.json"),
+    ):
+        with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+            call()
