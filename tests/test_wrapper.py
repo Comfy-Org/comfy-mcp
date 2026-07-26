@@ -868,6 +868,150 @@ def test_wait_for_job_gives_a_long_wait_the_full_poll_budget(monkeypatch):
     assert seen == [server._JOB_STATUS_POLL_TIMEOUT]
 
 
+def test_wait_for_job_reports_a_deadline_poll_timeout_as_timed_out(monkeypatch):
+    """A poll killed by the caller's own bound returns `timed_out`, not an error.
+
+    Capping each poll to the time left makes the poll's deadline double as the
+    caller's, so a slow-but-healthy `comfy jobs status` near the bound now raises
+    where the old fixed 60s budget let it finish. That is this call expiring, and
+    it must not discard the last real status behind a `ComfyCliError`.
+    """
+    statuses = iter([{"status": "running"}])
+
+    def fake_run(*args, **kwargs):
+        try:
+            return next(statuses)
+        except StopIteration:
+            raise server.ComfyCliError("comfy-cli timed out after 1.0s", timed_out=True)
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # 10s bound: the first poll succeeds, the second is granted the remainder and
+    # dies at it — by which time the clock is past the deadline.
+    reads = iter([0.0, 1.0, 2.0, 3.0, 11.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    result = server.wait_for_job("pid", timeout_seconds=10.0)
+
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
+def test_wait_for_job_reraises_a_wedged_poll_with_budget_left(monkeypatch):
+    """A poll that burns the FULL budget with time to spare is a real failure.
+
+    Only the caller's bound expiring earns the `timed_out` envelope. A poll that
+    exhausted `_JOB_STATUS_POLL_TIMEOUT` while the wait still has time left means
+    comfy-cli is wedged — which raised before the per-poll cap existed too.
+    """
+
+    def fake_run(*args, **kwargs):
+        raise server.ComfyCliError("comfy-cli timed out after 60.0s", timed_out=True)
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A 600s bound with the clock barely moving: the deadline is nowhere near.
+    reads = iter([0.0, 1.0, 2.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.wait_for_job("pid", timeout_seconds=600.0)
+
+
+def test_wait_for_job_reraises_when_no_status_was_ever_read(monkeypatch):
+    """With no status in hand, the error beats a contentless `{"status": None}`.
+
+    `{"timed_out": True, "status": None}` would bury the real diagnosis (and the
+    budget that produced it) under an envelope the caller can do nothing with.
+    """
+
+    def fake_run(*args, **kwargs):
+        raise server.ComfyCliError("comfy-cli timed out after 1.0s", timed_out=True)
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    reads = iter([0.0, 1.0, 2.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.wait_for_job("pid", timeout_seconds=1.0)
+
+
+def test_wait_for_job_reraises_a_non_timeout_poll_failure(monkeypatch):
+    """An ordinary comfy-cli error still propagates, deadline or not."""
+
+    def fake_run(*args, **kwargs):
+        raise server.ComfyCliError("job not found", code="not_found")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    reads = iter([0.0, 1.0, 99.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    with pytest.raises(server.ComfyCliError, match="job not found"):
+        server.wait_for_job("pid", timeout_seconds=1.0)
+
+
+def test_run_comfy_marks_a_subprocess_timeout(monkeypatch):
+    """The `timed_out` flag is set only where the child was killed at our budget.
+
+    `wait_for_job` branches on it to tell its own deadline from a comfy-cli
+    failure, so the flag has to come from the raise site rather than the message.
+    """
+
+    def fake_subprocess_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(server, "_require_comfy_bin", lambda: None)
+    monkeypatch.setattr(server, "_check_comfy_version", lambda: None)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("jobs", "status", "pid", timeout=1.0)
+
+    assert excinfo.value.timed_out is True
+
+
+def test_prompt_id_guard_rejects_an_oversized_id(monkeypatch):
+    """An id far past any real one is refused before it can reach argv.
+
+    An oversized argv is rejected by the OS with an `OSError` no caller converts
+    (and echoed back whole in the error), rather than failing as a clean
+    `ComfyCliError` like every other bad input.
+    """
+    oversized = "p" * (server._MAX_PROMPT_ID_LEN + 1)
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("spawned comfy-cli with an oversized prompt_id")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="exceeds"):
+        server.job_status(oversized)
+
+    # The cap is generous enough that a real (UUID-shaped) id is untouched.
+    assert server._guard_prompt_id("p" * server._MAX_PROMPT_ID_LEN)
+
+
+def test_fetch_outputs_rejects_a_nul_in_out_dir(monkeypatch):
+    """`out_dir` rides the same argv as the id and needs the same NUL refusal.
+
+    `_run_comfy_raw` converts only `TimeoutExpired`, so `subprocess.run`'s bare
+    "embedded null byte" ValueError would escape as an internal error.
+    """
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("spawned comfy-cli with a NUL-bearing out_dir")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="out_dir"):
+        server.fetch_outputs("pid", "/tmp/o\x00ut")
+
+
 def test_fetch_outputs_wraps_comfy_download(patched_run):
     """fetch_outputs is a thin `comfy download … --where local -o <dir>` passthrough."""
     calls = patched_run(

@@ -303,6 +303,15 @@ def _reject_nul(label: str, value: str) -> str:
     return value
 
 
+# Generous ceiling on a `prompt_id`'s length. Real ids are the server's UUIDs
+# (36 chars), and comfy-cli's own sanity check for one is `^[A-Za-z0-9_-]{1,128}$`
+# — so this deliberately sits at twice the engine's ceiling and can only refuse
+# input the engine would refuse anyway. What it buys: an oversized string reaches
+# argv, where the OS (not comfy-cli) rejects the exec with an `OSError` no caller
+# converts to a :class:`ComfyCliError`, and gets echoed back whole in the error.
+_MAX_PROMPT_ID_LEN = 256
+
+
 def _guard_prompt_id(prompt_id: str) -> str:
     """Reject a ``prompt_id`` comfy-cli would mis-read or ``subprocess`` can't carry.
 
@@ -315,10 +324,20 @@ def _guard_prompt_id(prompt_id: str) -> str:
     but makes ``subprocess.run`` raise a bare ``ValueError``, which would surface
     as an internal error instead of the :class:`ComfyCliError` every other bad
     input produces. An empty id can only ever be a caller mistake, and is
-    refused like every other positional this module guards.
+    refused like every other positional this module guards. A wildly oversized
+    id is the same story as the NUL: it fails in the exec, as an ``OSError``
+    nobody converts, rather than as a clean error — see
+    :data:`_MAX_PROMPT_ID_LEN`.
     """
     if not prompt_id or prompt_id.startswith("-"):
         raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (empty or leading '-')")
+    if len(prompt_id) > _MAX_PROMPT_ID_LEN:
+        # Report the length, not the value: echoing a megabyte-long "id" back is
+        # the same denial-of-legibility the cap exists to prevent.
+        raise ComfyCliError(
+            f"invalid prompt_id: {len(prompt_id)} characters exceeds the "
+            f"{_MAX_PROMPT_ID_LEN}-character maximum."
+        )
     return _reject_nul("prompt_id", prompt_id)
 
 
@@ -631,6 +650,13 @@ class ComfyCliError(RuntimeError):
     accept, which the message text alone cannot tell you. It stays ``None`` for
     the failures raised without ever reading a child's status (missing binary,
     timeout).
+
+    ``timed_out`` marks the one failure that is not comfy-cli misbehaving but us
+    running out of patience: the child was killed at the ``timeout=`` we handed
+    :func:`subprocess.run`. A caller that *chose* that budget can then tell its
+    own deadline firing from a genuine comfy-cli error without matching on the
+    message — :func:`wait_for_job`, which caps each poll to the time left on the
+    caller's bound, is exactly that caller.
     """
 
     def __init__(
@@ -639,11 +665,13 @@ class ComfyCliError(RuntimeError):
         code: str | None = None,
         no_envelope: bool = False,
         returncode: int | None = None,
+        timed_out: bool = False,
     ) -> None:
         super().__init__(*args)
         self.code = code
         self.no_envelope = no_envelope
         self.returncode = returncode
+        self.timed_out = timed_out
 
 
 def _comfy_bin_candidates() -> list[str]:
@@ -1010,7 +1038,7 @@ def _run_comfy_raw(
             stdout=exc.stdout,
             stderr=exc.stderr,
         )
-        raise ComfyCliError(message) from exc
+        raise ComfyCliError(message, timed_out=True) from exc
 
     return (
         _last_json_object(proc.stdout),
@@ -3619,7 +3647,12 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     maximum (the same ceiling as ``watch_job``, this tool's streaming
     counterpart), and a non-positive / NaN value is rejected outright; each
     individual poll is capped to the time left on that bound, so the call
-    returns at roughly the deadline even if a status poll wedges.
+    returns at roughly the deadline even if a status poll wedges — a poll killed
+    at that cap yields the ``timed_out`` payload rather than an error. "Roughly"
+    covers two bounded overshoots: a poll is never given less than
+    ``_MIN_JOB_STATUS_POLL_TIMEOUT``, and the FIRST comfy-cli call in a process
+    also pays the one-time ``comfy --version`` compatibility probe (bounded
+    separately, memoized after) before this tool's own budget starts to apply.
     """
     prompt_id = _guard_prompt_id(prompt_id)
     # "Bounded by design" only holds if the bound itself is bounded. Left raw,
@@ -3645,14 +3678,32 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
         # sliver of remaining time from spawning a poll that is guaranteed to
         # hit its own deadline (and raise) instead of returning `timed_out`; it
         # overshoots the caller's bound by at most that floor, never by 60s.
-        last = _run_comfy(
-            "jobs",
-            "status",
-            prompt_id,
-            timeout=min(
-                _JOB_STATUS_POLL_TIMEOUT, max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT)
-            ),
-        )
+        try:
+            last = _run_comfy(
+                "jobs",
+                "status",
+                prompt_id,
+                timeout=min(
+                    _JOB_STATUS_POLL_TIMEOUT,
+                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
+                ),
+            )
+        except ComfyCliError as exc:
+            # Capping the poll to the time left means its deadline now doubles as
+            # the CALLER's: a slow-but-healthy `comfy jobs status` (cold start
+            # plus imports) near the bound is killed where the old fixed 60s
+            # budget would have let it finish. That is this call expiring, not
+            # comfy-cli failing, so honor the documented envelope — and keep the
+            # last real status instead of discarding it with the exception.
+            # Two timeouts still raise, because neither is the caller's bound
+            # expiring: one with time left on that bound (the poll burned the
+            # full `_JOB_STATUS_POLL_TIMEOUT` — comfy-cli is genuinely wedged,
+            # which raised before this cap existed too), and one with no status
+            # yet read, where `{"status": None}` would bury a real failure under
+            # a contentless envelope.
+            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
+                raise
+            return {"timed_out": True, "status": last}
         if _is_terminal(last):
             return last
         remaining = deadline - time.monotonic()
@@ -3875,6 +3926,13 @@ def fetch_outputs(
     a large batch can't blow up the reply — the on-disk copies are never capped.
     """
     prompt_id = _guard_prompt_id(prompt_id)
+    # `out_dir` is the sibling client-supplied positional and rides the same argv
+    # as the id, so it needs the same NUL refusal: `_run_comfy_raw` only converts
+    # `TimeoutExpired`, leaving `subprocess.run`'s bare "embedded null byte"
+    # ValueError to escape as an internal error. A leading dash is NOT rejected
+    # here — `-o` takes a value, so comfy-cli reads even a dash-led one as this
+    # option's argument, and a relative path is legitimate input.
+    out_dir = _reject_nul("out_dir", out_dir)
     args = ["download", prompt_id, "-o", out_dir]
     if url_only:
         args.append("--url-only")
