@@ -264,9 +264,11 @@ def _in_pipe_pool(func, *args):
 # radius to partner generation itself, exactly as `_PIPE_EXECUTOR` does for the
 # streaming pipe reads.
 #
-# Shared with `run_template`, which is the same class of call: a blocking
-# comfy-cli run bounded only by the hour-long ceiling, on a tool that is async
-# for its own spend-consent round-trip.
+# Shared with the `run_template` / `generate_image` submit paths, which are the
+# same class of call: a blocking `subprocess.run` on a tool that is async for its
+# own spend-consent round-trip. Their `wait=True` runs stream instead (see
+# `_run_comfy_streaming`), so what those two park here is the short
+# fire-and-return submit, not the hour-long wait.
 #
 # Sized like the pipe pool. Saturating it queues further partner runs rather
 # than growing threads without bound — deliberate backpressure on a paid,
@@ -1195,7 +1197,9 @@ class _StreamProgress:
 
         State (``total`` / ``done`` / ``_last``) is updated unconditionally so a
         bounded, ctx-less watch still reports real progress in its timed-out
-        :meth:`snapshot`; the MCP notification is the only ctx-gated part.
+        :meth:`snapshot`; the MCP notification is the only ctx-gated part, and it
+        is best-effort — a send that fails is dropped rather than propagated, so
+        it can never abort the run it is only describing.
         """
         etype = event.get("type")
         if etype == "queued":
@@ -1222,9 +1226,27 @@ class _StreamProgress:
         progress = max(progress, self._last)
         self._last = progress
         if ctx is not None:
-            await ctx.report_progress(
-                progress=progress, total=self.total, message=message
-            )
+            try:
+                await ctx.report_progress(
+                    progress=progress, total=self.total, message=message
+                )
+            except Exception:  # noqa: BLE001 - telemetry must not abort the run
+                # A notification is best-effort; the run's RESULT is the
+                # deliverable. Any exception out of the pump reaches
+                # `_run_comfy_streaming`'s `finally`, which kills the comfy-cli
+                # tree — so letting a failed send (a disconnected client, a host
+                # that rejects the notification) escape would abort a live run
+                # over undelivered telemetry. On `run_template`'s paid path that
+                # means abandoning a run whose credits are already spent, with no
+                # `prompt_id` returned to recover the outputs. Drop the tick and
+                # keep reading the stream; the state above is already advanced, so
+                # a later `snapshot()` stays accurate. `CancelledError` is a
+                # BaseException and still propagates, so a real MCP cancellation
+                # is unaffected.
+                logging.getLogger(__name__).debug(
+                    "progress notification failed; continuing the run",
+                    exc_info=True,
+                )
 
 
 async def _run_comfy_streaming(
@@ -1463,9 +1485,11 @@ async def _run_comfy_streaming(
         )
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
-        # (timeout, a report_progress error, or normal completion). Kill the
-        # whole process tree (not just the direct child) so a descendant
-        # holding the stderr write fd can't keep the pipe from EOFing — see
+        # (timeout, cancellation, or normal completion — a failed progress
+        # notification is swallowed in `_StreamProgress.report` and reaches
+        # neither this block nor the caller). Kill the whole process tree (not
+        # just the direct child) so a descendant holding the stderr write fd
+        # can't keep the pipe from EOFing — see
         # _kill_proc_tree. (BE-3343) Reap on the dedicated pipe pool, not the
         # default `to_thread` pool, so this wait can never contend with (or be
         # confused for) unrelated `to_thread` callers.
@@ -2933,8 +2957,10 @@ async def run_template(
     ``prompt_id`` needed to track it rather than re-running it.
 
     With ``wait=True`` (default) this waits until the run finishes and returns the
-    result (``prompt_id`` + outputs); with ``wait=False`` it submits ``--async``
-    and returns immediately with a ``prompt_id`` to poll via ``job_status`` /
+    result (``prompt_id`` + outputs), streaming live progress as MCP progress
+    notifications (per-node execution + sampler step counts) so a long run is not
+    a silent block; with ``wait=False`` it submits ``--async`` and returns
+    immediately with a ``prompt_id`` to poll via ``job_status`` /
     ``wait_for_job`` / ``watch_job`` — use that for long (e.g. video) runs that
     may exceed your MCP client's tool timeout. OSS templates need their referenced
     models installed locally; a missing model surfaces the run path's per-node
@@ -2962,15 +2988,29 @@ async def run_template(
         # comfy-cli's paid-node consent for run-template; a bare boolean flag.
         args.append("--allow-spend")
     if not wait:
-        # Fire-and-return: submit and hand back a prompt_id to poll.
+        # Fire-and-return: submit and hand back a prompt_id to poll. No stream to
+        # follow, so keep the plain --json path — off the event loop, in the
+        # dedicated pool `generate_image`'s submit branch uses.
         args.append("--async")
-    # The parent stays the backstop only: a little slack past the budget so
-    # comfy-cli reports its own error rather than dying to a signal. Runs off
-    # the event loop in the dedicated pool for the same reason
-    # `partner_generate` does: this blocks for as long as the template takes (up
-    # to an hour) and the tool is async for the consent round-trip above.
-    return await _in_generate_pool(
-        _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+        return await _in_generate_pool(
+            _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+        )
+    # wait=True streams. `comfy run-template` hands the filled graph to the same
+    # comfy-cli run path `comfy run` uses, so under `--json-stream` it emits the
+    # same per-node events — which is what `generate_image` already rides for
+    # this very verb. A template run can block for up to an hour (its own
+    # docstring calls out long video runs), so it must report progress rather
+    # than sit silent.
+    #
+    # Same grace as the submit path above (and as `generate_image`): the child
+    # was handed `--timeout=min(budget, 120)`, so for a budget at or under
+    # comfy-cli's 120s cap the engine's deadline and the parent's kill land on
+    # the SAME instant. Without slack the parent can SIGKILL comfy-cli mid-write
+    # of its own structured timeout / `server_not_running` result, replacing an
+    # actionable error with a generic parent kill (and orphaning an
+    # already-enqueued run). The engine must be the side that gives up.
+    return await _run_comfy_streaming(
+        *args, ctx=ctx, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
     )
 
 
