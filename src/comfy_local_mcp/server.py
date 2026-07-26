@@ -4005,6 +4005,14 @@ def list_nodes(
         ("--label", label),
     ):
         if value:
+            # Same guarded loop as `search_templates`' filters, for the same two
+            # reasons: a dash-leading filter is input hygiene (Click reads an
+            # option's value verbatim, so this is a caller mistake worth naming
+            # rather than an injection vector — see `_reject_option_like`), and a
+            # NUL would otherwise escape as `subprocess`' bare ValueError instead
+            # of a `ComfyCliError`.
+            _reject_option_like(f"{flag} value", value)
+            _reject_nul(f"{flag} value", value)
             args += [flag, value]
     return _run_comfy(*args, timeout=60.0)
 

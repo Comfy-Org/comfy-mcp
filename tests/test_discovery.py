@@ -80,6 +80,52 @@ def test_list_nodes_omits_empty_filters(patched_run):
     ]
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"produces": "--help"},
+        {"accepts": "-x"},
+        {"category": "--pack"},
+        {"pack": "-p"},
+        {"label": "--label"},
+    ],
+    ids=lambda kw: next(iter(kw)),
+)
+def test_list_nodes_rejects_leading_dash_filter_values(patched_run, kwargs):
+    """A filter value starting with '-' is rejected before it reaches comfy-cli argv."""
+    calls = patched_run(envelope(data=[]))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.list_nodes(**kwargs)
+    # refused before the spawn, not after
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"produces": "a\0"},
+        {"accepts": "a\0"},
+        {"category": "a\0"},
+        {"pack": "a\0"},
+        {"label": "a\0"},
+    ],
+    ids=lambda kw: next(iter(kw)),
+)
+def test_list_nodes_rejects_embedded_nul_filter_values(patched_run, kwargs):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data=[]))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.list_nodes(**kwargs)
+    assert calls == []
+
+
+def test_list_nodes_still_passes_a_normal_filter_value(patched_run):
+    """The guards are value-shape only — an ordinary filter still reaches argv."""
+    calls = patched_run(envelope(data=[]))
+    server.list_nodes(produces="IMAGE")
+    assert calls[0]["cmd"][4:] == ["nodes", "ls", "--produces", "IMAGE"]
+
+
 def test_nodes_upstream_without_limit(patched_run):
     calls = patched_run(envelope(data=[{"name": "CheckpointLoaderSimple"}]))
     assert server.nodes_upstream("KSampler") == [{"name": "CheckpointLoaderSimple"}]
