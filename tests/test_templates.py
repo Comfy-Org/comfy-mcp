@@ -254,6 +254,19 @@ def test_search_templates_rejects_leading_dash_filter_values(monkeypatch):
             server.search_templates(**kwargs)
 
 
+def test_search_templates_rejects_embedded_nul_filter_values(monkeypatch):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    _patch_ls(monkeypatch)
+    for kwargs in (
+        {"tag": "a\0"},
+        {"type": "a\0"},
+        {"model": "a\0"},
+        {"provider": "a\0"},
+    ):
+        with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+            server.search_templates(**kwargs)
+
+
 def test_search_templates_negative_limit_raises(monkeypatch):
     """A negative limit is a caller typo -> raise, not a silently-empty page."""
     _patch_ls(monkeypatch)

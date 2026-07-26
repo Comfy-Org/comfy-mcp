@@ -3549,6 +3549,7 @@ def get_execution_error(prompt_id: str) -> Any:
     # comfy-cli parses a leading-dash positional as an option/flag; reject it
     # rather than let `jobs status` misread the id (argument injection).
     _reject_option_like("prompt_id", prompt_id)
+    _reject_nul("prompt_id", prompt_id)
 
     status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
@@ -3681,6 +3682,7 @@ async def watch_job(
     # comfy-cli parses a leading-dash positional as an option/flag; reject it
     # rather than let `jobs watch` misread the id (argument injection).
     _reject_option_like("prompt_id", prompt_id)
+    _reject_nul("prompt_id", prompt_id)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
     return await _run_comfy_streaming(
         "jobs",
@@ -4127,6 +4129,7 @@ def search_templates(
             # rather than let `templates ls` misread the filter (argument
             # injection).
             _reject_option_like(f"{flag} value", value)
+            _reject_nul(f"{flag} value", value)
             args += [flag, value]
     data = _run_comfy(*args, timeout=60.0)
 
@@ -4405,6 +4408,7 @@ def download_model(
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
     _reject_option_like("url", url)
+    _reject_nul("url", url)
     # Restrict to http(s): this is a remote fetch of a known model URL, so a
     # `file://` path or other scheme — an SSRF / local-file-read primitive whose
     # body would be written straight into the models dir — is never legitimate.
@@ -4414,6 +4418,7 @@ def download_model(
     # empty string is omitted rather than forwarded as `--relative-path ""`.
     if relative_path:
         _reject_option_like("relative_path", relative_path)
+        _reject_nul("relative_path", relative_path)
         # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
         # write inside the models dir by rejecting absolute paths and `..`.
         parts = relative_path.replace("\\", "/").split("/")
@@ -4423,9 +4428,17 @@ def download_model(
             )
     if filename:
         _reject_option_like("filename", filename)
-        # filename is a single output name, not a path; reject separators and `..`
-        # so it can't redirect the write out of the target directory.
-        if filename in (".", "..") or "/" in filename or "\\" in filename:
+        _reject_nul("filename", filename)
+        # filename is a single output name, not a path; reject separators, `..`,
+        # and `:` (a Windows drive prefix like `C:evil.dll` has no separator but
+        # still escapes the models dir via `os.path.join` on that platform) so it
+        # can't redirect the write out of the target directory.
+        if (
+            filename in (".", "..")
+            or "/" in filename
+            or "\\" in filename
+            or ":" in filename
+        ):
             raise ComfyCliError(
                 f"invalid filename: {filename!r} (must be a bare filename)"
             )

@@ -652,11 +652,31 @@ def test_download_model_rejects_traversal_relative_path(bad_path):
         server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
 
 
-@pytest.mark.parametrize("bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b"])
+@pytest.mark.parametrize(
+    "bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b", "C:evil.dll"]
+)
 def test_download_model_rejects_pathy_filename(bad_name):
-    """filename must be a bare name: no separators or `..` to escape the dir."""
+    """filename must be a bare name: no separators, `..`, or a drive prefix to
+    escape the dir (``C:evil.dll`` has no separator but is drive-relative on
+    Windows)."""
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+
+def test_download_model_rejects_embedded_nul_url():
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.download_model("https://hf.co/x\0.safetensors")
+
+
+def test_download_model_rejects_embedded_nul_relative_path():
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.download_model("https://hf.co/x.safetensors", relative_path="models/\0")
+
+
+def test_download_model_rejects_embedded_nul_filename():
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.download_model("https://hf.co/x.safetensors", filename="x\0.safetensors")
 
 
 def test_download_model_omits_empty_string_optionals(patched_run):
@@ -1624,6 +1644,12 @@ def test_watch_job_rejects_option_like_prompt_id():
     """A leading-dash prompt_id is refused so comfy-cli can't parse it as a flag."""
     with pytest.raises(server.ComfyCliError, match="invalid prompt_id"):
         asyncio.run(server.watch_job("--help"))
+
+
+def test_watch_job_rejects_embedded_nul_prompt_id():
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        asyncio.run(server.watch_job("pid\0"))
 
 
 def test_watch_job_clamps_oversized_timeout(monkeypatch):

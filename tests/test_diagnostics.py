@@ -179,6 +179,22 @@ def test_get_execution_error_rejects_leading_dash(monkeypatch):
     assert not called  # guarded before shelling out
 
 
+def test_get_execution_error_rejects_embedded_nul(monkeypatch):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    called = False
+
+    def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.get_execution_error("abc\0")
+    assert not called  # guarded before shelling out
+
+
 def test_cap_traceback_tail_hard_truncates_single_oversized_frame():
     """One frame longer than the cap is character-truncated, keeping its tail."""
     frame = "y" * (server._TRACEBACK_TAIL_MAX_CHARS + 500)
