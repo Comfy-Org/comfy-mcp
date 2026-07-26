@@ -508,6 +508,63 @@ def test_server_info_freshness_relayed_phrase_is_not_unsupported(
     assert "freshness unavailable" not in result["freshness"]["error"]
 
 
+def test_server_info_freshness_envelope_at_exit_two_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """An error envelope at Click's usage-error status still proves the verb ran.
+
+    Pins the `no_envelope` half of the gate INDEPENDENTLY of the exit code:
+    every other envelope-present negative here exits 1, so the exit-code check
+    alone would reject them and the provenance condition would go untested. A
+    comfy-cli that HAS `outdated` can reject one of its options and report that
+    structurally at exit 2 — only the absence of an envelope means the parser
+    never dispatched.
+    """
+    import json
+
+    error_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {
+            "code": "bad_option",
+            "message": "No such command 'outdated' handler registered for --json",
+        },
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (2, json.dumps(error_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "bad_option" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_dotted_command_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """`No such command 'outdated.foo'` is a different command, not our verb.
+
+    The lookahead must reject every character a command name can continue with,
+    not just word characters and the hyphen — a `.` would otherwise let the
+    `outdated` prefix match and discard a real diagnostic.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: No such command 'outdated.foo'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "outdated.foo" in result["freshness"]["error"]
+
+
 def test_server_info_freshness_midrun_crash_is_not_unsupported(
     patched_env_then_outdated,
 ):

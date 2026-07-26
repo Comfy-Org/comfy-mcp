@@ -514,11 +514,14 @@ class ComfyCliError(RuntimeError):
     report structurally?" must check this flag rather than ``code is None``.
     :func:`_is_missing_verb_error` is exactly that caller.
 
-    ``returncode`` is the child's exit status on that same no-envelope path
-    (``None`` elsewhere). It distinguishes *how* comfy-cli failed without an
-    envelope — a usage error the argument parser rejected before dispatch versus
-    a crash partway through a command it did accept — which the message text
-    alone cannot tell you.
+    ``returncode`` is the child's exit status wherever :func:`_unwrap_envelope`
+    knows it — on the no-envelope path AND on an error envelope — so it is
+    genuinely independent of ``no_envelope`` rather than a proxy for it. It
+    distinguishes *how* comfy-cli failed: a usage error the argument parser
+    rejected before dispatch versus a failure partway through a command it did
+    accept, which the message text alone cannot tell you. It stays ``None`` for
+    the failures raised without ever reading a child's status (missing binary,
+    timeout).
     """
 
     def __init__(
@@ -1156,7 +1159,7 @@ def _unwrap_envelope(
         detail_str = _render_error_details(err.get("details"))
         if detail_str:
             parts.append(detail_str)
-        raise ComfyCliError("\n".join(parts), code=code)
+        raise ComfyCliError("\n".join(parts), code=code, returncode=returncode)
     return envelope.get("data")
 
 
@@ -1665,10 +1668,12 @@ _CLICK_USAGE_ERROR_EXIT = 2
 # `_normalize_cli_text` first. The verb follows within a few non-word characters
 # (the quotes/colon/period around it) and must END there: `\b` would treat the
 # hyphen in a DIFFERENT command like `outdated-notifier` as a word boundary and
-# match it, so `(?![\w-])` requires a real delimiter. At least one separator,
-# since Click always writes a space and a quote there. See
+# match it, so the lookahead rejects every character a command name could
+# continue with — `\w` plus the `.`, `:`, `/`, `-` that appear in namespaced or
+# hyphenated verbs — and `outdated.foo` no longer reads as `outdated`. At least
+# one separator, since Click always writes a space and a quote there. See
 # `_is_missing_verb_error`.
-_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{1,8}}{verb}(?![\w-])"
+_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{1,8}}{verb}(?![\w.:/-])"
 
 # A CSI escape sequence (`\x1b[...m` and friends). Rich colourizes its error
 # panels, and those codes contain word characters (digits, `m`), so leaving them
@@ -1725,6 +1730,22 @@ def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
     verb with a different exit status just falls through to the raw passthrough
     below — the pre-existing behaviour, noisy but honest — whereas a wrong
     ``unsupported`` actively tells the user nothing is broken.
+
+    Two residuals are known and accepted, both bounded by the conditions above:
+
+    - Exit 2 is Click's status for ANY ``UsageError``, including one a command
+      body raises after dispatch, so it does not *strictly* prove the parser
+      rejected the verb. To reach a false ``unsupported`` through that door a
+      recognized ``comfy outdated`` would have to raise a usage error mid-run,
+      emit no envelope, AND print "no such command" naming ``outdated`` itself
+      with a closing delimiter — i.e. reproduce the parser's own message about
+      its own name. No further heuristic buys much here; the alternative is
+      pattern-matching Click's usage preamble, which a mid-run ``UsageError``
+      also prints.
+    - The message this reads is built from bounded stream tails, so a wide rich
+      panel could in principle push the phrase out of the slice. Click prints
+      the error line LAST and the tail is what's kept, so it lands inside; if it
+      ever did not, the miss fails toward the raw passthrough.
 
     The phrase must also name ``verb`` itself, within a few punctuation
     characters (Click writes ``No such command 'outdated'.``) and ending at a
