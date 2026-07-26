@@ -247,23 +247,47 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
       Click takes the token after a value-taking option verbatim — even one that is
       itself a valid option name (``--out-dir --slot`` parses as
       ``out_dir="--slot"``, not as a missing value). So ``vary_workflow``'s
-      ``slots`` / ``out_dir`` need no guard to be injection-safe.
+      ``slots`` / ``out_dir`` are already injection-safe before any guard runs.
 
-    Where a call site guards an option value anyway (``search_templates``'s
-    filters, ``download_model``'s ``relative_path`` / ``filename``,
-    ``fetch_template``'s ``out_path``), that is input hygiene rather than injection
-    defense: a dash-leading provider filter or output filename is a caller mistake,
-    and a named error beats comfy-cli matching zero rows or writing a file named
-    ``-x``. Read those as belt-and-braces, not as evidence that option values are
-    unsafe.
+    Option values ARE guarded anyway, nearly everywhere in the module
+    (``search_templates``'s filters, ``download_model``'s ``relative_path`` /
+    ``filename``, ``fetch_template``'s ``out_path``, ``vary_workflow``'s ``slots``
+    / ``out_dir``, ``run_workflow`` / ``validate_workflow``'s ``workflow_path``).
+    That is input hygiene rather than injection defense: a dash-leading provider
+    filter or output filename is a caller mistake, and a named error beats
+    comfy-cli matching zero rows, writing a file named ``-x``, or printing
+    ``--help`` text that then fails envelope parsing. Read those as
+    belt-and-braces, not as evidence that option values are unsafe — the
+    distinction above still decides which guards are *mandatory*.
 
-    That hygiene guard is a judgement per call site, not a default — apply it only
-    where a leading dash cannot be real DATA for that value. It does **not** fit a
-    free-form search term: ``search_models``'s ``--text`` matches model filenames,
-    where ``-fp16`` / ``-fp8`` / ``-turbo`` are ordinary substrings, so guarding it
-    would refuse a working search that has no other spelling. The hygiene sites
-    above all leave an escape hatch (``./-x`` names the same file as ``-x``); a
-    search term does not.
+    Two deliberate over-rejections, so neither reads as an oversight:
+
+    - **A lone ``-``.** Click treats it as a positional, not an option, so it is
+      not an injection vector. It is refused anyway because it is not a valid
+      value at any call site — not a path, template name, node class, connection
+      type, or slot address — and "wrote a file named ``-``" is precisely the
+      caller mistake the hygiene guards exist to name.
+    - **A dash-leading slot ADDR** (``vary_workflow``'s ``slots``). An ``ADDR``
+      begins with the node id, which comfy-cli surfaces non-negative via
+      ``list_workflow_slots``, so no reachable address starts with ``-``. It also
+      costs no capability: ``set_workflow_slot``'s overrides and both param
+      marshalers (:func:`_validate_param_key`) already refuse one, so every other
+      way to name a slot in this module rejects it too.
+
+    And one deliberate NON-rejection, which is what "nearly" above is doing:
+
+    - **``search_models``'s ``--text`` query.** The hygiene guards all rest on a
+      leading dash never being real DATA for that value, and each leaves an escape
+      hatch — ``./-x`` names the same file as ``-x``, which is why the messages
+      above suggest it. Neither holds for a free-form substring match over model
+      *filenames*: ``-fp16`` / ``-fp8`` / ``-turbo`` are ordinary filename
+      substrings, so a dash-leading query matches real rows, and there is no other
+      way to spell that substring through ``--text``. Verified against comfy-cli:
+      ``models search --text -fp16`` reaches the server call exactly as
+      ``--text fp16`` does, so guarding it would refuse a working search rather
+      than name a mistake. ``_reject_nul`` still applies there — a NUL cannot ride
+      in argv at all. Weigh a new option-value call site the same way before
+      copying the hygiene guard into it.
     """
     if value.startswith("-"):
         hint = f" — expected {expected}" if expected else ""
@@ -2023,6 +2047,20 @@ async def run_workflow(
     the surfaced error carries comfy-cli's hint (including the working
     ``comfy auth set comfy-cloud-api-key`` fallback).
     """
+    # Guarded HERE rather than inside `_attempt` so it covers BOTH the
+    # `wait=False` submit and the streaming path, and so a bad path fails once
+    # up front instead of being re-raised through the credential retry loop.
+    # `workflow_path` rides behind `--workflow` as an option value (Click takes
+    # that verbatim), so this is input hygiene, not injection defense — see
+    # `_reject_option_like`.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a workflow JSON file (prefix a dash-leading name with './')"
+        ),
+    )
+    _reject_nul("workflow_path", workflow_path)
     if wait:
         # Harden the caller's bound BEFORE it reaches `_run_comfy_streaming`
         # (and from there `asyncio.wait_for`): `inf` would wait on the child
@@ -3932,13 +3970,10 @@ def get_template(name: str) -> Any:
     fetching it, then ``fetch_template(name, out_path)`` writes the runnable JSON
     for ``run_workflow``.
     """
-    # `name` rides as a bare positional, so a leading dash reaches comfy-cli as
-    # an option rather than the template — the same guard `run_template` already
-    # applies to the same value.
-    _reject_option_like(
-        "template name", name, expected="a template name (e.g. 'flux_dev')"
-    )
-    _reject_nul("template name", name)
+    # Bare positional: a leading-dash name is read by comfy-cli as an option
+    # rather than the template to show (argument injection).
+    _reject_option_like("name", name, expected="a template name (e.g. 'image_flux2')")
+    _reject_nul("name", name)
     return _run_comfy("templates", "show", name, timeout=60.0)
 
 
@@ -3958,16 +3993,18 @@ def fetch_template(name: str, out_path: str) -> str:
 
     so an agent reaches a working generation without hand-authoring workflow JSON.
     """
-    # `name` is a bare positional (mandatory guard); `out_path` rides as the
-    # `--out` value, where the leading-dash check is input hygiene rather than
-    # injection defense — a file named `-x` is a caller mistake, not a flag, and
-    # a caller who really wants one can spell it `./-x` (same file, no guard).
-    # See `_reject_option_like` for why the two cases differ.
+    # `name` is a bare positional, so a leading-dash value is read as an option
+    # and every later token shifts up a slot. `out_path` rides behind `--out` as
+    # an option value, which Click takes verbatim — guarding it is input hygiene
+    # (a file literally named `-x` is a caller mistake worth naming), matching
+    # `download_model`'s `filename`. See `_reject_option_like` for the split.
+    _reject_option_like("name", name, expected="a template name (e.g. 'image_flux2')")
     _reject_option_like(
-        "template name", name, expected="a template name (e.g. 'flux_dev')"
+        "out_path",
+        out_path,
+        expected="a file path (prefix a dash-leading name with './')",
     )
-    _reject_nul("template name", name)
-    _reject_option_like("out_path", out_path)
+    _reject_nul("name", name)
     _reject_nul("out_path", out_path)
     _run_comfy("templates", "fetch", name, "--out", out_path, timeout=60.0)
     return os.path.abspath(out_path)
@@ -3983,9 +4020,11 @@ def search_nodes(query: str) -> Any:
     "KSampler", "load image") before authoring or repairing a workflow graph;
     pass the returned name to ``get_node`` for its full schema.
     """
-    # `query` rides as a bare positional: a leading dash is read by comfy-cli as
-    # an option, not the search term.
-    _reject_option_like("query", query)
+    # Bare positional: a leading-dash query is read as an option, not a search
+    # term (argument injection).
+    _reject_option_like(
+        "query", query, expected="a search term (e.g. 'KSampler' or 'load image')"
+    )
     _reject_nul("query", query)
     return _run_comfy("nodes", "search", query, timeout=60.0)
 
@@ -4000,10 +4039,10 @@ def get_node(name: str) -> Any:
     repair a workflow graph. Reflects the user's live install, so it resolves
     custom-node classes too (not just built-ins).
     """
-    # `name` rides as a bare positional: a leading dash is read by comfy-cli as
-    # an option, not the class name.
-    _reject_option_like("node name", name, expected="a node class (e.g. 'KSampler')")
-    _reject_nul("node name", name)
+    # Bare positional: a leading-dash name is read as an option rather than the
+    # node class to show (argument injection).
+    _reject_option_like("name", name, expected="a node class name (e.g. 'KSampler')")
+    _reject_nul("name", name)
     return _run_comfy("nodes", "show", name, timeout=60.0)
 
 
@@ -4023,10 +4062,17 @@ def list_nodes(
     - ``produces`` → ``--produces <TYPE>``: nodes whose outputs include ``<TYPE>``
       (e.g. ``IMAGE``, ``MODEL``).
     - ``accepts`` → ``--accepts <TYPE>``: nodes with an input of ``<TYPE>``.
-    - ``category`` → ``--category <path>``: nodes under a menu category
-      (e.g. ``loaders``).
-    - ``pack`` → ``--pack <name>``: nodes from a given custom-node pack.
-    - ``label`` → ``--label <text>``: nodes matching a display-label substring.
+    - ``category`` → ``--category <glob>``: glob match on the category path, so
+      ``loaders`` matches only that exact category while ``loaders*`` /
+      ``sampling/*`` match a subtree (``%`` also works as the wildcard).
+    - ``pack`` → ``--pack <name>``: nodes from a custom-node pack, matched on the
+      pack's whole name, case-insensitively (e.g. ``core``,
+      ``comfyui-impact-pack``).
+    - ``label`` → ``--label <Label>``: nodes carrying one of comfy-cli's curated
+      *behavioral* labels — ``WritesToDisk``, ``NetworkAccess``,
+      ``ReadsArbitraryFile``, … — matched exactly, and only on the nodes
+      comfy-cli annotates (a purely local custom node carries none). This is not
+      a display-name search; use ``search_nodes`` for that.
 
     Reads the user's live install, so results include installed custom nodes —
     the broad "what nodes can do X?" companion to ``search_nodes``' name search.
@@ -4040,6 +4086,14 @@ def list_nodes(
         ("--label", label),
     ):
         if value:
+            # Same guarded loop as `search_templates`' filters, for the same two
+            # reasons: a dash-leading filter is input hygiene (Click reads an
+            # option's value verbatim, so this is a caller mistake worth naming
+            # rather than an injection vector — see `_reject_option_like`), and a
+            # NUL would otherwise escape as `subprocess`' bare ValueError instead
+            # of a `ComfyCliError`.
+            _reject_option_like(f"{flag} value", value)
+            _reject_nul(f"{flag} value", value)
             args += [flag, value]
     return _run_comfy(*args, timeout=60.0)
 
@@ -4053,6 +4107,10 @@ def nodes_upstream(name: str, limit: int | None = None) -> Any:
     computed against the live local ``object_info`` (custom nodes included). Pass
     ``limit`` to cap the number of results; omit it for the full set.
     """
+    # Bare positional, and it sits beside this command's own `--limit`: a
+    # leading-dash name is read as an option (argument injection).
+    _reject_option_like("name", name, expected="a node class name (e.g. 'KSampler')")
+    _reject_nul("name", name)
     args = ["nodes", "upstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
@@ -4069,6 +4127,10 @@ def nodes_downstream(name: str, limit: int | None = None) -> Any:
     included). Pass ``limit`` to cap the number of results; omit it for the full
     set.
     """
+    # Bare positional, and it sits beside this command's own `--limit`: a
+    # leading-dash name is read as an option (argument injection).
+    _reject_option_like("name", name, expected="a node class name (e.g. 'KSampler')")
+    _reject_nul("name", name)
     args = ["nodes", "downstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
@@ -4087,6 +4149,18 @@ def nodes_path(
     local ``object_info`` graph. ``max_depth`` bounds the chain length and
     ``max_paths`` caps how many routes are returned.
     """
+    # Two bare positionals ahead of `--max-depth` / `--max-paths`: a leading-dash
+    # type is read as an option and shifts every later token up a slot, so the
+    # second type could land in the first's place (argument injection).
+    # `max_depth` / `max_paths` need no guard: they are typed ints (so they
+    # cannot carry an arbitrary caller string at all) and they ride behind
+    # `--max-depth` / `--max-paths` as option values, which Click takes
+    # verbatim — even the `"-1"` a negative bound would render as.
+    for label, value in (("from_type", from_type), ("to_type", to_type)):
+        _reject_option_like(
+            label, value, expected="a connection type (e.g. 'MODEL' or 'IMAGE')"
+        )
+        _reject_nul(label, value)
     return _run_comfy(
         "nodes",
         "path",
@@ -4310,6 +4384,19 @@ def validate_workflow(workflow_path: str) -> Any:
     Treat ``valid:true`` as necessary-not-sufficient and rely on
     ``run_workflow`` errors for final authority.
     """
+    # `workflow_path` rides behind `--workflow` as an option value, which Click
+    # takes verbatim, so this is input hygiene rather than injection defense —
+    # the same call the guarded `search_templates` filters and `download_model`'s
+    # `filename` make. A dash-leading path reaches comfy-cli as a usage error (or
+    # prints `--help`) that fails envelope parsing; a named error is better.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a workflow JSON file (prefix a dash-leading name with './')"
+        ),
+    )
+    _reject_nul("workflow_path", workflow_path)
     return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
 
 
@@ -4409,8 +4496,8 @@ def vary_workflow(
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path. `slots` and `out_dir` ride behind `--slot`
     # / `--out-dir` as option VALUES, which Click takes verbatim, so they are
-    # injection-safe unguarded; see `_reject_option_like` for why the two cases
-    # differ.
+    # already injection-safe; they are guarded below as input hygiene, matching
+    # `search_templates`' filters. See `_reject_option_like` for the two cases.
     _reject_option_like(
         "workflow_path",
         workflow_path,
@@ -4422,11 +4509,19 @@ def vary_workflow(
     _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
     for slot in slots:
-        # NUL is refused even though the leading-dash guard is not needed here:
-        # the two checks answer different questions (see `_reject_option_like`).
+        _reject_option_like(
+            "slot",
+            slot,
+            expected="an 'ADDR=[v1,v2,...]' string (e.g. '3.seed=[1,2,3]')",
+        )
         _reject_nul("slot", slot)
         args += ["--slot", slot]
     if out_dir:
+        _reject_option_like(
+            "out_dir",
+            out_dir,
+            expected="a directory path (prefix a dash-leading name with './')",
+        )
         _reject_nul("out_dir", out_dir)
         args += ["--out-dir", out_dir]
     return _run_comfy(*args, timeout=120.0)

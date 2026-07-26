@@ -294,22 +294,10 @@ def test_get_template_argv(patched_run):
     assert calls[0]["cmd"][4:] == ["templates", "show", "flux_dev"]
 
 
-@pytest.mark.parametrize("name", ["--help", "-x"])
-def test_get_template_rejects_leading_dash_name(patched_run, name):
-    """The name is a bare positional — a leading dash reaches comfy-cli as an option."""
-    calls = patched_run(envelope(data={}))
-    with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        server.get_template(name)
-    # refused before the spawn, not after
-    assert calls == []
-
-
-def test_get_template_rejects_embedded_nul_name(patched_run):
-    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
-    calls = patched_run(envelope(data={}))
-    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
-        server.get_template("flux\0dev")
-    assert calls == []
+# `get_template` / `fetch_template` leading-dash + NUL rejection is covered by
+# `test_get_template_rejects_option_like_name`,
+# `test_fetch_template_rejects_option_like_name_and_out_path` and
+# `test_template_tools_reject_embedded_nul` below (landed on main in #86).
 
 
 def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
@@ -332,28 +320,51 @@ def test_fetch_template_resolves_relative_path(monkeypatch):
     assert os.path.isabs(result)
 
 
-@pytest.mark.parametrize(
-    "args",
-    [("--help", "/tmp/out.json"), ("-x", "/tmp/out.json"), ("flux_dev", "--out")],
-    ids=["name-long", "name-short", "out_path"],
-)
-def test_fetch_template_rejects_leading_dash(patched_run, args):
-    """`name` is a bare positional; the `--out` value is guarded for hygiene too."""
-    calls = patched_run(envelope(data=None))
+def test_get_template_rejects_option_like_name(monkeypatch):
+    """A leading-dash name is refused before any child spawns.
+
+    ``name`` is a bare positional on ``templates show``, so comfy-cli reads a
+    dash-leading value as an option rather than the template to show.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        server.fetch_template(*args)
-    # refused before the spawn — and before any file is written
-    assert calls == []
+        server.get_template("--help")
 
 
-@pytest.mark.parametrize(
-    "args",
-    [("flux\0dev", "/tmp/out.json"), ("flux_dev", "/tmp/o\0ut.json")],
-    ids=["name", "out_path"],
-)
-def test_fetch_template_rejects_embedded_nul(patched_run, args):
+def test_fetch_template_rejects_option_like_name_and_out_path(monkeypatch):
+    """Both the ``name`` positional and the ``--out`` value are guarded."""
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.fetch_template("--help", "/tmp/flux.json")
+
+    # The escape hatch is named in the error, so a genuinely dash-leading
+    # filename stays reachable as `./-flux.json`.
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        server.fetch_template("flux_dev", "--help")
+
+
+def test_template_tools_reject_embedded_nul(monkeypatch):
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
-    calls = patched_run(envelope(data=None))
-    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
-        server.fetch_template(*args)
-    assert calls == []
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    for call in (
+        lambda: server.get_template("flux\0dev"),
+        lambda: server.fetch_template("flux\0dev", "/tmp/flux.json"),
+        lambda: server.fetch_template("flux_dev", "/tmp/f\0.json"),
+    ):
+        with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+            call()
