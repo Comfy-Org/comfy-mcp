@@ -377,7 +377,14 @@ def test_server_info_attaches_freshness_block(patched_env_then_outdated):
 
 
 def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdated):
-    """An older comfy-cli without `outdated` -> freshness.error, tool still succeeds."""
+    """A comfy-cli without `outdated` -> the purpose-built `unsupported` degrade.
+
+    Every released comfy-cli (through 1.12.0) lacks the verb, so this is the
+    COMMON path, not an edge case. It must read as a capability gap rather than
+    a failure of this server: no raw Click/Typer usage dump, no "returned no
+    JSON" wrapper text, and a machine-readable `unsupported` flag so a client
+    can branch without string-matching.
+    """
     import json
 
     patched_env_then_outdated(
@@ -391,8 +398,55 @@ def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdate
 
     assert result["running"] is True  # env data intact — the probe never breaks it
     assert "compatibility" in result
-    assert set(result["freshness"]) == {"error"}
-    assert "No such command 'outdated'" in result["freshness"]["error"]
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+    # The raw wrapper/CLI text no longer leaks through.
+    assert "returned no JSON" not in result["freshness"]["error"]
+    assert "No such command" not in result["freshness"]["error"]
+    assert "Usage: comfy" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_match_is_case_insensitive(
+    patched_env_then_outdated,
+):
+    """`Error: no such command 'outdated'` (lowercase) also degrades cleanly."""
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: no such command 'outdated'"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_passes_through_other_errors(patched_env_then_outdated):
+    """A NON-missing-verb spawn failure keeps the raw reason and no `unsupported`.
+
+    The special case above is deliberately narrow: for a network failure the raw
+    reason IS the diagnostic, so it must still reach the caller verbatim.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (1, "", "network unreachable"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True
+    assert set(result["freshness"]) == {"error"}  # no `unsupported` key
+    assert "unsupported" not in result["freshness"]
+    assert "network unreachable" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
 
 
 def test_server_info_freshness_degrades_on_error_envelope(patched_env_then_outdated):

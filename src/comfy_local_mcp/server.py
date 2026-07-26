@@ -1528,21 +1528,47 @@ def _freshness_report() -> Any:
     """Best-effort installed-vs-latest report via ``comfy outdated``.
 
     Returns the ``comfy outdated`` payload (``core`` install status, one row per
-    custom node ``packs`` entry, ``checked_at``) on success. On ANY
-    :class:`ComfyCliError` — the verb missing on an older comfy-cli, the network
-    lookup down, a timeout — returns ``{"error": "<reason>"}`` instead of
-    raising, so the probe can never take ``server_info`` down with it.
-    ``OSError`` is caught for the same reason: a spawn failure on this second
-    subprocess (the env probe already succeeded) is still just the freshness
-    probe failing, never grounds to fail ``server_info``. ``UnicodeDecodeError``
-    is caught too: ``_run_comfy_raw`` decodes the child's stdout with strict
-    ``encoding="utf-8"`` (no ``errors="replace"``), so non-UTF-8 bytes in a
-    pack name/path from the user's live custom-node install can raise it here,
-    same as the other probe failures above.
+    custom node ``packs`` entry, ``checked_at``) on success. It never raises, so
+    the probe can never take ``server_info`` down with it; it degrades to one of
+    two shapes instead.
+
+    The MISSING-VERB degrade is its own shape: ``comfy outdated`` does not exist
+    on any released comfy-cli (through 1.12.0), so on those installs this probe
+    fails every time — and Click/Typer's raw ``No such command 'outdated'.``
+    usage dump, relayed verbatim, reads like a broken MCP rather than the benign
+    capability gap it is. That case returns
+    ``{"error": "freshness unavailable: ...", "unsupported": True}``, with
+    ``unsupported`` machine-readable so a client can branch on it without
+    matching strings.
+
+    EVERY OTHER failure keeps the raw ``{"error": "<reason>"}`` passthrough — for
+    a network failure, a timeout, or a decode error the underlying reason IS the
+    diagnostic, so relaying it is the useful thing to do. ``OSError`` is caught
+    because a spawn failure on this second subprocess (the env probe already
+    succeeded) is still just the freshness probe failing, never grounds to fail
+    ``server_info``. ``UnicodeDecodeError`` is caught too: ``_run_comfy_raw``
+    decodes the child's stdout with strict ``encoding="utf-8"`` (no
+    ``errors="replace"``), so non-UTF-8 bytes in a pack name/path from the
+    user's live custom-node install can raise it here, same as the other probe
+    failures above.
     """
     try:
         return _run_comfy("outdated", timeout=15.0)
     except (ComfyCliError, OSError, UnicodeDecodeError) as exc:
+        # Click/Typer emits `No such command 'outdated'.` on stderr, which
+        # `_unwrap_envelope` embeds in the raised message via its stderr tail.
+        # Match on that phrase alone, NOT on a quoted `'outdated'`: rich-formatted
+        # Typer output can wrap lines inside its error panel, and any "no such
+        # command" raised from a `comfy outdated` invocation is unambiguous.
+        if isinstance(exc, ComfyCliError) and "no such command" in str(exc).lower():
+            return {
+                "error": (
+                    "freshness unavailable: the installed comfy-cli does not support "
+                    "'comfy outdated' (the verb ships in releases after 1.12.0). "
+                    "Workflows are unaffected; update checks were skipped."
+                ),
+                "unsupported": True,
+            }
         return {"error": str(exc)}
 
 
@@ -1584,9 +1610,16 @@ def server_info() -> Any:
     node, or template seems missing, tell the user to update FIRST
     (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
     before concluding the catalog lacks it; silent staleness is the usual
-    culprit. The probe is best-effort: on a comfy-cli without the ``outdated``
-    verb, a network failure, or a timeout, ``freshness`` degrades to
-    ``{"error": "<reason>"}`` — ``server_info`` itself still succeeds.
+    culprit. The probe is best-effort and degrades two ways — ``server_info``
+    itself still succeeds either way. On a comfy-cli that lacks the ``outdated``
+    verb (no release through 1.12.0 has it), ``freshness`` is
+    ``{"error": "freshness unavailable: ...", "unsupported": true}``:
+    ``unsupported: true`` means SKIP staleness advice entirely and do NOT tell
+    the user anything is broken — nothing failed, this comfy-cli just cannot
+    answer the question, and workflows are unaffected. On any other probe
+    failure (a network failure, a timeout, a decode error) ``freshness`` is
+    ``{"error": "<reason>"}`` with no ``unsupported`` key, and that reason is
+    the real diagnostic.
 
     Remote target: when a remote ComfyUI is configured (``COMFYUI_URL`` or
     ``COMFYUI_HOST`` — see :func:`_comfy_target`), a ``comfy_target`` block is
