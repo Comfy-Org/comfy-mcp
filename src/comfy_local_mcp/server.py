@@ -259,6 +259,20 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
     ``--help`` text that then fails envelope parsing. Read those as
     belt-and-braces, not as evidence that option values are unsafe — the
     distinction above still decides which guards are *mandatory*.
+
+    Two deliberate over-rejections, so neither reads as an oversight:
+
+    - **A lone ``-``.** Click treats it as a positional, not an option, so it is
+      not an injection vector. It is refused anyway because it is not a valid
+      value at any call site — not a path, template name, node class, connection
+      type, or slot address — and "wrote a file named ``-``" is precisely the
+      caller mistake the hygiene guards exist to name.
+    - **A dash-leading slot ADDR** (``vary_workflow``'s ``slots``). An ``ADDR``
+      begins with the node id, which comfy-cli surfaces non-negative via
+      ``list_workflow_slots``, so no reachable address starts with ``-``. It also
+      costs no capability: ``set_workflow_slot``'s overrides and both param
+      marshalers (:func:`_validate_param_key`) already refuse one, so every other
+      way to name a slot in this module rejects it too.
     """
     if value.startswith("-"):
         hint = f" — expected {expected}" if expected else ""
