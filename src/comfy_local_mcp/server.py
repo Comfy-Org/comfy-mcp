@@ -895,9 +895,7 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     # line on a successful run would be mis-unwrapped into a spurious "failed"
     # raise. A real error envelope still has `type==envelope`, so it flows to
     # `_unwrap_envelope` and raises as usual.
-    real_envelope = (
-        envelope if envelope and envelope.get("type") == "envelope" else None
-    )
+    real_envelope = _real_envelope(envelope)
     if plain_ok and real_envelope is None and returncode == 0:
         return _synthesize_plain_result(args, stdout, stderr)
     # Enforce the envelope contract on the normal path too: pass `real_envelope`
@@ -970,12 +968,20 @@ def _stream_tail(text: str | bytes | None, limit: int = 500) -> str:
     The *tail* is what's kept (not the head): a CLI traceback puts the
     exception — the part that says what actually went wrong — last.
     """
-    tail = _tail(text, limit=limit)
+    if limit <= 0:
+        # Mirror `_tail`'s own non-positive guard. It matters more here: we ask
+        # `_tail` for `limit + 1`, so a `limit` of 0 would slip past its check
+        # and the `[-limit:]` below would then be `[0:]` — the WHOLE capture,
+        # exactly the unbounded payload the limit exists to prevent.
+        return "<empty>"
+    # `_tail` clips silently, so ask it ONCE for one char more than the bound:
+    # an over-long answer is itself the evidence that something was dropped, and
+    # re-slicing it locally costs nothing (asking `_tail` twice would re-run the
+    # strip and any bytes-decode over the whole capture just to learn that).
+    tail = _tail(text, limit=limit + 1)
     if not tail:
         return "<empty>"
-    # `_tail` clips silently, so ask it for one char more than the bound: a
-    # longer answer means something was dropped and the marker is warranted.
-    return "..." + tail if len(_tail(text, limit=limit + 1)) > limit else tail
+    return "..." + tail[-limit:] if len(tail) > limit else tail
 
 
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
@@ -1104,9 +1110,15 @@ def _unwrap_envelope(
         # own message only — `_stream_tail` already bounds its result, and
         # re-slicing its HEAD here would chop off the truncation marker plus the
         # very end of the tail, i.e. the part worth keeping.
-        message = err.get("message")
+        # Strip BEFORE the truthiness test: a whitespace-only `error.message`
+        # ("   ") is truthy, so it would keep the fallback from firing and render
+        # exactly the dangling-colon message this branch exists to prevent —
+        # `_stream_tail` already treats a whitespace-only capture as `<empty>`,
+        # so treat the envelope's own field the same way.
+        raw_message = err.get("message")
+        message = str(raw_message).strip() if raw_message else ""
         message = (
-            str(message)[:_MAX_ERROR_FIELD_CHARS]
+            message[:_MAX_ERROR_FIELD_CHARS]
             if message
             else _stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
         )
@@ -1210,6 +1222,24 @@ def _last_json_object(stdout: str) -> dict | None:
         elif best is None or best.get("type") != "envelope":
             best = obj  # fallback to any JSON object until an envelope appears
     return best
+
+
+def _real_envelope(obj: dict | None) -> dict | None:
+    """Keep ``obj`` only if it is a genuine ``type==envelope``; else ``None``.
+
+    The companion filter to :func:`_last_json_object`, which deliberately falls
+    back to ANY JSON object on stdout so a caller can still see what comfy-cli
+    printed. That fallback must never reach :func:`_unwrap_envelope` unfiltered:
+    a stray progress/custom-node line would then be unwrapped as if it were the
+    result — one carrying ``ok: true`` read as a successful run, and one without
+    it raising a bogus ``failed [unknown]`` that SUPPRESSES the no-envelope
+    branch and its stdout/stderr diagnostics, which is the only thing that
+    explains a mid-run crash. Every path into ``_unwrap_envelope`` filters here
+    first. An envelope declaring an incompatible ``schema`` still passes through
+    on purpose — that is a real envelope, and ``_unwrap_envelope`` owns refusing
+    it with the version error rather than a generic "returned no JSON".
+    """
+    return obj if obj and obj.get("type") == "envelope" else None
 
 
 def _parse_event(line: str) -> dict | None:
@@ -1403,8 +1433,14 @@ async def _run_comfy_streaming(
         # the EOF path, so comfy-cli died without an envelope and whatever plain
         # text it printed is the only diagnosis there is.
         stdout_text = "".join(lines)
+        # `_real_envelope` for the same reason `_run_comfy` applies it: reaching
+        # EOF means `_pump` never saw a terminal envelope, so `_last_json_object`
+        # here is usually its fallback — the last progress/custom-node event of a
+        # crashed run. Unwrapping that would discard the diagnostics just
+        # collected; filtering to None routes it to the no-envelope branch, which
+        # is what actually reports why comfy-cli died.
         return False, _unwrap_envelope(
-            _last_json_object(stdout_text),
+            _real_envelope(_last_json_object(stdout_text)),
             args,
             returncode,
             stderr,
@@ -1664,6 +1700,11 @@ def server_info() -> Any:
     same host.
     """
     envelope, stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
+    # `_run_comfy_raw` hands back `_last_json_object`'s answer unfiltered, so
+    # enforce the envelope contract here exactly as `_run_comfy` does: an
+    # incidental non-envelope JSON line from `comfy env` must raise "returned no
+    # JSON" (with both stream tails) rather than be reported as server info.
+    envelope = _real_envelope(envelope)
     # _unwrap_envelope raises if envelope is None, so it is non-None below.
     data = _unwrap_envelope(envelope, args, returncode, stderr, stdout=stdout)
     compat = _check_comfy_cli_version()
