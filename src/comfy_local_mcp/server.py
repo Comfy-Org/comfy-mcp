@@ -513,6 +513,12 @@ class ComfyCliError(RuntimeError):
     ``error.code`` — so a caller asking "did comfy-cli fail *before* it could
     report structurally?" must check this flag rather than ``code is None``.
     :func:`_is_missing_verb_error` is exactly that caller.
+
+    ``returncode`` is the child's exit status on that same no-envelope path
+    (``None`` elsewhere). It distinguishes *how* comfy-cli failed without an
+    envelope — a usage error the argument parser rejected before dispatch versus
+    a crash partway through a command it did accept — which the message text
+    alone cannot tell you.
     """
 
     def __init__(
@@ -520,10 +526,12 @@ class ComfyCliError(RuntimeError):
         *args: object,
         code: str | None = None,
         no_envelope: bool = False,
+        returncode: int | None = None,
     ) -> None:
         super().__init__(*args)
         self.code = code
         self.no_envelope = no_envelope
+        self.returncode = returncode
 
 
 def _comfy_bin_candidates() -> list[str]:
@@ -1079,6 +1087,7 @@ def _unwrap_envelope(
                 # the cause, so its curated guidance beats a second raw stream.
                 f"Original error: {_stream_tail(stderr)}",
                 no_envelope=True,
+                returncode=returncode,
             )
         # Both streams, both explicitly marked when blank: comfy-cli splits its
         # diagnostics unpredictably (a Python traceback lands on stderr, a
@@ -1090,6 +1099,7 @@ def _unwrap_envelope(
             f"comfy-cli returned no JSON (exit {returncode}). "
             f"stderr: {_stream_tail(stderr)} | stdout: {_stream_tail(stdout)}",
             no_envelope=True,
+            returncode=returncode,
         )
     # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
     # Absent schema -> assume compatible (older comfy-cli); declared-but-unparseable
@@ -1642,6 +1652,11 @@ def _check_comfy_cli_version() -> dict:
     return report
 
 
+# `click.UsageError.exit_code` — the status Click exits with when its parser
+# rejects the command line (an unknown subcommand, a bad option) before
+# dispatching to any command body. Typer inherits it.
+_CLICK_USAGE_ERROR_EXIT = 2
+
 # Click/Typer's "No such command '<verb>'." usage error, made robust to the ways
 # that text arrives mangled. `\s+` between the words (not a literal space)
 # because rich renders Typer errors inside a bordered panel and wraps them at the
@@ -1650,14 +1665,18 @@ def _check_comfy_cli_version() -> dict:
 # `_normalize_cli_text` first. The verb follows within a few non-word characters
 # (the quotes/colon/period around it) and must END there: `\b` would treat the
 # hyphen in a DIFFERENT command like `outdated-notifier` as a word boundary and
-# match it, so `(?![\w-])` requires a real delimiter. See
+# match it, so `(?![\w-])` requires a real delimiter. At least one separator,
+# since Click always writes a space and a quote there. See
 # `_is_missing_verb_error`.
-_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{0,8}}{verb}(?![\w-])"
+_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{1,8}}{verb}(?![\w-])"
 
 # A CSI escape sequence (`\x1b[...m` and friends). Rich colourizes its error
 # panels, and those codes contain word characters (digits, `m`), so leaving them
 # in would let styling land between the matched words and defeat the pattern.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# The parameter-byte class is ECMA-48's full 0x30-0x3F range, not just `[0-9;]`:
+# colon-separated SGR (`\x1b[38:5:130m`, true-colour on many terminals) would
+# otherwise survive stripping and reintroduce the very problem.
+_ANSI_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]")
 
 # Whitespace, the Unicode Box Drawing block (U+2500-U+257F), and ASCII `|` —
 # i.e. every character rich can use to frame and wrap an error panel.
@@ -1696,6 +1715,17 @@ def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
     ``error.code`` also yields a null code, and gating on that would let exactly
     the relayed-message case above through.
 
+    ``exc.returncode == 2`` — Click's ``UsageError.exit_code``, i.e. the argument
+    parser rejected the command line before dispatching anything. On its own
+    ``no_envelope`` only says comfy-cli died before emitting JSON, which a verb
+    it DID accept can also do by crashing mid-run; if such a crash happened to
+    print our phrase, the degrade would swallow a genuine failure. Requiring the
+    usage-error status narrows it to "never dispatched". The trade is
+    deliberate and one-directional: a comfy-cli that someday reports an unknown
+    verb with a different exit status just falls through to the raw passthrough
+    below — the pre-existing behaviour, noisy but honest — whereas a wrong
+    ``unsupported`` actively tells the user nothing is broken.
+
     The phrase must also name ``verb`` itself, within a few punctuation
     characters (Click writes ``No such command 'outdated'.``) and ending at a
     real delimiter, so a different command that merely starts with the same
@@ -1703,7 +1733,7 @@ def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
     anywhere in the message would fold in the same relayed stderr the first
     condition exists to exclude.
     """
-    if not exc.no_envelope:
+    if not exc.no_envelope or exc.returncode != _CLICK_USAGE_ERROR_EXIT:
         return False
     pattern = _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape(verb))
     normalized = _normalize_cli_text(str(exc))

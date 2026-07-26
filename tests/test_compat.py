@@ -508,6 +508,56 @@ def test_server_info_freshness_relayed_phrase_is_not_unsupported(
     assert "freshness unavailable" not in result["freshness"]["error"]
 
 
+def test_server_info_freshness_midrun_crash_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """A crash in a verb comfy-cli DID accept keeps its raw diagnostic.
+
+    Emitting no envelope only proves comfy-cli died before it could report
+    structurally — a recognized verb can do that too by crashing mid-run. Click
+    exits 2 only when its parser rejected the command line before dispatch, so a
+    no-envelope failure at any other status is a real failure, even when its
+    output happens to quote the missing-verb phrase.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (1, "", "Traceback...\nRuntimeError: No such command 'outdated' in hook"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "Traceback" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_survives_colon_sgr(
+    patched_env_then_outdated,
+):
+    """Colon-separated SGR (`\\x1b[38:5:130m`) is stripped like any other CSI.
+
+    ECMA-48 allows `:<=>` in CSI parameter bytes, and terminals do emit the
+    colon form for true-colour. A parameter class of only `[0-9;]` would leave
+    those bytes in place, defeating the match and leaking the raw usage dump.
+    """
+    import json
+
+    coloured = (
+        "\x1b[38:5:130mError\x1b[0m: No such \x1b[38:2:255:0:0mcommand\x1b[0m "
+        "'outdated'."
+    )
+    patched_env_then_outdated([(0, json.dumps(_ENV_ENVELOPE), ""), (2, "", coloured)])
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
 def test_server_info_freshness_missing_verb_on_stdout(patched_env_then_outdated):
     """The usage error degrades cleanly whichever stream Click wrote it to.
 
