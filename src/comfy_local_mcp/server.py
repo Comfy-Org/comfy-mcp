@@ -4260,6 +4260,14 @@ def download_model(
     directory, optionally under ``relative_path`` (e.g. ``models/loras`` to place
     a LoRA in the right folder) and optionally renamed via ``filename``.
 
+    ``relative_path`` is resolved from the WORKSPACE ROOT, so it must name the
+    models dir or a subfolder of it — its first segment has to be ``models``
+    (``models``, ``models/loras``, ``models/checkpoints``). A bare folder name
+    like ``loras`` is REJECTED rather than assumed: pass ``models/loras``. Paths
+    into a sibling workspace directory (``custom_nodes/…``, ``input``,
+    ``output``, ``user``) are refused — this tool only downloads models. To put a
+    source image/mask in the ``input`` dir, use ``upload_file`` instead.
+
     DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
     there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
     such search), so the caller must already have the direct model URL.
@@ -4287,10 +4295,14 @@ def download_model(
     if relative_path:
         _reject_option_like("relative_path", relative_path)
         _reject_nul("relative_path", relative_path)
-        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
-        # write inside the models dir by rejecting absolute paths, `..`, and a
-        # Windows drive prefix (`C:evil` has no separator but is drive-relative
-        # on that platform, same escape as the bare `filename` case below).
+        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`), enforced
+        # in two stages. FIRST, below: keep the value inside the WORKSPACE by
+        # rejecting absolute paths, `..`, and a Windows drive prefix (`C:evil`
+        # has no separator but is drive-relative on that platform, same escape as
+        # the bare `filename` case below). That is a containment check, not a
+        # destination check — it says where the value cannot go, not where it
+        # must land — so a SECOND stage after it confines the write to the models
+        # tree itself; see the comment on that check for why both are needed.
         #
         # Decide this the same way on every host rather than deferring to
         # `os.path.isabs`: the guard runs wherever the MCP server runs, but the
@@ -4336,6 +4348,41 @@ def download_model(
         ):
             raise ComfyCliError(
                 f"invalid relative_path: {relative_path!r} (path traversal)"
+            )
+        # The checks above only prove the value cannot climb OUT of the
+        # workspace — they never required it to land in the models tree.
+        # comfy-cli joins `--relative-path` to the WORKSPACE ROOT, not to the
+        # models dir (`local_filepath = get_workspace() / relative_path /
+        # local_filename`, defaulting to `DEFAULT_COMFY_MODEL_PATH = "models"`),
+        # which is why the documented shape is `models/loras` and not a bare
+        # `loras`. So a value that is perfectly traversal-clean can still write
+        # anywhere in the workspace: `custom_nodes/pwn` + `__init__.py` puts
+        # attacker-controlled code on ComfyUI's import path, which it executes on
+        # the next start. Require the first segment to be `models` so the write
+        # lands where the tool says it does.
+        #
+        # Ordered AFTER the traversal checks so a traversal string still reports
+        # as traversal, and safe to state as a plain segment comparison only
+        # because those checks have already run: by here the value has no leading
+        # separator, no drive prefix, and no dot-run component, so the first
+        # non-empty segment really is the first directory the write enters.
+        #
+        # Empty segments are dropped for the same reason they are skipped above —
+        # `models/loras/` and `models//loras` are ordinary spellings of a real
+        # subfolder. Matched exactly, not case-folded: a case-insensitive match
+        # would only ever LOOSEN a security guard, and the error text names the
+        # shape to use, so the caller loses nothing but a spelling.
+        #
+        # A bare `loras` is REJECTED rather than normalized to `models/loras`.
+        # Normalizing would have to rewrite an untrusted argument, and it would
+        # quietly turn the sibling-dir names this check exists to refuse into
+        # accepted-but-nonsense paths (`input` -> `models/input`) instead of an
+        # error the caller can act on.
+        segs = [seg for seg in parts if seg]
+        if not segs or segs[0] != "models":
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} "
+                "(must be the models dir or a subfolder of it, e.g. 'models/loras')"
             )
     if filename:
         _reject_option_like("filename", filename)

