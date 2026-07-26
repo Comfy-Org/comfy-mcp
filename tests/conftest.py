@@ -24,7 +24,7 @@ import logging
 
 import pytest
 
-from comfy_local_mcp import server
+from comfy_local_mcp import failure_log, server
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +76,7 @@ def _clear_comfyui_target_env(monkeypatch):
 def _isolate_failure_log(monkeypatch):
     """Default every test to the opt-in failure log being OFF, and never leak it.
 
-    ``server._FAILURE_LOG_PATH`` is resolved from ``COMFY_LOCAL_MCP_DEBUG_LOG`` at
+    ``failure_log._FAILURE_LOG_PATH`` is resolved from ``COMFY_LOCAL_MCP_DEBUG_LOG`` at
     import, so a developer who has the var exported would otherwise have the whole
     suite writing real records into their app-support directory — and the
     "disabled by default" tests would fail for an environmental reason. Pin it off
@@ -86,10 +86,10 @@ def _isolate_failure_log(monkeypatch):
     on a ``tmp_path`` that pytest is about to remove, and no record written by one
     test can land in the next one's log.
     """
-    monkeypatch.setattr(server, "_FAILURE_LOG_PATH", None)
-    monkeypatch.setattr(server, "_failure_handler_path", None)
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", None)
+    monkeypatch.setattr(failure_log, "_failure_handler_path", None)
     yield
-    logger = logging.getLogger(server._FAILURE_LOGGER_NAME)
+    logger = logging.getLogger(failure_log._FAILURE_LOGGER_NAME)
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()

@@ -24,7 +24,7 @@ import time
 import pytest
 from conftest import _OK_STREAM, _FakeProc, _RecordingCtx
 
-from comfy_local_mcp import server
+from comfy_local_mcp import server, textutil
 
 
 def _fake_run(envelope: dict):
@@ -1041,25 +1041,25 @@ def test_plain_ok_still_honors_a_real_envelope(patched_run):
 
 def test_stream_tail_marks_empty_and_truncation():
     """`_stream_tail` marks a blank capture and a clipped one, and keeps the END."""
-    assert server._stream_tail("") == "<empty>"
-    assert server._stream_tail(None) == "<empty>"
-    assert server._stream_tail("   \n  ") == "<empty>"  # whitespace-only is empty
+    assert textutil._stream_tail("") == "<empty>"
+    assert textutil._stream_tail(None) == "<empty>"
+    assert textutil._stream_tail("   \n  ") == "<empty>"  # whitespace-only is empty
     # A capture that fits the bound is passed through verbatim — no marker.
-    assert server._stream_tail("  short  ") == "short"
-    assert server._stream_tail("x" * 500, limit=500) == "x" * 500  # exactly at bound
+    assert textutil._stream_tail("  short  ") == "short"
+    assert textutil._stream_tail("x" * 500, limit=500) == "x" * 500  # exactly at bound
     # One char over the bound: clipped, marked, and it is the TAIL that survives.
-    clipped = server._stream_tail("HEAD" + "x" * 600 + "FINAL_ERROR_LINE", limit=500)
+    clipped = textutil._stream_tail("HEAD" + "x" * 600 + "FINAL_ERROR_LINE", limit=500)
     assert clipped.startswith("...")
     assert clipped.endswith("FINAL_ERROR_LINE")
     assert "HEAD" not in clipped
     assert len(clipped) == 503  # bounded: the marker plus exactly `limit` chars
     # bytes are decoded defensively, same as `_tail`
-    assert server._stream_tail(b"cafe\xff") == "cafe\ufffd"
+    assert textutil._stream_tail(b"cafe\xff") == "cafe\ufffd"
     # A non-positive bound yields no tail rather than defeating itself: the
     # single-pass implementation asks `_tail` for `limit + 1`, so a 0 would slip
     # past its guard and `[-0:]` would return the whole capture unbounded.
-    assert server._stream_tail("x" * 100, limit=0) == "<empty>"
-    assert server._stream_tail("x" * 100, limit=-1) == "<empty>"
+    assert textutil._stream_tail("x" * 100, limit=0) == "<empty>"
+    assert textutil._stream_tail("x" * 100, limit=-1) == "<empty>"
 
 
 def test_no_envelope_error_marks_both_empty_streams(patched_plain_run):
@@ -1687,20 +1687,20 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
 
 def test_tail_bounds_and_decodes():
     """`_tail` hard-bounds length and decodes bytes defensively (never raises)."""
-    assert server._tail(None) == ""
-    assert server._tail("") == ""
-    assert server._tail(b"") == ""
-    assert server._tail("  hello  ") == "hello"  # stripped
+    assert textutil._tail(None) == ""
+    assert textutil._tail("") == ""
+    assert textutil._tail(b"") == ""
+    assert textutil._tail("  hello  ") == "hello"  # stripped
     # bytes decoded, invalid utf-8 replaced rather than raising
-    assert server._tail(b"cafe\xff") == "cafe\ufffd"
+    assert textutil._tail(b"cafe\xff") == "cafe\ufffd"
     # a chatty child cannot inflate the payload past the bound (str and bytes)
-    assert server._tail("x" * 999, limit=500) == "x" * 500
-    assert len(server._tail(b"y" * 5000)) == 500
+    assert textutil._tail("x" * 999, limit=500) == "x" * 500
+    assert len(textutil._tail(b"y" * 5000)) == 500
     # limit<=0 must NOT return the whole string (the `[-0:]` trap), it means "none"
-    assert server._tail("anything", limit=0) == ""
-    assert server._tail(b"anything", limit=0) == ""
+    assert textutil._tail("anything", limit=0) == ""
+    assert textutil._tail(b"anything", limit=0) == ""
     # slicing the raw bytes before decoding still yields the true tail
-    assert server._tail(b"z" * 100 + b"tail-marker", limit=20) == (
+    assert textutil._tail(b"z" * 100 + b"tail-marker", limit=20) == (
         "z" * 9 + "tail-marker"
     )
 
@@ -1841,7 +1841,7 @@ def test_streaming_timeout_stdout_tail_is_bounded(monkeypatch):
         )
     msg = str(exc.value)
     # only the bounded (<=500 char) tail of the 5000+ char stream is embedded
-    expected_tail = server._tail("".join(noisy))
+    expected_tail = textutil._tail("".join(noisy))
     assert len(expected_tail) == 500
     assert expected_tail in msg
     assert "".join(noisy).strip() not in msg  # the full blob never made it in

@@ -24,7 +24,7 @@ import threading
 import pytest
 from conftest import _FakeProc
 
-from comfy_local_mcp import server
+from comfy_local_mcp import failure_log, server, tcc, textutil
 
 # A failing envelope/1 result, the most common recorded failure.
 _ERROR_ENVELOPE = json.dumps(
@@ -45,7 +45,7 @@ def log_path(monkeypatch, tmp_path):
     first write, is part of the contract.
     """
     path = tmp_path / "state" / "failures.jsonl"
-    monkeypatch.setattr(server, "_FAILURE_LOG_PATH", str(path))
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(path))
     return path
 
 
@@ -86,22 +86,22 @@ def _entries(path) -> list[dict]:
 @pytest.mark.parametrize("value", [None, "", "   ", "0"])
 def test_env_var_unset_empty_or_zero_disables(value):
     """Unset, blank, or an explicit ``0`` all mean disabled."""
-    assert server._resolve_failure_log_path(value) is None
+    assert failure_log._resolve_failure_log_path(value) is None
 
 
 def test_env_var_one_selects_the_per_os_default(monkeypatch, tmp_path):
     """``1`` means "on, at the default path" — it is never taken as a literal path."""
     default = str(tmp_path / "default.jsonl")
-    monkeypatch.setattr(server, "_default_failure_log_path", lambda: default)
+    monkeypatch.setattr(failure_log, "_default_failure_log_path", lambda: default)
 
-    assert server._resolve_failure_log_path("1") == default
+    assert failure_log._resolve_failure_log_path("1") == default
 
 
 def test_env_var_any_other_value_is_the_log_path(tmp_path):
     """Any other value IS the path, so a tester can point it at a scratch file."""
     target = str(tmp_path / "x.jsonl")
 
-    assert server._resolve_failure_log_path(target) == target
+    assert failure_log._resolve_failure_log_path(target) == target
 
 
 @pytest.mark.parametrize(
@@ -114,10 +114,10 @@ def test_env_var_any_other_value_is_the_log_path(tmp_path):
 )
 def test_default_path_mirrors_comfy_cli_app_dirs(monkeypatch, platform, expected):
     """The default path follows comfy-cli's per-OS local-state convention."""
-    monkeypatch.setattr(server.sys, "platform", platform)
-    monkeypatch.setattr(server.os.path, "expanduser", lambda _: "/home/u")
+    monkeypatch.setattr(failure_log.sys, "platform", platform)
+    monkeypatch.setattr(failure_log.os.path, "expanduser", lambda _: "/home/u")
 
-    path = server._default_failure_log_path()
+    path = failure_log._default_failure_log_path()
 
     assert path.endswith("failures.jsonl")
     for segment in expected:
@@ -137,10 +137,10 @@ def test_disabled_by_default_writes_nothing_and_creates_no_dir(
     app-support directory and the assertion could not see it.
     """
     default = tmp_path / "default" / "failures.jsonl"
-    monkeypatch.setattr(server, "_default_failure_log_path", lambda: str(default))
+    monkeypatch.setattr(failure_log, "_default_failure_log_path", lambda: str(default))
     # The autouse `_isolate_failure_log` fixture already pins this to the
     # disabled state; restate it here so the test reads as its own premise.
-    monkeypatch.setattr(server, "_FAILURE_LOG_PATH", None)
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", None)
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
     with pytest.raises(server.ComfyCliError):
@@ -149,7 +149,7 @@ def test_disabled_by_default_writes_nothing_and_creates_no_dir(
     assert not default.exists()
     assert not default.parent.exists()
     # No handler was opened either — the memo is untouched.
-    assert server._failure_handler_path is None
+    assert failure_log._failure_handler_path is None
 
 
 def test_enabled_path_from_env_var_value_is_written(
@@ -158,7 +158,9 @@ def test_enabled_path_from_env_var_value_is_written(
     """``COMFY_LOCAL_MCP_DEBUG_LOG=<path>`` writes to exactly that file."""
     target = tmp_path / "nested" / "chosen.jsonl"
     monkeypatch.setattr(
-        server, "_FAILURE_LOG_PATH", server._resolve_failure_log_path(str(target))
+        failure_log,
+        "_FAILURE_LOG_PATH",
+        failure_log._resolve_failure_log_path(str(target)),
     )
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
@@ -202,7 +204,9 @@ def test_blank_streams_are_marked_not_dropped(blank):
     Same ``_stream_tail`` marker the error messages use, so a record can never
     show a stream that looks absent when it was actually truncated away.
     """
-    assert server._stream_tail(blank, server._FAILURE_LOG_TAIL_CHARS) == "<empty>"
+    assert (
+        textutil._stream_tail(blank, failure_log._FAILURE_LOG_TAIL_CHARS) == "<empty>"
+    )
 
 
 def test_concurrent_first_failures_write_one_line_each(log_path, fake_comfy):
@@ -227,7 +231,10 @@ def test_concurrent_first_failures_write_one_line_each(log_path, fake_comfy):
         thread.join()
 
     assert len(_entries(log_path)) == 4
-    assert len(server.logging.getLogger(server._FAILURE_LOGGER_NAME).handlers) == 1
+    assert (
+        len(failure_log.logging.getLogger(failure_log._FAILURE_LOGGER_NAME).handlers)
+        == 1
+    )
 
 
 def test_no_json_exit_is_recorded_with_both_tails(log_path, fake_comfy):
@@ -266,7 +273,7 @@ def test_timeout_is_recorded(log_path, fake_comfy):
 def test_binary_missing_is_recorded_with_no_args(monkeypatch, log_path):
     """No binary means no invocation, so ``args`` is empty by construction."""
     monkeypatch.setattr(server.shutil, "which", lambda _: None)
-    monkeypatch.setattr(server, "_is_macos", lambda: False)
+    monkeypatch.setattr(tcc, "_is_macos", lambda: False)
 
     with pytest.raises(server.ComfyCliError):
         server._run_comfy("run", "wf.json")
@@ -295,12 +302,12 @@ def test_schema_mismatch_is_recorded(log_path, fake_comfy):
 
 def test_tail_cap_is_larger_than_the_message_cap():
     """The log keeps MORE output than an error message can — its reason to exist."""
-    assert server._FAILURE_LOG_TAIL_CHARS > server._MAX_ERROR_FIELD_CHARS
+    assert failure_log._FAILURE_LOG_TAIL_CHARS > server._MAX_ERROR_FIELD_CHARS
 
 
 def test_long_stream_is_tail_truncated_with_a_marker(log_path, fake_comfy):
     """An oversized capture is clipped to the tail and marked, never silently."""
-    noise = "x" * (server._FAILURE_LOG_TAIL_CHARS * 2)
+    noise = "x" * (failure_log._FAILURE_LOG_TAIL_CHARS * 2)
     fake_comfy(stdout="no json here", stderr=noise + "THE-REAL-ERROR", returncode=1)
 
     with pytest.raises(server.ComfyCliError):
@@ -310,7 +317,7 @@ def test_long_stream_is_tail_truncated_with_a_marker(log_path, fake_comfy):
     tail = entry["stderr_tail"]
     # The `...` marker is additive to the bound, exactly as in the error messages
     # `_stream_tail` was written for — the payload itself stays capped.
-    assert len(tail) == server._FAILURE_LOG_TAIL_CHARS + len("...")
+    assert len(tail) == failure_log._FAILURE_LOG_TAIL_CHARS + len("...")
     assert tail.startswith("...")  # truncation is visible
     assert tail.endswith("THE-REAL-ERROR")  # the tail, not the head, is kept
 
@@ -394,11 +401,11 @@ def test_scrub_arg_masks_userinfo_and_strips_query(log_path, fake_comfy):
 def test_scrub_message_masks_urls_but_keeps_prose():
     """Only URL-shaped substrings are rewritten; the surrounding prose survives."""
     text = "comfy model download --url https://u:p@h/m.safetensors?token=s failed"
-    assert server._scrub_message(text) == (
+    assert failure_log._scrub_message(text) == (
         "comfy model download --url https://***@h/m.safetensors failed"
     )
     plain = "comfy run wf.json failed [bad_workflow]: node 3 has no input"
-    assert server._scrub_message(plain) == plain
+    assert failure_log._scrub_message(plain) == plain
 
 
 @pytest.mark.parametrize(
@@ -423,7 +430,7 @@ def test_scrub_message_masks_urls_but_keeps_prose():
     ],
 )
 def test_scrub_arg_cases(arg, expected):
-    assert server._scrub_arg(arg) == expected
+    assert failure_log._scrub_arg(arg) == expected
 
 
 # --- best-effort + rotation --------------------------------------------------
@@ -434,7 +441,9 @@ def test_unwritable_log_never_masks_the_real_error(monkeypatch, tmp_path, fake_c
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("i am a file")
     # Parent is a regular file, so `os.makedirs` inside the handler setup raises.
-    monkeypatch.setattr(server, "_FAILURE_LOG_PATH", str(blocker / "failures.jsonl"))
+    monkeypatch.setattr(
+        failure_log, "_FAILURE_LOG_PATH", str(blocker / "failures.jsonl")
+    )
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
@@ -444,12 +453,12 @@ def test_unwritable_log_never_masks_the_real_error(monkeypatch, tmp_path, fake_c
     assert "no API key configured" in str(excinfo.value)
     # The failed setup must not leave the memo claiming a path nothing writes to,
     # or the next failure would skip setup and silently drop its record.
-    assert server._failure_handler_path is None
+    assert failure_log._failure_handler_path is None
 
 
 def test_log_path_that_is_a_directory_is_swallowed(monkeypatch, tmp_path, fake_comfy):
     """Same best-effort contract when the path itself is an existing directory."""
-    monkeypatch.setattr(server, "_FAILURE_LOG_PATH", str(tmp_path))
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(tmp_path))
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
@@ -465,11 +474,11 @@ def test_handler_is_configured_for_rotation(log_path, fake_comfy):
     with pytest.raises(server.ComfyCliError):
         server._run_comfy("run", "wf.json")
 
-    logger = server.logging.getLogger(server._FAILURE_LOGGER_NAME)
+    logger = failure_log.logging.getLogger(failure_log._FAILURE_LOGGER_NAME)
     (handler,) = logger.handlers
-    assert isinstance(handler, server.RotatingFileHandler)
-    assert handler.maxBytes == server._FAILURE_LOG_MAX_BYTES == 1_048_576
-    assert handler.backupCount == server._FAILURE_LOG_BACKUPS == 2
+    assert isinstance(handler, failure_log.RotatingFileHandler)
+    assert handler.maxBytes == failure_log._FAILURE_LOG_MAX_BYTES == 1_048_576
+    assert handler.backupCount == failure_log._FAILURE_LOG_BACKUPS == 2
     assert handler.encoding == "utf-8"
     # Bare `%(message)s`: lines must be pure JSON for `jq`.
     assert handler.formatter._fmt == "%(message)s"
@@ -479,7 +488,7 @@ def test_handler_is_configured_for_rotation(log_path, fake_comfy):
 
 def test_rotation_produces_a_backup_file(monkeypatch, log_path, fake_comfy):
     """Past ``maxBytes`` the handler rolls over, so the log is self-limiting."""
-    monkeypatch.setattr(server, "_FAILURE_LOG_MAX_BYTES", 200)
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_MAX_BYTES", 200)
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
     for _ in range(5):

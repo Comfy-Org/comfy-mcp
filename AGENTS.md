@@ -59,6 +59,26 @@ The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via
 comfy-cli, not a bundled static catalog.
 
+## Module layout
+
+`server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the
+`--json-stream` machinery, the spend-consent plumbing) and every `@mcp.tool()`.
+Three **leaf** modules sit under it — nothing in them imports `server`, so the
+dependency edges only ever point one way:
+
+| Module | Owns |
+|---|---|
+| `textutil.py` | pure text helpers: `_tail` / `_stream_tail` (bounded stream tails) and `_redact_url` (userinfo masking) |
+| `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
+| `failure_log.py` | the opt-in `COMFY_LOCAL_MCP_DEBUG_LOG` failure log: its config, its module state, and `_log_failure` |
+
+`server` reaches them **module-qualified** (`tcc._tcc_guidance(...)`,
+`failure_log._log_failure(...)`) and re-exports nothing. That is deliberate: a
+test that patches a moved name on `server` would otherwise silently patch a name
+nothing reads. **Patch the owning module** — `monkeypatch.setattr(failure_log,
+"_FAILURE_LOG_PATH", …)`, not `server`. Patching the wrong one now raises
+`AttributeError` instead of passing while testing nothing.
+
 ## Toolchain
 
 Python ≥ 3.10. Everything runs through pip + setuptools (there is no `uv.lock`
