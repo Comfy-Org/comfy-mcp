@@ -2903,6 +2903,25 @@ async def _resolve_spend_consent(
     return confirm_spend
 
 
+def _validate_param_key(
+    key: str, *, empty_msg: str, invalid_msg: str, nul_label: str
+) -> None:
+    """Shared key-shape gate for the two argv param marshalers.
+
+    Order is load-bearing and identical in both callers: empty-or-leading-dash,
+    then ``=``-or-whitespace, then NUL. Each caller passes its own fully rendered
+    messages so its error text survives byte-for-byte, and keeps its own comment
+    for WHY the ``=``/whitespace check matters for its argv shape. If the two
+    gates ever need to diverge, split this back into the callers rather than
+    growing parameters here.
+    """
+    if not key or key.startswith("-"):
+        raise ComfyCliError(empty_msg)
+    if "=" in key or any(ch.isspace() for ch in key):
+        raise ComfyCliError(invalid_msg)
+    _reject_nul(nul_label, key)
+
+
 def _generate_param_args(params: dict[str, Any]) -> list[str]:
     """Marshal per-model ``params`` into ``comfy generate`` ``--name=value`` tokens.
 
@@ -2921,24 +2940,23 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
     """
     argv: list[str] = []
     for name, value in params.items():
-        if not name or name.startswith("-"):
-            raise ComfyCliError(
+        # `=`/whitespace in a NAME is argv-integrity here: comfy-cli splits
+        # `--<body>` at the FIRST `=`, so a key carrying its own `=` would land
+        # as a run-level flag, smuggling past the meta-flag check below (which
+        # only ever sees the whole key).
+        _validate_param_key(
+            name,
+            empty_msg=(
                 f"invalid parameter name: {name!r} — expected a model parameter "
                 "name (e.g. 'prompt'), not an empty or option-like value."
-            )
-        # A name carrying its own `=` (or whitespace) is not a parameter name:
-        # comfy-cli splits `--<body>` at the FIRST `=`, so `{"output-prefix=/tmp/x":
-        # v}` renders `--output-prefix=/tmp/x=v` and lands as the run-level
-        # `output-prefix` flag — smuggling past the meta-flag check below, which
-        # only ever sees the whole key. Refuse the shape instead of trying to
-        # out-parse comfy-cli's splitter.
-        if "=" in name or any(ch.isspace() for ch in name):
-            raise ComfyCliError(
+            ),
+            invalid_msg=(
                 f"invalid parameter name: {name!r} — a parameter name cannot "
                 "contain '=' or whitespace. Pass the value as the dict value, "
                 "not inside the key."
-            )
-        _reject_nul(f"parameter name {name!r}", name)
+            ),
+            nul_label=f"parameter name {name!r}",
+        )
         # Compare hyphen-normalized so `api_key` / `emit_workflow` are caught
         # too; agents naturally spell CLI flags with underscores. Case is NOT
         # normalized: comfy-cli matches its run-level flags case-sensitively in
@@ -3222,26 +3240,24 @@ def _run_template_param_args(params: dict[str, Any]) -> list[str]:
     """
     argv: list[str] = []
     for key, value in params.items():
-        if not key or key.startswith("-"):
-            raise ComfyCliError(
+        # `=` is the load-bearing check here: comfy-cli splits the `--param`
+        # value on its FIRST `=` to separate slot key from value. Whitespace is
+        # refused for a weaker reason — KEY rides inside the single
+        # `--param=KEY=VALUE` token so it is never argv-ambiguous, but a clear
+        # error beats the engine's "matches no slot".
+        _validate_param_key(
+            key,
+            empty_msg=(
                 f"invalid param key: {key!r} — expected a slot address (e.g. "
                 "'6.text') or a slot name (e.g. 'prompt'), not an empty or "
                 "option-like value."
-            )
-        # `=` is the load-bearing one: comfy-cli splits the `--param` value on
-        # its FIRST `=` to separate slot key from value, so a key carrying its
-        # own `=` mis-splits. Refuse the shape rather than out-parse the
-        # splitter. Whitespace is refused for a weaker reason — KEY rides inside
-        # the single `--param=KEY=VALUE` token, so it is never argv-ambiguous,
-        # but comfy-cli `.strip()`s the key and slot names come from node input
-        # names (0 of the 574 gallery templates carry whitespace or a leading
-        # dash in one). A clear error here beats the engine's "matches no slot".
-        if "=" in key or any(ch.isspace() for ch in key):
-            raise ComfyCliError(
+            ),
+            invalid_msg=(
                 f"invalid param key: {key!r} — a slot key cannot contain '=' or "
                 "whitespace. Pass the value as the dict value, not in the key."
-            )
-        _reject_nul(f"param key {key!r}", key)
+            ),
+            nul_label=f"param key {key!r}",
+        )
         if value is None:
             continue
         # json.dumps escapes a NUL inside a string value (so it can't crash
