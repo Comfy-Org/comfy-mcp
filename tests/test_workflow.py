@@ -119,6 +119,31 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     ]
 
 
+def test_workflow_tools_reject_embedded_nul(monkeypatch):
+    """A NUL anywhere surfaces as ComfyCliError, not subprocess's bare ValueError.
+
+    Orthogonal to the leading-dash guard: `subprocess` cannot carry a NUL in
+    argv at all, so it is refused on option values (`--slot`, `--out-dir`) too,
+    not just on the bare positionals.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    for call in (
+        lambda: server.list_workflow_slots("/tmp/f\0.json"),
+        lambda: server.set_workflow_slot("/tmp/f\0.json", ["6.text=x"]),
+        lambda: server.set_workflow_slot("/tmp/f.json", ["6.text=\0"]),
+        lambda: server.vary_workflow("/tmp/f\0.json", ["3.seed=[1,2]"]),
+        lambda: server.vary_workflow("/tmp/f.json", ["3.seed=\0"]),
+        lambda: server.vary_workflow("/tmp/f.json", ["3.seed=[1,2]"], out_dir="/o\0"),
+    ):
+        with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+            call()
+
+
 def test_vary_workflow_option_values_are_not_guarded(patched_run):
     """Option VALUES stay unguarded on purpose — only bare positionals are injectable.
 

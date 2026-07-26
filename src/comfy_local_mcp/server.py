@@ -2495,7 +2495,7 @@ async def generate_image(
         # an empty env value, so an empty name should be unreachable from here.
         raise ComfyCliError(
             f"invalid COMFY_T2I_TEMPLATE: {template!r} — expected a gallery "
-            "template name (e.g. 'default'), not an empty or option-like value."
+            "template name (e.g. 'default'), not an empty value."
         )
     # A leading-dash name is read by comfy-cli as an option, not the template
     # positional. Only reachable via a malformed COMFY_T2I_TEMPLATE, but a
@@ -3087,7 +3087,7 @@ async def partner_generate(
     if not model:
         raise ComfyCliError(
             f"invalid model: {model!r} — expected a partner model alias "
-            "(e.g. 'flux-pro'), not an empty or option-like value."
+            "(e.g. 'flux-pro'), not an empty value."
         )
     # A leading-dash target is read by comfy-cli as an option rather than a
     # model (the same guard watch_job applies to prompt_id).
@@ -3419,7 +3419,7 @@ async def run_template(
     if not name:
         raise ComfyCliError(
             f"invalid template name: {name!r} — expected a template name "
-            "(e.g. 'image_flux2'), not an empty or option-like value."
+            "(e.g. 'image_flux2'), not an empty value."
         )
     # A leading-dash name is read by comfy-cli as an option, not the template
     # positional (the same guard partner_generate applies to its model).
@@ -4454,13 +4454,17 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     """
     # Each path is splatted in as a positional, so a leading-dash entry is read
     # by comfy-cli as a flag instead — `paths=["--overwrite"]` would silently
-    # become the overwrite flag rather than a (failing) upload.
+    # become the overwrite flag rather than a (failing) upload. NUL is orthogonal
+    # to that (it is refused wherever it rides, positional or not): `subprocess`
+    # raises a bare `ValueError` on one, which would escape as an internal error
+    # instead of the `ComfyCliError` every other bad input produces.
     for p in paths:
         _reject_option_like(
             "upload path",
             p,
             expected="a file path (prefix a dash-leading name with './')",
         )
+        _reject_nul("upload path", p)
     args = ["upload", *paths]
     if overwrite:
         args.append("--overwrite")
@@ -4523,6 +4527,7 @@ def list_workflow_slots(workflow_path: str) -> Any:
             "(prefix a dash-leading name with './')"
         ),
     )
+    _reject_nul("workflow_path", workflow_path)
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
 
 
@@ -4561,12 +4566,14 @@ def set_workflow_slot(
             "(prefix a dash-leading name with './')"
         ),
     )
+    _reject_nul("workflow_path", workflow_path)
     for o in overrides:
         _reject_option_like(
             "override",
             o,
             expected="an 'ADDR=VALUE' string (e.g. '6.text=a red bicycle')",
         )
+        _reject_nul("override", o)
     args = ["workflow", "set-slot", workflow_path, *overrides]
     if stdout:
         args.append("--stdout")
@@ -4604,10 +4611,15 @@ def vary_workflow(
             "(prefix a dash-leading name with './')"
         ),
     )
+    _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
     for slot in slots:
+        # NUL is refused even though the leading-dash guard is not needed here:
+        # the two checks answer different questions (see `_reject_option_like`).
+        _reject_nul("slot", slot)
         args += ["--slot", slot]
     if out_dir:
+        _reject_nul("out_dir", out_dir)
         args += ["--out-dir", out_dir]
     return _run_comfy(*args, timeout=120.0)
 

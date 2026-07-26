@@ -526,6 +526,15 @@ def test_upload_file_rejects_option_like_path_among_valid_ones():
         server.upload_file(["/tmp/a.png", "--overwrite"])
 
 
+def test_upload_file_rejects_embedded_nul_path():
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.upload_file(["/tmp/a\0.png"])
+
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.upload_file(["/tmp/a.png", "/tmp/b\0.png"])
+
+
 def test_download_model_url_only(patched_run):
     """download_model wraps the SINGULAR `model download --url` and returns data."""
     calls = patched_run(
