@@ -357,6 +357,36 @@ def test_cancel_job_unknown_id_raises_error_envelope(patched_run):
         server.cancel_job("nope")
 
 
+# `_run_comfy` builds argv with no `--` separator, so a leading-dash positional
+# reaches comfy-cli as an option rather than a job id. `watch_job` and
+# `get_execution_error` already refuse one (covered separately); these are the
+# remaining prompt_id-taking tools, checked together so the family stays uniform
+# — `fetch_outputs` most of all, since there the id sits beside a real `-o`.
+@pytest.mark.parametrize(
+    ("tool", "extra_args"),
+    [
+        ("job_status", ()),
+        ("cancel_job", ()),
+        ("wait_for_job", ()),
+        ("fetch_outputs", ("/tmp/out",)),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+@pytest.mark.parametrize("option_like", ["--help", "-o"])
+def test_job_tools_reject_an_option_like_prompt_id(
+    monkeypatch, tool, extra_args, option_like
+):
+    """A leading-dash prompt_id is refused before comfy-cli is ever spawned."""
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError(f"{tool} spawned comfy-cli with {option_like!r}")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="invalid prompt_id"):
+        getattr(server, tool)(option_like, *extra_args)
+
+
 def test_get_queue_maps_command_and_returns_data(patched_run):
     """get_queue wraps `comfy jobs ls` and returns the merged job list."""
     jobs = {

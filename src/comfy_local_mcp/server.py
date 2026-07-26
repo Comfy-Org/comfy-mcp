@@ -3408,6 +3408,10 @@ def job_status(prompt_id: str) -> Any:
     Wraps ``comfy jobs status <prompt_id>``. Returns the job status and, when
     finished, its output references. Poll this after ``run_workflow(wait=False)``.
     """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject
+        # it rather than let `jobs status` misread the id (argument injection).
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
     return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
 
@@ -3595,6 +3599,10 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     maximum (the same ceiling as ``watch_job``, this tool's streaming
     counterpart), and a non-positive / NaN value is rejected outright.
     """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject
+        # it rather than let `jobs status` misread the id (argument injection).
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
     # "Bounded by design" only holds if the bound itself is bounded. Left raw,
     # `inf` keeps `remaining` positive forever and NaN makes every comparison
     # False (so `remaining <= 0` never fires and `min(2.0, nan)` yields 2.0) —
@@ -3659,6 +3667,10 @@ def cancel_job(prompt_id: str) -> Any:
     submitted via ``run_workflow(wait=False)`` before it finishes; cancelling an
     unknown or already-finished ``prompt_id`` surfaces comfy-cli's error envelope.
     """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject
+        # it rather than let `jobs cancel` misread the id (argument injection).
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
     return _run_comfy("jobs", "cancel", prompt_id, timeout=60.0)
 
 
@@ -3829,6 +3841,11 @@ def fetch_outputs(
     (``_INLINE_IMAGE_MAX_COUNT`` files / ``_INLINE_IMAGE_MAX_BYTES`` aggregate) so
     a large batch can't blow up the reply — the on-disk copies are never capped.
     """
+    if prompt_id.startswith("-"):
+        # comfy-cli parses a leading-dash positional as an option/flag; reject it
+        # rather than let `download` misread the id (argument injection) — here it
+        # would sit directly alongside this command's own `-o` / `--url-only`.
+        raise ComfyCliError(f"invalid prompt_id: {prompt_id!r} (leading '-')")
     args = ["download", prompt_id, "-o", out_dir]
     if url_only:
         args.append("--url-only")
