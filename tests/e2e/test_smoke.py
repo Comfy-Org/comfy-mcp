@@ -1,14 +1,26 @@
-"""End-to-end smoke test: a real no-model round-trip against a LIVE local ComfyUI.
+"""End-to-end smoke tests: real round-trips against a LIVE local ComfyUI.
 
 This is the manual validation ritual turned into a command. It drives the actual
-tools (no mocks): ``server_info`` -> ``run_workflow`` on a checkpoint-free
-``EmptyImage`` -> ``SaveImage`` graph (both ComfyUI core nodes) -> ``fetch_outputs``,
-then asserts a real PNG landed in a temp out_dir.
+tools (no mocks):
 
-**Gated.** It requires BOTH a live local ComfyUI answering on ``COMFYUI_URL`` (or
+1. ``server_info`` -> ``run_workflow`` on a checkpoint-free ``EmptyImage`` ->
+   ``SaveImage`` graph (both ComfyUI core nodes) -> ``fetch_outputs``, then
+   asserts a real PNG landed in a temp out_dir.
+2. ``generate_image(prompt=…, wait=True)`` — the text-prompt on-ramp — end to
+   end, likewise down to a real PNG. This one is a REGRESSION GUARD: the tool
+   used to wrap ``comfy generate``, a partner/cloud-only verb with no local mode
+   and no ``--prompt`` flag, so every call died in comfy-cli's argument parser
+   ("comfy-cli returned no JSON (exit 1)") and nothing was ever enqueued. No unit
+   test could catch that — mocks happily accept an argv the real CLI rejects —
+   so the only real defense is running it. Unlike case 1 it needs the default
+   template's SD1.5 checkpoint (``v1-5-pruned-emaonly-fp16.safetensors``)
+   installed locally; without it the run fails with comfy-cli's own missing-model
+   error rather than skipping.
+
+**Gated.** They require BOTH a live local ComfyUI answering on ``COMFYUI_URL`` (or
 ``http://127.0.0.1:8188``) AND the ``comfy`` binary on ``PATH`` (or ``COMFY_BIN``).
-CI runners have neither, so it SKIPS cleanly there — CI stays green via skip, not
-failure. Run it on a machine that has both with::
+CI runners have neither, so they SKIP cleanly there — CI stays green via skip, not
+failure. Run them on a machine that has both with::
 
     python -m pytest tests/e2e -m e2e      # or: scripts/smoke.sh
 """
@@ -116,3 +128,30 @@ def test_no_model_round_trip(tmp_path):
         if p.is_file() and p.read_bytes()[:8] == _PNG_MAGIC
     ]
     assert pngs, f"no valid PNG downloaded into {out_dir}"
+
+
+def test_generate_image_round_trip(tmp_path):
+    """generate_image(prompt, wait=True) enqueues a real job and yields a PNG.
+
+    The regression guard for the ``comfy generate`` era: a green run proves the
+    pinned comfy-cli actually PARSES the argv this tool emits and runs the
+    default text-to-image template to completion. Needs the template's SD1.5
+    checkpoint installed (see the module docstring).
+    """
+    # `generate_image` raises ComfyCliError on an error envelope, so simply
+    # returning is already the "non-error envelope" half of the assertion.
+    result = asyncio.run(
+        server.generate_image("a cat", wait=True, timeout_seconds=600.0)
+    )
+    prompt_id = _extract_prompt_id(result)
+    assert prompt_id, f"no prompt_id in generate_image result: {result!r}"
+
+    out_dir = tmp_path / "generate_out"
+    server.fetch_outputs(prompt_id, str(out_dir))
+
+    pngs = [
+        p
+        for p in out_dir.rglob("*")
+        if p.is_file() and p.read_bytes()[:8] == _PNG_MAGIC
+    ]
+    assert pngs, f"generate_image produced no valid PNG in {out_dir}"

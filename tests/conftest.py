@@ -71,6 +71,23 @@ def _clear_comfyui_target_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _clear_t2i_env(monkeypatch):
+    """Default every test to ``generate_image``'s built-in template + slot keys.
+
+    Same reason as the target env above: ``generate_image`` reads
+    ``COMFY_T2I_TEMPLATE`` / ``COMFY_T2I_PROMPT_SLOT`` /
+    ``COMFY_T2I_CHECKPOINT_SLOT`` per call, so an ambient value would perturb its
+    exact-argv assertions. The override test sets them explicitly.
+    """
+    for var in (
+        "COMFY_T2I_TEMPLATE",
+        "COMFY_T2I_PROMPT_SLOT",
+        "COMFY_T2I_CHECKPOINT_SLOT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
