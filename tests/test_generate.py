@@ -228,6 +228,88 @@ def test_generate_image_slot_error_names_the_env_knobs(monkeypatch):
     assert "matches no slot" in message  # the engine's own diagnosis survives
     assert "COMFY_T2I_PROMPT_SLOT" in message
     assert exc.value.code == "workflow_slot_invalid"
+    # No checkpoint was passed, so that slot was never sent — naming it here
+    # would send the reader after a knob that cannot be the cause.
+    assert "checkpoint slot" not in message
+    assert "COMFY_T2I_CHECKPOINT_SLOT" not in message
+
+
+def test_generate_image_slot_error_names_checkpoint_only_when_filled(monkeypatch):
+    """With a checkpoint actually filled, the hint names that knob too."""
+
+    def fake_run_comfy(*args, timeout=None):
+        raise server.ComfyCliError(
+            "--param key 'ckpt_name' matches no slot in this template",
+            code="workflow_slot_invalid",
+        )
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server.generate_image("a cat", checkpoint="sd_xl.safetensors", wait=False)
+        )
+
+    message = str(exc.value)
+    assert "checkpoint slot 'ckpt_name'" in message
+    assert "COMFY_T2I_CHECKPOINT_SLOT" in message
+
+
+def test_generate_image_rejects_colliding_slot_overrides(monkeypatch):
+    """One key for both slots would silently drop the prompt — refuse it instead."""
+    monkeypatch.setenv("COMFY_T2I_PROMPT_SLOT", "6.text")
+    monkeypatch.setenv("COMFY_T2I_CHECKPOINT_SLOT", "6.text")
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+    monkeypatch.setattr(server, "_run_comfy_streaming", boom)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(server.generate_image("a cat", checkpoint="sd_xl.safetensors"))
+
+    message = str(exc.value)
+    assert "COMFY_T2I_PROMPT_SLOT" in message
+    assert "COMFY_T2I_CHECKPOINT_SLOT" in message
+
+
+def test_generate_image_colliding_slots_are_fine_without_a_checkpoint(
+    patched_stream, monkeypatch
+):
+    """Nothing overwrites the prompt when no checkpoint is passed, so the run proceeds."""
+    procs = patched_stream(_OK_STREAM)
+    monkeypatch.setenv("COMFY_T2I_PROMPT_SLOT", "6.text")
+    monkeypatch.setenv("COMFY_T2I_CHECKPOINT_SLOT", "6.text")
+
+    asyncio.run(server.generate_image("a cat"))
+
+    assert procs[0].cmd[4:] == [
+        "run-template",
+        "default",
+        '--param=6.text="a cat"',
+        "--timeout=120",
+    ]
+
+
+def test_generate_image_streaming_parent_deadline_has_the_engine_grace(monkeypatch):
+    """The parent outlives the deadline it hands the engine, so comfy-cli reports first."""
+    seen: dict = {}
+
+    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
+        seen["args"] = args
+        seen["timeout"] = timeout
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+
+    # A budget at/under comfy-cli's 120s cap is the dangerous case: the child's
+    # `--timeout` equals the budget, so without grace both deadlines fire at the
+    # same instant and the parent's SIGKILL wins over the engine's own report.
+    asyncio.run(server.generate_image("a cat", timeout_seconds=45.0))
+
+    assert seen["args"][-1] == "--timeout=45"  # engine's deadline: the budget
+    assert seen["timeout"] == pytest.approx(45.0 + server._RUN_TEMPLATE_TIMEOUT_GRACE)
 
 
 def test_generate_image_other_errors_pass_through_unchanged(monkeypatch):

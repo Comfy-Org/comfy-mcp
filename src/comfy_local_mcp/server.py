@@ -1867,6 +1867,19 @@ async def generate_image(
     # owns that escaping, the JSON value rendering, and the key validation.
     params: dict[str, Any] = {prompt_slot: prompt}
     if checkpoint:
+        if checkpoint_slot == prompt_slot:
+            # Same key for both slots would have the checkpoint overwrite the
+            # prompt already stored under it, running the template's DEFAULT
+            # prompt with no error at all — the worst failure mode available
+            # (a plausible wrong image). Only reachable via a misconfigured
+            # override pair; refuse it by name instead.
+            raise ComfyCliError(
+                f"COMFY_T2I_PROMPT_SLOT and COMFY_T2I_CHECKPOINT_SLOT are both "
+                f"{prompt_slot!r} — the checkpoint would overwrite the prompt. "
+                "Point them at the two different slots of template "
+                f"{template!r} (list them with `comfy templates fetch "
+                f"{template} -o wf.json && comfy workflow slots wf.json`)."
+            )
         params[checkpoint_slot] = checkpoint
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
     args, budget = _run_template_argv(
@@ -1887,9 +1900,20 @@ async def generate_image(
             return await _in_generate_pool(
                 _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
             )
-        return await _run_comfy_streaming(*args, ctx=ctx, timeout=budget)
+        # Same grace as the submit path above (and as `run_template`): the child
+        # was handed `--timeout=min(budget, 120)`, so for a budget at or under
+        # comfy-cli's 120s cap the engine's deadline and the parent's kill land
+        # on the SAME instant. Without slack the parent can SIGKILL comfy-cli
+        # mid-write of its own structured timeout / `server_not_running` result,
+        # replacing an actionable error with a generic parent kill (and orphaning
+        # an already-enqueued run). The engine must be the side that gives up.
+        return await _run_comfy_streaming(
+            *args, ctx=ctx, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+        )
     except ComfyCliError as exc:
-        hinted = _t2i_slot_hint(exc, template, prompt_slot, checkpoint_slot)
+        hinted = _t2i_slot_hint(
+            exc, template, prompt_slot, checkpoint_slot if checkpoint else None
+        )
         if hinted is exc:
             # Not a slot failure — let the engine's own error through untouched,
             # with its original traceback rather than a self-referential cause.
@@ -1898,7 +1922,7 @@ async def generate_image(
 
 
 def _t2i_slot_hint(
-    exc: ComfyCliError, template: str, prompt_slot: str, checkpoint_slot: str
+    exc: ComfyCliError, template: str, prompt_slot: str, checkpoint_slot: str | None
 ) -> ComfyCliError:
     """Re-raise a slot-resolution failure with the knob that fixes it, else pass through.
 
@@ -1907,14 +1931,22 @@ def _t2i_slot_hint(
     a graph with a different shape) comfy-cli answers ``workflow_slot_invalid``
     with the template's real addresses — accurate, but it says nothing about
     WHICH knob in this server produced the bad key. Name them.
+
+    ``checkpoint_slot`` is None when the call passed no ``checkpoint``: that slot
+    was never sent, so naming it would implicate a knob that cannot be the cause
+    and send the reader after the wrong env var.
     """
     if exc.code != "workflow_slot_invalid":
         return exc
+    filled = f"prompt slot {prompt_slot!r}"
+    knobs = "COMFY_T2I_TEMPLATE / COMFY_T2I_PROMPT_SLOT"
+    if checkpoint_slot is not None:
+        filled += f" and checkpoint slot {checkpoint_slot!r}"
+        knobs += " / COMFY_T2I_CHECKPOINT_SLOT"
     return ComfyCliError(
-        f"{exc}\n(generate_image filled template {template!r} using prompt slot "
-        f"{prompt_slot!r} and checkpoint slot {checkpoint_slot!r}; set "
-        "COMFY_T2I_TEMPLATE / COMFY_T2I_PROMPT_SLOT / COMFY_T2I_CHECKPOINT_SLOT "
-        "to match the addresses above, or use run_template directly)",
+        f"{exc}\n(generate_image filled template {template!r} using {filled}; "
+        f"set {knobs} to match the addresses above, or use run_template "
+        "directly)",
         code=exc.code,
     )
 
