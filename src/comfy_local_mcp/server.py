@@ -250,7 +250,7 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
       ``out_dir="--slot"``, not as a missing value). So ``vary_workflow``'s
       ``slots`` / ``out_dir`` are already injection-safe before any guard runs.
 
-    Option values ARE guarded anyway, uniformly across the module
+    Option values ARE guarded anyway, nearly everywhere in the module
     (``search_templates``'s filters, ``download_model``'s ``relative_path`` /
     ``filename``, ``fetch_template``'s ``out_path``, ``vary_workflow``'s ``slots``
     / ``out_dir``, ``run_workflow`` / ``validate_workflow``'s ``workflow_path``).
@@ -274,6 +274,21 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
       costs no capability: ``set_workflow_slot``'s overrides and both param
       marshalers (:func:`_validate_param_key`) already refuse one, so every other
       way to name a slot in this module rejects it too.
+
+    And one deliberate NON-rejection, which is what "nearly" above is doing:
+
+    - **``search_models``'s ``--text`` query.** The hygiene guards all rest on a
+      leading dash never being real DATA for that value, and each leaves an escape
+      hatch — ``./-x`` names the same file as ``-x``, which is why the messages
+      above suggest it. Neither holds for a free-form substring match over model
+      *filenames*: ``-fp16`` / ``-fp8`` / ``-turbo`` are ordinary filename
+      substrings, so a dash-leading query matches real rows, and there is no other
+      way to spell that substring through ``--text``. Verified against comfy-cli:
+      ``models search --text -fp16`` reaches the server call exactly as
+      ``--text fp16`` does, so guarding it would refuse a working search rather
+      than name a mistake. ``_reject_nul`` still applies there — a NUL cannot ride
+      in argv at all. Weigh a new option-value call site the same way before
+      copying the hygiene guard into it.
     """
     if value.startswith("-"):
         hint = f" — expected {expected}" if expected else ""
@@ -4202,9 +4217,30 @@ def search_models(query: str = "", folder: str = "") -> Any:
     download metadata). Agents should set expectations accordingly: it answers
     "which model files does this install have?", not "tell me about this model".
     """
+    # The guards sit INSIDE their branch so an empty value keeps meaning "mode
+    # not selected" (the precedence above) rather than becoming an error.
     if query:
+        # NUL only — deliberately NO `_reject_option_like` here, unlike the other
+        # option values this module guards for hygiene. `--text` is a free-form
+        # substring match over model FILENAMES, and a leading dash is legitimate
+        # data in that position: the `-fp16` / `-fp8` / `-turbo` suffixes are
+        # ordinary in model filenames, so `query="-fp16"` is a real search that
+        # matches real rows. Click takes the token after a value-taking option
+        # verbatim, so comfy-cli accepts it and there is no other way to spell
+        # that substring — guarding it would refuse a working search rather than
+        # catch a mistake. Contrast the hygiene sites (`search_templates`'s
+        # enumerated filters, `download_model`'s output names, `fetch_template`'s
+        # `--out`), where a dash-leading value really is a caller slip and an
+        # escape hatch exists. See `_reject_option_like`.
+        _reject_nul("query", query)
         return _run_comfy("models", "search", "--text", query, timeout=60.0)
     if folder:
+        # `folder` rides as a bare positional, so its leading-dash guard is the
+        # mandatory kind.
+        _reject_option_like(
+            "folder", folder, expected="a model folder (e.g. 'checkpoints')"
+        )
+        _reject_nul("folder", folder)
         return _run_comfy("models", "list-folder", folder, timeout=60.0)
     return _run_comfy("models", "list-folders", timeout=60.0)
 

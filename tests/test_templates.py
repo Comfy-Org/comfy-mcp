@@ -294,6 +294,12 @@ def test_get_template_argv(patched_run):
     assert calls[0]["cmd"][4:] == ["templates", "show", "flux_dev"]
 
 
+# `get_template` / `fetch_template` leading-dash + NUL rejection is covered by
+# `test_get_template_rejects_option_like_name`,
+# `test_fetch_template_rejects_option_like_name_and_out_path` and
+# `test_template_tools_reject_embedded_nul` below (landed on main in #86).
+
+
 def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
     """Passthrough argv is `templates fetch <name> --out <path>`; returns the abs path."""
     calls = patched_run(envelope(data=None))
