@@ -2817,3 +2817,241 @@ def test_get_logs_caps_oversized_line(patched_run):
     # TOTAL length (content + marker) never exceeds the hard cap.
     assert len(lines[1]) <= server._MAX_LOG_LINE_CHARS
     assert lines[1].endswith(server._TRACEBACK_TRUNCATION_MARKER)
+
+
+# --- credential redaction on every surfaced stream tail ---------------------
+# comfy-cli can print secrets when it crashes — a signed model-download URL
+# carrying a token, or an API key echoed back as part of an argv/usage error —
+# and those tails are interpolated straight into `ComfyCliError` messages that
+# reach the MCP client (an LLM context) and the host logs. Every tail is masked;
+# a tail with no credential shape in it must survive byte-for-byte, because
+# mangling a traceback defeats the point of surfacing it at all.
+
+_SIGNED_URL = "https://cdn.example/models/f.safetensors?token=abc123&expires=99"
+_USERINFO_URL = "https://user:tok@host/f.safetensors"
+
+
+def test_redact_secrets_masks_url_userinfo_including_multiple_urls():
+    """Every `scheme://user:pass@host` is masked — not just the first (what `_redact_url` can't do)."""
+    assert server._redact_secrets(_USERINFO_URL) == "https://***@host/f.safetensors"
+    two = f"tried {_USERINFO_URL} then http://svc:pw2@mirror/g.bin"
+    masked = server._redact_secrets(two)
+    assert masked == "tried https://***@host/f.safetensors then http://***@mirror/g.bin"
+    assert "tok" not in masked
+    assert "pw2" not in masked
+    # A password-less userinfo (`scheme://token@host`) is masked the same way.
+    assert server._redact_secrets("https://deadbeefcafe@h/x") == "https://***@h/x"
+
+
+def test_redact_secrets_masks_secret_query_params():
+    """A signed URL's token/signature values are masked, the rest of the URL kept."""
+    masked = server._redact_secrets(_SIGNED_URL)
+    assert masked == "https://cdn.example/models/f.safetensors?token=***&expires=99"
+    for param in (
+        "sig",
+        "signature",
+        "key",
+        "api_key",
+        "access_token",
+        "X-Amz-Signature",
+    ):
+        out = server._redact_secrets(f"https://h/o?{param}=SUPERSECRET&x=1")
+        assert "SUPERSECRET" not in out
+        assert f"{param}=***" in out
+        assert "x=1" in out  # a non-secret param is untouched
+
+
+def test_redact_secrets_masks_cli_flag_values():
+    """comfy-cli usage errors echo argv — the `--key`-family value must not survive."""
+    argv = "comfy auth set comfy-cloud-api-key --key sk-real-secret"
+    assert server._redact_secrets(argv) == (
+        "comfy auth set comfy-cloud-api-key --key ***"
+    )
+    for flag in ("--api-key", "--api_key", "--token", "--access-token", "--KEY"):
+        out = server._redact_secrets(f"usage: comfy {flag} sk-real-secret --json")
+        assert "sk-real-secret" not in out
+        assert f"{flag} ***" in out
+        assert "--json" in out  # the following flag is not swallowed
+    # `=` form too, and a value-less flag must not eat the NEXT flag.
+    assert server._redact_secrets("--key=sk-real-secret") == "--key=***"
+    assert server._redact_secrets("--key --verbose") == "--key --verbose"
+
+
+def test_redact_secrets_masks_bearer_tokens_but_not_prose():
+    """A `Bearer <token>` value is masked; a short prose word after `bearer` is not."""
+    out = server._redact_secrets("Authorization: Bearer abcdefghij0123456789")
+    assert out == "Authorization: Bearer ***"
+    assert server._redact_secrets("the bearer token was absent") == (
+        "the bearer token was absent"
+    )
+
+
+def test_redact_secrets_leaves_a_plain_traceback_byte_for_byte():
+    """The over-redaction guard: text with no credential shape is returned unchanged."""
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "/opt/comfy/cli.py", line 42, in run\n'
+        "    raise ValueError('boom')\n"
+        "ValueError: boom\n"
+        "note: user@example.com filed this; see key: value, a@b, http://plain/host\n"
+    )
+    assert server._redact_secrets(traceback) == traceback
+
+
+# One test per call site: a future tail interpolation added without redaction
+# should show up as a gap here rather than as a leaked credential in production.
+
+
+def test_sync_timeout_tails_are_redacted(monkeypatch):
+    """Site 1 — `_run_comfy_raw`'s TimeoutExpired tails (stderr AND stdout)."""
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        _timeout_run(
+            stderr=f"downloading {_USERINFO_URL}".encode(),
+            stdout=b"usage: comfy auth set comfy-cloud-api-key --key sk-real-secret",
+        ),
+    )
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("discover", timeout=60.0)
+    msg = str(exc.value)
+    assert "tok" not in msg
+    assert "***@host" in msg
+    assert "sk-real-secret" not in msg
+    assert "--key ***" in msg
+
+
+def test_no_envelope_error_tails_are_redacted(patched_plain_run):
+    """Site 2 — the `_unwrap_envelope` no-envelope branch, both halves."""
+    patched_plain_run(
+        1,
+        stdout="usage: comfy auth set comfy-cloud-api-key --key sk-real-secret",
+        stderr=f"failed to fetch {_SIGNED_URL}",
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+
+    msg = str(excinfo.value)
+    assert "abc123" not in msg
+    assert "token=***" in msg
+    assert "expires=99" in msg  # the diagnosis around it survives
+    assert "sk-real-secret" not in msg
+    assert "--key ***" in msg
+
+
+def test_error_envelope_stderr_fallback_is_redacted():
+    """Site 3 — the `ok: false` stderr fallback when the envelope carries no message."""
+    envelope = {"type": "envelope", "ok": False, "error": {"code": "x"}}
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(
+            envelope, ("env",), 1, f"download failed: {_USERINFO_URL}"
+        )
+
+    msg = str(excinfo.value)
+    assert "tok@" not in msg
+    assert msg.endswith("download failed: https://***@host/f.safetensors")
+
+
+def test_streaming_timeout_tails_are_redacted(monkeypatch):
+    """Site 4 — `_run_comfy_streaming`'s timeout, stderr tail AND joined stdout tail."""
+    line = json.dumps({"type": "log", "message": f"GET {_SIGNED_URL}"})
+
+    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+        return _BlockingProcWithStderr(cmd, [line + "\n"], f"pulling {_USERINFO_URL}")
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run", "--workflow", "wf.json", timeout=0.25, ctx=_RecordingCtx()
+            )
+        )
+    msg = str(exc.value)
+    assert "tok@" not in msg  # stderr tail masked
+    assert "***@host" in msg
+    assert "abc123" not in msg  # stdout (NDJSON) tail masked
+    assert "token=***" in msg
+
+
+# The two macOS-denial branches interpolate a tail too. They are not in the
+# ticket's four, but they share the same chokepoint — assert it, so the
+# chokepoint's coverage is what's locked in rather than four hand-wired sites.
+
+_TCC_STDERR = (
+    "Fatal Python error: init_import_site: Failed to import the site module\n"
+    "PermissionError: [Errno 1] Operation not permitted: "
+    "'/Users/x/Documents/ComfyUI/venv/pyvenv.cfg'\n"
+    f"while fetching {_USERINFO_URL}\n"
+)
+
+
+def test_tcc_no_envelope_original_error_tail_is_redacted(monkeypatch):
+    """The macOS-denial branch of `_unwrap_envelope` masks its `Original error:` tail."""
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._unwrap_envelope(None, ("env",), 1, _TCC_STDERR)
+
+    msg = str(exc.value)
+    assert "Full Disk Access" in msg  # still the curated guidance
+    assert "tok@" not in msg
+    assert "***@host" in msg
+
+
+def test_version_guard_tcc_original_error_tail_is_redacted(monkeypatch):
+    """The version guard's macOS-denial branch masks its `Original error:` tail."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+
+    def fake(cmd, **kwargs):  # noqa: ARG001
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=_TCC_STDERR)
+
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._check_comfy_version()
+
+    msg = str(exc.value)
+    assert "tok@" not in msg
+    assert "***@host" in msg
+
+
+def test_redact_secrets_stays_linear_on_a_large_capture():
+    """Every pattern leads with a literal, so a huge capture can't wedge the scan.
+
+    Anchoring the userinfo pattern on the URL *scheme* instead of `://` makes it
+    re-scan from every offset — quadratic, and it hangs for minutes on a
+    multi-megabyte alphanumeric stderr. Guard the shape, not a wall-clock number.
+    """
+    started = time.monotonic()
+    assert server._redact_secrets("a" * 2_000_000) == "a" * 2_000_000
+    assert time.monotonic() - started < 5.0
+
+
+def test_tail_masks_a_credential_that_straddles_the_truncation_boundary():
+    """Redaction runs on a window PAST the bound, so a clipped URL is still masked."""
+    capture = "x" * 400 + _USERINFO_URL + "y" * 477
+    # The raw 500-char tail begins in the MIDDLE of the userinfo — the `://` that
+    # identifies it has been clipped away, so redacting the clipped tail alone
+    # would leave the password in the message.
+    assert capture[-500:].startswith(":tok@host")
+    tail = server._tail(capture, limit=500)
+
+    assert len(tail) == 500
+    assert "tok" not in tail
+    assert "*@host/f.safetensors" in tail
+
+
+def test_tail_bound_survives_a_capture_larger_than_the_redaction_window():
+    """A capture far bigger than the lookback window is still bounded and scanned."""
+    capture = "z" * (server._REDACT_LOOKBACK * 3) + _SIGNED_URL
+    tail = server._tail(capture, limit=500)
+
+    assert len(tail) == 500
+    assert "abc123" not in tail
+    assert "token=***" in tail

@@ -696,6 +696,77 @@ def _redact_url(url: str) -> str:
     return url
 
 
+# The secret-bearing shapes masked out of any comfy-cli output we echo back.
+# Deliberately STRUCTURED patterns rather than an entropy heuristic: these
+# messages exist to diagnose a crash, so mangling a traceback is a real cost —
+# under-redacting a shape we don't recognize beats over-redacting prose.
+#
+# A credential is only ever masked in a position where it cannot be anything
+# else: after a URL scheme separator, as the value of a known secret query
+# param, as the value of a `--key`-family CLI flag, or after a `Bearer` scheme
+# keyword. None of them can fire on ordinary traceback text.
+#
+# Every pattern starts with a LITERAL (`://`, `?`/`&`, `--`, `bearer`) so the
+# engine can skip ahead to a candidate instead of re-scanning from each
+# position. That matters: an earlier draft anchored the first pattern on the
+# scheme (`[A-Za-z][A-Za-z0-9+.-]*://`), whose leading character class re-scans
+# forward from every offset — quadratic, and it hangs for minutes on a
+# multi-megabyte alphanumeric capture. The scheme is not needed anyway: `://`
+# effectively only occurs in a URL, and the replacement puts it back verbatim.
+_URL_USERINFO_RE = re.compile(r"://[^/\s@]+@")
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"([?&](?:token|sig|signature|key|api[_-]?key|access[_-]?token"
+    r"|x-amz-signature)=)[^&\s\"'<>]+",
+    re.IGNORECASE,
+)
+# `(?!-)` keeps `--key --verbose` (a flag missing its value) from swallowing the
+# NEXT flag; the separator excludes newlines so a dangling `--key` at end of line
+# can't eat the first word of the following traceback frame.
+_SECRET_FLAG_RE = re.compile(
+    r"(--(?:key|token|api[_-]?key|access[_-]?token)(?:=|[ \t]+))(?!-)\S+",
+    re.IGNORECASE,
+)
+# 16+ chars so a prose "bearer <word>" can't trip it; `Basic`/`Token`/a bare
+# `Authorization:` value are deliberately NOT matched — those keywords are common
+# English ("Basic authentication", "authorization: failed") and masking them
+# would eat the diagnosis instead of a secret.
+_BEARER_TOKEN_RE = re.compile(r"(\bbearer[ \t]+)[A-Za-z0-9._\-+/=]{16,}", re.IGNORECASE)
+
+# How far past a tail's bound :func:`_tail` scans for credentials to mask. Any
+# credential shorter than this that reaches into the kept tail begins inside the
+# window, and signed URLs — the longest shape here — run well under 2k chars.
+_REDACT_LOOKBACK = 4096
+
+
+def _redact_secrets(text: str) -> str:
+    """Mask credential-shaped substrings anywhere in ``text``.
+
+    comfy-cli output reaches the MCP client (an LLM context) and the host logs
+    verbatim through :class:`ComfyCliError`, and a crashing comfy-cli can print
+    secrets: a signed model-download URL carrying a token, or an API key echoed
+    back as part of an argv/usage error. Everything we surface from a captured
+    stream goes through here first.
+
+    Distinct from :func:`_redact_url`, which takes a *whole* URL and masks its
+    netloc by offset arithmetic — over free text that handles only one
+    well-formed URL and is confused by a stray ``@`` in surrounding prose. This
+    one scans arbitrary text and masks every occurrence:
+
+    - URL userinfo (``scheme://user:pass@host`` -> ``scheme://***@host``);
+    - the value of a secret-bearing query param (``?token=…`` -> ``?token=***``);
+    - the value of a ``--key`` / ``--api-key`` / ``--token`` CLI flag, since
+      comfy-cli usage errors echo argv (cf. the ``comfy auth set
+      comfy-cloud-api-key --key …`` hint text this server already forwards);
+    - a ``Bearer <token>`` authorization value.
+
+    Text with none of those shapes — a plain traceback — comes back byte-for-byte.
+    """
+    text = _URL_USERINFO_RE.sub("://***@", text)
+    text = _SECRET_QUERY_PARAM_RE.sub(r"\1***", text)
+    text = _SECRET_FLAG_RE.sub(r"\1***", text)
+    return _BEARER_TOKEN_RE.sub(r"\1***", text)
+
+
 def _strip_brackets(host: str) -> str:
     """Strip surrounding ``[...]`` from a bracketed IPv6 host for consistency.
 
@@ -938,6 +1009,12 @@ def _tail(text: str | bytes | None, limit: int = 500) -> str:
     Windows ``run()`` re-communicates after the kill and returns ``str``), so
     callers can hand us either. The ``limit`` hard-bounds the result so a chatty
     child cannot inflate an error payload.
+
+    Every tail is passed through :func:`_redact_secrets` before it is returned:
+    this helper is the single chokepoint through which captured comfy-cli output
+    reaches a :class:`ComfyCliError` message, so masking here covers every call
+    site (including :func:`_stream_tail`, which is built on it) and any future
+    one, instead of relying on each message to remember.
     """
     if not text or limit <= 0:
         # ``[-0:]`` is ``[0:]`` (the whole string), so a non-positive limit would
@@ -950,7 +1027,14 @@ def _tail(text: str | bytes | None, limit: int = 500) -> str:
         # enough to yield ``limit`` decoded chars (a leading byte may be dropped,
         # which ``errors="replace"`` handles cleanly).
         text = text[-4 * limit :].decode("utf-8", errors="replace")
-    return text.strip()[-limit:]
+    # Redact BEFORE the tail slice, not after: a credential straddling the
+    # truncation boundary would otherwise lose the `://` that identifies its
+    # userinfo and slip through unmasked. Scan a window that reaches
+    # `_REDACT_LOOKBACK` chars PAST the bound rather than the whole capture, so
+    # the cost stays proportional to what we keep even for a multi-megabyte str
+    # (the bytes branch above is already bounded); any credential shorter than
+    # the lookback that reaches into the kept tail starts inside the window.
+    return _redact_secrets(text.strip()[-(limit + _REDACT_LOOKBACK) :])[-limit:]
 
 
 def _stream_tail(text: str | bytes | None, limit: int = 500) -> str:
@@ -967,6 +1051,12 @@ def _stream_tail(text: str | bytes | None, limit: int = 500) -> str:
 
     The *tail* is what's kept (not the head): a CLI traceback puts the
     exception — the part that says what actually went wrong — last.
+
+    Credential masking comes from :func:`_tail` underneath, so the truncation
+    test below measures the REDACTED length. A mask can shift that length either
+    way, so on a capture carrying a credential right at the bound the ``...``
+    marker can be one off in either direction — cosmetic, and only on the
+    already-masked case. The result stays bounded and never leaks.
     """
     if limit <= 0:
         # Mirror `_tail`'s own non-positive guard. It matters more here: we ask
