@@ -425,6 +425,88 @@ def test_server_info_freshness_missing_verb_match_is_case_insensitive(
     assert "freshness unavailable" in result["freshness"]["error"]
 
 
+def test_server_info_freshness_missing_verb_survives_panel_wrapping(
+    patched_env_then_outdated,
+):
+    """A rich panel that wraps the phrase mid-line still degrades cleanly.
+
+    Typer renders errors inside a bordered rich panel and wraps at the terminal
+    width, so `No such command` and `'outdated'` can land on separate lines with
+    box-drawing glyphs between them. Matching a literal one-line phrase would
+    miss this and leak the raw usage dump — the exact outcome this degrade
+    exists to prevent.
+    """
+    import json
+
+    wrapped_panel = (
+        "╭─ Error ─────────────────────────╮\n"
+        "│ No such command\n"
+        "│ 'outdated'.                     │\n"
+        "╰─────────────────────────────────╯"
+    )
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (2, "", wrapped_panel)]
+    )
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_relayed_phrase_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """A REAL failure relaying "no such command" keeps its raw diagnostic.
+
+    A comfy-cli that HAS the verb can fail with an error envelope whose message
+    quotes a nested tool's own "no such command" (a git/pip call, a custom-node
+    pack's install script, a relayed registry response). Classifying that as
+    `unsupported` would tell the agent to skip staleness advice and reassure the
+    user that nothing is broken — masking a genuine failure. The envelope's
+    structured `error.code` proves the verb ran, so it must pass through.
+    """
+    import json
+
+    error_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {
+            "code": "pack_probe_failed",
+            "message": "git: 'no such command' while probing pack 'outdated-notifier'",
+        },
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (1, json.dumps(error_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "pack_probe_failed" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_unknown_other_verb_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """ "No such command" naming a DIFFERENT verb is not our capability gap."""
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: No such command 'git-lfs'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "git-lfs" in result["freshness"]["error"]
+
+
 def test_server_info_freshness_passes_through_other_errors(patched_env_then_outdated):
     """A NON-missing-verb spawn failure keeps the raw reason and no `unsupported`.
 

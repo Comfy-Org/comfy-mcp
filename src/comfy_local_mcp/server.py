@@ -1524,6 +1524,61 @@ def _check_comfy_cli_version() -> dict:
     return report
 
 
+# Click/Typer's "No such command '<verb>'." usage error, made robust to the two
+# ways that text arrives mangled. `\s+` between the words (not a literal space)
+# because rich renders Typer errors inside a bordered panel and wraps them at the
+# terminal width, so a newline can land mid-phrase; the box-drawing characters
+# that wrapping introduces are stripped by `_normalize_cli_text` first. The verb
+# must follow within a few non-word characters (the quotes/colon/period around
+# it) — see `_is_missing_verb_error`.
+_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{0,8}}{verb}\b"
+
+# Whitespace, the Unicode Box Drawing block (U+2500-U+257F), and ASCII `|` —
+# i.e. every character rich can use to frame and wrap an error panel.
+_PANEL_NOISE_RE = re.compile(r"[\s─-╿|]+")
+
+
+def _normalize_cli_text(text: str) -> str:
+    """Lowercased text with panel borders and wrapping collapsed to single spaces.
+
+    Typer renders errors inside a rich panel when rich is installed, so the raw
+    stderr of a usage error can read ``"│ No such command\\n│ 'outdated'. │"``.
+    Folding the border glyphs and any run of whitespace into one space puts that
+    back on a single line, so a phrase match cannot be defeated by the terminal
+    width the child happened to render at.
+    """
+    return _PANEL_NOISE_RE.sub(" ", text).strip().lower()
+
+
+def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
+    """Is *exc* comfy-cli rejecting ``verb`` as unknown, rather than *running* it?
+
+    Deliberately narrow, because the caller's degrade tells the agent that
+    NOTHING is broken: a false positive here silently buries a real failure.
+    Two independent conditions must both hold.
+
+    ``exc.code is None`` — an error envelope carries a structured ``error.code``
+    (see :class:`ComfyCliError`), and an envelope means comfy-cli *recognized*
+    the verb, ran it, and reported why it failed. A missing verb never gets that
+    far: Click aborts with a usage error and exit 2 before any envelope is
+    emitted, so the failure can only reach us via the wrapper-raised "returned
+    no JSON" path, where ``code`` is ``None``. This is what stops a relayed
+    nested error — a git/pip call, a custom-node pack name, a registry response
+    that happens to contain "no such command" — from being mistaken for the verb
+    itself being absent.
+
+    The phrase must also name ``verb`` itself, within a few punctuation
+    characters (Click writes ``No such command 'outdated'.``). Matching the bare
+    phrase anywhere in the message would fold in the same relayed stderr the
+    first condition exists to exclude.
+    """
+    if exc.code is not None:
+        return False
+    pattern = _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape(verb))
+    normalized = _normalize_cli_text(str(exc))
+    return re.search(pattern, normalized, re.IGNORECASE) is not None
+
+
 def _freshness_report() -> Any:
     """Best-effort installed-vs-latest report via ``comfy outdated``.
 
@@ -1539,7 +1594,10 @@ def _freshness_report() -> Any:
     capability gap it is. That case returns
     ``{"error": "freshness unavailable: ...", "unsupported": True}``, with
     ``unsupported`` machine-readable so a client can branch on it without
-    matching strings.
+    matching strings. :func:`_is_missing_verb_error` decides that case, and is
+    deliberately strict: this degrade asserts nothing is broken, so a failure
+    that merely *relays* a "no such command" from somewhere else must keep the
+    raw passthrough below rather than be waved through as a capability gap.
 
     EVERY OTHER failure keeps the raw ``{"error": "<reason>"}`` passthrough — for
     a network failure, a timeout, or a decode error the underlying reason IS the
@@ -1556,11 +1614,11 @@ def _freshness_report() -> Any:
         return _run_comfy("outdated", timeout=15.0)
     except (ComfyCliError, OSError, UnicodeDecodeError) as exc:
         # Click/Typer emits `No such command 'outdated'.` on stderr, which
-        # `_unwrap_envelope` embeds in the raised message via its stderr tail.
-        # Match on that phrase alone, NOT on a quoted `'outdated'`: rich-formatted
-        # Typer output can wrap lines inside its error panel, and any "no such
-        # command" raised from a `comfy outdated` invocation is unambiguous.
-        if isinstance(exc, ComfyCliError) and "no such command" in str(exc).lower():
+        # `_unwrap_envelope` embeds in the raised message. `_is_missing_verb_error`
+        # keeps that detection narrow — a relayed nested error that merely quotes
+        # the same phrase must NOT reach this degrade, which claims nothing is
+        # wrong.
+        if isinstance(exc, ComfyCliError) and _is_missing_verb_error(exc, "outdated"):
             return {
                 "error": (
                     "freshness unavailable: the installed comfy-cli does not support "
