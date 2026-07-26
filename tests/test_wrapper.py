@@ -705,6 +705,61 @@ def test_wait_for_job_times_out_cleanly(monkeypatch):
     assert result == {"timed_out": True, "status": {"status": "running"}}
 
 
+@pytest.mark.parametrize("oversized", [float("inf"), 86_400.0])
+def test_wait_for_job_clamps_an_oversized_timeout(monkeypatch, oversized):
+    """An oversized bound is clamped to the ceiling, so the poll loop terminates.
+
+    Left raw, `deadline = monotonic() + inf` keeps `remaining` positive forever
+    and the tool re-spawns `comfy jobs status` until the client gives up; a
+    day-long finite bound outlives any client's patience just as surely.
+    """
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A clock that jumps just past the ceiling on its second read: clamped, the
+    # deadline has passed and the tool returns; unclamped, it would poll on and
+    # exhaust the iterator (failing loudly instead of hanging the suite).
+    reads = iter([0.0, server._MAX_WATCH_TIMEOUT + 1.0])
+
+    def fake_monotonic():
+        try:
+            return next(reads)
+        except StopIteration:
+            pytest.fail("wait_for_job kept polling past the clamped ceiling")
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server.wait_for_job("pid", timeout_seconds=oversized)
+
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
+def test_wait_for_job_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
+    """NaN/0/negative are refused before the first poll.
+
+    With NaN every comparison is False, so `remaining <= 0` never fires and
+    `min(2.0, nan)` returns 2.0 — the same forever-loop as `inf`.
+    """
+    polled = False
+
+    # Raise rather than return a status: with a NaN bound left unclamped this
+    # loop never exits (`remaining <= 0` is False and `sleep` is stubbed out),
+    # so a regression must fail the test rather than hang the suite.
+    def fake_run(*args, **kwargs):
+        nonlocal polled
+        polled = True
+        raise AssertionError("wait_for_job polled with an invalid timeout")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
+        server.wait_for_job("pid", timeout_seconds=bad)
+
+    assert polled is False
+
+
 def test_fetch_outputs_wraps_comfy_download(patched_run):
     """fetch_outputs is a thin `comfy download … --where local -o <dir>` passthrough."""
     calls = patched_run(
@@ -1676,6 +1731,68 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
 
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == ("run", "--workflow", "wf.json")  # no --wait
+    assert seen["timeout"] == 60.0
+
+
+@pytest.mark.parametrize("oversized", [float("inf"), 86_400.0])
+def test_run_workflow_clamps_oversized_timeout(monkeypatch, oversized):
+    """timeout_seconds is clamped to the module ceiling, not passed through raw.
+
+    Raw, `inf` reaches `asyncio.wait_for` and the `comfy run --wait` child is
+    never given up on; a day-long finite bound is the same problem, slower.
+    """
+    seen: dict = {}
+
+    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
+        seen["timeout"] = timeout
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+    asyncio.run(server.run_workflow("wf.json", wait=True, timeout_seconds=oversized))
+
+    assert seen["timeout"] == server._MAX_RUN_WORKFLOW_TIMEOUT
+
+
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
+def test_run_workflow_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
+    """NaN/0/negative are refused before the streaming child is spawned."""
+    started = False
+
+    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
+        nonlocal started
+        started = True
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+
+    with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
+        asyncio.run(server.run_workflow("wf.json", wait=True, timeout_seconds=bad))
+
+    assert started is False
+
+
+@pytest.mark.parametrize("ignored", [float("nan"), 0.0, float("inf")])
+def test_run_workflow_wait_false_still_submits_with_an_odd_timeout(
+    monkeypatch, ignored
+):
+    """`wait=False` never reads timeout_seconds, so the clamp must not reject it.
+
+    The submit runs on its own fixed 60s budget; hardening the waiting path must
+    not turn a working fire-and-return call into an error.
+    """
+    seen: dict = {}
+
+    def fake_run_comfy(*args, timeout=None):
+        seen["timeout"] = timeout
+        return {"prompt_id": "p1"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
+
+    result = asyncio.run(
+        server.run_workflow("wf.json", wait=False, timeout_seconds=ignored)
+    )
+
+    assert result == {"prompt_id": "p1"}
     assert seen["timeout"] == 60.0
 
 

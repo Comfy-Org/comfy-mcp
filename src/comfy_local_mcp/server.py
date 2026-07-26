@@ -238,8 +238,10 @@ ENVELOPE_SCHEMA_MAJOR = 1
 # then rejects an older CLI (see ``_check_comfy_cli_version``).
 MIN_COMFY_CLI_VERSION = os.environ.get("COMFY_CLI_MIN_VERSION") or None
 
-# Hard ceiling for a single bounded watch so `float('inf')` / an absurd value
-# can't hold a `comfy jobs watch` child open effectively forever (1 hour).
+# Hard ceiling for a single bounded wait on an already-submitted job — the
+# streaming `watch_job` and the polling `wait_for_job` share it — so
+# `float('inf')` / an absurd value can't hold a `comfy jobs watch` child open,
+# or keep re-spawning `comfy jobs status`, effectively forever (1 hour).
 _MAX_WATCH_TIMEOUT = 3600.0
 
 
@@ -2310,7 +2312,9 @@ async def run_workflow(
     of an opaque client-side deadline. Keep it under your client's tool timeout;
     for generations that may exceed it, submit with ``wait=False`` and poll
     ``wait_for_job`` / ``watch_job`` (the server INSTRUCTIONS teach this flow)
-    rather than raising this bound.
+    rather than raising this bound. On the waiting path it is clamped to a sane
+    maximum, and a non-positive / NaN value is rejected outright; ``wait=False``
+    ignores it entirely (that submit runs on its own fixed budget).
 
     Partner-API nodes (Seedream/Veo/Kling/Gemini/…) need a Comfy credential in
     the server's environment (``COMFY_API_KEY`` in the client registration). A
@@ -2318,6 +2322,14 @@ async def run_workflow(
     the surfaced error carries comfy-cli's hint (including the working
     ``comfy auth set comfy-cloud-api-key`` fallback).
     """
+    if wait:
+        # Harden the caller's bound BEFORE it reaches `_run_comfy_streaming`
+        # (and from there `asyncio.wait_for`): `inf` would wait on the child
+        # forever and NaN is undefined timer behavior — see `_bounded_timeout`.
+        # Only on this path: `wait=False` runs on a fixed 60s budget and never
+        # reads this parameter, so validating it there would newly reject a
+        # submit that works fine today.
+        timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_WORKFLOW_TIMEOUT)
 
     async def _attempt() -> Any:
         if not wait:
@@ -2356,6 +2368,13 @@ async def run_workflow(
                     ) from exc
                 raise
             await asyncio.sleep(backoff)
+
+
+# Hard ceiling for one waited `run_workflow`, so a `float('inf')` / absurd value
+# can't hold the `comfy run --wait` child open effectively forever. Matches the
+# other per-tool ceilings (partner_generate, run_template, watch_job) at an
+# hour; the docstring already steers genuinely long runs to `wait=False`.
+_MAX_RUN_WORKFLOW_TIMEOUT = 3600.0
 
 
 # The gallery template `generate_image` runs: ComfyUI's own default graph — the
@@ -3572,8 +3591,16 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     or ``{"timed_out": True, "status": <last payload>}`` on expiry. The wait is
     bounded by design — chain several short ``wait_for_job`` calls (checking
     ``job_status`` in between) rather than issuing one long block. Use after
-    ``run_workflow(wait=False)``.
+    ``run_workflow(wait=False)``. ``timeout_seconds`` is clamped to a sane
+    maximum (the same ceiling as ``watch_job``, this tool's streaming
+    counterpart), and a non-positive / NaN value is rejected outright.
     """
+    # "Bounded by design" only holds if the bound itself is bounded. Left raw,
+    # `inf` keeps `remaining` positive forever and NaN makes every comparison
+    # False (so `remaining <= 0` never fires and `min(2.0, nan)` yields 2.0) —
+    # either way the poll loop re-spawns `comfy jobs status` until the client
+    # gives up. See `_bounded_timeout`.
+    timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
     deadline = time.monotonic() + timeout_seconds
     poll_interval = 2.0
     last: Any = None
