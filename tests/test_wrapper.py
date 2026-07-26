@@ -498,6 +498,18 @@ def test_upload_file_omits_overwrite_by_default(patched_run):
     assert "--overwrite" not in calls[0]["cmd"]
 
 
+def test_upload_file_rejects_option_like_path():
+    """A leading-dash path is refused: splatted in, it would BE the flag."""
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.upload_file(["--overwrite"])
+
+
+def test_upload_file_rejects_option_like_path_among_valid_ones():
+    """The guard scans every path, not just the first (argument injection)."""
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.upload_file(["/tmp/a.png", "--overwrite"])
+
+
 def test_download_model_url_only(patched_run):
     """download_model wraps the SINGULAR `model download --url` and returns data."""
     calls = patched_run(

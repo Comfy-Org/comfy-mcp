@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
 from comfy_local_mcp import server
 
 
@@ -80,6 +82,45 @@ def test_set_workflow_slot_stdout_false_writes_in_place(monkeypatch):
     cmd = calls[0]["cmd"]
     assert cmd[4:] == ["workflow", "set-slot", "/tmp/flux.json", "3.seed=7"]
     assert "--stdout" not in cmd
+
+
+def test_set_workflow_slot_rejects_option_like_override(monkeypatch):
+    """A leading-dash override is refused before any child spawns.
+
+    Splatted in as a positional it would BE the flag — `"--stdout"` would flip
+    the in-place-write behavior the ``stdout`` argument owns.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.set_workflow_slot("/tmp/flux.json", ["--stdout"])
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.set_workflow_slot("/tmp/flux.json", ["6.text=x", "--stdout"])
+
+
+def test_set_workflow_slot_guard_leaves_valid_overrides_alone(monkeypatch):
+    """The guard reads the override's FIRST character only: `-` inside a VALUE is fine."""
+    fake, calls = _fake_run(
+        {"type": "envelope", "ok": True, "data": {"modified": True}}
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server.set_workflow_slot("/tmp/flux.json", ["6.text=x", "4.ckpt=sd-xl --turbo"])
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "set-slot",
+        "/tmp/flux.json",
+        "6.text=x",
+        "4.ckpt=sd-xl --turbo",
+        "--stdout",
+    ]
 
 
 def test_vary_workflow_argv_repeats_slot_flag(monkeypatch):
