@@ -373,6 +373,36 @@ def test_cancel_job_unknown_id_raises_error_envelope(patched_run):
         server.cancel_job("nope")
 
 
+# `_run_comfy` builds argv with no `--` separator, so a leading-dash positional
+# reaches comfy-cli as an option rather than a job id — `fetch_outputs` most
+# sharply, since there the id sits beside a real `-o`. An embedded NUL is a legal
+# JSON (so MCP) string that `subprocess.run` refuses with a bare ValueError, and
+# an empty id can only be a caller mistake. `_guard_prompt_id` rejects all three
+# for every tool that takes one; the synchronous ones are checked here as a
+# family (`watch_job` and `get_execution_error` are covered separately).
+@pytest.mark.parametrize(
+    ("tool", "extra_args"),
+    [
+        ("job_status", ()),
+        ("cancel_job", ()),
+        ("wait_for_job", ()),
+        ("fetch_outputs", ("/tmp/out",)),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+@pytest.mark.parametrize("bad_id", ["--help", "-o", "", "p\x001"])
+def test_job_tools_reject_an_unusable_prompt_id(monkeypatch, tool, extra_args, bad_id):
+    """A dash-led / empty / NUL-bearing prompt_id is refused before any spawn."""
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError(f"{tool} spawned comfy-cli with {bad_id!r}")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        getattr(server, tool)(bad_id, *extra_args)
+
+
 def test_get_queue_maps_command_and_returns_data(patched_run):
     """get_queue wraps `comfy jobs ls` and returns the merged job list."""
     jobs = {
@@ -763,6 +793,283 @@ def test_wait_for_job_times_out_cleanly(monkeypatch):
     result = server.wait_for_job("pid", timeout_seconds=25.0)
 
     assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
+@pytest.mark.parametrize("oversized", [float("inf"), 86_400.0])
+def test_wait_for_job_clamps_an_oversized_timeout(monkeypatch, oversized):
+    """An oversized bound is clamped to the ceiling, so the poll loop terminates.
+
+    Left raw, `deadline = monotonic() + inf` keeps `remaining` positive forever
+    and the tool re-spawns `comfy jobs status` until the client gives up; a
+    day-long finite bound outlives any client's patience just as surely.
+    """
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A clock that jumps just past the ceiling once the first poll is done:
+    # clamped, the deadline has passed and the tool returns; unclamped, it would
+    # sleep and poll on, exhausting the iterator (failing loudly rather than
+    # hanging the suite). Reads are (deadline, pre-poll, post-poll).
+    reads = iter([0.0, 1.0, server._MAX_WATCH_TIMEOUT + 1.0])
+
+    def fake_monotonic():
+        try:
+            return next(reads)
+        except StopIteration:
+            pytest.fail("wait_for_job kept polling past the clamped ceiling")
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server.wait_for_job("pid", timeout_seconds=oversized)
+
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
+def test_wait_for_job_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
+    """NaN/0/negative are refused before the first poll.
+
+    With NaN every comparison is False, so `remaining <= 0` never fires and
+    `min(2.0, nan)` returns 2.0 — the same forever-loop as `inf`.
+    """
+    polled = False
+
+    # Raise rather than return a status: with a NaN bound left unclamped this
+    # loop never exits (`remaining <= 0` is False and `sleep` is stubbed out),
+    # so a regression must fail the test rather than hang the suite.
+    def fake_run(*args, **kwargs):
+        nonlocal polled
+        polled = True
+        raise AssertionError("wait_for_job polled with an invalid timeout")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
+        server.wait_for_job("pid", timeout_seconds=bad)
+
+    assert polled is False
+
+
+def test_wait_for_job_always_polls_at_least_once(monkeypatch):
+    """A bound that expires before the first poll still reports a real status.
+
+    The per-poll cap re-checks the deadline at the top of the loop; that check
+    must not short-circuit the very first poll and return the degenerate
+    `{"timed_out": True, "status": None}` with nothing ever asked of comfy-cli.
+    """
+    calls = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"status": "running"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    # A clock that is already past the deadline by the loop's first read: the
+    # bound is set at t=0 and every later read is t=1.
+    reads = iter([0.0])
+
+    def fake_monotonic():
+        return next(reads, 1.0)
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server.wait_for_job("pid", timeout_seconds=1e-9)
+
+    assert calls == 1
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
+def test_wait_for_job_caps_each_poll_to_the_remaining_bound(monkeypatch):
+    """A single poll never gets a longer subprocess budget than the wait itself.
+
+    Each `comfy jobs status` used a fixed 60s timeout, so a short wait was only
+    bounded *between* polls: one wedged status call could hold a
+    `timeout_seconds=1` wait open for a full minute.
+    """
+    seen: list[float] = []
+
+    def fake_run(*args, timeout=None, **kwargs):
+        seen.append(timeout)
+        return {"status": "running"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A clock that advances 1s per read, so the 5s bound expires after two polls.
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        now = clock["t"]
+        clock["t"] += 1.0
+        return now
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server.wait_for_job("pid", timeout_seconds=5.0)
+
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+    assert seen == [4.0, 2.0]  # each poll gets only what is left of the 5s bound
+
+
+def test_wait_for_job_gives_a_long_wait_the_full_poll_budget(monkeypatch):
+    """The per-poll cap only bites when it is *below* the normal poll budget."""
+    seen: list[float] = []
+
+    def fake_run(*args, timeout=None, **kwargs):
+        seen.append(timeout)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    assert server.wait_for_job("pid", timeout_seconds=600.0) == {"status": "completed"}
+    assert seen == [server._JOB_STATUS_POLL_TIMEOUT]
+
+
+def test_wait_for_job_reports_a_deadline_poll_timeout_as_timed_out(monkeypatch):
+    """A poll killed by the caller's own bound returns `timed_out`, not an error.
+
+    Capping each poll to the time left makes the poll's deadline double as the
+    caller's, so a slow-but-healthy `comfy jobs status` near the bound now raises
+    where the old fixed 60s budget let it finish. That is this call expiring, and
+    it must not discard the last real status behind a `ComfyCliError`.
+    """
+    statuses = iter([{"status": "running"}])
+
+    def fake_run(*args, **kwargs):
+        try:
+            return next(statuses)
+        except StopIteration:
+            raise server.ComfyCliError("comfy-cli timed out after 1.0s", timed_out=True)
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # 10s bound: the first poll succeeds, the second is granted the remainder and
+    # dies at it — by which time the clock is past the deadline.
+    reads = iter([0.0, 1.0, 2.0, 3.0, 11.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    result = server.wait_for_job("pid", timeout_seconds=10.0)
+
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
+def test_wait_for_job_reraises_a_wedged_poll_with_budget_left(monkeypatch):
+    """A poll that burns the FULL budget with time to spare is a real failure.
+
+    Only the caller's bound expiring earns the `timed_out` envelope. A poll that
+    exhausted `_JOB_STATUS_POLL_TIMEOUT` while the wait still has time left means
+    comfy-cli is wedged — which raised before the per-poll cap existed too.
+    """
+
+    def fake_run(*args, **kwargs):
+        raise server.ComfyCliError("comfy-cli timed out after 60.0s", timed_out=True)
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A 600s bound with the clock barely moving: the deadline is nowhere near.
+    reads = iter([0.0, 1.0, 2.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.wait_for_job("pid", timeout_seconds=600.0)
+
+
+def test_wait_for_job_reraises_when_no_status_was_ever_read(monkeypatch):
+    """With no status in hand, the error beats a contentless `{"status": None}`.
+
+    `{"timed_out": True, "status": None}` would bury the real diagnosis (and the
+    budget that produced it) under an envelope the caller can do nothing with.
+    """
+
+    def fake_run(*args, **kwargs):
+        raise server.ComfyCliError("comfy-cli timed out after 1.0s", timed_out=True)
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    reads = iter([0.0, 1.0, 2.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.wait_for_job("pid", timeout_seconds=1.0)
+
+
+def test_wait_for_job_reraises_a_non_timeout_poll_failure(monkeypatch):
+    """An ordinary comfy-cli error still propagates, deadline or not."""
+
+    def fake_run(*args, **kwargs):
+        raise server.ComfyCliError("job not found", code="not_found")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    reads = iter([0.0, 1.0, 99.0])
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(reads))
+
+    with pytest.raises(server.ComfyCliError, match="job not found"):
+        server.wait_for_job("pid", timeout_seconds=1.0)
+
+
+def test_run_comfy_marks_a_subprocess_timeout(monkeypatch):
+    """The `timed_out` flag is set only where the child was killed at our budget.
+
+    `wait_for_job` branches on it to tell its own deadline from a comfy-cli
+    failure, so the flag has to come from the raise site rather than the message.
+    """
+
+    def fake_subprocess_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(server, "_require_comfy_bin", lambda: None)
+    monkeypatch.setattr(server, "_check_comfy_version", lambda: None)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("jobs", "status", "pid", timeout=1.0)
+
+    assert excinfo.value.timed_out is True
+
+
+def test_prompt_id_guard_rejects_an_oversized_id(monkeypatch):
+    """An id far past any real one is refused before it can reach argv.
+
+    An oversized argv is rejected by the OS with an `OSError` no caller converts
+    (and echoed back whole in the error), rather than failing as a clean
+    `ComfyCliError` like every other bad input.
+    """
+    oversized = "p" * (server._MAX_PROMPT_ID_LEN + 1)
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("spawned comfy-cli with an oversized prompt_id")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="exceeds"):
+        server.job_status(oversized)
+
+    # The cap is generous enough that a real (UUID-shaped) id is untouched.
+    assert server._guard_prompt_id("p" * server._MAX_PROMPT_ID_LEN)
+
+
+def test_fetch_outputs_rejects_a_nul_in_out_dir(monkeypatch):
+    """`out_dir` rides the same argv as the id and needs the same NUL refusal.
+
+    `_run_comfy_raw` converts only `TimeoutExpired`, so `subprocess.run`'s bare
+    "embedded null byte" ValueError would escape as an internal error.
+    """
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("spawned comfy-cli with a NUL-bearing out_dir")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="out_dir"):
+        server.fetch_outputs("pid", "/tmp/o\x00ut")
 
 
 def test_fetch_outputs_wraps_comfy_download(patched_run):
@@ -1665,10 +1972,11 @@ def test_watch_job_times_out_reports_progress_without_ctx(monkeypatch):
     assert procs[0].killed
 
 
-def test_watch_job_rejects_option_like_prompt_id():
-    """A leading-dash prompt_id is refused so comfy-cli can't parse it as a flag."""
-    with pytest.raises(server.ComfyCliError, match="invalid prompt_id"):
-        asyncio.run(server.watch_job("--help"))
+@pytest.mark.parametrize("bad_id", ["--help", "", "p\x001"])
+def test_watch_job_rejects_an_unusable_prompt_id(bad_id):
+    """watch_job shares the family guard: no dash-led, empty, or NUL-bearing id."""
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        asyncio.run(server.watch_job(bad_id))
 
 
 def test_watch_job_rejects_embedded_nul_prompt_id():
@@ -1734,6 +2042,68 @@ def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
 
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == ("run", "--workflow", "wf.json")  # no --wait
+    assert seen["timeout"] == 60.0
+
+
+@pytest.mark.parametrize("oversized", [float("inf"), 86_400.0])
+def test_run_workflow_clamps_oversized_timeout(monkeypatch, oversized):
+    """timeout_seconds is clamped to the module ceiling, not passed through raw.
+
+    Raw, `inf` reaches `asyncio.wait_for` and the `comfy run --wait` child is
+    never given up on; a day-long finite bound is the same problem, slower.
+    """
+    seen: dict = {}
+
+    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
+        seen["timeout"] = timeout
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+    asyncio.run(server.run_workflow("wf.json", wait=True, timeout_seconds=oversized))
+
+    assert seen["timeout"] == server._MAX_RUN_WORKFLOW_TIMEOUT
+
+
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
+def test_run_workflow_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
+    """NaN/0/negative are refused before the streaming child is spawned."""
+    started = False
+
+    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
+        nonlocal started
+        started = True
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+
+    with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
+        asyncio.run(server.run_workflow("wf.json", wait=True, timeout_seconds=bad))
+
+    assert started is False
+
+
+@pytest.mark.parametrize("ignored", [float("nan"), 0.0, float("inf")])
+def test_run_workflow_wait_false_still_submits_with_an_odd_timeout(
+    monkeypatch, ignored
+):
+    """`wait=False` never reads timeout_seconds, so the clamp must not reject it.
+
+    The submit runs on its own fixed 60s budget; hardening the waiting path must
+    not turn a working fire-and-return call into an error.
+    """
+    seen: dict = {}
+
+    def fake_run_comfy(*args, timeout=None):
+        seen["timeout"] = timeout
+        return {"prompt_id": "p1"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
+
+    result = asyncio.run(
+        server.run_workflow("wf.json", wait=False, timeout_seconds=ignored)
+    )
+
+    assert result == {"prompt_id": "p1"}
     assert seen["timeout"] == 60.0
 
 
