@@ -65,10 +65,25 @@ jobs:
           code=true
           if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
             merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-            if [ -n "$merge_base" ] && changed=$(git diff --name-only "$merge_base" "$HEAD_SHA"); then
+            # --no-renames is load-bearing, not tidiness. With rename detection
+            # on (the default) `--name-only` prints ONLY a rename's destination,
+            # so `git mv src/mod.py doc.md` lists just `doc.md` and the deleted
+            # .py disappears from the list — a pure code move would read as
+            # docs-only and skip the suite. Listing both endpoints keeps it code.
+            if [ -n "$merge_base" ] && changed=$(git diff --no-renames --name-only "$merge_base" "$HEAD_SHA"); then
               if [ -n "$changed" ]; then
+                # Empty output alone is NOT proof of "docs-only": grep prints
+                # nothing both when no line is selected (exit 1) and when grep
+                # itself fails (exit >= 2, e.g. an I/O error). Treating the
+                # latter as docs-only skips the suite — fail-closed, the one
+                # direction this step must never take. So require BOTH signals
+                # to agree, and let any disagreement fall through to code=true.
+                # (`-q` is deliberately not used here: BSD grep returns 1 from
+                # `grep -q -v` even when a line IS selected, which would report
+                # a green no-op over real code changes on a mixed PR.)
                 non_docs=$(printf '%s\n' "$changed" | grep -v -e '^$' -e '\.md$')
-                if [ -z "$non_docs" ]; then
+                grep_status=$?
+                if [ "$grep_status" -eq 1 ] && [ -z "$non_docs" ]; then
                   code=false
                 fi
               fi
