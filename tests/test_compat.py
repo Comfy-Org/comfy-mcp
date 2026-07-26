@@ -463,8 +463,8 @@ def test_server_info_freshness_relayed_phrase_is_not_unsupported(
     quotes a nested tool's own "no such command" (a git/pip call, a custom-node
     pack's install script, a relayed registry response). Classifying that as
     `unsupported` would tell the agent to skip staleness advice and reassure the
-    user that nothing is broken — masking a genuine failure. The envelope's
-    structured `error.code` proves the verb ran, so it must pass through.
+    user that nothing is broken — masking a genuine failure. The presence of an
+    envelope at all proves the verb ran, so it must pass through.
     """
     import json
 
@@ -486,6 +486,81 @@ def test_server_info_freshness_relayed_phrase_is_not_unsupported(
     assert "unsupported" not in result["freshness"]
     assert "pack_probe_failed" in result["freshness"]["error"]
     assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_codeless_envelope_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """An error envelope that OMITS `error.code` still proves the verb ran.
+
+    A null `code` is not evidence of a missing verb — `_unwrap_envelope` leaves
+    it `None` whenever an otherwise well-formed error envelope has no `code`
+    field. Gating on `code is None` would misread this genuine failure as the
+    benign capability gap; `no_envelope` is the signal that actually holds.
+    """
+    import json
+
+    codeless_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {"message": "No such command 'outdated' in the pack's hook script"},
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (1, json.dumps(codeless_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "hook script" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_hyphenated_command_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """`No such command 'outdated-notifier'` is a DIFFERENT command, not our verb.
+
+    A trailing `\\b` would treat the hyphen as a word boundary and match the
+    `outdated` prefix, discarding a real diagnostic about some other command.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: No such command 'outdated-notifier'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "outdated-notifier" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_survives_ansi_colour(
+    patched_env_then_outdated,
+):
+    """Colourized rich output still degrades cleanly.
+
+    Rich styles its error panel with ANSI escapes, whose bytes include word
+    characters (digits, `m`). Left in place they land between the matched words
+    and defeat the pattern, leaking the raw usage dump.
+    """
+    import json
+
+    coloured = (
+        "\x1b[31mError\x1b[0m: \x1b[1mNo such\x1b[0m \x1b[1mcommand\x1b[0m "
+        "\x1b[33m'outdated'\x1b[0m."
+    )
+    patched_env_then_outdated([(0, json.dumps(_ENV_ENVELOPE), ""), (2, "", coloured)])
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
 
 
 def test_server_info_freshness_unknown_other_verb_is_not_unsupported(

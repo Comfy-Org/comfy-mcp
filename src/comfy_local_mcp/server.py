@@ -504,11 +504,24 @@ class ComfyCliError(RuntimeError):
     itself (missing binary, timeout, no-JSON output), so callers can branch on a
     specific code without string-matching the message — e.g. ``get_logs``
     swallows ``no_log_file`` but re-raises the rest.
+
+    ``no_envelope`` is the stronger, unambiguous provenance signal: ``True`` only
+    when comfy-cli ran to completion and emitted NO envelope at all. A null
+    ``code`` does NOT imply that — a well-formed error envelope may simply omit
+    ``error.code`` — so a caller asking "did comfy-cli fail *before* it could
+    report structurally?" must check this flag rather than ``code is None``.
+    :func:`_is_missing_verb_error` is exactly that caller.
     """
 
-    def __init__(self, *args: object, code: str | None = None) -> None:
+    def __init__(
+        self,
+        *args: object,
+        code: str | None = None,
+        no_envelope: bool = False,
+    ) -> None:
         super().__init__(*args)
         self.code = code
+        self.no_envelope = no_envelope
 
 
 def _comfy_bin_candidates() -> list[str]:
@@ -1015,11 +1028,13 @@ def _unwrap_envelope(
             raise ComfyCliError(
                 f"comfy-cli could not run (exit {returncode}).\n\n"
                 f"{_tcc_guidance(_tcc_path_from(stderr))}\n\n"
-                f"Original error: {_tail(stderr)}"
+                f"Original error: {_tail(stderr)}",
+                no_envelope=True,
             )
         raise ComfyCliError(
             f"comfy-cli returned no JSON (exit {returncode}). "
-            f"stderr: {stderr.strip()[:500]}"
+            f"stderr: {stderr.strip()[:500]}",
+            no_envelope=True,
         )
     # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
     # Absent schema -> assume compatible (older comfy-cli); declared-but-unparseable
@@ -1524,14 +1539,22 @@ def _check_comfy_cli_version() -> dict:
     return report
 
 
-# Click/Typer's "No such command '<verb>'." usage error, made robust to the two
-# ways that text arrives mangled. `\s+` between the words (not a literal space)
+# Click/Typer's "No such command '<verb>'." usage error, made robust to the ways
+# that text arrives mangled. `\s+` between the words (not a literal space)
 # because rich renders Typer errors inside a bordered panel and wraps them at the
 # terminal width, so a newline can land mid-phrase; the box-drawing characters
-# that wrapping introduces are stripped by `_normalize_cli_text` first. The verb
-# must follow within a few non-word characters (the quotes/colon/period around
-# it) — see `_is_missing_verb_error`.
-_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{0,8}}{verb}\b"
+# and ANSI colour codes that wrapping and styling introduce are stripped by
+# `_normalize_cli_text` first. The verb follows within a few non-word characters
+# (the quotes/colon/period around it) and must END there: `\b` would treat the
+# hyphen in a DIFFERENT command like `outdated-notifier` as a word boundary and
+# match it, so `(?![\w-])` requires a real delimiter. See
+# `_is_missing_verb_error`.
+_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{0,8}}{verb}(?![\w-])"
+
+# A CSI escape sequence (`\x1b[...m` and friends). Rich colourizes its error
+# panels, and those codes contain word characters (digits, `m`), so leaving them
+# in would let styling land between the matched words and defeat the pattern.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 # Whitespace, the Unicode Box Drawing block (U+2500-U+257F), and ASCII `|` —
 # i.e. every character rich can use to frame and wrap an error panel.
@@ -1539,15 +1562,16 @@ _PANEL_NOISE_RE = re.compile(r"[\s─-╿|]+")
 
 
 def _normalize_cli_text(text: str) -> str:
-    """Lowercased text with panel borders and wrapping collapsed to single spaces.
+    """Lowercased text with ANSI, panel borders, and wrapping folded away.
 
     Typer renders errors inside a rich panel when rich is installed, so the raw
-    stderr of a usage error can read ``"│ No such command\\n│ 'outdated'. │"``.
-    Folding the border glyphs and any run of whitespace into one space puts that
-    back on a single line, so a phrase match cannot be defeated by the terminal
-    width the child happened to render at.
+    stderr of a usage error can read ``"│ No such command\\n│ 'outdated'. │"``,
+    optionally colourized. Dropping the escape sequences and folding the border
+    glyphs and any run of whitespace into one space puts that back on a single
+    plain line, so a phrase match cannot be defeated by the terminal width the
+    child happened to render at, or by whether it decided to emit colour.
     """
-    return _PANEL_NOISE_RE.sub(" ", text).strip().lower()
+    return _PANEL_NOISE_RE.sub(" ", _ANSI_RE.sub("", text)).strip().lower()
 
 
 def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
@@ -1557,22 +1581,26 @@ def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
     NOTHING is broken: a false positive here silently buries a real failure.
     Two independent conditions must both hold.
 
-    ``exc.code is None`` — an error envelope carries a structured ``error.code``
-    (see :class:`ComfyCliError`), and an envelope means comfy-cli *recognized*
-    the verb, ran it, and reported why it failed. A missing verb never gets that
-    far: Click aborts with a usage error and exit 2 before any envelope is
-    emitted, so the failure can only reach us via the wrapper-raised "returned
-    no JSON" path, where ``code`` is ``None``. This is what stops a relayed
+    ``exc.no_envelope`` — comfy-cli emitted no envelope at all. An envelope, even
+    a codeless one, means comfy-cli *recognized* the verb, ran it, and reported
+    why it failed. A missing verb never gets that far: Click aborts with a usage
+    error before any envelope is emitted, so the failure can only reach us via
+    the wrapper-raised "returned no JSON" path. This is what stops a relayed
     nested error — a git/pip call, a custom-node pack name, a registry response
     that happens to contain "no such command" — from being mistaken for the verb
-    itself being absent.
+    itself being absent. Note this is checked instead of ``exc.code is None``,
+    which looks equivalent but is not: an error envelope that merely omits
+    ``error.code`` also yields a null code, and gating on that would let exactly
+    the relayed-message case above through.
 
     The phrase must also name ``verb`` itself, within a few punctuation
-    characters (Click writes ``No such command 'outdated'.``). Matching the bare
-    phrase anywhere in the message would fold in the same relayed stderr the
-    first condition exists to exclude.
+    characters (Click writes ``No such command 'outdated'.``) and ending at a
+    real delimiter, so a different command that merely starts with the same
+    letters — ``outdated-notifier`` — does not match. Matching the bare phrase
+    anywhere in the message would fold in the same relayed stderr the first
+    condition exists to exclude.
     """
-    if exc.code is not None:
+    if not exc.no_envelope:
         return False
     pattern = _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape(verb))
     normalized = _normalize_cli_text(str(exc))
