@@ -28,10 +28,45 @@ def test_search_nodes_argv(patched_run):
     ]
 
 
+@pytest.mark.parametrize("query", ["--help", "-x"])
+def test_search_nodes_rejects_leading_dash_query(patched_run, query):
+    """The query is a bare positional — a leading dash would reach comfy-cli as a flag."""
+    calls = patched_run(envelope(data=[]))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.search_nodes(query)
+    # refused before the spawn, not after
+    assert calls == []
+
+
+def test_search_nodes_rejects_embedded_nul_query(patched_run):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data=[]))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.search_nodes("samp\0ler")
+    assert calls == []
+
+
 def test_get_node_argv(patched_run):
     calls = patched_run(envelope(data={"name": "KSampler", "inputs": {}}))
     assert server.get_node("KSampler") == {"name": "KSampler", "inputs": {}}
     assert calls[0]["cmd"][4:] == ["nodes", "show", "KSampler"]
+
+
+@pytest.mark.parametrize("name", ["--help", "-x"])
+def test_get_node_rejects_leading_dash_name(patched_run, name):
+    """The class name is a bare positional — a leading dash is read as an option."""
+    calls = patched_run(envelope(data={}))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.get_node(name)
+    assert calls == []
+
+
+def test_get_node_rejects_embedded_nul_name(patched_run):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data={}))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.get_node("KSam\0pler")
+    assert calls == []
 
 
 def test_list_nodes_no_filters_bare_ls(patched_run):
@@ -171,6 +206,43 @@ def test_search_models_query_takes_precedence_over_folder(patched_run):
     calls = patched_run(envelope(data=[]))
     server.search_models(query="xl", folder="checkpoints")
     assert calls[0]["cmd"][4:] == ["models", "search", "--text", "xl"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"query": "--help"}, {"query": "-x"}, {"folder": "--pack"}, {"folder": "-c"}],
+    ids=lambda kw: f"{next(iter(kw))}-{next(iter(kw.values()))}",
+)
+def test_search_models_rejects_leading_dash(patched_run, kwargs):
+    """`folder` is a bare positional; the `--text` value is guarded for hygiene."""
+    calls = patched_run(envelope(data=[]))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.search_models(**kwargs)
+    # refused before the spawn, not after
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"query": "x\0l"}, {"folder": "check\0points"}],
+    ids=lambda kw: next(iter(kw)),
+)
+def test_search_models_rejects_embedded_nul(patched_run, kwargs):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data=[]))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.search_models(**kwargs)
+    assert calls == []
+
+
+def test_search_models_empty_values_still_select_the_mode(patched_run):
+    """Empty stays the 'mode not selected' signal — the guards must not reject it."""
+    calls = patched_run(envelope(data=["checkpoints"]))
+    # empty query falls through to the folder mode, empty folder to list-folders
+    server.search_models(query="", folder="checkpoints")
+    server.search_models(query="", folder="")
+    assert calls[0]["cmd"][4:] == ["models", "list-folder", "checkpoints"]
+    assert calls[1]["cmd"][4:] == ["models", "list-folders"]
 
 
 def test_discovery_surfaces_error_envelope(patched_run):

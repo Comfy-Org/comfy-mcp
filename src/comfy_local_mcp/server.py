@@ -3923,6 +3923,13 @@ def get_template(name: str) -> Any:
     fetching it, then ``fetch_template(name, out_path)`` writes the runnable JSON
     for ``run_workflow``.
     """
+    # `name` rides as a bare positional, so a leading dash reaches comfy-cli as
+    # an option rather than the template — the same guard `run_template` already
+    # applies to the same value.
+    _reject_option_like(
+        "template name", name, expected="a template name (e.g. 'flux_dev')"
+    )
+    _reject_nul("template name", name)
     return _run_comfy("templates", "show", name, timeout=60.0)
 
 
@@ -3942,6 +3949,16 @@ def fetch_template(name: str, out_path: str) -> str:
 
     so an agent reaches a working generation without hand-authoring workflow JSON.
     """
+    # `name` is a bare positional (mandatory guard); `out_path` rides as the
+    # `--out` value, where the leading-dash check is input hygiene rather than
+    # injection defense — a file named `-x` is a caller mistake, not a flag.
+    # See `_reject_option_like` for why the two cases differ.
+    _reject_option_like(
+        "template name", name, expected="a template name (e.g. 'flux_dev')"
+    )
+    _reject_nul("template name", name)
+    _reject_option_like("out_path", out_path)
+    _reject_nul("out_path", out_path)
     _run_comfy("templates", "fetch", name, "--out", out_path, timeout=60.0)
     return os.path.abspath(out_path)
 
@@ -3956,6 +3973,10 @@ def search_nodes(query: str) -> Any:
     "KSampler", "load image") before authoring or repairing a workflow graph;
     pass the returned name to ``get_node`` for its full schema.
     """
+    # `query` rides as a bare positional: a leading dash is read by comfy-cli as
+    # an option, not the search term.
+    _reject_option_like("query", query)
+    _reject_nul("query", query)
     return _run_comfy("nodes", "search", query, timeout=60.0)
 
 
@@ -3969,6 +3990,10 @@ def get_node(name: str) -> Any:
     repair a workflow graph. Reflects the user's live install, so it resolves
     custom-node classes too (not just built-ins).
     """
+    # `name` rides as a bare positional: a leading dash is read by comfy-cli as
+    # an option, not the class name.
+    _reject_option_like("node name", name, expected="a node class (e.g. 'KSampler')")
+    _reject_nul("node name", name)
     return _run_comfy("nodes", "show", name, timeout=60.0)
 
 
@@ -4107,9 +4132,22 @@ def search_models(query: str = "", folder: str = "") -> Any:
     download metadata). Agents should set expectations accordingly: it answers
     "which model files does this install have?", not "tell me about this model".
     """
+    # Both guards sit INSIDE their branch so an empty value keeps meaning "mode
+    # not selected" (the precedence above) rather than becoming an error.
     if query:
+        # `--text` value: the leading-dash check is input hygiene (Click reads
+        # the token after a value-taking option verbatim), the NUL check is not
+        # optional — see `_reject_option_like` / `_reject_nul`.
+        _reject_option_like("query", query)
+        _reject_nul("query", query)
         return _run_comfy("models", "search", "--text", query, timeout=60.0)
     if folder:
+        # `folder` rides as a bare positional, so its leading-dash guard is the
+        # mandatory kind.
+        _reject_option_like(
+            "folder", folder, expected="a model folder (e.g. 'checkpoints')"
+        )
+        _reject_nul("folder", folder)
         return _run_comfy("models", "list-folder", folder, timeout=60.0)
     return _run_comfy("models", "list-folders", timeout=60.0)
 

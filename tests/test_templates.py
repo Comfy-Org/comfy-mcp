@@ -294,6 +294,24 @@ def test_get_template_argv(patched_run):
     assert calls[0]["cmd"][4:] == ["templates", "show", "flux_dev"]
 
 
+@pytest.mark.parametrize("name", ["--help", "-x"])
+def test_get_template_rejects_leading_dash_name(patched_run, name):
+    """The name is a bare positional — a leading dash reaches comfy-cli as an option."""
+    calls = patched_run(envelope(data={}))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.get_template(name)
+    # refused before the spawn, not after
+    assert calls == []
+
+
+def test_get_template_rejects_embedded_nul_name(patched_run):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data={}))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.get_template("flux\0dev")
+    assert calls == []
+
+
 def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
     """Passthrough argv is `templates fetch <name> --out <path>`; returns the abs path."""
     calls = patched_run(envelope(data=None))
@@ -312,3 +330,30 @@ def test_fetch_template_resolves_relative_path(monkeypatch):
     result = server.fetch_template("flux_dev", "flux.json")
     assert result == os.path.abspath("flux.json")
     assert os.path.isabs(result)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("--help", "/tmp/out.json"), ("-x", "/tmp/out.json"), ("flux_dev", "--out")],
+    ids=["name-long", "name-short", "out_path"],
+)
+def test_fetch_template_rejects_leading_dash(patched_run, args):
+    """`name` is a bare positional; the `--out` value is guarded for hygiene too."""
+    calls = patched_run(envelope(data=None))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.fetch_template(*args)
+    # refused before the spawn — and before any file is written
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("flux\0dev", "/tmp/out.json"), ("flux_dev", "/tmp/o\0ut.json")],
+    ids=["name", "out_path"],
+)
+def test_fetch_template_rejects_embedded_nul(patched_run, args):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data=None))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.fetch_template(*args)
+    assert calls == []
