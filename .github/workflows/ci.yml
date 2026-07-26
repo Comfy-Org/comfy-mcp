@@ -1,9 +1,23 @@
 name: CI
 
+# `test (py3.10)` / `test (py3.14)` are REQUIRED status contexts on main, and a
+# workflow that never runs never reports one — branch protection then shows
+# "Expected — Waiting for status to be reported" forever with nothing in flight,
+# and the PR blocks permanently.
+#
+# So there is DELIBERATELY no `paths` / `paths-ignore` filter on `pull_request`:
+# the workflow always triggers, and whether the Python suite is worth running is
+# decided INSIDE the test job (see "Detect non-docs changes"). The required
+# contexts are therefore reported on every PR, for every combination of paths.
+# Do not reintroduce a path filter on the `pull_request` trigger. The previous
+# design split this across ci.yml + ci-docs-only.yml with complementary path
+# filters, which stayed correct only as long as those two filters partitioned
+# every possible changed-file set.
+#
+# The `push` filter below is safe to keep — no context is required on main, so
+# skipping docs-only pushes there costs nothing.
 on:
   pull_request:
-    paths-ignore:
-      - '**/*.md'
   push:
     branches: [main]
     paths-ignore:
@@ -30,16 +44,67 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # Full history so the merge base with the PR's base branch is present.
+          fetch-depth: 0
           persist-credentials: false
+
+      # Decides whether this run does real work. Every branch of this step FAILS
+      # OPEN (`code=true`, run the suite): a determination we cannot make
+      # confidently must never silently downgrade the gate to a no-op. The steps
+      # below are gated on `!= 'false'` rather than `== 'true'` for the same
+      # reason — a missing/empty output runs the suite instead of reporting a
+      # green no-op over unrun code.
+      - name: Detect non-docs changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          code=true
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            if [ -n "$merge_base" ] && changed=$(git diff --name-only "$merge_base" "$HEAD_SHA"); then
+              if [ -n "$changed" ]; then
+                non_docs=$(printf '%s\n' "$changed" | grep -v -e '^$' -e '\.md$')
+                if [ -z "$non_docs" ]; then
+                  code=false
+                fi
+              fi
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "non-docs files changed: $code"
+
+      - name: Docs-only change — Python suite skipped
+        if: steps.filter.outputs.code == 'false'
+        run: |
+          echo "Only Markdown files changed — nothing for ruff or pytest to check."
+          {
+            echo "Only Markdown files changed — nothing for ruff or pytest to check."
+            echo ""
+            echo "This job still reports the required \`test (py${{ matrix.python-version }})\` context."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: steps.filter.outputs.code != 'false'
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+
       - name: Install
+        if: steps.filter.outputs.code != 'false'
         run: pip install -e '.[dev]'
+
       - name: Lint (ruff)
+        if: steps.filter.outputs.code != 'false'
         run: ruff check .
+
       - name: Format check (ruff)
+        if: steps.filter.outputs.code != 'false'
         run: ruff format --check .
+
       - name: Tests
+        if: steps.filter.outputs.code != 'false'
         run: pytest -q
