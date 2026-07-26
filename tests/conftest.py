@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 
 import pytest
 
@@ -69,6 +70,29 @@ def _clear_comfyui_target_env(monkeypatch):
     """
     for var in ("COMFYUI_URL", "COMFYUI_HOST", "COMFYUI_PORT"):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_failure_log(monkeypatch):
+    """Default every test to the opt-in failure log being OFF, and never leak it.
+
+    ``server._FAILURE_LOG_PATH`` is resolved from ``COMFY_LOCAL_MCP_DEBUG_LOG`` at
+    import, so a developer who has the var exported would otherwise have the whole
+    suite writing real records into their app-support directory — and the
+    "disabled by default" tests would fail for an environmental reason. Pin it off
+    here (`test_failure_log.py` enables it explicitly per test).
+
+    The teardown closes any handler a test opened, so no test leaves a file handle
+    on a ``tmp_path`` that pytest is about to remove, and no record written by one
+    test can land in the next one's log.
+    """
+    monkeypatch.setattr(server, "_FAILURE_LOG_PATH", None)
+    monkeypatch.setattr(server, "_failure_handler_path", None)
+    yield
+    logger = logging.getLogger(server._FAILURE_LOGGER_NAME)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
 
 @pytest.fixture(autouse=True)
