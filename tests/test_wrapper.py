@@ -544,6 +544,27 @@ def test_upload_file_omits_overwrite_by_default(patched_run):
     assert "--overwrite" not in calls[0]["cmd"]
 
 
+def test_upload_file_rejects_option_like_path():
+    """A leading-dash path is refused: splatted in, it would BE the flag."""
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.upload_file(["--overwrite"])
+
+
+def test_upload_file_rejects_option_like_path_among_valid_ones():
+    """The guard scans every path, not just the first (argument injection)."""
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.upload_file(["/tmp/a.png", "--overwrite"])
+
+
+def test_upload_file_rejects_embedded_nul_path():
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.upload_file(["/tmp/a\0.png"])
+
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.upload_file(["/tmp/a.png", "/tmp/b\0.png"])
+
+
 def test_download_model_url_only(patched_run):
     """download_model wraps the SINGULAR `model download --url` and returns data."""
     calls = patched_run(
@@ -653,19 +674,42 @@ def test_download_model_rejects_non_http_scheme(bad_url):
 
 
 @pytest.mark.parametrize(
-    "bad_path", ["../../etc", "models/../../etc", "/abs/models", "..\\..\\etc"]
+    "bad_path",
+    ["../../etc", "models/../../etc", "/abs/models", "..\\..\\etc", "C:evil"],
 )
 def test_download_model_rejects_traversal_relative_path(bad_path):
-    """relative_path must stay within the models dir: no `..` or absolute paths."""
+    """relative_path must stay within the models dir: no `..`, absolute paths,
+    or a drive prefix (``C:evil`` has no separator but is drive-relative on
+    Windows)."""
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
 
 
-@pytest.mark.parametrize("bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b"])
+@pytest.mark.parametrize(
+    "bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b", "C:evil.dll"]
+)
 def test_download_model_rejects_pathy_filename(bad_name):
-    """filename must be a bare name: no separators or `..` to escape the dir."""
+    """filename must be a bare name: no separators, `..`, or a drive prefix to
+    escape the dir (``C:evil.dll`` has no separator but is drive-relative on
+    Windows)."""
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+
+def test_download_model_rejects_embedded_nul_url():
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.download_model("https://hf.co/x\0.safetensors")
+
+
+def test_download_model_rejects_embedded_nul_relative_path():
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.download_model("https://hf.co/x.safetensors", relative_path="models/\0")
+
+
+def test_download_model_rejects_embedded_nul_filename():
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.download_model("https://hf.co/x.safetensors", filename="x\0.safetensors")
 
 
 def test_download_model_omits_empty_string_optionals(patched_run):
@@ -1933,6 +1977,12 @@ def test_watch_job_rejects_an_unusable_prompt_id(bad_id):
     """watch_job shares the family guard: no dash-led, empty, or NUL-bearing id."""
     with pytest.raises(server.ComfyCliError, match="prompt_id"):
         asyncio.run(server.watch_job(bad_id))
+
+
+def test_watch_job_rejects_embedded_nul_prompt_id():
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        asyncio.run(server.watch_job("pid\0"))
 
 
 def test_watch_job_clamps_oversized_timeout(monkeypatch):

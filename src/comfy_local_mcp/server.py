@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import logging
 import math
 import os
 import re
@@ -228,6 +229,36 @@ def _reject_nul(label: str, value: str) -> str:
             f"invalid {label}: embedded NUL character — a command argument "
             "cannot contain one."
         )
+    return value
+
+
+def _reject_option_like(label: str, value: str, expected: str = "") -> str:
+    """Reject a leading-dash value comfy-cli would parse as an option, not data.
+
+    Two different jobs share this helper, and the distinction is worth keeping
+    straight when adding a call site:
+
+    - **A bare POSITIONAL is an argument-injection vector.** A leading-dash entry
+      IS read as a flag, and every later positional shifts up one slot — how
+      ``upload_file(paths=["--overwrite"])`` becomes the overwrite flag, and how a
+      dash-leading ``workflow_path`` would let the first ``set-slot`` override land
+      in the path slot. Guarding these is mandatory.
+    - **An option VALUE (``--flag VALUE``) is NOT.** comfy-cli is Click-backed, and
+      Click takes the token after a value-taking option verbatim — even one that is
+      itself a valid option name (``--out-dir --slot`` parses as
+      ``out_dir="--slot"``, not as a missing value). So ``vary_workflow``'s
+      ``slots`` / ``out_dir`` need no guard to be injection-safe.
+
+    Where a call site guards an option value anyway (``search_templates``'s
+    filters, ``download_model``'s ``relative_path`` / ``filename``), that is input
+    hygiene rather than injection defense: a dash-leading provider filter or output
+    filename is a caller mistake, and a named error beats comfy-cli matching zero
+    rows or writing a file named ``-x``. Read those as belt-and-braces, not as
+    evidence that option values are unsafe.
+    """
+    if value.startswith("-"):
+        hint = f" — expected {expected}" if expected else ""
+        raise ComfyCliError(f"invalid {label}: {value!r} (leading '-'){hint}")
     return value
 
 
@@ -2122,14 +2153,21 @@ async def generate_image(
     ``_run_comfy``), so there is no cloud reachability here.
     """
     template, prompt_slot, checkpoint_slot = _t2i_config()
-    if not template or template.startswith("-"):
-        # A leading-dash name is read by comfy-cli as an option, not the template
-        # positional. Only reachable via a malformed COMFY_T2I_TEMPLATE, but a
-        # named error beats comfy-cli's "No such option".
+    if not template:
+        # Defensive: `_t2i_config` already falls back to the built-in template on
+        # an empty env value, so an empty name should be unreachable from here.
         raise ComfyCliError(
             f"invalid COMFY_T2I_TEMPLATE: {template!r} — expected a gallery "
-            "template name (e.g. 'default'), not an empty or option-like value."
+            "template name (e.g. 'default'), not an empty value."
         )
+    # A leading-dash name is read by comfy-cli as an option, not the template
+    # positional. Only reachable via a malformed COMFY_T2I_TEMPLATE, but a
+    # named error beats comfy-cli's "No such option".
+    _reject_option_like(
+        "COMFY_T2I_TEMPLATE",
+        template,
+        expected="a gallery template name (e.g. 'default')",
+    )
     _reject_nul("template name", template)
     # The free-form prompt rides inside a single `--param=KEY=VALUE` token, so a
     # prompt that begins with `-` (or contains `=`) is carried as the value
@@ -2709,13 +2747,16 @@ async def partner_generate(
     exit is the success signal and the payload carries the printed text. A
     non-zero exit — including the consent refusal — still raises.
     """
-    if not model or model.startswith("-"):
-        # A leading-dash target is read by comfy-cli as an option rather than a
-        # model (the same guard watch_job applies to prompt_id).
+    if not model:
         raise ComfyCliError(
             f"invalid model: {model!r} — expected a partner model alias "
-            "(e.g. 'flux-pro'), not an empty or option-like value."
+            "(e.g. 'flux-pro'), not an empty value."
         )
+    # A leading-dash target is read by comfy-cli as an option rather than a
+    # model (the same guard watch_job applies to prompt_id).
+    _reject_option_like(
+        "model", model, expected="a partner model alias (e.g. 'flux-pro')"
+    )
     if model in _GENERATE_RESERVED_TARGETS:
         raise ComfyCliError(
             f"invalid model: {model!r} is a `comfy generate` sub-action, not a "
@@ -3040,13 +3081,16 @@ async def run_template(
     error (see ``search_models`` / ``download_model``). Everything targets the
     LOCAL server (``--where local`` is injected by ``_run_comfy``).
     """
-    if not name or name.startswith("-"):
-        # A leading-dash name is read by comfy-cli as an option, not the template
-        # positional (the same guard partner_generate applies to its model).
+    if not name:
         raise ComfyCliError(
             f"invalid template name: {name!r} — expected a template name "
-            "(e.g. 'image_flux2'), not an empty or option-like value."
+            "(e.g. 'image_flux2'), not an empty value."
         )
+    # A leading-dash name is read by comfy-cli as an option, not the template
+    # positional (the same guard partner_generate applies to its model).
+    _reject_option_like(
+        "template name", name, expected="a template name (e.g. 'image_flux2')"
+    )
     _reject_nul("template name", name)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
     # argv + the engine deadline are built by the shared helper (see
@@ -3818,11 +3862,11 @@ def search_templates(
         ("--provider", provider),
     ):
         if value:
-            if value.startswith("-"):
-                # comfy-cli parses a leading-dash value as an option/flag; reject
-                # it rather than let `templates ls` misread the filter (argument
-                # injection).
-                raise ComfyCliError(f"invalid {flag} value: {value!r} (leading '-')")
+            # comfy-cli parses a leading-dash value as an option/flag; reject it
+            # rather than let `templates ls` misread the filter (argument
+            # injection).
+            _reject_option_like(f"{flag} value", value)
+            _reject_nul(f"{flag} value", value)
             args += [flag, value]
     data = _run_comfy(*args, timeout=60.0)
 
@@ -4100,8 +4144,8 @@ def download_model(
     """
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
-    if url.startswith("-"):
-        raise ComfyCliError(f"invalid url: {url!r} (leading '-')")
+    _reject_option_like("url", url)
+    _reject_nul("url", url)
     # Restrict to http(s): this is a remote fetch of a known model URL, so a
     # `file://` path or other scheme — an SSRF / local-file-read primitive whose
     # body would be written straight into the models dir — is never legitimate.
@@ -4110,23 +4154,30 @@ def download_model(
     # Optional args are treated as unset when falsy (None or ""), so an explicit
     # empty string is omitted rather than forwarded as `--relative-path ""`.
     if relative_path:
-        if relative_path.startswith("-"):
-            raise ComfyCliError(
-                f"invalid relative_path: {relative_path!r} (leading '-')"
-            )
+        _reject_option_like("relative_path", relative_path)
+        _reject_nul("relative_path", relative_path)
         # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
-        # write inside the models dir by rejecting absolute paths and `..`.
+        # write inside the models dir by rejecting absolute paths, `..`, and a
+        # Windows drive prefix (`C:evil` has no separator but is drive-relative
+        # on that platform, same escape as the bare `filename` case below).
         parts = relative_path.replace("\\", "/").split("/")
-        if os.path.isabs(relative_path) or ".." in parts:
+        if os.path.isabs(relative_path) or ".." in parts or ":" in relative_path:
             raise ComfyCliError(
                 f"invalid relative_path: {relative_path!r} (path traversal)"
             )
     if filename:
-        if filename.startswith("-"):
-            raise ComfyCliError(f"invalid filename: {filename!r} (leading '-')")
-        # filename is a single output name, not a path; reject separators and `..`
-        # so it can't redirect the write out of the target directory.
-        if filename in (".", "..") or "/" in filename or "\\" in filename:
+        _reject_option_like("filename", filename)
+        _reject_nul("filename", filename)
+        # filename is a single output name, not a path; reject separators, `..`,
+        # and `:` (a Windows drive prefix like `C:evil.dll` has no separator but
+        # still escapes the models dir via `os.path.join` on that platform) so it
+        # can't redirect the write out of the target directory.
+        if (
+            filename in (".", "..")
+            or "/" in filename
+            or "\\" in filename
+            or ":" in filename
+        ):
             raise ComfyCliError(
                 f"invalid filename: {filename!r} (must be a bare filename)"
             )
@@ -4153,6 +4204,19 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     ``overwrite=True`` to replace files that already exist in the input dir
     (otherwise comfy-cli skips or errors on collisions).
     """
+    # Each path is splatted in as a positional, so a leading-dash entry is read
+    # by comfy-cli as a flag instead — `paths=["--overwrite"]` would silently
+    # become the overwrite flag rather than a (failing) upload. NUL is orthogonal
+    # to that (it is refused wherever it rides, positional or not): `subprocess`
+    # raises a bare `ValueError` on one, which would escape as an internal error
+    # instead of the `ComfyCliError` every other bad input produces.
+    for p in paths:
+        _reject_option_like(
+            "upload path",
+            p,
+            expected="a file path (prefix a dash-leading name with './')",
+        )
+        _reject_nul("upload path", p)
     args = ["upload", *paths]
     if overwrite:
         args.append("--overwrite")
@@ -4205,6 +4269,17 @@ def list_workflow_slots(workflow_path: str) -> Any:
     ``run_workflow`` accepts. Pass a slot's ``ADDR`` back to ``set_workflow_slot``
     (or ``vary_workflow``) to change it.
     """
+    # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
+    # as a flag rather than the path comfy-cli is meant to read.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
+    _reject_nul("workflow_path", workflow_path)
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
 
 
@@ -4229,6 +4304,28 @@ def set_workflow_slot(
         modified = set_workflow_slot(path, ["6.text=a red bicycle", "3.seed=42"])
         # write `modified` to disk (or call with stdout=False), then run_workflow
     """
+    # `workflow_path` and each override are splatted in as bare positionals, so
+    # a leading-dash entry is read by comfy-cli as a flag — e.g. `"--stdout"`
+    # would flip the non-destructive/in-place behavior this tool's `stdout`
+    # argument owns. Guarding only the overrides would leave the path as an
+    # equivalent way in: consumed as a flag, it shifts the first override into
+    # the path slot.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
+    _reject_nul("workflow_path", workflow_path)
+    for o in overrides:
+        _reject_option_like(
+            "override",
+            o,
+            expected="an 'ADDR=VALUE' string (e.g. '6.text=a red bicycle')",
+        )
+        _reject_nul("override", o)
     args = ["workflow", "set-slot", workflow_path, *overrides]
     if stdout:
         args.append("--stdout")
@@ -4253,10 +4350,28 @@ def vary_workflow(
     forward ``--out-dir``). Run each variant with ``run_workflow`` to sweep a
     parameter grid.
     """
+    # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
+    # as a flag rather than the path. `slots` and `out_dir` ride behind `--slot`
+    # / `--out-dir` as option VALUES, which Click takes verbatim, so they are
+    # injection-safe unguarded; see `_reject_option_like` for why the two cases
+    # differ.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
+    _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
     for slot in slots:
+        # NUL is refused even though the leading-dash guard is not needed here:
+        # the two checks answer different questions (see `_reject_option_like`).
+        _reject_nul("slot", slot)
         args += ["--slot", slot]
     if out_dir:
+        _reject_nul("out_dir", out_dir)
         args += ["--out-dir", out_dir]
     return _run_comfy(*args, timeout=120.0)
 
