@@ -21,7 +21,7 @@ import subprocess
 
 import pytest
 
-from comfy_local_mcp import server
+from comfy_local_mcp import server, tcc
 
 # The child's stderr when its venv sits in a TCC-protected folder.
 _DENIED_PATH = os.path.join(
@@ -39,12 +39,12 @@ _FATAL_STDERR = (
 @pytest.fixture
 def on_macos(monkeypatch):
     """Run the body as if on macOS (the diagnostics are macOS-only by design)."""
-    monkeypatch.setattr(server.sys, "platform", "darwin")
+    monkeypatch.setattr(tcc.sys, "platform", "darwin")
 
 
 @pytest.fixture
 def on_linux(monkeypatch):
-    monkeypatch.setattr(server.sys, "platform", "linux")
+    monkeypatch.setattr(tcc.sys, "platform", "linux")
 
 
 def _assert_actionable(message: str) -> None:
@@ -60,39 +60,39 @@ def _assert_actionable(message: str) -> None:
 @pytest.mark.parametrize("folder", ["Documents", "Desktop", "Downloads"])
 def test_protected_dir_detects_each_folder(folder):
     path = os.path.join(os.path.expanduser("~"), folder, "ComfyUI", "venv", "bin")
-    assert server._macos_protected_dir(path) == folder
+    assert tcc._macos_protected_dir(path) == folder
 
 
 def test_protected_dir_ignores_unprotected_and_prefix_collisions():
     home = os.path.expanduser("~")
-    assert server._macos_protected_dir(os.path.join(home, "ComfyUI")) is None
+    assert tcc._macos_protected_dir(os.path.join(home, "ComfyUI")) is None
     # "~/DocumentsArchive" merely starts with "~/Documents" — not the same folder.
-    assert server._macos_protected_dir(os.path.join(home, "DocumentsArchive")) is None
-    assert server._macos_protected_dir("/opt/comfy/venv") is None
-    assert server._macos_protected_dir(None) is None
+    assert tcc._macos_protected_dir(os.path.join(home, "DocumentsArchive")) is None
+    assert tcc._macos_protected_dir("/opt/comfy/venv") is None
+    assert tcc._macos_protected_dir(None) is None
 
 
 def test_protected_dir_matches_case_insensitively():
     """macOS volumes are case-insensitive by default: ~/downloads IS ~/Downloads."""
     path = os.path.join(os.path.expanduser("~"), "downloads", "ComfyUI")
-    assert server._macos_protected_dir(path) == "Downloads"
+    assert tcc._macos_protected_dir(path) == "Downloads"
 
 
 def test_protected_dir_accepts_a_bytes_path():
     """An OSError from a bytes-path syscall carries a bytes `filename`."""
     path = os.path.join(os.path.expanduser("~"), "Documents", "ComfyUI")
-    assert server._macos_protected_dir(os.fsencode(path)) == "Documents"
+    assert tcc._macos_protected_dir(os.fsencode(path)) == "Documents"
 
 
 def test_guidance_names_the_folder_when_the_path_is_known(on_macos):
-    message = server._tcc_guidance(_DENIED_PATH)
+    message = tcc._tcc_guidance(_DENIED_PATH)
     assert "~/Documents" in message
     assert _DENIED_PATH in message
     _assert_actionable(message)
 
 
 def test_guidance_stays_general_without_a_path(on_macos):
-    message = server._tcc_guidance(None)
+    message = tcc._tcc_guidance(None)
     # No location is asserted as fact; all three protected folders are listed.
     for folder in ("~/Documents", "~/Desktop", "~/Downloads"):
         assert folder in message
@@ -100,11 +100,11 @@ def test_guidance_stays_general_without_a_path(on_macos):
 
 
 def test_denial_signature_is_macos_only(on_macos, monkeypatch):
-    assert server._looks_like_tcc_denial(_FATAL_STDERR) is True
-    assert server._looks_like_tcc_denial("connection refused") is False
-    assert server._looks_like_tcc_denial("") is False
-    monkeypatch.setattr(server.sys, "platform", "linux")
-    assert server._looks_like_tcc_denial(_FATAL_STDERR) is False
+    assert tcc._looks_like_tcc_denial(_FATAL_STDERR) is True
+    assert tcc._looks_like_tcc_denial("connection refused") is False
+    assert tcc._looks_like_tcc_denial("") is False
+    monkeypatch.setattr(tcc.sys, "platform", "linux")
+    assert tcc._looks_like_tcc_denial(_FATAL_STDERR) is False
 
 
 def test_denial_survives_a_localized_strerror(on_macos):
@@ -113,14 +113,13 @@ def test_denial_survives_a_localized_strerror(on_macos):
         "Fatal Python error: init_import_site: Failed to import the site module\n"
         f"PermissionError: [Errno 1] Opération non permise: '{_DENIED_PATH}'\n"
     )
-    assert server._looks_like_tcc_denial(localized) is True
+    assert tcc._looks_like_tcc_denial(localized) is True
     # …and the path still resolves, so the message names the folder.
-    assert server._tcc_path_from(localized) == _DENIED_PATH
-    assert "~/Documents" in server._tcc_guidance(server._tcc_path_from(localized))
+    assert tcc._tcc_path_from(localized) == _DENIED_PATH
+    assert "~/Documents" in tcc._tcc_guidance(tcc._tcc_path_from(localized))
     # A different errno must not be swept in by the `[Errno 1]` marker.
     assert (
-        server._looks_like_tcc_denial("PermissionError: [Errno 13] Accès refusé")
-        is False
+        tcc._looks_like_tcc_denial("PermissionError: [Errno 13] Accès refusé") is False
     )
 
 
@@ -131,16 +130,16 @@ def test_eperm_alone_is_not_enough_to_claim_tcc(on_macos):
     path that really is under a protected folder) the original message stands.
     """
     sip = "OSError: [Errno 1] Operation not permitted: '/usr/lib/dyld'"
-    assert server._looks_like_tcc_denial(sip) is False
-    assert server._looks_like_tcc_denial("Operation not permitted") is False
+    assert tcc._looks_like_tcc_denial(sip) is False
+    assert tcc._looks_like_tcc_denial("Operation not permitted") is False
     # …but a denied path inside a protected folder needs no startup marker.
     mid_run = f"OSError: [Errno 1] Operation not permitted: '{_DENIED_PATH}'"
-    assert server._looks_like_tcc_denial(mid_run) is True
+    assert tcc._looks_like_tcc_denial(mid_run) is True
 
 
 def test_denied_path_is_parsed_out_of_the_traceback():
-    assert server._tcc_path_from(_FATAL_STDERR) == _DENIED_PATH
-    assert server._tcc_path_from("no path here") is None
+    assert tcc._tcc_path_from(_FATAL_STDERR) == _DENIED_PATH
+    assert tcc._tcc_path_from("no path here") is None
 
 
 def test_denied_path_is_parsed_when_repr_used_double_quotes(on_macos):
@@ -149,8 +148,8 @@ def test_denied_path_is_parsed_when_repr_used_double_quotes(on_macos):
         os.path.expanduser("~"), "Documents", "Conan's App", "venv", "pyvenv.cfg"
     )
     text = f'PermissionError: [Errno 1] Operation not permitted: "{path}"'
-    assert server._tcc_path_from(text) == path
-    assert server._looks_like_tcc_denial(text) is True
+    assert tcc._tcc_path_from(text) == path
+    assert tcc._looks_like_tcc_denial(text) is True
 
 
 # --- binary resolution -------------------------------------------------------
