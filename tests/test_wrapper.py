@@ -644,10 +644,13 @@ def test_download_model_rejects_non_http_scheme(bad_url):
 
 
 @pytest.mark.parametrize(
-    "bad_path", ["../../etc", "models/../../etc", "/abs/models", "..\\..\\etc"]
+    "bad_path",
+    ["../../etc", "models/../../etc", "/abs/models", "..\\..\\etc", "C:evil"],
 )
 def test_download_model_rejects_traversal_relative_path(bad_path):
-    """relative_path must stay within the models dir: no `..` or absolute paths."""
+    """relative_path must stay within the models dir: no `..`, absolute paths,
+    or a drive prefix (``C:evil`` has no separator but is drive-relative on
+    Windows)."""
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
 

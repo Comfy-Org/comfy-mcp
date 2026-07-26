@@ -4026,9 +4026,11 @@ def download_model(
         _reject_option_like("relative_path", relative_path)
         _reject_nul("relative_path", relative_path)
         # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
-        # write inside the models dir by rejecting absolute paths and `..`.
+        # write inside the models dir by rejecting absolute paths, `..`, and a
+        # Windows drive prefix (`C:evil` has no separator but is drive-relative
+        # on that platform, same escape as the bare `filename` case below).
         parts = relative_path.replace("\\", "/").split("/")
-        if os.path.isabs(relative_path) or ".." in parts:
+        if os.path.isabs(relative_path) or ".." in parts or ":" in relative_path:
             raise ComfyCliError(
                 f"invalid relative_path: {relative_path!r} (path traversal)"
             )
