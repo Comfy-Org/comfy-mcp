@@ -22,49 +22,14 @@ import threading
 import time
 
 import pytest
-from conftest import _OK_STREAM, _FakeProc, _RecordingCtx
+from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope
 
 from comfy_local_mcp import server
 
 
-def _fake_run(envelope: dict):
-    """Return a ``subprocess.run`` stand-in that captures calls and emits ``envelope``.
-
-    Pure factory (no patching): returns ``(fake, calls)``. Tests either patch
-    ``fake`` in themselves or use the ``patched_run`` fixture, which wraps this.
-    """
-    calls: list[dict] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env, "encoding": encoding})
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(envelope), stderr=""
-        )
-
-    return fake, calls
-
-
-@pytest.fixture
-def patched_run(monkeypatch):
-    """Patch away ``shutil.which`` + ``subprocess.run`` for ``_run_comfy``.
-
-    Returns a ``setup(envelope) -> calls`` helper: call it with the envelope
-    the fake comfy-cli should emit, and get back the list that captures each
-    invocation (``cmd`` + ``env``).
-    """
-
-    def setup(envelope: dict) -> list[dict]:
-        fake, calls = _fake_run(envelope)
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
-        return calls
-
-    return setup
-
-
 def test_global_flags_precede_subcommand(patched_run):
     """Regression: `comfy run … --json` errors; it must be `comfy --json … run`."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+    calls = patched_run(envelope(data={"x": 1}))
 
     assert server._run_comfy("jobs", "status", "abc") == {"x": 1}
 
@@ -77,7 +42,7 @@ def test_global_flags_precede_subcommand(patched_run):
 
 def test_run_comfy_sets_no_watch_env(patched_run):
     """Agentic caller: comfy-cli's file watcher is suppressed via COMFY_NO_WATCH."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+    calls = patched_run(envelope(data={"x": 1}))
 
     server._run_comfy("jobs", "status", "abc")
 
@@ -91,7 +56,7 @@ def test_run_comfy_forces_utf8_env(patched_run):
     printing the UTF-8 catalog and wedges, so discovery tools present as a 60s
     timeout. Forcing UTF-8 on the child prevents the crash (no-op on POSIX).
     """
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+    calls = patched_run(envelope(data={"x": 1}))
 
     server._run_comfy("jobs", "status", "abc")
 
@@ -107,7 +72,7 @@ def test_run_comfy_pins_parent_decode_to_utf8(patched_run):
     output raises UnicodeDecodeError/mojibake before ``_unwrap_envelope`` — the
     same crash, just moved from the child's write to the parent's read.
     """
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+    calls = patched_run(envelope(data={"x": 1}))
 
     server._run_comfy("jobs", "status", "abc")
 
@@ -118,7 +83,7 @@ def test_run_comfy_utf8_env_overrides_inherited(patched_run, monkeypatch):
     """The injected UTF-8 vars win over any conflicting value in the parent env."""
     monkeypatch.setenv("PYTHONUTF8", "0")
     monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"x": 1}})
+    calls = patched_run(envelope(data={"x": 1}))
 
     server._run_comfy("jobs", "status", "abc")
 
@@ -326,7 +291,7 @@ def test_get_logs_maps_command_and_returns_data(patched_run):
         "path": "/ws/user/comfyui_8188.log",
         "truncated": False,
     }
-    calls = patched_run({"type": "envelope", "ok": True, "data": payload})
+    calls = patched_run(envelope(data=payload))
 
     assert server.get_logs() == payload
 
@@ -337,7 +302,7 @@ def test_get_logs_maps_command_and_returns_data(patched_run):
 
 def test_get_logs_forwards_custom_tail(patched_run):
     """A custom tail is stringified and forwarded to `--tail`."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"lines": []}})
+    calls = patched_run(envelope(data={"lines": []}))
 
     server.get_logs(tail=50)
 
@@ -347,7 +312,7 @@ def test_get_logs_forwards_custom_tail(patched_run):
 def test_get_logs_clamps_negative_and_huge_tail(patched_run):
     """A negative tail can't forward a malformed `--tail -N`, and an absurd tail
     is capped so comfy-cli isn't asked for an enormous slice."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"lines": []}})
+    calls = patched_run(envelope(data={"lines": []}))
 
     server.get_logs(tail=-5)
     assert calls[-1]["cmd"][4:] == ["logs", "--tail", str(server._MIN_LOG_TAIL)]
@@ -388,7 +353,7 @@ def test_get_logs_other_error_still_raises(patched_run):
 
 def test_cancel_job_maps_command_and_returns_data(patched_run):
     """cancel_job wraps `comfy jobs cancel <id>` and returns the envelope data."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"cancelled": "abc"}})
+    calls = patched_run(envelope(data={"cancelled": "abc"}))
 
     assert server.cancel_job("abc") == {"cancelled": "abc"}
     assert calls[0]["cmd"][4:] == ["jobs", "cancel", "abc"]  # mapped subcommand
@@ -416,7 +381,7 @@ def test_get_queue_maps_command_and_returns_data(patched_run):
             {"prompt_id": "b", "status": "completed"},
         ]
     }
-    calls = patched_run({"type": "envelope", "ok": True, "data": jobs})
+    calls = patched_run(envelope(data=jobs))
 
     assert server.get_queue() == jobs
     assert calls[0]["cmd"][4:] == ["jobs", "ls"]  # no positional args
@@ -530,7 +495,7 @@ def test_get_queue_passes_through_payload_without_jobs(patched_run):
 
 def test_upload_file_passes_paths_and_overwrite(patched_run):
     """upload_file forwards every path and appends --overwrite when asked."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"uploaded": 2}})
+    calls = patched_run(envelope(data={"uploaded": 2}))
 
     assert server.upload_file(["a.png", "b.png"], overwrite=True) == {"uploaded": 2}
 
@@ -541,7 +506,7 @@ def test_upload_file_passes_paths_and_overwrite(patched_run):
 
 def test_upload_file_omits_overwrite_by_default(patched_run):
     """Without overwrite the flag must be absent, not passed as False."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"uploaded": 1}})
+    calls = patched_run(envelope(data={"uploaded": 1}))
 
     server.upload_file(["only.png"])
 
@@ -567,7 +532,7 @@ def test_download_model_url_only(patched_run):
 
 def test_download_model_threads_relative_path(patched_run):
     """--relative-path is appended only when provided."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.download_model("https://hf.co/l.safetensors", relative_path="models/loras")
 
@@ -583,7 +548,7 @@ def test_download_model_threads_relative_path(patched_run):
 
 def test_download_model_threads_filename(patched_run):
     """--filename is appended only when provided."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.download_model("https://hf.co/c.safetensors", filename="renamed.safetensors")
 
@@ -599,7 +564,7 @@ def test_download_model_threads_filename(patched_run):
 
 def test_download_model_threads_all_optionals(patched_run):
     """Both optional args thread through together, in order, only when set."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.download_model(
         "https://civitai.com/api/download/models/42",
@@ -621,7 +586,7 @@ def test_download_model_threads_all_optionals(patched_run):
 
 def test_download_model_omits_absent_optionals(patched_run):
     """Neither optional flag is emitted when the argument is left unset."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.download_model("https://hf.co/x.safetensors")
 
@@ -675,7 +640,7 @@ def test_download_model_rejects_pathy_filename(bad_name):
 
 def test_download_model_omits_empty_string_optionals(patched_run):
     """Explicit empty-string optionals are treated as unset, not forwarded as ``""``."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.download_model("https://hf.co/x.safetensors", relative_path="", filename="")
 
@@ -772,7 +737,7 @@ def test_fetch_outputs_wraps_comfy_download(patched_run):
 
 def test_fetch_outputs_url_only_appends_flag(patched_run):
     """url_only=True adds --url-only so comfy emits URLs without downloading bytes."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"urls": []}})
+    calls = patched_run(envelope(data={"urls": []}))
 
     server.fetch_outputs("pid", "/tmp/out", url_only=True)
 
@@ -781,7 +746,7 @@ def test_fetch_outputs_url_only_appends_flag(patched_run):
 
 def test_fetch_outputs_omits_url_only_by_default(patched_run):
     """Without url_only the flag must be absent, not passed as False."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.fetch_outputs("pid", "/tmp/out")
 
@@ -811,7 +776,7 @@ def test_auth_status_maps_command_and_passes_payload_through(patched_run, monkey
         "base_url": "https://api.comfy.example",
         "expired": False,
     }
-    calls = patched_run({"type": "envelope", "ok": True, "data": whoami})
+    calls = patched_run(envelope(data=whoami))
     # No registration env key set -> the added flag is False, everything else as-is.
     monkeypatch.delenv("COMFY_API_KEY", raising=False)
 
@@ -837,7 +802,7 @@ def test_auth_status_signed_out_payload_passes_through(patched_run, monkeypatch)
         "api_key_source": None,
         "base_url": "https://api.comfy.example",
     }
-    patched_run({"type": "envelope", "ok": True, "data": whoami})
+    patched_run(envelope(data=whoami))
     monkeypatch.delenv("COMFY_API_KEY", raising=False)
 
     result = server.auth_status()
@@ -871,7 +836,7 @@ def test_auth_status_reports_flag_even_for_non_dict_payload(patched_run, monkeyp
     """A non-dict whoami payload still carries registration_env_key_present."""
     # Defensive: whoami normally returns an object, but if it ever hands back a
     # non-dict (null / list), the flag must still be present per the docstring.
-    patched_run({"type": "envelope", "ok": True, "data": None})
+    patched_run(envelope(data=None))
     monkeypatch.setenv("COMFY_API_KEY", "sk-super-secret-value")
 
     result = server.auth_status()
@@ -893,7 +858,7 @@ def test_auth_status_never_returns_key_material(patched_run, monkeypatch):
         "session": {"api_key": "***REDACTED***", "token": "***REDACTED***"},
         "stale_base_url": False,
     }
-    patched_run({"type": "envelope", "ok": True, "data": whoami})
+    patched_run(envelope(data=whoami))
     monkeypatch.delenv("COMFY_API_KEY", raising=False)
 
     dumped = json.dumps(server.auth_status())
@@ -933,7 +898,7 @@ def test_server_instructions_cover_credential_steering():
 
 def test_launch_comfyui_passes_background_flag(patched_run):
     """launch_comfyui must run `comfy … launch --background` (detached start)."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 42}})
+    calls = patched_run(envelope(data={"pid": 42}))
 
     assert server.launch_comfyui() == {"pid": 42}
 
@@ -944,7 +909,7 @@ def test_launch_comfyui_passes_background_flag(patched_run):
 
 def test_launch_comfyui_forwards_extra_args_after_separator(patched_run):
     """Extra args are forwarded to ComfyUI after a `--` separator."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.launch_comfyui(["--port", "8189"])
 
@@ -971,36 +936,6 @@ def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
 
 
 # --- lifecycle commands with no JSON envelope (BE-2953) --------------------
-
-
-def _fake_run_plain(returncode: int, stdout: str = "", stderr: str = ""):
-    """`subprocess.run` stand-in emitting HUMAN text (no envelope) + a returncode.
-
-    Mirrors ``launch``/``stop``: comfy-cli prints plain text and exits without
-    ever writing an ``envelope/1`` object.
-    """
-    calls: list[dict] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env})
-        return subprocess.CompletedProcess(
-            cmd, returncode, stdout=stdout, stderr=stderr
-        )
-
-    return fake, calls
-
-
-@pytest.fixture
-def patched_plain_run(monkeypatch):
-    """`setup(returncode, stdout, stderr) -> calls` for the no-envelope path."""
-
-    def setup(returncode: int, stdout: str = "", stderr: str = "") -> list[dict]:
-        fake, calls = _fake_run_plain(returncode, stdout, stderr)
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
-        return calls
-
-    return setup
 
 
 def test_stop_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
@@ -1077,7 +1012,7 @@ def test_non_plain_ok_rejects_stray_non_envelope_json(patched_plain_run):
 
 def test_plain_ok_still_honors_a_real_envelope(patched_run):
     """When comfy-cli DOES emit an envelope, plain_ok unwraps it normally."""
-    patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
+    patched_run(envelope(data={"pid": 7}))
 
     assert server._run_comfy("launch", "--background", plain_ok=True) == {"pid": 7}
 
@@ -1435,7 +1370,7 @@ def test_download_model_fallback_omits_url_when_no_output(patched_plain_run):
 def test_discover_maps_command_and_returns_data(patched_run):
     """discover wraps `comfy discover` and returns the envelope data verbatim."""
     surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
-    calls = patched_run({"type": "envelope", "ok": True, "data": surface})
+    calls = patched_run(envelope(data=surface))
 
     assert server.discover() == surface
     cmd = calls[0]["cmd"]
@@ -1756,25 +1691,26 @@ def test_tail_bounds_and_decodes():
     )
 
 
-def _timeout_run(stderr, stdout):
-    """A `subprocess.run` stand-in that raises TimeoutExpired with given captures."""
+def _timeout(stderr, stdout):
+    """The ``TimeoutExpired`` a killed ``comfy discover`` child would raise.
 
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+    The captures are what ``subprocess.run(capture_output=True)`` attaches to the
+    exception before re-raising; the message the tests below read is built by
+    ``_run_comfy`` from its OWN cmd/timeout, so these two only have to be
+    plausible.
+    """
+    return subprocess.TimeoutExpired(
+        [server.COMFY_BIN, "discover"], 60.0, output=stdout, stderr=stderr
+    )
 
-    return fake
 
-
-def test_sync_timeout_surfaces_bytes_stderr(monkeypatch):
+def test_sync_timeout_surfaces_bytes_stderr(patched_run):
     """POSIX shape: TimeoutExpired carries bytes; the stderr traceback reaches the message."""
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(
-        server.subprocess,
-        "run",
-        _timeout_run(
+    patched_run(
+        raises=_timeout(
             stderr=b"Traceback (most recent call last):\nUnicodeEncodeError: 'charmap'",
             stdout=b"partial stdout",
-        ),
+        )
     )
     with pytest.raises(server.ComfyCliError) as exc:
         server._run_comfy("discover", timeout=60.0)
@@ -1784,14 +1720,9 @@ def test_sync_timeout_surfaces_bytes_stderr(monkeypatch):
     assert "partial stdout" in msg
 
 
-def test_sync_timeout_surfaces_str_stderr(monkeypatch):
+def test_sync_timeout_surfaces_str_stderr(patched_run):
     """Windows shape: run() re-communicates after the kill and returns str captures."""
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(
-        server.subprocess,
-        "run",
-        _timeout_run(stderr="boom on stderr", stdout="half a line"),
-    )
+    patched_run(raises=_timeout(stderr="boom on stderr", stdout="half a line"))
     with pytest.raises(server.ComfyCliError) as exc:
         server._run_comfy("discover", timeout=60.0)
     msg = str(exc.value)
@@ -1799,12 +1730,9 @@ def test_sync_timeout_surfaces_str_stderr(monkeypatch):
     assert "half a line" in msg
 
 
-def test_sync_timeout_with_no_captures_is_sane(monkeypatch):
+def test_sync_timeout_with_no_captures_is_sane(patched_run):
     """None captures (nothing written before the kill) must not crash and read sanely."""
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(
-        server.subprocess, "run", _timeout_run(stderr=None, stdout=None)
-    )
+    patched_run(raises=_timeout(stderr=None, stdout=None))
     with pytest.raises(server.ComfyCliError) as exc:
         server._run_comfy("discover", timeout=60.0)
     msg = str(exc.value)
@@ -1967,7 +1895,7 @@ def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
 
 def test_restart_comfyui_runs_stop_then_launch(patched_run):
     """restart is a thin `comfy stop` then `comfy launch --background` composition."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
+    calls = patched_run(envelope(data={"pid": 7}))
 
     # patched_run's fake emits the same envelope for every call, so launch's
     # data ({"pid": 7}) is what restart returns.
@@ -1980,7 +1908,7 @@ def test_restart_comfyui_runs_stop_then_launch(patched_run):
 
 def test_restart_comfyui_forwards_extra_args_to_launch(patched_run):
     """extra_args ride the launch step after the `--` separator, not the stop."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope(data={}))
 
     server.restart_comfyui(["--port", "8189"])
 
@@ -2061,7 +1989,7 @@ _FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
 def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path):
     """inline_images=True returns [metadata, Image...] for each downloaded image."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
-    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+    patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
@@ -2141,7 +2069,7 @@ def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
     (cwd / "gen.png").write_bytes(b"cwd-decoy-not-this-one")  # a CWD shadow
     monkeypatch.chdir(cwd)
 
-    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+    patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
@@ -2178,7 +2106,7 @@ def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
     names = [f"g{i}.png" for i in range(server._INLINE_IMAGE_MAX_COUNT + 5)]
     for name in names:
         (tmp_path / name).write_bytes(_FAKE_PNG)
-    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": names}})
+    patched_run(envelope(data={"downloaded": names}))
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
@@ -2241,7 +2169,7 @@ def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
 def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
     """Without inline_images the bare envelope data is returned (no list wrapping)."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
-    patched_run({"type": "envelope", "ok": True, "data": {"downloaded": ["gen.png"]}})
+    patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path))
 
@@ -2858,7 +2786,7 @@ def test_get_logs_caps_oversized_line(patched_run):
         "path": "/ws/user/comfyui_8188.log",
         "truncated": False,
     }
-    patched_run({"type": "envelope", "ok": True, "data": payload})
+    patched_run(envelope(data=payload))
 
     result = server.get_logs()
     lines = result["lines"]
