@@ -23,10 +23,9 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
-import json
-import subprocess
 
 import pytest
+from conftest import envelope
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -80,42 +79,10 @@ class _FakeCtx:
         return CancelledElicitation()
 
 
-def _envelope(*, ok: bool = True, data=None, error=None) -> str:
-    body: dict = {"schema": "envelope/1", "type": "envelope", "ok": ok}
-    if error is not None:
-        body["error"] = error
-    else:
-        body["data"] = data if data is not None else {}
-    return json.dumps(body)
-
-
-@pytest.fixture
-def patched_run(monkeypatch):
-    """``setup(stdout=..., returncode=...) -> calls`` mocking ``comfy`` via subprocess.
-
-    Defaults to a successful ``envelope/1`` so the happy path returns real data;
-    pass ``stdout`` to shape the envelope (e.g. an error) per test.
-    """
-
-    def setup(stdout: str | None = None, returncode: int = 0) -> list[dict]:
-        calls: list[dict] = []
-        payload = (
-            _envelope(data={"prompt_id": "p1", "outputs": ["/x.png"]})
-            if stdout is None
-            else stdout
-        )
-
-        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-            calls.append({"cmd": cmd, "env": env, "timeout": timeout})
-            return subprocess.CompletedProcess(
-                cmd, returncode, stdout=payload, stderr=""
-            )
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
-        return calls
-
-    return setup
+# A realistic `comfy run-template` result, for the few tests that assert on what
+# comes BACK rather than on the argv that went out. The rest take conftest's
+# ``patched_run`` default (a success envelope with empty ``data``).
+_RUN_RESULT = {"prompt_id": "p1", "outputs": ["/x.png"]}
 
 
 # --- passthrough argv -------------------------------------------------------
@@ -123,14 +90,11 @@ def patched_run(monkeypatch):
 
 def test_run_template_argv_is_a_local_json_passthrough(patched_run):
     """`comfy --json --where local run-template <name> --param=k=v` (flags first)."""
-    calls = patched_run()
+    calls = patched_run(envelope(data=_RUN_RESULT))
 
     result = _run_template("image_flux2", params={"prompt": "a red fox"})
 
-    assert result == {
-        "prompt_id": "p1",
-        "outputs": ["/x.png"],
-    }  # envelope data unwrapped
+    assert result == _RUN_RESULT  # envelope data unwrapped
     cmd = calls[0]["cmd"]
     assert cmd[0] == server.COMFY_BIN
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
@@ -312,7 +276,9 @@ def test_run_template_falls_back_to_confirm_spend_when_client_cannot_elicit(
     assert "--allow-spend" in calls[0]["cmd"]
 
 
-def test_run_template_does_not_consult_the_generate_auto_confirm(monkeypatch):
+def test_run_template_does_not_consult_the_generate_auto_confirm(
+    monkeypatch, patched_run
+):
     """comfy-cli scopes `spend.auto_confirm` to `comfy generate`.
 
     `run-template` never reads it, so treating it as consent here would forward
@@ -327,14 +293,7 @@ def test_run_template_does_not_consult_the_generate_auto_confirm(monkeypatch):
     ctx = _FakeCtx()
 
     # A free run: no consent machinery should be reached at all.
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(
-        server.subprocess,
-        "run",
-        lambda *a, **k: subprocess.CompletedProcess(
-            [], 0, stdout=_envelope(data={"prompt_id": "p1"}), stderr=""
-        ),
-    )
+    patched_run(envelope(data=_RUN_RESULT))
 
     _run_template("image_flux2", confirm_spend=True, ctx=ctx)
 
@@ -344,7 +303,7 @@ def test_run_template_does_not_consult_the_generate_auto_confirm(monkeypatch):
 def test_run_template_spend_refusal_raises_with_code(patched_run):
     """The engine's fail-closed refusal (error envelope) raises — no false success."""
     patched_run(
-        stdout=_envelope(
+        envelope(
             ok=False,
             error={
                 "code": "spend_consent_required",
@@ -363,7 +322,7 @@ def test_run_template_spend_refusal_raises_with_code(patched_run):
 
 def test_run_template_wait_false_submits_async(patched_run):
     """`wait=False` appends `--async` and uses the short fire-and-return timeout."""
-    calls = patched_run(stdout=_envelope(data={"prompt_id": "p9"}))
+    calls = patched_run(envelope(data={"prompt_id": "p9"}))
 
     result = _run_template("image_flux2", params={"prompt": "x"}, wait=False)
 

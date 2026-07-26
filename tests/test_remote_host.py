@@ -17,40 +17,11 @@ subcommand). These lock in:
 from __future__ import annotations
 
 import asyncio
-import json
-import subprocess
 
 import pytest
-from conftest import _OK_STREAM
+from conftest import _OK_STREAM, envelope
 
 from comfy_local_mcp import server
-
-
-def _fake_run(envelope: dict):
-    """A ``subprocess.run`` stand-in that captures calls and emits ``envelope``."""
-    calls: list[dict] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env})
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(envelope), stderr=""
-        )
-
-    return fake, calls
-
-
-@pytest.fixture
-def patched_run(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.run``; returns ``setup(envelope) -> calls``."""
-
-    def setup(envelope: dict) -> list[dict]:
-        fake, calls = _fake_run(envelope)
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
-        return calls
-
-    return setup
-
 
 # --- _comfy_target env parsing ---------------------------------------------
 
@@ -194,7 +165,7 @@ def test_local_only_verb_survives_malformed_config(patched_run, monkeypatch):
     monkeypatch.setenv(
         "COMFYUI_URL", "https://gpu.example"
     )  # scheme rejected by _comfy_target
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope())
 
     # `env` never touches the remote, so it must run despite the bad config.
     server._run_comfy("env")
@@ -209,7 +180,7 @@ def test_run_forwards_host_port_into_subcommand(patched_run, monkeypatch):
     """`comfy run` gets --host/--port appended AFTER the verb, not in the global prefix."""
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "9001")
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"prompt_id": "p1"}})
+    calls = patched_run(envelope(data={"prompt_id": "p1"}))
 
     server._run_comfy("run", "--workflow", "wf.json")
 
@@ -229,7 +200,7 @@ def test_run_forwards_host_port_into_subcommand(patched_run, monkeypatch):
 def test_jobs_forwards_host_port_into_subcommand(patched_run, monkeypatch):
     """Every `comfy jobs` subcommand accepts --host/--port; they are forwarded."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    calls = patched_run({"type": "envelope", "ok": True, "data": {"status": "running"}})
+    calls = patched_run(envelope(data={"status": "running"}))
 
     server._run_comfy("jobs", "status", "abc")
 
@@ -247,7 +218,7 @@ def test_jobs_forwards_host_port_into_subcommand(patched_run, monkeypatch):
 def test_env_is_not_forwarded_host_port(patched_run, monkeypatch):
     """`comfy env` takes no --host/--port; forwarding would error 'No such option'."""
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope())
 
     server._run_comfy("env")
 
@@ -257,7 +228,7 @@ def test_env_is_not_forwarded_host_port(patched_run, monkeypatch):
 def test_download_and_upload_not_forwarded(patched_run, monkeypatch):
     """download / upload verbs don't accept --host/--port -> stay local-only."""
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope())
 
     server._run_comfy("download", "abc", "-o", "/tmp/out")
     server._run_comfy("upload", "a.png")
@@ -268,7 +239,7 @@ def test_download_and_upload_not_forwarded(patched_run, monkeypatch):
 
 def test_local_default_is_byte_identical(patched_run):
     """With nothing configured the argv is exactly today's — no --host appended."""
-    calls = patched_run({"type": "envelope", "ok": True, "data": {}})
+    calls = patched_run(envelope())
 
     server._run_comfy("run", "--workflow", "wf.json")
 
@@ -322,24 +293,15 @@ def test_watch_job_stream_forwards_host_port(patched_stream, monkeypatch):
 # --- server_info surfaces the configured target ----------------------------
 
 
-def _patch_env_for_server_info(monkeypatch):
+def _patch_env_for_server_info(monkeypatch, patched_run):
     """Stub `comfy env` + the version detection so `server_info()` runs offline."""
-    fake, _calls = _fake_run(
-        {
-            "schema": "envelope/1",
-            "type": "envelope",
-            "ok": True,
-            "data": {"running": False},
-        }
-    )
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    patched_run(envelope(data={"running": False}))
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
     monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
 
 
-def test_server_info_reports_remote_target(monkeypatch):
-    _patch_env_for_server_info(monkeypatch)
+def test_server_info_reports_remote_target(monkeypatch, patched_run):
+    _patch_env_for_server_info(monkeypatch, patched_run)
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
 
     result = server.server_info()
@@ -351,17 +313,17 @@ def test_server_info_reports_remote_target(monkeypatch):
     assert result["compatibility"]["envelope_schema"] == "envelope/1"
 
 
-def test_server_info_omits_target_when_local(monkeypatch):
-    _patch_env_for_server_info(monkeypatch)
+def test_server_info_omits_target_when_local(monkeypatch, patched_run):
+    _patch_env_for_server_info(monkeypatch, patched_run)
 
     result = server.server_info()
 
     assert "comfy_target" not in result  # no remote configured -> no block
 
 
-def test_server_info_reports_malformed_target_as_data(monkeypatch):
+def test_server_info_reports_malformed_target_as_data(monkeypatch, patched_run):
     """A malformed remote config surfaces as a diagnostic field, not a hard failure."""
-    _patch_env_for_server_info(monkeypatch)
+    _patch_env_for_server_info(monkeypatch, patched_run)
     monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")
 
     result = server.server_info()
