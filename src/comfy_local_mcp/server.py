@@ -906,7 +906,7 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     # response for a non-`plain_ok` tool; it raises the "returned no JSON" error
     # like any other missing envelope. A real error envelope still has
     # `type==envelope`, so it flows through and raises with its code as usual.
-    return _unwrap_envelope(real_envelope, args, returncode, stderr)
+    return _unwrap_envelope(real_envelope, args, returncode, stderr, stdout=stdout)
 
 
 def _envelope_schema(envelope: dict) -> str | None:
@@ -955,6 +955,29 @@ def _tail(text: str | bytes | None, limit: int = 500) -> str:
     return text.strip()[-limit:]
 
 
+def _stream_tail(text: str | bytes | None, limit: int = 500) -> str:
+    """Bounded tail of a captured stream, with explicit empty/truncation markers.
+
+    The error-message dressing over :func:`_tail`, for the messages a user
+    actually reads when comfy-cli fails:
+
+    - a blank/absent capture renders as ``<empty>`` rather than nothing, so a
+      message can never end in a dangling ``stderr:`` that is indistinguishable
+      from a capture we truncated away;
+    - a capture that WAS clipped is prefixed with ``...`` so the truncation is
+      visible instead of looking like the whole stream.
+
+    The *tail* is what's kept (not the head): a CLI traceback puts the
+    exception — the part that says what actually went wrong — last.
+    """
+    tail = _tail(text, limit=limit)
+    if not tail:
+        return "<empty>"
+    # `_tail` clips silently, so ask it for one char more than the bound: a
+    # longer answer means something was dropped and the marker is warranted.
+    return "..." + tail if len(_tail(text, limit=limit + 1)) > limit else tail
+
+
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
     """Kill the child *and* any grandchildren it spawned.
 
@@ -993,13 +1016,25 @@ def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
 
 
 def _unwrap_envelope(
-    envelope: dict | None, args: tuple[str, ...], returncode: int | None, stderr: str
+    envelope: dict | None,
+    args: tuple[str, ...],
+    returncode: int | None,
+    stderr: str,
+    stdout: str = "",
 ) -> Any:
     """Unwrap comfy-cli's ``envelope/1`` result, raising on error/absence.
 
     Shared by the plain (`--json`) and streaming (`--json-stream`) paths so both
     have identical terminal behavior: return ``data`` on success, and raise a
     :class:`ComfyCliError` carrying the envelope's ``error.code`` on failure.
+
+    ``stdout`` is the RAW captured stdout the caller parsed ``envelope`` out of.
+    It is only read on the no-envelope path, where it is the whole point: a
+    comfy-cli that dies before emitting JSON usually prints its diagnosis as
+    plain text, and every caller parses stdout through :func:`_last_json_object`
+    — which drops that text on the floor. Passing it here is what keeps the
+    failure legible; it defaults to ``""`` (rendered ``<empty>``) so a caller
+    that genuinely has no stdout still produces a well-formed message.
 
     Also the envelope-version assertion: if comfy-cli declares an envelope
     ``schema`` whose major differs from :data:`ENVELOPE_SCHEMA_MAJOR`, the whole
@@ -1015,11 +1050,23 @@ def _unwrap_envelope(
             raise ComfyCliError(
                 f"comfy-cli could not run (exit {returncode}).\n\n"
                 f"{_tcc_guidance(_tcc_path_from(stderr))}\n\n"
-                f"Original error: {_tail(stderr)}"
+                # `_stream_tail` for the truncation marker: `_looks_like_tcc_denial`
+                # only fires on a non-empty stderr, so the `<empty>` half is
+                # unreachable here — but a long denial traceback still gets
+                # clipped, and silently is how you misread it as the whole thing.
+                # No stdout here on purpose: this branch has already identified
+                # the cause, so its curated guidance beats a second raw stream.
+                f"Original error: {_stream_tail(stderr)}"
             )
+        # Both streams, both explicitly marked when blank: comfy-cli splits its
+        # diagnostics unpredictably (a Python traceback lands on stderr, a
+        # Typer/click usage error or a plain-text status line on stdout), and
+        # `_last_json_object` has already discarded the stdout text by the time
+        # we get here. Rendering only stderr — and rendering an empty one as
+        # nothing at all — is what made this error opaque.
         raise ComfyCliError(
             f"comfy-cli returned no JSON (exit {returncode}). "
-            f"stderr: {stderr.strip()[:500]}"
+            f"stderr: {_stream_tail(stderr)} | stdout: {_stream_tail(stdout)}"
         )
     # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
     # Absent schema -> assume compatible (older comfy-cli); declared-but-unparseable
@@ -1051,12 +1098,19 @@ def _unwrap_envelope(
         # credential) — dropping them was the exact workaround testers needed.
         # Each field is length-capped so a huge/malformed envelope can't bloat
         # the message propagated to the MCP client.
-        message = err.get("message") or stderr.strip()[:_MAX_ERROR_FIELD_CHARS]
-        parts = [
-            f"comfy {' '.join(args)} failed "
-            f"[{code or 'unknown'}]: "
-            f"{str(message)[:_MAX_ERROR_FIELD_CHARS]}"
-        ]
+        # The stderr fallback goes through `_stream_tail` so an envelope with an
+        # empty `error.message` AND an empty stderr can't render a bare trailing
+        # colon with nothing after it. Note the cap is applied to the envelope's
+        # own message only — `_stream_tail` already bounds its result, and
+        # re-slicing its HEAD here would chop off the truncation marker plus the
+        # very end of the tail, i.e. the part worth keeping.
+        message = err.get("message")
+        message = (
+            str(message)[:_MAX_ERROR_FIELD_CHARS]
+            if message
+            else _stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
+        )
+        parts = [f"comfy {' '.join(args)} failed [{code or 'unknown'}]: {message}"]
         hint = err.get("hint")
         if hint:
             parts.append(f"hint: {str(hint)[:_MAX_ERROR_FIELD_CHARS]}")
@@ -1345,8 +1399,16 @@ async def _run_comfy_streaming(
         # stderr is collectible for the error message.
         returncode = await _in_pipe_pool(proc.wait)
         stderr = (await stderr_future) if stderr_future is not None else ""
+        # Keep the joined stdout around rather than only its parsed JSON: this is
+        # the EOF path, so comfy-cli died without an envelope and whatever plain
+        # text it printed is the only diagnosis there is.
+        stdout_text = "".join(lines)
         return False, _unwrap_envelope(
-            _last_json_object("".join(lines)), args, returncode, stderr
+            _last_json_object(stdout_text),
+            args,
+            returncode,
+            stderr,
+            stdout=stdout_text,
         )
 
     try:
@@ -1403,7 +1465,8 @@ async def _run_comfy_streaming(
         # Envelope path: the authoritative result is already in `lines`, read
         # within the deadline. Give the child a brief grace to exit on a SEPARATE
         # budget; the `finally` kills a still-live one.
-        envelope = _last_json_object("".join(lines))
+        stdout_text = "".join(lines)
+        envelope = _last_json_object(stdout_text)
         child_reaped = True
         try:
             await asyncio.wait_for(
@@ -1431,7 +1494,9 @@ async def _run_comfy_streaming(
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 stderr = ""
-        return _unwrap_envelope(envelope, args, proc.returncode, stderr)
+        return _unwrap_envelope(
+            envelope, args, proc.returncode, stderr, stdout=stdout_text
+        )
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion). Kill the
@@ -1598,9 +1663,9 @@ def server_info() -> Any:
     reachability is confirmed by the first run/queue call, which targets the
     same host.
     """
-    envelope, _stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
-    # _unwrap_envelope has already raised if envelope was None, so it is non-None here.
-    data = _unwrap_envelope(envelope, args, returncode, stderr)
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
+    # _unwrap_envelope raises if envelope is None, so it is non-None below.
+    data = _unwrap_envelope(envelope, args, returncode, stderr, stdout=stdout)
     compat = _check_comfy_cli_version()
     compat["envelope_schema"] = _envelope_schema(envelope)
     freshness = _freshness_report()
