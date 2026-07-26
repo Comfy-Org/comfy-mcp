@@ -397,7 +397,14 @@ def test_server_info_attaches_freshness_block(patched_env_then_outdated):
 
 
 def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdated):
-    """An older comfy-cli without `outdated` -> freshness.error, tool still succeeds."""
+    """A comfy-cli without `outdated` -> the purpose-built `unsupported` degrade.
+
+    Every released comfy-cli (through 1.12.0) lacks the verb, so this is the
+    COMMON path, not an edge case. It must read as a capability gap rather than
+    a failure of this server: no raw Click/Typer usage dump, no "returned no
+    JSON" wrapper text, and a machine-readable `unsupported` flag so a client
+    can branch without string-matching.
+    """
     import json
 
     patched_env_then_outdated(
@@ -411,8 +418,342 @@ def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdate
 
     assert result["running"] is True  # env data intact — the probe never breaks it
     assert "compatibility" in result
-    assert set(result["freshness"]) == {"error"}
-    assert "No such command 'outdated'" in result["freshness"]["error"]
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+    # The raw wrapper/CLI text no longer leaks through.
+    assert "returned no JSON" not in result["freshness"]["error"]
+    assert "No such command" not in result["freshness"]["error"]
+    assert "Usage: comfy" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_match_is_case_insensitive(
+    patched_env_then_outdated,
+):
+    """`Error: no such command 'outdated'` (lowercase) also degrades cleanly."""
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: no such command 'outdated'"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_survives_panel_wrapping(
+    patched_env_then_outdated,
+):
+    """A rich panel that wraps the phrase mid-line still degrades cleanly.
+
+    Typer renders errors inside a bordered rich panel and wraps at the terminal
+    width, so `No such command` and `'outdated'` can land on separate lines with
+    box-drawing glyphs between them. Matching a literal one-line phrase would
+    miss this and leak the raw usage dump — the exact outcome this degrade
+    exists to prevent.
+    """
+    import json
+
+    wrapped_panel = (
+        "╭─ Error ─────────────────────────╮\n"
+        "│ No such command\n"
+        "│ 'outdated'.                     │\n"
+        "╰─────────────────────────────────╯"
+    )
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (2, "", wrapped_panel)]
+    )
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_relayed_phrase_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """A REAL failure relaying "no such command" keeps its raw diagnostic.
+
+    A comfy-cli that HAS the verb can fail with an error envelope whose message
+    quotes a nested tool's own "no such command" (a git/pip call, a custom-node
+    pack's install script, a relayed registry response). Classifying that as
+    `unsupported` would tell the agent to skip staleness advice and reassure the
+    user that nothing is broken — masking a genuine failure. The presence of an
+    envelope at all proves the verb ran, so it must pass through.
+    """
+    import json
+
+    error_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {
+            "code": "pack_probe_failed",
+            "message": "git: 'no such command' while probing pack 'outdated-notifier'",
+        },
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (1, json.dumps(error_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "pack_probe_failed" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_envelope_at_exit_two_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """An error envelope at Click's usage-error status still proves the verb ran.
+
+    Pins the `no_envelope` half of the gate INDEPENDENTLY of the exit code:
+    every other envelope-present negative here exits 1, so the exit-code check
+    alone would reject them and the provenance condition would go untested. A
+    comfy-cli that HAS `outdated` can reject one of its options and report that
+    structurally at exit 2 — only the absence of an envelope means the parser
+    never dispatched.
+    """
+    import json
+
+    error_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {
+            "code": "bad_option",
+            "message": "No such command 'outdated' handler registered for --json",
+        },
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (2, json.dumps(error_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "bad_option" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_dotted_command_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """`No such command 'outdated.foo'` is a different command, not our verb.
+
+    The lookahead must reject every character a command name can continue with,
+    not just word characters and the hyphen — a `.` would otherwise let the
+    `outdated` prefix match and discard a real diagnostic.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: No such command 'outdated.foo'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "outdated.foo" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_midrun_crash_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """A crash in a verb comfy-cli DID accept keeps its raw diagnostic.
+
+    Emitting no envelope only proves comfy-cli died before it could report
+    structurally — a recognized verb can do that too by crashing mid-run. Click
+    exits 2 only when its parser rejected the command line before dispatch, so a
+    no-envelope failure at any other status is a real failure, even when its
+    output happens to quote the missing-verb phrase.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (1, "", "Traceback...\nRuntimeError: No such command 'outdated' in hook"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "Traceback" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_survives_colon_sgr(
+    patched_env_then_outdated,
+):
+    """Colon-separated SGR (`\\x1b[38:5:130m`) is stripped like any other CSI.
+
+    ECMA-48 allows `:<=>` in CSI parameter bytes, and terminals do emit the
+    colon form for true-colour. A parameter class of only `[0-9;]` would leave
+    those bytes in place, defeating the match and leaking the raw usage dump.
+    """
+    import json
+
+    coloured = (
+        "\x1b[38:5:130mError\x1b[0m: No such \x1b[38:2:255:0:0mcommand\x1b[0m "
+        "'outdated'."
+    )
+    patched_env_then_outdated([(0, json.dumps(_ENV_ENVELOPE), ""), (2, "", coloured)])
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_on_stdout(patched_env_then_outdated):
+    """The usage error degrades cleanly whichever stream Click wrote it to.
+
+    `_unwrap_envelope` renders both streams because comfy-cli splits its
+    diagnostics unpredictably — a Typer/click usage error can land on stdout
+    rather than stderr. The missing-verb classifier reads the raised message, so
+    it must not care which half carried the text.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "Usage: comfy [OPTIONS] COMMAND\nNo such command 'outdated'.", ""),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_codeless_envelope_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """An error envelope that OMITS `error.code` still proves the verb ran.
+
+    A null `code` is not evidence of a missing verb — `_unwrap_envelope` leaves
+    it `None` whenever an otherwise well-formed error envelope has no `code`
+    field. Gating on `code is None` would misread this genuine failure as the
+    benign capability gap; `no_envelope` is the signal that actually holds.
+    """
+    import json
+
+    codeless_envelope = {
+        "schema": "envelope/1",
+        "type": "envelope",
+        "ok": False,
+        "error": {"message": "No such command 'outdated' in the pack's hook script"},
+    }
+    patched_env_then_outdated(
+        [(0, json.dumps(_ENV_ENVELOPE), ""), (1, json.dumps(codeless_envelope), "")]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "hook script" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
+
+
+def test_server_info_freshness_hyphenated_command_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """`No such command 'outdated-notifier'` is a DIFFERENT command, not our verb.
+
+    A trailing `\\b` would treat the hyphen as a word boundary and match the
+    `outdated` prefix, discarding a real diagnostic about some other command.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: No such command 'outdated-notifier'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "outdated-notifier" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_missing_verb_survives_ansi_colour(
+    patched_env_then_outdated,
+):
+    """Colourized rich output still degrades cleanly.
+
+    Rich styles its error panel with ANSI escapes, whose bytes include word
+    characters (digits, `m`). Left in place they land between the matched words
+    and defeat the pattern, leaking the raw usage dump.
+    """
+    import json
+
+    coloured = (
+        "\x1b[31mError\x1b[0m: \x1b[1mNo such\x1b[0m \x1b[1mcommand\x1b[0m "
+        "\x1b[33m'outdated'\x1b[0m."
+    )
+    patched_env_then_outdated([(0, json.dumps(_ENV_ENVELOPE), ""), (2, "", coloured)])
+
+    result = server.server_info()
+
+    assert result["freshness"]["unsupported"] is True
+    assert "freshness unavailable" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_unknown_other_verb_is_not_unsupported(
+    patched_env_then_outdated,
+):
+    """ "No such command" naming a DIFFERENT verb is not our capability gap."""
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (2, "", "Error: No such command 'git-lfs'."),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert "unsupported" not in result["freshness"]
+    assert "git-lfs" in result["freshness"]["error"]
+
+
+def test_server_info_freshness_passes_through_other_errors(patched_env_then_outdated):
+    """A NON-missing-verb spawn failure keeps the raw reason and no `unsupported`.
+
+    The special case above is deliberately narrow: for a network failure the raw
+    reason IS the diagnostic, so it must still reach the caller verbatim.
+    """
+    import json
+
+    patched_env_then_outdated(
+        [
+            (0, json.dumps(_ENV_ENVELOPE), ""),
+            (1, "", "network unreachable"),
+        ]
+    )
+
+    result = server.server_info()
+
+    assert result["running"] is True
+    assert set(result["freshness"]) == {"error"}  # no `unsupported` key
+    assert "unsupported" not in result["freshness"]
+    assert "network unreachable" in result["freshness"]["error"]
+    assert "freshness unavailable" not in result["freshness"]["error"]
 
 
 def test_server_info_freshness_degrades_on_error_envelope(patched_env_then_outdated):

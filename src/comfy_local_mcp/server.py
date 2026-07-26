@@ -580,11 +580,35 @@ class ComfyCliError(RuntimeError):
     itself (missing binary, timeout, no-JSON output), so callers can branch on a
     specific code without string-matching the message — e.g. ``get_logs``
     swallows ``no_log_file`` but re-raises the rest.
+
+    ``no_envelope`` is the stronger, unambiguous provenance signal: ``True`` only
+    when comfy-cli ran to completion and emitted NO envelope at all. A null
+    ``code`` does NOT imply that — a well-formed error envelope may simply omit
+    ``error.code`` — so a caller asking "did comfy-cli fail *before* it could
+    report structurally?" must check this flag rather than ``code is None``.
+    :func:`_is_missing_verb_error` is exactly that caller.
+
+    ``returncode`` is the child's exit status wherever :func:`_unwrap_envelope`
+    knows it — on the no-envelope path AND on an error envelope — so it is
+    genuinely independent of ``no_envelope`` rather than a proxy for it. It
+    distinguishes *how* comfy-cli failed: a usage error the argument parser
+    rejected before dispatch versus a failure partway through a command it did
+    accept, which the message text alone cannot tell you. It stays ``None`` for
+    the failures raised without ever reading a child's status (missing binary,
+    timeout).
     """
 
-    def __init__(self, *args: object, code: str | None = None) -> None:
+    def __init__(
+        self,
+        *args: object,
+        code: str | None = None,
+        no_envelope: bool = False,
+        returncode: int | None = None,
+    ) -> None:
         super().__init__(*args)
         self.code = code
+        self.no_envelope = no_envelope
+        self.returncode = returncode
 
 
 def _comfy_bin_candidates() -> list[str]:
@@ -1330,7 +1354,7 @@ def _unwrap_envelope(
                 stderr=stderr,
                 streaming=streaming,
             )
-            raise ComfyCliError(message)
+            raise ComfyCliError(message, no_envelope=True, returncode=returncode)
         # Both streams, both explicitly marked when blank: comfy-cli splits its
         # diagnostics unpredictably (a Python traceback lands on stderr, a
         # Typer/click usage error or a plain-text status line on stdout), and
@@ -1350,7 +1374,7 @@ def _unwrap_envelope(
             stderr=stderr,
             streaming=streaming,
         )
-        raise ComfyCliError(message)
+        raise ComfyCliError(message, no_envelope=True, returncode=returncode)
     # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
     # Absent schema -> assume compatible (older comfy-cli); declared-but-unparseable
     # or a different major -> refuse loudly rather than fail open on a shape we
@@ -1430,7 +1454,11 @@ def _unwrap_envelope(
             stderr=stderr,
             streaming=streaming,
         )
-        raise ComfyCliError(text, code=code)
+        # `returncode` rides along on the envelope path too, so
+        # `_is_missing_verb_error`'s Click-usage-exit condition stays genuinely
+        # independent of its `no_envelope` provenance condition rather than
+        # being a proxy for it (an envelope-borne failure can also exit 2).
+        raise ComfyCliError(text, code=code, returncode=returncode)
     return envelope.get("data")
 
 
@@ -1946,25 +1974,160 @@ def _check_comfy_cli_version() -> dict:
     return report
 
 
+# `click.UsageError.exit_code` — the status Click exits with when its parser
+# rejects the command line (an unknown subcommand, a bad option) before
+# dispatching to any command body. Typer inherits it.
+_CLICK_USAGE_ERROR_EXIT = 2
+
+# Click/Typer's "No such command '<verb>'." usage error, made robust to the ways
+# that text arrives mangled. `\s+` between the words (not a literal space)
+# because rich renders Typer errors inside a bordered panel and wraps them at the
+# terminal width, so a newline can land mid-phrase; the box-drawing characters
+# and ANSI colour codes that wrapping and styling introduce are stripped by
+# `_normalize_cli_text` first. The verb follows within a few non-word characters
+# (the quotes/colon/period around it) and must END there: `\b` would treat the
+# hyphen in a DIFFERENT command like `outdated-notifier` as a word boundary and
+# match it, so the lookahead rejects every character a command name could
+# continue with — `\w` plus the `.`, `:`, `/`, `-` that appear in namespaced or
+# hyphenated verbs — and `outdated.foo` no longer reads as `outdated`. At least
+# one separator, since Click always writes a space and a quote there. See
+# `_is_missing_verb_error`.
+_MISSING_VERB_RE_TEMPLATE = r"no\s+such\s+command\W{{1,8}}{verb}(?![\w.:/-])"
+
+# A CSI escape sequence (`\x1b[...m` and friends). Rich colourizes its error
+# panels, and those codes contain word characters (digits, `m`), so leaving them
+# in would let styling land between the matched words and defeat the pattern.
+# The parameter-byte class is ECMA-48's full 0x30-0x3F range, not just `[0-9;]`:
+# colon-separated SGR (`\x1b[38:5:130m`, true-colour on many terminals) would
+# otherwise survive stripping and reintroduce the very problem.
+_ANSI_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]")
+
+# Whitespace, the Unicode Box Drawing block (U+2500-U+257F), and ASCII `|` —
+# i.e. every character rich can use to frame and wrap an error panel.
+_PANEL_NOISE_RE = re.compile(r"[\s─-╿|]+")
+
+
+def _normalize_cli_text(text: str) -> str:
+    """Lowercased text with ANSI, panel borders, and wrapping folded away.
+
+    Typer renders errors inside a rich panel when rich is installed, so the raw
+    stderr of a usage error can read ``"│ No such command\\n│ 'outdated'. │"``,
+    optionally colourized. Dropping the escape sequences and folding the border
+    glyphs and any run of whitespace into one space puts that back on a single
+    plain line, so a phrase match cannot be defeated by the terminal width the
+    child happened to render at, or by whether it decided to emit colour.
+    """
+    return _PANEL_NOISE_RE.sub(" ", _ANSI_RE.sub("", text)).strip().lower()
+
+
+def _is_missing_verb_error(exc: ComfyCliError, verb: str) -> bool:
+    """Is *exc* comfy-cli rejecting ``verb`` as unknown, rather than *running* it?
+
+    Deliberately narrow, because the caller's degrade tells the agent that
+    NOTHING is broken: a false positive here silently buries a real failure.
+    Two independent conditions must both hold.
+
+    ``exc.no_envelope`` — comfy-cli emitted no envelope at all. An envelope, even
+    a codeless one, means comfy-cli *recognized* the verb, ran it, and reported
+    why it failed. A missing verb never gets that far: Click aborts with a usage
+    error before any envelope is emitted, so the failure can only reach us via
+    the wrapper-raised "returned no JSON" path. This is what stops a relayed
+    nested error — a git/pip call, a custom-node pack name, a registry response
+    that happens to contain "no such command" — from being mistaken for the verb
+    itself being absent. Note this is checked instead of ``exc.code is None``,
+    which looks equivalent but is not: an error envelope that merely omits
+    ``error.code`` also yields a null code, and gating on that would let exactly
+    the relayed-message case above through.
+
+    ``exc.returncode == 2`` — Click's ``UsageError.exit_code``, i.e. the argument
+    parser rejected the command line before dispatching anything. On its own
+    ``no_envelope`` only says comfy-cli died before emitting JSON, which a verb
+    it DID accept can also do by crashing mid-run; if such a crash happened to
+    print our phrase, the degrade would swallow a genuine failure. Requiring the
+    usage-error status narrows it to "never dispatched". The trade is
+    deliberate and one-directional: a comfy-cli that someday reports an unknown
+    verb with a different exit status just falls through to the raw passthrough
+    below — the pre-existing behaviour, noisy but honest — whereas a wrong
+    ``unsupported`` actively tells the user nothing is broken.
+
+    Two residuals are known and accepted, both bounded by the conditions above:
+
+    - Exit 2 is Click's status for ANY ``UsageError``, including one a command
+      body raises after dispatch, so it does not *strictly* prove the parser
+      rejected the verb. To reach a false ``unsupported`` through that door a
+      recognized ``comfy outdated`` would have to raise a usage error mid-run,
+      emit no envelope, AND print "no such command" naming ``outdated`` itself
+      with a closing delimiter — i.e. reproduce the parser's own message about
+      its own name. No further heuristic buys much here; the alternative is
+      pattern-matching Click's usage preamble, which a mid-run ``UsageError``
+      also prints.
+    - The message this reads is built from bounded stream tails, so a wide rich
+      panel could in principle push the phrase out of the slice. Click prints
+      the error line LAST and the tail is what's kept, so it lands inside; if it
+      ever did not, the miss fails toward the raw passthrough.
+
+    The phrase must also name ``verb`` itself, within a few punctuation
+    characters (Click writes ``No such command 'outdated'.``) and ending at a
+    real delimiter, so a different command that merely starts with the same
+    letters — ``outdated-notifier`` — does not match. Matching the bare phrase
+    anywhere in the message would fold in the same relayed stderr the first
+    condition exists to exclude.
+    """
+    if not exc.no_envelope or exc.returncode != _CLICK_USAGE_ERROR_EXIT:
+        return False
+    pattern = _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape(verb))
+    normalized = _normalize_cli_text(str(exc))
+    return re.search(pattern, normalized, re.IGNORECASE) is not None
+
+
 def _freshness_report() -> Any:
     """Best-effort installed-vs-latest report via ``comfy outdated``.
 
     Returns the ``comfy outdated`` payload (``core`` install status, one row per
-    custom node ``packs`` entry, ``checked_at``) on success. On ANY
-    :class:`ComfyCliError` — the verb missing on an older comfy-cli, the network
-    lookup down, a timeout — returns ``{"error": "<reason>"}`` instead of
-    raising, so the probe can never take ``server_info`` down with it.
-    ``OSError`` is caught for the same reason: a spawn failure on this second
-    subprocess (the env probe already succeeded) is still just the freshness
-    probe failing, never grounds to fail ``server_info``. ``UnicodeDecodeError``
-    is caught too: ``_run_comfy_raw`` decodes the child's stdout with strict
-    ``encoding="utf-8"`` (no ``errors="replace"``), so non-UTF-8 bytes in a
-    pack name/path from the user's live custom-node install can raise it here,
-    same as the other probe failures above.
+    custom node ``packs`` entry, ``checked_at``) on success. It never raises, so
+    the probe can never take ``server_info`` down with it; it degrades to one of
+    two shapes instead.
+
+    The MISSING-VERB degrade is its own shape: ``comfy outdated`` does not exist
+    on any released comfy-cli (through 1.12.0), so on those installs this probe
+    fails every time — and Click/Typer's raw ``No such command 'outdated'.``
+    usage dump, relayed verbatim, reads like a broken MCP rather than the benign
+    capability gap it is. That case returns
+    ``{"error": "freshness unavailable: ...", "unsupported": True}``, with
+    ``unsupported`` machine-readable so a client can branch on it without
+    matching strings. :func:`_is_missing_verb_error` decides that case, and is
+    deliberately strict: this degrade asserts nothing is broken, so a failure
+    that merely *relays* a "no such command" from somewhere else must keep the
+    raw passthrough below rather than be waved through as a capability gap.
+
+    EVERY OTHER failure keeps the raw ``{"error": "<reason>"}`` passthrough — for
+    a network failure, a timeout, or a decode error the underlying reason IS the
+    diagnostic, so relaying it is the useful thing to do. ``OSError`` is caught
+    because a spawn failure on this second subprocess (the env probe already
+    succeeded) is still just the freshness probe failing, never grounds to fail
+    ``server_info``. ``UnicodeDecodeError`` is caught too: ``_run_comfy_raw``
+    decodes the child's stdout with strict ``encoding="utf-8"`` (no
+    ``errors="replace"``), so non-UTF-8 bytes in a pack name/path from the
+    user's live custom-node install can raise it here, same as the other probe
+    failures above.
     """
     try:
         return _run_comfy("outdated", timeout=15.0)
     except (ComfyCliError, OSError, UnicodeDecodeError) as exc:
+        # Click/Typer emits `No such command 'outdated'.` on stderr, which
+        # `_unwrap_envelope` embeds in the raised message. `_is_missing_verb_error`
+        # keeps that detection narrow — a relayed nested error that merely quotes
+        # the same phrase must NOT reach this degrade, which claims nothing is
+        # wrong.
+        if isinstance(exc, ComfyCliError) and _is_missing_verb_error(exc, "outdated"):
+            return {
+                "error": (
+                    "freshness unavailable: the installed comfy-cli does not support "
+                    "'comfy outdated' (the verb ships in releases after 1.12.0). "
+                    "Workflows are unaffected; update checks were skipped."
+                ),
+                "unsupported": True,
+            }
         return {"error": str(exc)}
 
 
@@ -2006,9 +2169,16 @@ def server_info() -> Any:
     node, or template seems missing, tell the user to update FIRST
     (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
     before concluding the catalog lacks it; silent staleness is the usual
-    culprit. The probe is best-effort: on a comfy-cli without the ``outdated``
-    verb, a network failure, or a timeout, ``freshness`` degrades to
-    ``{"error": "<reason>"}`` — ``server_info`` itself still succeeds.
+    culprit. The probe is best-effort and degrades two ways — ``server_info``
+    itself still succeeds either way. On a comfy-cli that lacks the ``outdated``
+    verb (no release through 1.12.0 has it), ``freshness`` is
+    ``{"error": "freshness unavailable: ...", "unsupported": true}``:
+    ``unsupported: true`` means SKIP staleness advice entirely and do NOT tell
+    the user anything is broken — nothing failed, this comfy-cli just cannot
+    answer the question, and workflows are unaffected. On any other probe
+    failure (a network failure, a timeout, a decode error) ``freshness`` is
+    ``{"error": "<reason>"}`` with no ``unsupported`` key, and that reason is
+    the real diagnostic.
 
     Remote target: when a remote ComfyUI is configured (``COMFYUI_URL`` or
     ``COMFYUI_HOST`` — see :func:`_comfy_target`), a ``comfy_target`` block is
