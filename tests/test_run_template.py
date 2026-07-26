@@ -193,6 +193,36 @@ def test_run_template_streams_without_a_ctx(patched_streamed_run):
     assert calls[0]["cmd"][1] == "--json-stream"
 
 
+def test_run_template_survives_a_failing_progress_notification(patched_streamed_run):
+    """A notification that fails mid-run must not abort the run it describes.
+
+    Streaming is what newly puts a CREDIT-SPENDING path under
+    ``ctx.report_progress``: an exception escaping the send would reach
+    ``_run_comfy_streaming``'s cleanup, which kills the comfy-cli tree — losing a
+    run whose credits are already spent, with no ``prompt_id`` to recover the
+    outputs. A disconnected client is telemetry loss, not a reason to cancel.
+    """
+
+    class _BrokenCtx:
+        def __init__(self):
+            self.attempts = 0
+
+        async def report_progress(self, progress, total=None, message=None):  # noqa: ARG002
+            self.attempts += 1
+            raise RuntimeError("client disconnected")
+
+    calls = patched_streamed_run()
+    ctx = _BrokenCtx()
+
+    result = _run_template("api_seedance", params={"prompt": "a cat"}, ctx=ctx)
+
+    assert result == {"outputs": ["/x.png"]}  # the run's own result still lands
+    assert calls[0]["cmd"][1] == "--json-stream"
+    # Every event was attempted and every failure swallowed — one broken send does
+    # not stop the pump either.
+    assert ctx.attempts > 1
+
+
 def test_run_template_marshals_param_types_as_json(patched_streamed_run):
     """Each value is JSON-encoded so its Python type round-trips through the slot."""
     calls = patched_streamed_run()
@@ -451,7 +481,14 @@ def test_run_template_wait_false_submits_async(patched_run, monkeypatch):
 
 
 class _BlockingProc:
-    """A Popen fake that emits ``first_lines`` and then never yields an envelope."""
+    """A Popen fake that emits ``first_lines`` and then never yields an envelope.
+
+    Local rather than in ``conftest`` because this is the one case where the call
+    genuinely differs (see AGENTS.md): the shared ``patched_stream`` fake drains a
+    canned stream to EOF instantly and reports itself already exited, so it can
+    never hold the read past a deadline — which is precisely the state this test
+    is about.
+    """
 
     def __init__(self, cmd, first_lines):
         self.cmd = cmd

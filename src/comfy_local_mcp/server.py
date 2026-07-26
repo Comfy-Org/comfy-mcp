@@ -1633,7 +1633,9 @@ class _StreamProgress:
 
         State (``total`` / ``done`` / ``_last``) is updated unconditionally so a
         bounded, ctx-less watch still reports real progress in its timed-out
-        :meth:`snapshot`; the MCP notification is the only ctx-gated part.
+        :meth:`snapshot`; the MCP notification is the only ctx-gated part, and it
+        is best-effort — a send that fails is dropped rather than propagated, so
+        it can never abort the run it is only describing.
         """
         etype = event.get("type")
         if etype == "queued":
@@ -1660,9 +1662,27 @@ class _StreamProgress:
         progress = max(progress, self._last)
         self._last = progress
         if ctx is not None:
-            await ctx.report_progress(
-                progress=progress, total=self.total, message=message
-            )
+            try:
+                await ctx.report_progress(
+                    progress=progress, total=self.total, message=message
+                )
+            except Exception:  # noqa: BLE001 - telemetry must not abort the run
+                # A notification is best-effort; the run's RESULT is the
+                # deliverable. Any exception out of the pump reaches
+                # `_run_comfy_streaming`'s `finally`, which kills the comfy-cli
+                # tree — so letting a failed send (a disconnected client, a host
+                # that rejects the notification) escape would abort a live run
+                # over undelivered telemetry. On `run_template`'s paid path that
+                # means abandoning a run whose credits are already spent, with no
+                # `prompt_id` returned to recover the outputs. Drop the tick and
+                # keep reading the stream; the state above is already advanced, so
+                # a later `snapshot()` stays accurate. `CancelledError` is a
+                # BaseException and still propagates, so a real MCP cancellation
+                # is unaffected.
+                logging.getLogger(__name__).debug(
+                    "progress notification failed; continuing the run",
+                    exc_info=True,
+                )
 
 
 async def _run_comfy_streaming(
@@ -1900,9 +1920,11 @@ async def _run_comfy_streaming(
         )
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
-        # (timeout, a report_progress error, or normal completion). Kill the
-        # whole process tree (not just the direct child) so a descendant
-        # holding the stderr write fd can't keep the pipe from EOFing — see
+        # (timeout, cancellation, or normal completion — a failed progress
+        # notification is swallowed in `_StreamProgress.report` and reaches
+        # neither this block nor the caller). Kill the whole process tree (not
+        # just the direct child) so a descendant holding the stderr write fd
+        # can't keep the pipe from EOFing — see
         # _kill_proc_tree. (BE-3343) Reap on the dedicated pipe pool, not the
         # default `to_thread` pool, so this wait can never contend with (or be
         # confused for) unrelated `to_thread` callers.
