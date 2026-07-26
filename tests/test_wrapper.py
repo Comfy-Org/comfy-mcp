@@ -1062,6 +1062,28 @@ def test_stream_tail_marks_empty_and_truncation():
     assert textutil._stream_tail("x" * 100, limit=-1) == "<empty>"
 
 
+def test_tail_of_bytes_survives_a_long_trailing_whitespace_run():
+    """A whitespace flood at the end must not swallow the error before it.
+
+    The bytes branch windows the last ``4 * limit`` bytes before decoding (to
+    avoid decoding a huge capture). If that window lands wholly inside trailing
+    padding — a progress bar's, say — the strip empties it and the real error,
+    sitting just before, is lost. The str branch strips first and never has this
+    problem, so the two must agree.
+    """
+    padded = b"REAL_ERROR_LINE" + b" " * 5000
+
+    assert textutil._tail(padded, limit=100) == "REAL_ERROR_LINE"
+    assert textutil._stream_tail(padded, limit=100) == "REAL_ERROR_LINE"
+    # Same answer as the equivalent str capture, which strips before slicing.
+    assert textutil._tail(padded.decode(), limit=100) == textutil._tail(
+        padded, limit=100
+    )
+    # The fast path is unchanged: a capture with no trailing flood is windowed,
+    # not fully stripped, and still yields the TAIL.
+    assert textutil._tail(b"HEAD" + b"y" * 600, limit=100) == "y" * 100
+
+
 def test_no_envelope_error_marks_both_empty_streams(patched_plain_run):
     """Nothing on either stream still renders explicitly, never a dangling colon."""
     patched_plain_run(1, stdout="", stderr="")

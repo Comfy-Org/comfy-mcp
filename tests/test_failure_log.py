@@ -18,7 +18,10 @@ Like the rest of the suite these mock comfy-cli; nothing here needs a real
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -433,6 +436,91 @@ def test_scrub_arg_cases(arg, expected):
     assert failure_log._scrub_arg(arg) == expected
 
 
+@pytest.mark.parametrize(
+    ("arg", "expected"),
+    [
+        # `_render_param_args` emits combined-flag tokens, so the URL is not at
+        # the token's start — a start-anchored test would log the credential.
+        (
+            "--image_url=https://user:tok@host/x?token=abc",
+            "--image_url=https://***@host/x",
+        ),
+        # …and `run_template` wraps the value in JSON, offsetting it further.
+        (
+            '--param=src={"https://u:p@h/i.png"}',
+            '--param=src={"https://***@h/i.png"}',
+        ),
+    ],
+)
+def test_scrub_arg_finds_a_url_anywhere_in_the_token(arg, expected):
+    """A URL mid-token is scrubbed, not just one the token starts with."""
+    assert failure_log._scrub_arg(arg) == expected
+
+
+def test_message_is_scrubbed_before_it_is_capped(log_path):
+    """A URL straddling the message cap is masked, not cut into an unmasked half.
+
+    Capping first would slice ``https://user:pass@host`` before its ``@``, and
+    :func:`_redact_url` only masks userinfo it can still find in the netloc — so
+    the surviving ``user:pass`` would land in the file verbatim.
+    """
+    cap = failure_log._FAILURE_LOG_MESSAGE_CHARS
+    # Place the URL so the cap falls on its `@` — the whole userinfo is inside
+    # the kept prefix but the `@` that marks it as userinfo is not, which is
+    # precisely what defeats `_redact_url` when the cap runs first.
+    message = "x" * (cap - 16) + "https://user:tok@host/m.safetensors?token=abc"
+
+    failure_log._log_failure("error_envelope", ("run",), message=message)
+
+    (entry,) = _entries(log_path)
+    assert "user:tok" not in entry["message"]
+    assert "token=abc" not in entry["message"]
+    assert len(entry["message"]) == cap
+    # The cap now lands inside the *masked* URL, so what it clips is `***@…`
+    # rather than the raw `user:tok@…` the old cap-then-scrub order would leave.
+    assert entry["message"].endswith("https://***@host")
+
+
+def test_stream_tails_are_scrubbed_like_the_message(log_path):
+    """comfy-cli echoing a credential URL to a stream must not persist it raw."""
+    failure_log._log_failure(
+        "no_json",
+        ("model", "download"),
+        stdout="fetching https://user:tok@host/m.safetensors?token=abc",
+        stderr="failed: https://u:p@h/x?sig=deadbeef",
+    )
+
+    (entry,) = _entries(log_path)
+    assert entry["stdout_tail"] == "fetching https://***@host/m.safetensors"
+    assert entry["stderr_tail"] == "failed: https://***@h/x"
+    assert "user:tok" not in log_path.read_text()
+    assert "deadbeef" not in log_path.read_text()
+
+
+def test_stream_tail_scrubs_a_url_straddling_the_tail_cut(log_path):
+    """A URL clipped by the tail bound is dropped, never half-written.
+
+    The tail keeps the END of a capture, so scrubbing after the clip would see a
+    URL already shorn of its ``https://`` and skip it entirely.
+    """
+    limit = failure_log._FAILURE_LOG_TAIL_CHARS
+    url = "https://user:tok@host/x"
+    # Sized so the clip falls immediately after the URL's `https://` — the exact
+    # case where a scrub-after-clip pass sees no scheme, matches nothing, and
+    # writes the whole `user:tok@host/x` remainder to disk.
+    stderr = "A" * 100 + url + "B" * (limit + 108 - 100 - len(url))
+    assert len(textutil._stream_tail(stderr, limit)) == limit + 3  # it IS clipped
+
+    failure_log._log_failure("no_json", ("run",), stderr=stderr)
+
+    (entry,) = _entries(log_path)
+    assert "user:tok" not in entry["stderr_tail"]
+    assert "tok@host" not in entry["stderr_tail"]
+    # Still bounded, and still marked as truncated.
+    assert entry["stderr_tail"].startswith("...")
+    assert len(entry["stderr_tail"]) == limit + 3
+
+
 # --- best-effort + rotation --------------------------------------------------
 
 
@@ -484,6 +572,56 @@ def test_handler_is_configured_for_rotation(log_path, fake_comfy):
     assert handler.formatter._fmt == "%(message)s"
     # Never up to the root logger — stdout is the MCP transport.
     assert logger.propagate is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_log_directory_and_file_are_owner_only(monkeypatch, log_path, fake_comfy):
+    """The trail holds argv and stderr tails, so it must not be world-readable."""
+    # A permissive umask is exactly the case the explicit modes exist for.
+    previous = os.umask(0o022)
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_MAX_BYTES", 200)
+    try:
+        fake_comfy(stdout=_ERROR_ENVELOPE)
+        # Enough failures to force at least one rollover: the handler opens a
+        # fresh file on rotation, which must be owner-only too.
+        for _ in range(5):
+            with pytest.raises(server.ComfyCliError):
+                server._run_comfy("run", "wf.json")
+    finally:
+        os.umask(previous)
+
+    backup = log_path.with_suffix(log_path.suffix + ".1")
+    assert backup.exists()
+    assert stat.S_IMODE(log_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+
+def test_a_handler_that_fails_to_close_does_not_wedge_the_log(
+    monkeypatch, log_path, fake_comfy
+):
+    """Teardown survives a raising ``close()`` and leaves no stale memo.
+
+    Clearing the memo only AFTER the loop would let a raising ``close()`` leave
+    it pointing at a path whose handler is already detached — and if
+    ``_FAILURE_LOG_PATH`` were later repointed back to it, setup would be
+    skipped and every subsequent record silently dropped.
+    """
+    logger = failure_log.logging.getLogger(failure_log._FAILURE_LOGGER_NAME)
+    hostile = failure_log.logging.NullHandler()
+    monkeypatch.setattr(
+        hostile, "close", lambda: (_ for _ in ()).throw(OSError("boom")), raising=False
+    )
+    logger.addHandler(hostile)
+    fake_comfy(stdout=_ERROR_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError):
+        server._run_comfy("run", "wf.json")
+
+    # The hostile handler is gone, the real one is installed, and the record landed.
+    assert hostile not in logger.handlers
+    assert failure_log._failure_handler_path == str(log_path)
+    assert len(_entries(log_path)) == 1
 
 
 def test_rotation_produces_a_backup_file(monkeypatch, log_path, fake_comfy):

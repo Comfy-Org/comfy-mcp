@@ -28,7 +28,16 @@ def _tail(text: str | bytes | None, limit: int = 500) -> str:
         # most 4 bytes/char, so the last ``4 * limit`` bytes always contain
         # enough to yield ``limit`` decoded chars (a leading byte may be dropped,
         # which ``errors="replace"`` handles cleanly).
-        text = text[-4 * limit :].decode("utf-8", errors="replace")
+        window = text[-4 * limit :]
+        if len(window) < len(text) and not window.strip():
+            # The window landed wholly inside a run of trailing whitespace (a
+            # progress bar's padding, say), so the strip below would return
+            # nothing and silently drop the real error sitting just before it.
+            # The str branch never has this problem — it strips first — so only
+            # in this case pay for a full-buffer rstrip and re-window.
+            text = text.rstrip()
+            window = text[-4 * limit :]
+        text = window.decode("utf-8", errors="replace")
     return text.strip()[-limit:]
 
 

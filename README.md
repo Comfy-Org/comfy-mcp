@@ -580,8 +580,10 @@ full stop.
 
 > **Privacy — review before sharing.** The log contains local file paths and comfy-cli's own
 > command output, which can include the workflow or prompt text comfy-cli echoed back. Credentials
-> in a URL argument are masked (`user:pass@` userinfo, and the whole query string, are stripped),
-> but read a file over before you attach it to an issue.
+> in a URL are masked (`user:pass@` userinfo, and the whole query string, are stripped) wherever
+> the URL appears — in `args`, in `message`, and in the `stdout_tail` / `stderr_tail` captures —
+> but read a file over before you attach it to an issue. The log directory is created `0700` and
+> its files `0600`, so on a shared machine they are readable only by you.
 
 ## Smoke test
 

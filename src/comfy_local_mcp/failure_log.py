@@ -22,6 +22,14 @@ from logging.handlers import RotatingFileHandler
 
 from .textutil import _redact_url, _stream_tail
 
+# Mode bits for the log's directory and files. The JSONL trail holds comfy-cli
+# argv and stdout/stderr tails, so on a shared host it must not land at the
+# umask default (`0o777`/`0o666` minus the umask — typically group/world
+# readable). Owner-only on both, applied at creation so an existing directory
+# the operator chose (a custom path's parent may be `/tmp`) is never re-moded.
+_FAILURE_LOG_DIR_MODE = 0o700
+_FAILURE_LOG_FILE_MODE = 0o600
+
 # `COMFY_LOCAL_MCP_DEBUG_LOG` turns on a rotating, local-only JSONL record of
 # every comfy-cli failure this server surfaces, so a tester can zip up a durable
 # diagnostic trail instead of scraping an MCP client's transcript after the fact.
@@ -92,12 +100,10 @@ def _resolve_failure_log_path(value: str | None) -> str | None:
 _FAILURE_LOG_PATH = _resolve_failure_log_path(os.environ.get(_FAILURE_LOG_ENV))
 
 
-def _scrub_arg(arg: str) -> str:
-    """A comfy-cli argv token, safe to record in the failure log.
+def _scrub_url(url: str) -> str:
+    """One URL, credential-masked, safe to record in the failure log.
 
-    A URL argument gets two treatments and everything else passes through
-    verbatim (an arg is usually a path or a subcommand, and mangling those would
-    defeat the log):
+    A URL gets two treatments:
 
     - :func:`_redact_url` masks ``user:pass@`` userinfo, exactly as it does for
       the config values the error messages echo;
@@ -106,9 +112,7 @@ def _scrub_arg(arg: str) -> str:
       model URL carries its credential as ``?token=…`` — a secret no amount of
       userinfo masking would catch.
     """
-    if not arg.lower().startswith(("http://", "https://")):
-        return arg
-    scrubbed = _redact_url(arg)
+    scrubbed = _redact_url(url)
     # Cut at whichever of `?` / `#` comes first: a fragment can precede a
     # (meaningless, but present) query, and slicing on each in turn would leave
     # the earlier delimiter's contents behind.
@@ -119,27 +123,92 @@ def _scrub_arg(arg: str) -> str:
     return scrubbed if cut == -1 else scrubbed[:cut]
 
 
-# A URL anywhere in a recorded `message`. Anchored on the literal scheme so the
-# engine can skip ahead to a candidate rather than re-scan from every offset,
-# and `\S+` is a possessive-free single-pass match — no backtracking risk on a
+# A URL ANYWHERE in a recorded string — deliberately not anchored to the start.
+# argv is not all bare URLs: `_render_param_args` emits combined-flag tokens
+# (`--image_url=https://user:pass@host/x?token=…`, `--param=k={"https://…"}`)
+# whose URL sits mid-token, so a start-anchored test would wave the credential
+# straight through into `args`. Anchoring on the literal scheme still lets the
+# engine skip ahead to a candidate rather than re-scan from every offset, and
+# `\S+` is a possessive-free single-pass match — no backtracking risk on a
 # multi-KB message.
-_MESSAGE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _scrub_text(text: str) -> str:
+    """Apply :func:`_scrub_url` to every URL embedded anywhere in ``text``.
+
+    Only URL-shaped substrings are touched; everything around them (a path, a
+    subcommand, a flag name, the prose of a message — the point of keeping the
+    field at all) is preserved byte-for-byte.
+    """
+    return _URL_RE.sub(lambda match: _scrub_url(match.group(0)), text)
+
+
+def _scrub_arg(arg: str) -> str:
+    """A comfy-cli argv token, safe to record in the failure log."""
+    return _scrub_text(arg)
 
 
 def _scrub_message(message: str) -> str:
-    """Apply :func:`_scrub_arg`'s URL scrubbing to every URL inside ``message``.
+    """A recorded ``message`` / stream tail, safe to record in the failure log.
 
     Scrubbing ``args`` alone would be theatre: the error-envelope message this log
     records is built by :func:`_unwrap_envelope` as ``comfy <args> failed …``, so
     the RAW argv — including a signed ``?token=…`` model URL — is echoed right
-    back into it. That string is already what the MCP client sees (unchanged
-    here), but this log PERSISTS it to disk for a tester to zip up and share, so
-    the same masking has to reach it.
-
-    Only URL-shaped substrings are touched; the surrounding prose (the point of
-    keeping ``message`` at all) is preserved byte-for-byte.
+    back into it. The captured stream tails are the same story from the other
+    side: comfy-cli echoes the URL it is fetching to stderr. Those strings are
+    already what the MCP client sees (unchanged here), but this log PERSISTS them
+    to disk for a tester to zip up and share, so the same masking has to reach
+    all three.
     """
-    return _MESSAGE_URL_RE.sub(lambda match: _scrub_arg(match.group(0)), message)
+    return _scrub_text(message)
+
+
+def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
+    """A bounded stream tail with the same URL masking ``message`` gets.
+
+    Scrubbing has to happen BEFORE the final clip to ``limit``, not after: the
+    tail keeps the END of a capture, so a URL straddling the cut would arrive
+    here already shorn of its ``https://`` and slip past :data:`_URL_RE`
+    entirely — leaving the ``user:pass@host`` remainder in the file. So bound
+    generously first (``_stream_tail`` slices raw bytes before decoding, so the
+    wider window is still cheap on a multi-MB capture), scrub the whole window,
+    and only then clip: any half-URL at the window's head is now beyond
+    ``limit`` and is dropped rather than written.
+    """
+    if limit <= 0:
+        # Mirror `_stream_tail`'s own non-positive guard: `[-0:]` is the WHOLE
+        # string, so the re-clip below would otherwise hand back the entire
+        # (double-width) window — the opposite of a bound.
+        return "<empty>"
+    window = _stream_tail(stream, limit * 2)
+    scrubbed = _scrub_message(window)
+    if len(scrubbed) <= limit:
+        return scrubbed
+    # Re-clipping loses the marker `_stream_tail` may have added, so re-add it:
+    # this result is truncated either way.
+    return "..." + scrubbed[-limit:]
+
+
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """:class:`RotatingFileHandler` that keeps every file it opens owner-only.
+
+    The stdlib handler opens through :func:`open`, so the log lands at
+    ``0o666 & ~umask`` — group/world-readable under a typical umask, for a file
+    holding comfy-cli argv and stderr tails. Rotation opens a fresh file too, so
+    the mode has to be reapplied on every open rather than once at setup.
+    """
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, _FAILURE_LOG_FILE_MODE)
+        except OSError:
+            # Best-effort, like everything else here: a file we cannot chmod
+            # (someone else's, or a filesystem with no mode bits) must still be
+            # logged to rather than silently disabling the diagnostics.
+            pass
+        return stream
 
 
 # The path the currently-open rotating handler writes to; ``None`` until the
@@ -172,17 +241,26 @@ def _failure_logger(path: str) -> logging.Logger:
             # Re-check under the lock: the thread that lost the race must not
             # tear down and rebuild the handler the winner just installed.
             if _failure_handler_path != path:
+                # Cleared BEFORE the teardown and the (fallible) setup below, so
+                # neither a `close()` that raises nor a handler that fails to
+                # open can leave the global claiming a path nothing is actually
+                # writing to — which, if `_FAILURE_LOG_PATH` were later
+                # repointed BACK to it, would make this memo report a handler
+                # that is no longer attached and silently drop every record.
+                _failure_handler_path = None
                 for existing in list(logger.handlers):
                     logger.removeHandler(existing)
-                    existing.close()
-                # Cleared BEFORE the (fallible) setup below, so a handler that
-                # fails to open cannot leave the global claiming a path nothing
-                # is actually writing to.
-                _failure_handler_path = None
+                    try:
+                        existing.close()
+                    except Exception:
+                        # A handler that fails to close is already detached; it
+                        # must not abort the teardown of the ones after it (two
+                        # live handlers would duplicate every line).
+                        pass
                 parent = os.path.dirname(path)
                 if parent:
-                    os.makedirs(parent, exist_ok=True)
-                handler = RotatingFileHandler(
+                    os.makedirs(parent, mode=_FAILURE_LOG_DIR_MODE, exist_ok=True)
+                handler = _OwnerOnlyRotatingFileHandler(
                     path,
                     maxBytes=_FAILURE_LOG_MAX_BYTES,
                     backupCount=_FAILURE_LOG_BACKUPS,
@@ -235,12 +313,16 @@ def _log_failure(
             "args": [_scrub_arg(arg) for arg in args],
             "exit_code": exit_code,
             "error_code": error_code,
-            # Cap first, then scrub: bounding the work keeps the regex pass off a
-            # pathological multi-MB message, and a URL that survives the cap is
-            # still scrubbed in full.
-            "message": _scrub_message(message[:_FAILURE_LOG_MESSAGE_CHARS]),
-            "stdout_tail": _stream_tail(stdout, _FAILURE_LOG_TAIL_CHARS),
-            "stderr_tail": _stream_tail(stderr, _FAILURE_LOG_TAIL_CHARS),
+            # Scrub first, THEN cap. Capping first would cut a
+            # `https://user:pass@host` URL straddling the boundary, and
+            # `_redact_url` only masks userinfo when it still finds the `@` in
+            # the netloc — so the surviving `user:pass` half would be written
+            # unredacted. `_URL_RE` is a linear single-pass scan, so running it
+            # over the full message before bounding costs nothing worth the
+            # leak.
+            "message": _scrub_text(message)[:_FAILURE_LOG_MESSAGE_CHARS],
+            "stdout_tail": _scrubbed_stream_tail(stdout, _FAILURE_LOG_TAIL_CHARS),
+            "stderr_tail": _scrubbed_stream_tail(stderr, _FAILURE_LOG_TAIL_CHARS),
             "streaming": streaming,
         }
         _failure_logger(path).info(json.dumps(entry, ensure_ascii=False))
