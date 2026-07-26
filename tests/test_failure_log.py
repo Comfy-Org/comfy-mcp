@@ -50,23 +50,16 @@ def log_path(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def fake_comfy(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.run`` for one canned comfy-cli result.
+def fake_comfy(patched_run):
+    """``setup(stdout=…, stderr=…, returncode=…, raises=…)`` for one canned result.
 
-    ``setup(stdout=…, stderr=…, returncode=…, raises=…)`` — ``raises`` makes the
-    fake raise instead of returning (used for ``subprocess.TimeoutExpired``).
+    The shared ``patched_run`` (conftest) with this file's own default of an
+    EMPTY stdout — these tests are about what a *failing* call records, and "no
+    JSON at all" is one of the failures under test.
     """
 
     def setup(stdout="", stderr="", returncode=0, raises=None):
-        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-            if raises is not None:
-                raise raises
-            return subprocess.CompletedProcess(
-                cmd, returncode, stdout=stdout, stderr=stderr
-            )
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
+        patched_run(stdout, stderr=stderr, returncode=returncode, raises=raises)
 
     return setup
 

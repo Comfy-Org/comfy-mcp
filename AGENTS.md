@@ -84,6 +84,22 @@ the `comfy` binary. `_run_comfy` and the envelope parser are exercised directly
 (`test_discovery.py`, `test_templates.py`). When you add or change a tool, add or
 update its test in the same PR.
 
+**Mock comfy-cli through the shared fixtures in `tests/conftest.py`, never a
+hand-rolled stub.** They are the single place that mirrors how `server` spawns
+the CLI, so a change to the spawn signature is one edit rather than a sweep:
+
+- `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
+- `patched_run(stdout=…, returncode=…, stderr=…, raises=…) -> calls` — the plain
+  `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/
+  `encoding` per invocation for exact-argv assertions.
+- `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for the verbs
+  that print human text and emit no envelope (`launch`/`stop`/`generate`).
+- `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
+  (`subprocess.Popen`).
+
+A local stub is justified only where the call genuinely differs — the
+`comfy --version` probe (its own kwargs) and multi-call sequenced replies.
+
 ## Destined-public hygiene
 
 This repository is **private but destined to go public.** Treat everything you

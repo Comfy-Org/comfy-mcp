@@ -67,17 +67,11 @@ def test_unwrap_rejects_incompatible_major_even_on_error_envelope():
         server._unwrap_envelope(envelope, ("env",), 0, "")
 
 
-def test_incompatible_envelope_propagates_through_run_comfy(monkeypatch):
+def test_incompatible_envelope_propagates_through_run_comfy(patched_run):
     """The assertion guards every tool: a bad-schema envelope raises via _run_comfy."""
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        import json
-
-        out = json.dumps({"schema": "envelope/99", "type": "envelope", "ok": True})
-        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    # Deliberately NOT conftest's `envelope()` — the whole point is the major
+    # this server does not speak, which that builder cannot emit.
+    patched_run({"schema": "envelope/99", "type": "envelope", "ok": True})
 
     with pytest.raises(server.ComfyCliError, match="incompatible comfy-cli envelope"):
         server._run_comfy("env")
@@ -212,22 +206,11 @@ def test_check_warns_but_does_not_raise_when_floor_set_and_version_unknown(monke
 
 
 @pytest.fixture
-def patched_env(monkeypatch):
+def patched_env(monkeypatch, patched_run):
     """Patch comfy-cli so ``server_info`` sees a given ``comfy env`` envelope."""
 
-    def setup(envelope: dict, version: str | None = "1.12.0") -> list[dict]:
-        import json
-
-        calls: list[dict] = []
-
-        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-            calls.append({"cmd": cmd})
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout=json.dumps(envelope), stderr=""
-            )
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
+    def setup(payload: dict, version: str | None = "1.12.0") -> list[dict]:
+        calls = patched_run(payload)
         monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: version)
         return calls
 

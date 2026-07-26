@@ -16,26 +16,12 @@ comfy-cli's real ``templates ls`` payload:
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 
 import pytest
+from conftest import envelope
 
 from comfy_local_mcp import server
-
-
-def _fake_run(envelope: dict):
-    """Return a subprocess.run stand-in that captures the call and emits an envelope."""
-    calls: list[dict] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env})
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(envelope), stderr=""
-        )
-
-    return fake, calls
 
 
 # A representative slice of the real comfy-cli `templates ls` payload shape.
@@ -124,11 +110,9 @@ def _names(result) -> list[str]:
     return [r["name"] for r in _rows(result)]
 
 
-def test_search_templates_argv_and_empty_query_pages(monkeypatch):
+def test_search_templates_argv_and_empty_query_pages(patched_run):
     """Passthrough `comfy --json --where local templates ls`; empty query = first page + total."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": _payload()})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data=_payload()))
 
     result = server.search_templates()
 
@@ -199,11 +183,9 @@ def test_search_templates_pagination(monkeypatch):
     assert server.search_templates(limit=2, offset=100)["rows"] == []  # past the end
 
 
-def test_search_templates_forwards_gallery_filters(monkeypatch):
+def test_search_templates_forwards_gallery_filters(patched_run):
     """tag/type/model/provider become the corresponding `templates ls` flags."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": _payload()})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data=_payload()))
 
     server.search_templates(
         tag="API", type="image", model="Flux", provider="Black Forest Labs"
@@ -291,23 +273,17 @@ def test_search_templates_limit_capped(monkeypatch):
     assert result["shown"] == server._TEMPLATE_LIST_MAX_LIMIT  # page is capped
 
 
-def test_get_template_argv(monkeypatch):
+def test_get_template_argv(patched_run):
     """Passthrough: `comfy --json --where local templates show <name>`."""
-    fake, calls = _fake_run(
-        {"type": "envelope", "ok": True, "data": {"name": "flux_dev", "nodes": 12}}
-    )
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data={"name": "flux_dev", "nodes": 12}))
 
     assert server.get_template("flux_dev") == {"name": "flux_dev", "nodes": 12}
     assert calls[0]["cmd"][4:] == ["templates", "show", "flux_dev"]
 
 
-def test_fetch_template_argv_and_returns_abspath(monkeypatch, tmp_path):
+def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
     """Passthrough argv is `templates fetch <name> --out <path>`; returns the abs path."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": None})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data=None))
 
     out = tmp_path / "flux.json"
     result = server.fetch_template("flux_dev", str(out))

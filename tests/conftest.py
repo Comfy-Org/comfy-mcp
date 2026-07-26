@@ -9,11 +9,15 @@ guard tests (`test_wrapper.py`) re-enable it explicitly and mock `--version`.
 ``partner_generate``'s spend-gate probe is a second such once-per-process
 shell-out and is neutralized the same way.
 
-This module also holds the shared test helpers for the streaming
-(``--json-stream``) tool paths. ``run_workflow``, ``watch_job`` and
-``generate_image`` all drive the same ``subprocess.Popen`` NDJSON streaming
-path, so their tests share the fakes and the ``patched_stream`` fixture defined
-here rather than each redefining them.
+This module also holds the shared test helpers for both comfy-cli spawn paths,
+so a change to how ``server`` shells out lands in ONE fake rather than in a
+copy per test file:
+
+* the plain ``--json`` path (``subprocess.run``) — ``envelope`` +
+  ``patched_run`` / ``patched_plain_run``;
+* the streaming ``--json-stream`` path (``subprocess.Popen``) —
+  ``patched_stream``. ``run_workflow``, ``watch_job`` and ``generate_image``
+  all drive the same NDJSON stream.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import subprocess
 
 import pytest
 
@@ -110,6 +115,107 @@ def _clear_t2i_env(monkeypatch):
         "COMFY_T2I_CHECKPOINT_SLOT",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+_UNSET = object()
+
+
+def envelope(*, ok: bool = True, data=_UNSET, error=None) -> dict:
+    """Build a comfy-cli ``envelope/1`` result body.
+
+    Mirrors what the CLI emits on its ``--json`` path: an ``error`` object when
+    the call failed, a ``data`` payload otherwise. One builder here rather than
+    one re-derived per test file, so a schema bump has a single place to land.
+
+    ``data`` defaults to ``{}`` only when it is OMITTED — an explicit
+    ``data=None`` stays ``None``, which several tests rely on to exercise the
+    non-dict-payload branches.
+    """
+    body: dict = {"schema": "envelope/1", "type": "envelope", "ok": ok}
+    if error is not None:
+        body["error"] = error
+    else:
+        body["data"] = {} if data is _UNSET else data
+    return body
+
+
+def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
+    """The one ``subprocess.run`` stand-in for the plain (non-streaming) path.
+
+    Its parameter list mirrors ``_run_comfy``'s exact ``subprocess.run`` kwargs
+    — which is precisely why it lives here: a kwarg added or renamed there (the
+    ``encoding=`` pin was the last one) is a one-line edit instead of a sweep
+    across every test file.
+
+    Each call is recorded as ``{"cmd", "env", "timeout", "encoding"}`` — a
+    superset of what any caller asserts on — BEFORE ``raises`` fires, so a test
+    for a spawn that blows up can still see the argv it blew up on.
+    """
+
+    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        calls.append({"cmd": cmd, "env": env, "timeout": timeout, "encoding": encoding})
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(
+            cmd, returncode, stdout=stdout, stderr=stderr
+        )
+
+    return fake
+
+
+@pytest.fixture
+def patched_run(monkeypatch):
+    """Patch ``shutil.which`` + ``subprocess.run`` for the plain ``--json`` path.
+
+    Returns ``setup(stdout=…, returncode=…, stderr=…, raises=…) -> calls``:
+
+    * ``stdout`` — a dict (JSON-encoded for you, the common case: pass an
+      :func:`envelope`) or a raw string; defaults to an empty-``data`` success
+      envelope.
+    * ``raises`` — an exception instance the fake raises instead of returning,
+      for the spawn-failure paths (``TimeoutExpired`` and friends).
+
+    ``calls`` is the live list every invocation is recorded into, for the exact
+    argv assertions this suite is built on.
+    """
+
+    def setup(stdout=None, *, returncode: int = 0, stderr: str = "", raises=None):
+        if stdout is None:
+            stdout = envelope()
+        if isinstance(stdout, dict):
+            stdout = json.dumps(stdout)
+        calls: list[dict] = []
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            _canonical_run(
+                calls,
+                stdout=stdout,
+                returncode=returncode,
+                stderr=stderr,
+                raises=raises,
+            ),
+        )
+        return calls
+
+    return setup
+
+
+@pytest.fixture
+def patched_plain_run(patched_run):
+    """``setup(returncode=…, stdout=…, stderr=…) -> calls`` for the NO-envelope path.
+
+    ``comfy launch`` / ``stop`` / ``generate`` print human text through their own
+    printer and never emit an ``envelope/1``, so their tests are about the exit
+    code and the streams. Same fake as :func:`patched_run`, with the returncode
+    first and an empty stdout default.
+    """
+
+    def setup(returncode: int = 0, stdout: str = "", stderr: str = "") -> list[dict]:
+        return patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    return setup
 
 
 class _FakeProc:

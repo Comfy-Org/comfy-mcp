@@ -695,6 +695,27 @@ def _parse_version(text: str) -> tuple[int, int, int] | None:
     return int(major), int(minor), int(patch)
 
 
+def _spawn_comfy_version() -> subprocess.CompletedProcess:
+    """Run ``comfy --version`` and return the completed process.
+
+    The single spawn site shared by the two ``--version`` probes —
+    :func:`_check_comfy_version` (the hard ``>= 1.12.0`` floor) and
+    :func:`_detect_comfy_cli_version` (the opt-in ``COMFY_CLI_MIN_VERSION``
+    report). It deliberately does NOT catch anything: the two callers have
+    different, load-bearing failure policies (fail-open with a latched timeout
+    and a macOS TCC translation vs. best-effort ``None``), so each keeps its own
+    ``try``/``except`` around this call. Only the invocation itself is shared.
+    """
+    return subprocess.run(
+        [COMFY_BIN, "--version"],
+        capture_output=True,
+        text=True,
+        errors="replace",  # never crash on undecodable `--version` bytes
+        timeout=30.0,
+        check=False,
+    )
+
+
 def _check_comfy_version() -> None:
     """Guard: refuse to run against a comfy-cli older than :data:`_MIN_COMFY_CLI`.
 
@@ -710,14 +731,7 @@ def _check_comfy_version() -> None:
     if _version_checked:
         return
     try:
-        proc = subprocess.run(
-            [COMFY_BIN, "--version"],
-            capture_output=True,
-            text=True,
-            errors="replace",  # never crash on undecodable `--version` bytes
-            timeout=30.0,
-            check=False,
-        )
+        proc = _spawn_comfy_version()
     except subprocess.TimeoutExpired:
         # A hung `--version` is latched so we don't re-block every later call on
         # the same 30s wait; fail OPEN for the rest of the process.
@@ -1911,15 +1925,12 @@ def _detect_comfy_cli_version() -> str | None:
     if shutil.which(COMFY_BIN) is None:
         return None
     try:
-        proc = subprocess.run(
-            [COMFY_BIN, "--version"],
-            capture_output=True,
-            text=True,
-            errors="replace",  # never crash on non-UTF-8 bytes; report None instead
-            timeout=30.0,
-            check=False,
-        )
+        proc = _spawn_comfy_version()
     except (subprocess.SubprocessError, OSError):
+        # Best-effort by design: this broad catch also swallows the
+        # TimeoutExpired / PermissionError cases that _check_comfy_version
+        # translates, because an undetermined version here is reported as
+        # "unknown" rather than raised. Do not narrow it to match that guard.
         return None
     # Only trust stdout on a clean exit: a non-zero exit or a stderr warning can
     # carry an unrelated dotted number (an embedded Python / ComfyUI core version)

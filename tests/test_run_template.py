@@ -29,11 +29,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import subprocess
 import time
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx
+from conftest import _OK_STREAM, _RecordingCtx, envelope
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -96,44 +95,6 @@ class _FakeCtx:
         return CancelledElicitation()
 
 
-def _envelope(*, ok: bool = True, data=None, error=None) -> str:
-    body: dict = {"schema": "envelope/1", "type": "envelope", "ok": ok}
-    if error is not None:
-        body["error"] = error
-    else:
-        body["data"] = data if data is not None else {}
-    return json.dumps(body)
-
-
-@pytest.fixture
-def patched_run(monkeypatch):
-    """``setup(stdout=..., returncode=...) -> calls`` mocking ``comfy`` via subprocess.
-
-    Defaults to a successful ``envelope/1`` so the happy path returns real data;
-    pass ``stdout`` to shape the envelope (e.g. an error) per test.
-    """
-
-    def setup(stdout: str | None = None, returncode: int = 0) -> list[dict]:
-        calls: list[dict] = []
-        payload = (
-            _envelope(data={"prompt_id": "p1", "outputs": ["/x.png"]})
-            if stdout is None
-            else stdout
-        )
-
-        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-            calls.append({"cmd": cmd, "env": env, "timeout": timeout})
-            return subprocess.CompletedProcess(
-                cmd, returncode, stdout=payload, stderr=""
-            )
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
-        return calls
-
-    return setup
-
-
 @pytest.fixture
 def patched_streamed_run(patched_stream, monkeypatch):
     """``setup(stdout=...) -> calls`` — the same recorder over the STREAMING path.
@@ -147,12 +108,20 @@ def patched_streamed_run(patched_stream, monkeypatch):
     which the streaming path takes as an argument rather than handing to
     ``subprocess.run``.
 
+    ``stdout`` mirrors ``patched_run``'s contract — a dict (an :func:`envelope`,
+    NDJSON-encoded as the stream's final line for you) or a raw NDJSON string;
+    it defaults to conftest's shared ``_OK_STREAM``.
+
     ``calls`` stays empty when no child is spawned, so the input-guard tests read
     identically on both paths.
     """
 
-    def setup(stdout: str | None = None) -> list[dict]:
-        procs = patched_stream(_OK_STREAM if stdout is None else stdout)
+    def setup(stdout=None) -> list[dict]:
+        if stdout is None:
+            stdout = _OK_STREAM
+        elif isinstance(stdout, dict):
+            stdout = json.dumps(stdout) + "\n"
+        procs = patched_stream(stdout)
         calls: list[dict] = []
         real_streaming = server._run_comfy_streaming
 
@@ -433,14 +402,13 @@ def test_run_template_does_not_consult_the_generate_auto_confirm(
 def test_run_template_spend_refusal_raises_with_code(patched_streamed_run):
     """The engine's fail-closed refusal (error envelope) raises — no false success."""
     patched_streamed_run(
-        stdout=_envelope(
+        envelope(
             ok=False,
             error={
                 "code": "spend_consent_required",
                 "message": "template uses paid nodes; re-run with --allow-spend",
             },
         )
-        + "\n"
     )
 
     with pytest.raises(server.ComfyCliError, match="spend_consent_required"):
@@ -456,7 +424,7 @@ def test_run_template_wait_false_submits_async(patched_run, monkeypatch):
     It also stays on the plain `--json` dialect: there is nothing to stream from a
     submit that returns as soon as the job is queued.
     """
-    calls = patched_run(stdout=_envelope(data={"prompt_id": "p9"}))
+    calls = patched_run(envelope(data={"prompt_id": "p9"}))
     monkeypatch.setattr(
         server,
         "_run_comfy_streaming",

@@ -22,9 +22,9 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
-import subprocess
 
 import pytest
+from conftest import envelope
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -75,36 +75,6 @@ class _FakeCtx:
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
-
-
-def _fake_run_plain(returncode: int, stdout: str = "", stderr: str = ""):
-    """``subprocess.run`` stand-in emitting HUMAN text (no envelope) + a returncode.
-
-    Mirrors the real ``comfy generate``, which prints its result through its own
-    printer and never emits a renderer envelope on the generate path.
-    """
-    calls: list[dict] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env, "timeout": timeout})
-        return subprocess.CompletedProcess(
-            cmd, returncode, stdout=stdout, stderr=stderr
-        )
-
-    return fake, calls
-
-
-@pytest.fixture
-def patched_plain_run(monkeypatch):
-    """``setup(returncode, stdout, stderr) -> calls`` for the no-envelope path."""
-
-    def setup(returncode: int = 0, stdout: str = "", stderr: str = "") -> list[dict]:
-        fake, calls = _fake_run_plain(returncode, stdout, stderr)
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
-        return calls
-
-    return setup
 
 
 # --- passthrough argv -------------------------------------------------------
@@ -321,7 +291,9 @@ def test_partner_generate_surfaces_a_broken_elicitation_without_spending(
     assert calls == []
 
 
-def test_partner_generate_honors_the_engines_durable_always_proceed(monkeypatch):
+def test_partner_generate_honors_the_engines_durable_always_proceed(
+    monkeypatch, patched_plain_run
+):
     """`spend.auto_confirm` -> no prompt, and no `--yes`: the engine consents itself.
 
     The durable "always proceed" is the user's own choice, persisted in
@@ -330,20 +302,14 @@ def test_partner_generate_honors_the_engines_durable_always_proceed(monkeypatch)
     the wrapper re-asking a question the user already answered for good.
     """
     monkeypatch.setattr(server, "_engine_auto_confirms", lambda: True)
-    calls = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="done", stderr="")
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_plain_run(0, stdout="done")
     ctx = _FakeCtx(action="decline")
 
     _generate("flux-pro", ctx=ctx)
 
     assert ctx.elicitations == []  # nothing left to ask
-    assert "--yes" not in calls[0]  # consent is the engine's, not ours to assert
+    # consent is the engine's, not ours to assert
+    assert "--yes" not in calls[0]["cmd"]
 
 
 # --- reading the engine's durable always-proceed ----------------------------
@@ -354,20 +320,14 @@ def test_partner_generate_honors_the_engines_durable_always_proceed(monkeypatch)
 _real_engine_auto_confirms = server._engine_auto_confirms
 
 
-def _patched_consent_show(monkeypatch, returncode: int, stdout: str) -> list[list[str]]:
+def _patched_consent_show(
+    patched_plain_run, returncode: int, stdout: str
+) -> list[dict]:
     """Stub `comfy generate consent show --json` with a canned exit + stdout."""
-    calls: list[list[str]] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
-    return calls
+    return patched_plain_run(returncode, stdout=stdout)
 
 
-def test_engine_auto_confirms_reads_the_json_consent_payload(monkeypatch):
+def test_engine_auto_confirms_reads_the_json_consent_payload(patched_plain_run):
     """comfy-cli pretty-prints the setting, so it is read from the WHOLE stdout.
 
     `output.print_json` uses `indent=2`, so no single line parses — the
@@ -375,11 +335,13 @@ def test_engine_auto_confirms_reads_the_json_consent_payload(monkeypatch):
     who had turned it on.
     """
     calls = _patched_consent_show(
-        monkeypatch, 0, '{\n  "spend_auto_confirm": true,\n  "action": "show"\n}\n'
+        patched_plain_run,
+        0,
+        '{\n  "spend_auto_confirm": true,\n  "action": "show"\n}\n',
     )
 
     assert _real_engine_auto_confirms() is True
-    assert calls[0][4:] == ["generate", "consent", "show", "--json"]
+    assert calls[0]["cmd"][4:] == ["generate", "consent", "show", "--json"]
 
 
 @pytest.mark.parametrize(
@@ -394,14 +356,14 @@ def test_engine_auto_confirms_reads_the_json_consent_payload(monkeypatch):
     ],
 )
 def test_engine_auto_confirms_is_false_for_anything_unreadable(
-    monkeypatch, returncode, stdout
+    patched_plain_run, returncode, stdout
 ):
     """Only a real JSON `true` from a clean exit counts as pre-authorization.
 
     Every other answer falls through to ASKING the user — the failure direction
     that costs a prompt, not the one that costs money.
     """
-    _patched_consent_show(monkeypatch, returncode, stdout)
+    _patched_consent_show(patched_plain_run, returncode, stdout)
 
     assert _real_engine_auto_confirms() is False
 
@@ -439,7 +401,7 @@ def test_engine_auto_confirms_is_false_when_the_probe_blows_up(monkeypatch, exc)
     assert _real_engine_auto_confirms() is False
 
 
-def test_engine_auto_confirms_asks_comfy_cli_for_json_explicitly(monkeypatch):
+def test_engine_auto_confirms_asks_comfy_cli_for_json_explicitly(patched_plain_run):
     """The trailing `--json` is load-bearing and must not be "cleaned up" away.
 
     `comfy generate` takes `allow_extra_args`, so the tail after the target
@@ -448,18 +410,18 @@ def test_engine_auto_confirms_asks_comfy_cli_for_json_explicitly(monkeypatch):
     so dropping this flag would make the command print rich human text, fail the
     parse, and silently turn `comfy generate consent always` into a dead setting.
     """
-    calls = _patched_consent_show(monkeypatch, 0, '{"spend_auto_confirm": true}')
+    calls = _patched_consent_show(patched_plain_run, 0, '{"spend_auto_confirm": true}')
 
     assert _real_engine_auto_confirms() is True
     # The global flag precedes the subcommand; the subcommand's own flag trails it.
-    assert calls[0][:2] == [server.COMFY_BIN, "--json"]
-    assert calls[0][-1] == "--json"
+    assert calls[0]["cmd"][:2] == [server.COMFY_BIN, "--json"]
+    assert calls[0]["cmd"][-1] == "--json"
 
 
-def test_engine_auto_confirms_unwraps_a_future_envelope(monkeypatch):
+def test_engine_auto_confirms_unwraps_a_future_envelope(patched_plain_run):
     """If comfy-cli ever wraps this verb in an `envelope/1`, read `data`."""
     _patched_consent_show(
-        monkeypatch,
+        patched_plain_run,
         0,
         '{"schema": "envelope/1", "type": "envelope", "ok": true, '
         '"data": {"spend_auto_confirm": true}}',
@@ -651,7 +613,9 @@ def test_partner_generate_rejects_a_non_positive_or_nan_timeout(patched_plain_ru
 # --- the engine's spend gate must actually be installed ---------------------
 
 
-def test_partner_generate_refuses_when_comfy_cli_has_no_spend_gate(monkeypatch):
+def test_partner_generate_refuses_when_comfy_cli_has_no_spend_gate(
+    monkeypatch, patched_plain_run
+):
     """No `comfy generate consent` -> no interlock -> refuse BEFORE spending.
 
     The fail-closed guarantee is comfy-cli's, and it landed after the >= 1.12.0
@@ -660,37 +624,28 @@ def test_partner_generate_refuses_when_comfy_cli_has_no_spend_gate(monkeypatch):
     user with nothing to stop it.
     """
     monkeypatch.setattr(server, "_spend_gate_probed", False)
-    calls: list[list[str]] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append(cmd)
-        # An older comfy-cli reads `consent` as a model name and exits non-zero.
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such model")
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    # An older comfy-cli reads `consent` as a model name and exits non-zero.
+    calls = patched_plain_run(1, stderr="no such model")
 
     with pytest.raises(server.ComfyCliError, match="no `comfy generate` spend gate"):
         _generate("flux-pro", params={"prompt": "a cat"})
 
     assert len(calls) == 1  # only the probe ran
-    assert calls[0][4:] == ["generate", "consent", "show"]  # never the generation
+    # never the generation
+    assert calls[0]["cmd"][4:] == ["generate", "consent", "show"]
     assert server._spend_gate_probed is False  # a failed probe is not latched
 
 
-def test_partner_generate_checks_the_gate_before_prompting_the_user(monkeypatch):
+def test_partner_generate_checks_the_gate_before_prompting_the_user(
+    monkeypatch, patched_plain_run
+):
     """The gate probe runs BEFORE the elicitation, not after.
 
     Prompting first would ask the user to authorize a spend this call was always
     going to refuse — a confirmation dialog whose only outcome is an error.
     """
     monkeypatch.setattr(server, "_spend_gate_probed", False)
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such model")
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    patched_plain_run(1, stderr="no such model")
     ctx = _FakeCtx(action="accept", approve=True)
 
     with pytest.raises(server.ComfyCliError, match="no `comfy generate` spend gate"):
@@ -845,22 +800,17 @@ def test_the_model_name_shown_in_the_prompt_is_length_capped(patched_plain_run):
     assert "SPENDS Comfy credits" in ctx.elicitations[0]
 
 
-def test_partner_generate_probes_the_spend_gate_once_then_generates(monkeypatch):
+def test_partner_generate_probes_the_spend_gate_once_then_generates(
+    monkeypatch, patched_plain_run
+):
     """A CLI that HAS the gate is probed once, then the generation goes through."""
     monkeypatch.setattr(server, "_spend_gate_probed", False)
-    calls: list[list[str]] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="done", stderr="")
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_plain_run(0, stdout="done")
 
     _generate("flux-pro", confirm_spend=True)
     _generate("flux-pro", confirm_spend=True)
 
-    assert [c[4:6] for c in calls] == [
+    assert [c["cmd"][4:6] for c in calls] == [
         ["generate", "consent"],  # probed once...
         ["generate", "flux-pro"],
         ["generate", "flux-pro"],  # ...not again on the second call
@@ -886,7 +836,7 @@ def test_partner_generate_synthesizes_success_without_an_envelope(patched_plain_
 
 
 def test_partner_generate_prefers_a_real_envelope_when_comfy_cli_emits_one(
-    monkeypatch,
+    patched_run,
 ):
     """If comfy-cli ever DOES emit an envelope for generate, its data wins.
 
@@ -894,37 +844,19 @@ def test_partner_generate_prefers_a_real_envelope_when_comfy_cli_emits_one(
     normally, so this tool needs no change when the CLI starts emitting one.
     """
 
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout='{"schema": "envelope/1", "type": "envelope", "ok": true, '
-            '"data": {"images": ["/tmp/out.png"]}}',
-            stderr="",
-        )
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    patched_run(envelope(data={"images": ["/tmp/out.png"]}))
 
     result = _generate("flux-pro", confirm_spend=True)
 
     assert result == {"images": ["/tmp/out.png"]}
 
 
-def test_partner_generate_error_envelope_raises_with_code(monkeypatch):
+def test_partner_generate_error_envelope_raises_with_code(patched_run):
     """A real error envelope still surfaces comfy-cli's structured code."""
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        return subprocess.CompletedProcess(
-            cmd,
-            1,
-            stdout='{"schema": "envelope/1", "type": "envelope", "ok": false, '
-            '"error": {"code": "unknown_model", "message": "no such model"}}',
-            stderr="",
-        )
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    patched_run(
+        envelope(ok=False, error={"code": "unknown_model", "message": "no such model"}),
+        returncode=1,
+    )
 
     with pytest.raises(server.ComfyCliError, match="unknown_model"):
         _generate("nope-not-a-model", confirm_spend=True)
