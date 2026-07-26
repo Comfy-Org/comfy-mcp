@@ -685,6 +685,37 @@ def test_download_model_rejects_traversal_relative_path(bad_path):
         server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
 
 
+# --- Windows-shaped escapes are refused on EVERY host, including Linux CI ----
+#
+# The guard runs wherever the MCP server runs; the write happens wherever
+# comfy-cli runs. Judging these from the string's own shape plus
+# `ntpath.splitdrive` — never the host's `os.path` — is what makes them fail on a
+# POSIX box too, so these cases are the regression pins for that: to `posixpath`
+# on Linux CI every string below is an ordinary relative name.
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "C:evil",  # drive-RELATIVE: no separator, resolves against C:'s cwd
+        "C:/Windows",  # drive-absolute with a forward slash
+        "C:\\Windows",  # drive-absolute with a backslash
+        "\\\\server\\share",  # UNC root — no `:` at all, so `:`-checks miss it
+        "\\\\server\\share\\evil",  # UNC with a trailing path
+        "\\evil",  # root-relative on the current drive
+    ],
+)
+def test_download_model_rejects_windows_drive_relative_path(bad_path, patched_run):
+    """A Windows drive/UNC/root-relative ``relative_path`` is refused before any
+    child spawns — on Linux CI as much as on Windows."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b", "C:evil.dll"]
 )
@@ -694,6 +725,44 @@ def test_download_model_rejects_pathy_filename(bad_name):
     Windows)."""
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "C:evil.exe",  # drive-RELATIVE: a bare-name check alone lets this pass
+        "C:/evil.exe",
+        "\\\\server\\share\\evil.exe",  # UNC
+        "\\evil.exe",  # root-relative on the current drive
+    ],
+)
+def test_download_model_rejects_windows_drive_relative_filename(bad_name, patched_run):
+    """A Windows drive/UNC/root-relative ``filename`` is refused before any child
+    spawns — on Linux CI as much as on Windows."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid filename"):
+        server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+    assert calls == []
+
+
+def test_download_model_still_accepts_ordinary_path_and_name(patched_run):
+    """Regression pin: the Windows-shaped rejections above must not catch the
+    ordinary values these tools are actually called with."""
+    calls = patched_run(envelope(data={}))
+
+    server.download_model(
+        "https://hf.co/x.safetensors",
+        relative_path="models/loras",
+        filename="x.safetensors",
+    )
+
+    cmd = calls[0]["cmd"]
+    assert "--relative-path" in cmd and cmd[cmd.index("--relative-path") + 1] == (
+        "models/loras"
+    )
+    assert "--filename" in cmd and cmd[cmd.index("--filename") + 1] == "x.safetensors"
 
 
 def test_download_model_rejects_embedded_nul_url():

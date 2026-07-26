@@ -43,6 +43,7 @@ import functools
 import json
 import logging
 import math
+import ntpath
 import os
 import re
 import shutil
@@ -4160,8 +4161,30 @@ def download_model(
         # write inside the models dir by rejecting absolute paths, `..`, and a
         # Windows drive prefix (`C:evil` has no separator but is drive-relative
         # on that platform, same escape as the bare `filename` case below).
+        #
+        # Decide this the same way on every host rather than deferring to
+        # `os.path.isabs`: the guard runs wherever the MCP server runs, but the
+        # write happens wherever comfy-cli runs, so a Windows-shaped escape has
+        # to be refused from a POSIX server too (`os.path` is `posixpath` there
+        # and sees `\\server\share` as an ordinary directory name).
+        #
+        # An empty leading segment means the value opened with `/` or `\` — an
+        # absolute POSIX path, a UNC root, or a Windows root-relative path like
+        # `\evil` (which lands at the root of the *current drive*, outside the
+        # models dir). Testing the split segment rather than `ntpath.isabs` also
+        # keeps the answer stable across Python versions: 3.13 stopped reporting
+        # single-separator paths as absolute, so `ntpath.isabs("\\evil")` is True
+        # on 3.10 and False on 3.14 — and CI runs both.
+        #
+        # `splitdrive` then covers what no separator reveals: a drive-relative
+        # `C:evil` resolves against drive C:'s own working directory.
         parts = relative_path.replace("\\", "/").split("/")
-        if os.path.isabs(relative_path) or ".." in parts or ":" in relative_path:
+        if (
+            parts[0] == ""
+            or ntpath.splitdrive(relative_path)[0] != ""
+            or ".." in parts
+            or ":" in relative_path
+        ):
             raise ComfyCliError(
                 f"invalid relative_path: {relative_path!r} (path traversal)"
             )
@@ -4171,7 +4194,10 @@ def download_model(
         # filename is a single output name, not a path; reject separators, `..`,
         # and `:` (a Windows drive prefix like `C:evil.dll` has no separator but
         # still escapes the models dir via `os.path.join` on that platform) so it
-        # can't redirect the write out of the target directory.
+        # can't redirect the write out of the target directory. These already
+        # subsume an `ntpath.splitdrive` test — every string it reports a drive
+        # for is either `X:…` (caught by `:`) or a UNC `\\host\share…` (caught by
+        # `\`) — so a bare name needs no separate drive check.
         if (
             filename in (".", "..")
             or "/" in filename
