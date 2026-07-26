@@ -81,6 +81,8 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   For a one-shot run, `run_template(name, params=...)` does fetch + fill + run in a
   single call; a template that embeds partner (paid) nodes spends credits and is
   gated by the same `confirm_spend` flag as `partner_generate` (free templates ignore it).
+  For the quickest path from text to an image, `generate_image(prompt)` runs the
+  default local text-to-image template through that same verb — free, no API key.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
@@ -908,9 +910,7 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     # line on a successful run would be mis-unwrapped into a spurious "failed"
     # raise. A real error envelope still has `type==envelope`, so it flows to
     # `_unwrap_envelope` and raises as usual.
-    real_envelope = (
-        envelope if envelope and envelope.get("type") == "envelope" else None
-    )
+    real_envelope = _real_envelope(envelope)
     if plain_ok and real_envelope is None and returncode == 0:
         return _synthesize_plain_result(args, stdout, stderr)
     # Enforce the envelope contract on the normal path too: pass `real_envelope`
@@ -919,7 +919,7 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     # response for a non-`plain_ok` tool; it raises the "returned no JSON" error
     # like any other missing envelope. A real error envelope still has
     # `type==envelope`, so it flows through and raises with its code as usual.
-    return _unwrap_envelope(real_envelope, args, returncode, stderr)
+    return _unwrap_envelope(real_envelope, args, returncode, stderr, stdout=stdout)
 
 
 def _envelope_schema(envelope: dict) -> str | None:
@@ -968,6 +968,37 @@ def _tail(text: str | bytes | None, limit: int = 500) -> str:
     return text.strip()[-limit:]
 
 
+def _stream_tail(text: str | bytes | None, limit: int = 500) -> str:
+    """Bounded tail of a captured stream, with explicit empty/truncation markers.
+
+    The error-message dressing over :func:`_tail`, for the messages a user
+    actually reads when comfy-cli fails:
+
+    - a blank/absent capture renders as ``<empty>`` rather than nothing, so a
+      message can never end in a dangling ``stderr:`` that is indistinguishable
+      from a capture we truncated away;
+    - a capture that WAS clipped is prefixed with ``...`` so the truncation is
+      visible instead of looking like the whole stream.
+
+    The *tail* is what's kept (not the head): a CLI traceback puts the
+    exception — the part that says what actually went wrong — last.
+    """
+    if limit <= 0:
+        # Mirror `_tail`'s own non-positive guard. It matters more here: we ask
+        # `_tail` for `limit + 1`, so a `limit` of 0 would slip past its check
+        # and the `[-limit:]` below would then be `[0:]` — the WHOLE capture,
+        # exactly the unbounded payload the limit exists to prevent.
+        return "<empty>"
+    # `_tail` clips silently, so ask it ONCE for one char more than the bound:
+    # an over-long answer is itself the evidence that something was dropped, and
+    # re-slicing it locally costs nothing (asking `_tail` twice would re-run the
+    # strip and any bytes-decode over the whole capture just to learn that).
+    tail = _tail(text, limit=limit + 1)
+    if not tail:
+        return "<empty>"
+    return "..." + tail[-limit:] if len(tail) > limit else tail
+
+
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
     """Kill the child *and* any grandchildren it spawned.
 
@@ -1006,13 +1037,25 @@ def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
 
 
 def _unwrap_envelope(
-    envelope: dict | None, args: tuple[str, ...], returncode: int | None, stderr: str
+    envelope: dict | None,
+    args: tuple[str, ...],
+    returncode: int | None,
+    stderr: str,
+    stdout: str = "",
 ) -> Any:
     """Unwrap comfy-cli's ``envelope/1`` result, raising on error/absence.
 
     Shared by the plain (`--json`) and streaming (`--json-stream`) paths so both
     have identical terminal behavior: return ``data`` on success, and raise a
     :class:`ComfyCliError` carrying the envelope's ``error.code`` on failure.
+
+    ``stdout`` is the RAW captured stdout the caller parsed ``envelope`` out of.
+    It is only read on the no-envelope path, where it is the whole point: a
+    comfy-cli that dies before emitting JSON usually prints its diagnosis as
+    plain text, and every caller parses stdout through :func:`_last_json_object`
+    — which drops that text on the floor. Passing it here is what keeps the
+    failure legible; it defaults to ``""`` (rendered ``<empty>``) so a caller
+    that genuinely has no stdout still produces a well-formed message.
 
     Also the envelope-version assertion: if comfy-cli declares an envelope
     ``schema`` whose major differs from :data:`ENVELOPE_SCHEMA_MAJOR`, the whole
@@ -1028,12 +1071,24 @@ def _unwrap_envelope(
             raise ComfyCliError(
                 f"comfy-cli could not run (exit {returncode}).\n\n"
                 f"{_tcc_guidance(_tcc_path_from(stderr))}\n\n"
-                f"Original error: {_tail(stderr)}",
+                # `_stream_tail` for the truncation marker: `_looks_like_tcc_denial`
+                # only fires on a non-empty stderr, so the `<empty>` half is
+                # unreachable here — but a long denial traceback still gets
+                # clipped, and silently is how you misread it as the whole thing.
+                # No stdout here on purpose: this branch has already identified
+                # the cause, so its curated guidance beats a second raw stream.
+                f"Original error: {_stream_tail(stderr)}",
                 no_envelope=True,
             )
+        # Both streams, both explicitly marked when blank: comfy-cli splits its
+        # diagnostics unpredictably (a Python traceback lands on stderr, a
+        # Typer/click usage error or a plain-text status line on stdout), and
+        # `_last_json_object` has already discarded the stdout text by the time
+        # we get here. Rendering only stderr — and rendering an empty one as
+        # nothing at all — is what made this error opaque.
         raise ComfyCliError(
             f"comfy-cli returned no JSON (exit {returncode}). "
-            f"stderr: {stderr.strip()[:500]}",
+            f"stderr: {_stream_tail(stderr)} | stdout: {_stream_tail(stdout)}",
             no_envelope=True,
         )
     # A declared schema must be a recognized ``envelope/<N>`` whose major matches.
@@ -1066,12 +1121,25 @@ def _unwrap_envelope(
         # credential) — dropping them was the exact workaround testers needed.
         # Each field is length-capped so a huge/malformed envelope can't bloat
         # the message propagated to the MCP client.
-        message = err.get("message") or stderr.strip()[:_MAX_ERROR_FIELD_CHARS]
-        parts = [
-            f"comfy {' '.join(args)} failed "
-            f"[{code or 'unknown'}]: "
-            f"{str(message)[:_MAX_ERROR_FIELD_CHARS]}"
-        ]
+        # The stderr fallback goes through `_stream_tail` so an envelope with an
+        # empty `error.message` AND an empty stderr can't render a bare trailing
+        # colon with nothing after it. Note the cap is applied to the envelope's
+        # own message only — `_stream_tail` already bounds its result, and
+        # re-slicing its HEAD here would chop off the truncation marker plus the
+        # very end of the tail, i.e. the part worth keeping.
+        # Strip BEFORE the truthiness test: a whitespace-only `error.message`
+        # ("   ") is truthy, so it would keep the fallback from firing and render
+        # exactly the dangling-colon message this branch exists to prevent —
+        # `_stream_tail` already treats a whitespace-only capture as `<empty>`,
+        # so treat the envelope's own field the same way.
+        raw_message = err.get("message")
+        message = str(raw_message).strip() if raw_message else ""
+        message = (
+            message[:_MAX_ERROR_FIELD_CHARS]
+            if message
+            else _stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
+        )
+        parts = [f"comfy {' '.join(args)} failed [{code or 'unknown'}]: {message}"]
         hint = err.get("hint")
         if hint:
             parts.append(f"hint: {str(hint)[:_MAX_ERROR_FIELD_CHARS]}")
@@ -1171,6 +1239,24 @@ def _last_json_object(stdout: str) -> dict | None:
         elif best is None or best.get("type") != "envelope":
             best = obj  # fallback to any JSON object until an envelope appears
     return best
+
+
+def _real_envelope(obj: dict | None) -> dict | None:
+    """Keep ``obj`` only if it is a genuine ``type==envelope``; else ``None``.
+
+    The companion filter to :func:`_last_json_object`, which deliberately falls
+    back to ANY JSON object on stdout so a caller can still see what comfy-cli
+    printed. That fallback must never reach :func:`_unwrap_envelope` unfiltered:
+    a stray progress/custom-node line would then be unwrapped as if it were the
+    result — one carrying ``ok: true`` read as a successful run, and one without
+    it raising a bogus ``failed [unknown]`` that SUPPRESSES the no-envelope
+    branch and its stdout/stderr diagnostics, which is the only thing that
+    explains a mid-run crash. Every path into ``_unwrap_envelope`` filters here
+    first. An envelope declaring an incompatible ``schema`` still passes through
+    on purpose — that is a real envelope, and ``_unwrap_envelope`` owns refusing
+    it with the version error rather than a generic "returned no JSON".
+    """
+    return obj if obj and obj.get("type") == "envelope" else None
 
 
 def _parse_event(line: str) -> dict | None:
@@ -1360,8 +1446,22 @@ async def _run_comfy_streaming(
         # stderr is collectible for the error message.
         returncode = await _in_pipe_pool(proc.wait)
         stderr = (await stderr_future) if stderr_future is not None else ""
+        # Keep the joined stdout around rather than only its parsed JSON: this is
+        # the EOF path, so comfy-cli died without an envelope and whatever plain
+        # text it printed is the only diagnosis there is.
+        stdout_text = "".join(lines)
+        # `_real_envelope` for the same reason `_run_comfy` applies it: reaching
+        # EOF means `_pump` never saw a terminal envelope, so `_last_json_object`
+        # here is usually its fallback — the last progress/custom-node event of a
+        # crashed run. Unwrapping that would discard the diagnostics just
+        # collected; filtering to None routes it to the no-envelope branch, which
+        # is what actually reports why comfy-cli died.
         return False, _unwrap_envelope(
-            _last_json_object("".join(lines)), args, returncode, stderr
+            _real_envelope(_last_json_object(stdout_text)),
+            args,
+            returncode,
+            stderr,
+            stdout=stdout_text,
         )
 
     try:
@@ -1418,7 +1518,8 @@ async def _run_comfy_streaming(
         # Envelope path: the authoritative result is already in `lines`, read
         # within the deadline. Give the child a brief grace to exit on a SEPARATE
         # budget; the `finally` kills a still-live one.
-        envelope = _last_json_object("".join(lines))
+        stdout_text = "".join(lines)
+        envelope = _last_json_object(stdout_text)
         child_reaped = True
         try:
             await asyncio.wait_for(
@@ -1446,7 +1547,9 @@ async def _run_comfy_streaming(
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 stderr = ""
-        return _unwrap_envelope(envelope, args, proc.returncode, stderr)
+        return _unwrap_envelope(
+            envelope, args, proc.returncode, stderr, stdout=stdout_text
+        )
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, a report_progress error, or normal completion). Kill the
@@ -1717,9 +1820,14 @@ def server_info() -> Any:
     reachability is confirmed by the first run/queue call, which targets the
     same host.
     """
-    envelope, _stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
-    # _unwrap_envelope has already raised if envelope was None, so it is non-None here.
-    data = _unwrap_envelope(envelope, args, returncode, stderr)
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
+    # `_run_comfy_raw` hands back `_last_json_object`'s answer unfiltered, so
+    # enforce the envelope contract here exactly as `_run_comfy` does: an
+    # incidental non-envelope JSON line from `comfy env` must raise "returned no
+    # JSON" (with both stream tails) rather than be reported as server info.
+    envelope = _real_envelope(envelope)
+    # _unwrap_envelope raises if envelope is None, so it is non-None below.
+    data = _unwrap_envelope(envelope, args, returncode, stderr, stdout=stdout)
     compat = _check_comfy_cli_version()
     compat["envelope_schema"] = _envelope_schema(envelope)
     freshness = _freshness_report()
@@ -1880,6 +1988,49 @@ async def run_workflow(
             await asyncio.sleep(backoff)
 
 
+# The gallery template `generate_image` runs: ComfyUI's own default graph — the
+# basic SD1.5 text-to-image workflow whose CheckpointLoaderSimple default is
+# `v1-5-pruned-emaonly-fp16.safetensors`. Free (core nodes only, no partner-API
+# node, no `API` gallery tag), so the run never trips comfy-cli's spend gate.
+_T2I_TEMPLATE = "default"
+
+# Slot keys for that template's prompt + checkpoint inputs. These VERSION WITH
+# `_T2I_TEMPLATE` — they are properties of that one graph, verified with
+# `comfy templates fetch default -o wf.json && comfy workflow slots wf.json`:
+#
+#   4.ckpt_name | ckpt_name       | CheckpointLoaderSimple
+#   6.text      | text (positive) | CLIPTextEncode
+#   7.text      | text (negative) | CLIPTextEncode
+#
+# The prompt MUST use the node-address form: `text` is carried by BOTH
+# CLIPTextEncode nodes, so the bare name is ambiguous and comfy-cli refuses it
+# (`workflow_slot_invalid`) rather than guessing which one is the positive
+# prompt. `ckpt_name` is unique in this graph, so the name form is used there —
+# it survives a template revision that renumbers nodes.
+_T2I_PROMPT_SLOT = "6.text"
+_T2I_CHECKPOINT_SLOT = "ckpt_name"
+
+
+def _t2i_config() -> tuple[str, str, str]:
+    """Resolve ``generate_image``'s (template, prompt slot, checkpoint slot).
+
+    Each is env-overridable so a user can point the on-ramp at a different local
+    text-to-image graph without a code change. All three move TOGETHER: the slot
+    keys describe one specific template, so overriding ``COMFY_T2I_TEMPLATE``
+    alone will almost certainly leave the prompt address matching no slot in the
+    new graph. List a replacement's slots with ``comfy templates fetch <name> -o
+    wf.json && comfy workflow slots wf.json``.
+
+    Read per call rather than latched at import so a test (or a client that
+    re-execs with different env) sees the current value.
+    """
+    return (
+        os.environ.get("COMFY_T2I_TEMPLATE") or _T2I_TEMPLATE,
+        os.environ.get("COMFY_T2I_PROMPT_SLOT") or _T2I_PROMPT_SLOT,
+        os.environ.get("COMFY_T2I_CHECKPOINT_SLOT") or _T2I_CHECKPOINT_SLOT,
+    )
+
+
 @mcp.tool()
 async def generate_image(
     prompt: str,
@@ -1890,22 +2041,35 @@ async def generate_image(
 ) -> Any:
     """Generate an image from a text prompt on the LOCAL ComfyUI — the fast on-ramp.
 
-    Wraps ``comfy generate --prompt <prompt>``: a single call that turns a text
-    prompt into an image, so an agent does not have to hand-assemble a workflow
-    graph. comfy-cli owns the text->workflow injection (which node/slot the
-    prompt fills, the default graph, checkpoint selection); this tool is a pure
-    passthrough to that verb. Returns the same envelope shape as
-    ``run_workflow`` (``prompt_id`` + outputs).
+    A single call that turns a text prompt into an image, so an agent does not
+    have to hand-assemble a workflow graph. It runs ComfyUI's default SD1.5
+    text-to-image gallery template through ``comfy run-template <name>
+    --param=KEY=VALUE`` — the same verb (and the same local run path) as
+    ``run_template``, with the prompt filled into the template's positive
+    CLIPTextEncode slot. Returns the same envelope shape as ``run_workflow``
+    (``prompt_id`` + outputs).
 
-    Pass ``checkpoint`` to pick a specific checkpoint model (forwarded to
-    ``comfy generate --checkpoint``); omit it to let comfy-cli choose a default.
+    The template is ``default`` unless ``COMFY_T2I_TEMPLATE`` overrides it; its
+    prompt / checkpoint slot keys are overridable alongside it via
+    ``COMFY_T2I_PROMPT_SLOT`` / ``COMFY_T2I_CHECKPOINT_SLOT``, and must be
+    overridden together with the template since slot keys describe one specific
+    graph; the two must name DIFFERENT slots (one key for both is refused rather
+    than silently dropping the prompt). Pass ``checkpoint`` to swap the
+    template's checkpoint model (it must
+    already be installed locally — see ``search_models`` / ``download_model``);
+    omit it to use the template's own default. The default template is a free,
+    fully local OSS graph: nothing here spends Comfy credits, so no spend
+    consent is passed and none is needed. (For hosted PARTNER models, which do
+    spend, use ``partner_generate``.)
+
     With ``wait=True`` (default) this waits until the generation finishes and
     streams live progress as MCP progress notifications (per-node execution +
     sampler step counts) so a long generation is not a silent block; with
     ``wait=False`` it submits and returns immediately with a ``prompt_id`` to
-    poll via ``job_status``. ``timeout_seconds`` only bounds the ``wait=True``
-    streaming path; the ``wait=False`` submit-and-return branch uses a fixed
-    short timeout, so callers should not expect it to govern that case.
+    poll via ``job_status`` / ``wait_for_job`` / ``watch_job``.
+    ``timeout_seconds`` only bounds the ``wait=True`` streaming path; the
+    ``wait=False`` submit-and-return branch uses a fixed short timeout, so
+    callers should not expect it to govern that case.
 
     This is the quickest path to an image. For full control — choosing a
     template, editing its graph, or running a hand-authored workflow — use the
@@ -1914,24 +2078,104 @@ async def generate_image(
     Everything targets the LOCAL server (``--where local`` is injected by
     ``_run_comfy``), so there is no cloud reachability here.
     """
-    # Pass the free-form text as ``--flag=value`` so a prompt (or checkpoint)
-    # that begins with ``-`` is read as the value rather than mis-parsed by
-    # comfy-cli as an option token. The leading-dash guards elsewhere reject
-    # such input, but a prompt legitimately can start with ``-``, so we keep it
-    # instead of rejecting it.
-    checkpoint_args = [f"--checkpoint={checkpoint}"] if checkpoint else []
-    if not wait:
-        # Fire-and-return: no stream to follow, so keep the plain --json path.
-        return _run_comfy(
-            "generate", f"--prompt={prompt}", *checkpoint_args, timeout=60.0
+    template, prompt_slot, checkpoint_slot = _t2i_config()
+    if not template or template.startswith("-"):
+        # A leading-dash name is read by comfy-cli as an option, not the template
+        # positional. Only reachable via a malformed COMFY_T2I_TEMPLATE, but a
+        # named error beats comfy-cli's "No such option".
+        raise ComfyCliError(
+            f"invalid COMFY_T2I_TEMPLATE: {template!r} — expected a gallery "
+            "template name (e.g. 'default'), not an empty or option-like value."
         )
-    return await _run_comfy_streaming(
-        "generate",
-        f"--prompt={prompt}",
-        *checkpoint_args,
-        "--wait",
-        ctx=ctx,
-        timeout=timeout_seconds,
+    _reject_nul("template name", template)
+    # The free-form prompt rides inside a single `--param=KEY=VALUE` token, so a
+    # prompt that begins with `-` (or contains `=`) is carried as the value
+    # rather than mis-parsed by comfy-cli as an option. `_run_template_param_args`
+    # owns that escaping, the JSON value rendering, and the key validation.
+    params: dict[str, Any] = {prompt_slot: prompt}
+    if checkpoint:
+        if checkpoint_slot == prompt_slot:
+            # Same key for both slots would have the checkpoint overwrite the
+            # prompt already stored under it, running the template's DEFAULT
+            # prompt with no error at all — the worst failure mode available
+            # (a plausible wrong image). Only reachable via a misconfigured
+            # override pair; refuse it by name instead.
+            raise ComfyCliError(
+                f"generate_image's prompt slot and checkpoint slot both resolve "
+                f"to {prompt_slot!r} — the checkpoint would overwrite the "
+                "prompt. Set COMFY_T2I_PROMPT_SLOT / COMFY_T2I_CHECKPOINT_SLOT "
+                f"to the two different slots of template {template!r} (list "
+                f"them with `comfy templates fetch {template} -o wf.json && "
+                "comfy workflow slots wf.json`)."
+            )
+        params[checkpoint_slot] = checkpoint
+    timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
+    args, budget = _run_template_argv(
+        template,
+        _run_template_param_args(params),
+        wait=wait,
+        timeout_seconds=timeout_seconds,
+    )
+    # No `--allow-spend`, and deliberately no `_require_spend_gate` probe: that
+    # gate is `comfy generate`-scoped, and this template is free. A
+    # `spend_consent_required` here would mean the constant above names a paid
+    # template — fix the constant, not the consent plumbing.
+    try:
+        if not wait:
+            # Fire-and-return: no stream to follow, so keep the plain --json
+            # path — off the event loop, in the same pool `run_template` uses.
+            args.append("--async")
+            return await _in_generate_pool(
+                _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+            )
+        # Same grace as the submit path above (and as `run_template`): the child
+        # was handed `--timeout=min(budget, 120)`, so for a budget at or under
+        # comfy-cli's 120s cap the engine's deadline and the parent's kill land
+        # on the SAME instant. Without slack the parent can SIGKILL comfy-cli
+        # mid-write of its own structured timeout / `server_not_running` result,
+        # replacing an actionable error with a generic parent kill (and orphaning
+        # an already-enqueued run). The engine must be the side that gives up.
+        return await _run_comfy_streaming(
+            *args, ctx=ctx, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+        )
+    except ComfyCliError as exc:
+        hinted = _t2i_slot_hint(
+            exc, template, prompt_slot, checkpoint_slot if checkpoint else None
+        )
+        if hinted is exc:
+            # Not a slot failure — let the engine's own error through untouched,
+            # with its original traceback rather than a self-referential cause.
+            raise
+        raise hinted from exc
+
+
+def _t2i_slot_hint(
+    exc: ComfyCliError, template: str, prompt_slot: str, checkpoint_slot: str | None
+) -> ComfyCliError:
+    """Re-raise a slot-resolution failure with the knob that fixes it, else pass through.
+
+    The slot keys above are pinned to one revision of one template, so the day
+    the gallery renumbers that graph (or a ``COMFY_T2I_TEMPLATE`` override names
+    a graph with a different shape) comfy-cli answers ``workflow_slot_invalid``
+    with the template's real addresses — accurate, but it says nothing about
+    WHICH knob in this server produced the bad key. Name them.
+
+    ``checkpoint_slot`` is None when the call passed no ``checkpoint``: that slot
+    was never sent, so naming it would implicate a knob that cannot be the cause
+    and send the reader after the wrong env var.
+    """
+    if exc.code != "workflow_slot_invalid":
+        return exc
+    filled = f"prompt slot {prompt_slot!r}"
+    knobs = "COMFY_T2I_TEMPLATE / COMFY_T2I_PROMPT_SLOT"
+    if checkpoint_slot is not None:
+        filled += f" and checkpoint slot {checkpoint_slot!r}"
+        knobs += " / COMFY_T2I_CHECKPOINT_SLOT"
+    return ComfyCliError(
+        f"{exc}\n(generate_image filled template {template!r} using {filled}; "
+        f"set {knobs} to match the addresses above, or use run_template "
+        "directly)",
+        code=exc.code,
     )
 
 
@@ -2630,6 +2874,33 @@ def _run_template_param_args(params: dict[str, Any]) -> list[str]:
     return argv
 
 
+def _run_template_argv(
+    name: str, param_args: list[str], *, wait: bool, timeout_seconds: float
+) -> tuple[list[str], float]:
+    """Build the ``run-template`` argv (sans consent/``--async``) + the parent budget.
+
+    Shared by :func:`run_template` and :func:`generate_image` so the engine
+    deadline rule lives in exactly one place. ``wait``'s budget is the caller's
+    (already bounded) ``timeout_seconds``; a ``wait=False`` submit gets the fixed
+    short :data:`_RUN_TEMPLATE_ASYNC_TIMEOUT` instead, since the run outlives the
+    call.
+
+    Hand the engine a deadline it can act on. Unlike ``comfy generate --timeout``,
+    this one is PER-EVENT, not a whole-run bound, so the caller's total budget
+    cannot simply be forwarded; it is used only to LOWER the engine's bound when
+    that budget is smaller than comfy-cli's 120s default. Without it a short
+    budget is consumed entirely inside the engine's own 120s server probe and the
+    child is SIGKILLed with no diagnostic — e.g. ``wait=False`` had a 60s budget
+    against a 120s probe. Never RAISED above the default: that would blunt stall
+    detection on long runs. comfy-cli types this flag as an int, so a float is a
+    parse error.
+    """
+    budget = timeout_seconds if wait else _RUN_TEMPLATE_ASYNC_TIMEOUT
+    args = ["run-template", name, *param_args]
+    args.append(f"--timeout={max(1, int(min(budget, _RUN_TEMPLATE_EVENT_TIMEOUT)))}")
+    return args, budget
+
+
 @mcp.tool()
 async def run_template(
     name: str,
@@ -2717,18 +2988,14 @@ async def run_template(
         )
     _reject_nul("template name", name)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
-    args = ["run-template", name, *_run_template_param_args(params or {})]
-    # Hand the engine a deadline it can act on. Unlike `comfy generate
-    # --timeout`, this one is PER-EVENT, not a whole-run bound, so the caller's
-    # total budget cannot simply be forwarded; it is used only to LOWER the
-    # engine's bound when that budget is smaller than comfy-cli's 120s default.
-    # Without it a short `timeout_seconds` is consumed entirely inside the
-    # engine's own 120s server probe and the child is SIGKILLed with no
-    # diagnostic — e.g. `wait=False` had a 60s budget against a 120s probe.
-    # Never RAISED above the default: that would blunt stall detection on long
-    # runs. comfy-cli types this flag as an int, so a float is a parse error.
-    budget = timeout_seconds if wait else _RUN_TEMPLATE_ASYNC_TIMEOUT
-    args.append(f"--timeout={max(1, int(min(budget, _RUN_TEMPLATE_EVENT_TIMEOUT)))}")
+    # argv + the engine deadline are built by the shared helper (see
+    # `_run_template_argv` for why `--timeout` is needed and never raised).
+    args, budget = _run_template_argv(
+        name,
+        _run_template_param_args(params or {}),
+        wait=wait,
+        timeout_seconds=timeout_seconds,
+    )
     if await _resolve_template_spend_consent(name, confirm_spend, ctx):
         # comfy-cli's paid-node consent for run-template; a bare boolean flag.
         args.append("--allow-spend")

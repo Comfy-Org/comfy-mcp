@@ -77,7 +77,7 @@ Cloud MCP** — comfy-cli is the engine.
   `server_info`. Nothing here starts ComfyUI implicitly.
 
 <details>
-<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_LOCAL_URL</code>)</summary>
+<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_LOCAL_URL</code>, <code>COMFY_T2I_TEMPLATE</code>)</summary>
 
 <br>
 
@@ -103,6 +103,14 @@ Cloud MCP** — comfy-cli is the engine.
   holds `:8188`). Read by comfy-cli, not by this server — it rides the environment passthrough,
   so setting it in the client `env` block re-points every tool. See
   **[Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)**.
+- **`COMFY_T2I_TEMPLATE` / `COMFY_T2I_PROMPT_SLOT` / `COMFY_T2I_CHECKPOINT_SLOT` (optional — retarget
+  `generate_image`).** `generate_image(prompt)` runs the gallery's `default` template (ComfyUI's own
+  basic SD1.5 text-to-image graph), filling its positive-prompt slot `6.text` and, when you pass
+  `checkpoint`, its `ckpt_name` slot. To point that on-ramp at a different local text-to-image graph,
+  set all three **together** — the slot keys describe one specific template, so changing the template
+  alone leaves the prompt address matching no slot. List a replacement's slots with
+  `comfy templates fetch <name> -o wf.json && comfy workflow slots wf.json`. For a one-off run of some
+  other template, prefer the `run_template` tool over these.
 
 </details>
 
@@ -220,7 +228,8 @@ reports the configured target under a `comfy_target` block.
   **local** ComfyUI process and stay local-only; they cannot start/stop or read logs from a remote
   box. Start ComfyUI on the remote host yourself.
 - **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
-  / `generate_image` / `partner_generate` — the underlying comfy-cli verbs take **no** `--host`/`--port`, so they run
+  / `generate_image` / `run_template` / `partner_generate` — this server forwards **no**
+  `--host`/`--port` to these verbs (most of them accept none at all), so they run
   against comfy-cli's local default. Against a remote target, prefer `run_workflow(wait=True)` /
   `job_status` (which return the remote job's `/view` output URLs) to retrieve results.
 - **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`) — their comfy-cli
@@ -435,7 +444,7 @@ the originals stay in the ComfyUI workspace.
 | Tool | Wraps | What it does |
 |---|---|---|
 | `run_workflow(workflow_path, wait=True, timeout_seconds=600.0)` | `comfy run --workflow <path> [--wait]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. |
-| `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy generate --prompt <prompt> [--checkpoint <ckpt>]` | Text prompt → image in one call — comfy-cli owns the graph/checkpoint injection, so no hand-assembled workflow needed. Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
+| `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy run-template default --param=6.text=<prompt> [--param=ckpt_name=<ckpt>]` | Text prompt → image in one call, with no hand-assembled workflow needed: it runs ComfyUI's own default SD1.5 text-to-image gallery template through the same verb (and the same local run path) as `run_template`. Free and fully local — nothing here spends credits. Retarget it with [`COMFY_T2I_TEMPLATE` and its slot-key companions](#prerequisites). Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
 | `partner_generate(model, params=None, confirm_spend=False, download=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--timeout=<s>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits**, unlike the local `run_workflow` / `generate_image` paths. Every call confirms the spend with you first — see [Spending credits](#spending-credits-on-partner-models) below. `params` are the model's own schema-driven inputs, forwarded verbatim (discover them with `comfy generate schema <model>` / `comfy generate list`). `timeout_seconds` becomes comfy-cli's own `--timeout` so the engine — not a parent kill — owns the deadline on a job the partner may already have charged for. |
 | `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on local ComfyUI (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
