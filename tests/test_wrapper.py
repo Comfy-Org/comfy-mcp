@@ -358,10 +358,12 @@ def test_cancel_job_unknown_id_raises_error_envelope(patched_run):
 
 
 # `_run_comfy` builds argv with no `--` separator, so a leading-dash positional
-# reaches comfy-cli as an option rather than a job id. `watch_job` and
-# `get_execution_error` already refuse one (covered separately); these are the
-# remaining prompt_id-taking tools, checked together so the family stays uniform
-# — `fetch_outputs` most of all, since there the id sits beside a real `-o`.
+# reaches comfy-cli as an option rather than a job id — `fetch_outputs` most
+# sharply, since there the id sits beside a real `-o`. An embedded NUL is a legal
+# JSON (so MCP) string that `subprocess.run` refuses with a bare ValueError, and
+# an empty id can only be a caller mistake. `_guard_prompt_id` rejects all three
+# for every tool that takes one; the synchronous ones are checked here as a
+# family (`watch_job` and `get_execution_error` are covered separately).
 @pytest.mark.parametrize(
     ("tool", "extra_args"),
     [
@@ -372,19 +374,17 @@ def test_cancel_job_unknown_id_raises_error_envelope(patched_run):
     ],
     ids=lambda v: v if isinstance(v, str) else "",
 )
-@pytest.mark.parametrize("option_like", ["--help", "-o"])
-def test_job_tools_reject_an_option_like_prompt_id(
-    monkeypatch, tool, extra_args, option_like
-):
-    """A leading-dash prompt_id is refused before comfy-cli is ever spawned."""
+@pytest.mark.parametrize("bad_id", ["--help", "-o", "", "p\x001"])
+def test_job_tools_reject_an_unusable_prompt_id(monkeypatch, tool, extra_args, bad_id):
+    """A dash-led / empty / NUL-bearing prompt_id is refused before any spawn."""
 
     def fake_run(*args, **kwargs):
-        raise AssertionError(f"{tool} spawned comfy-cli with {option_like!r}")
+        raise AssertionError(f"{tool} spawned comfy-cli with {bad_id!r}")
 
     monkeypatch.setattr(server, "_run_comfy", fake_run)
 
-    with pytest.raises(server.ComfyCliError, match="invalid prompt_id"):
-        getattr(server, tool)(option_like, *extra_args)
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        getattr(server, tool)(bad_id, *extra_args)
 
 
 def test_get_queue_maps_command_and_returns_data(patched_run):
@@ -746,10 +746,11 @@ def test_wait_for_job_clamps_an_oversized_timeout(monkeypatch, oversized):
     monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
     monkeypatch.setattr(server.time, "sleep", lambda _s: None)
 
-    # A clock that jumps just past the ceiling on its second read: clamped, the
-    # deadline has passed and the tool returns; unclamped, it would poll on and
-    # exhaust the iterator (failing loudly instead of hanging the suite).
-    reads = iter([0.0, server._MAX_WATCH_TIMEOUT + 1.0])
+    # A clock that jumps just past the ceiling once the first poll is done:
+    # clamped, the deadline has passed and the tool returns; unclamped, it would
+    # sleep and poll on, exhausting the iterator (failing loudly rather than
+    # hanging the suite). Reads are (deadline, pre-poll, post-poll).
+    reads = iter([0.0, 1.0, server._MAX_WATCH_TIMEOUT + 1.0])
 
     def fake_monotonic():
         try:
@@ -788,6 +789,52 @@ def test_wait_for_job_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
         server.wait_for_job("pid", timeout_seconds=bad)
 
     assert polled is False
+
+
+def test_wait_for_job_caps_each_poll_to_the_remaining_bound(monkeypatch):
+    """A single poll never gets a longer subprocess budget than the wait itself.
+
+    Each `comfy jobs status` used a fixed 60s timeout, so a short wait was only
+    bounded *between* polls: one wedged status call could hold a
+    `timeout_seconds=1` wait open for a full minute.
+    """
+    seen: list[float] = []
+
+    def fake_run(*args, timeout=None, **kwargs):
+        seen.append(timeout)
+        return {"status": "running"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A clock that advances 1s per read, so the 5s bound expires after two polls.
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        now = clock["t"]
+        clock["t"] += 1.0
+        return now
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server.wait_for_job("pid", timeout_seconds=5.0)
+
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+    assert seen == [4.0, 2.0]  # each poll gets only what is left of the 5s bound
+
+
+def test_wait_for_job_gives_a_long_wait_the_full_poll_budget(monkeypatch):
+    """The per-poll cap only bites when it is *below* the normal poll budget."""
+    seen: list[float] = []
+
+    def fake_run(*args, timeout=None, **kwargs):
+        seen.append(timeout)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    assert server.wait_for_job("pid", timeout_seconds=600.0) == {"status": "completed"}
+    assert seen == [server._JOB_STATUS_POLL_TIMEOUT]
 
 
 def test_fetch_outputs_wraps_comfy_download(patched_run):
@@ -1698,10 +1745,11 @@ def test_watch_job_times_out_reports_progress_without_ctx(monkeypatch):
     assert procs[0].killed
 
 
-def test_watch_job_rejects_option_like_prompt_id():
-    """A leading-dash prompt_id is refused so comfy-cli can't parse it as a flag."""
-    with pytest.raises(server.ComfyCliError, match="invalid prompt_id"):
-        asyncio.run(server.watch_job("--help"))
+@pytest.mark.parametrize("bad_id", ["--help", "", "p\x001"])
+def test_watch_job_rejects_an_unusable_prompt_id(bad_id):
+    """watch_job shares the family guard: no dash-led, empty, or NUL-bearing id."""
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        asyncio.run(server.watch_job(bad_id))
 
 
 def test_watch_job_clamps_oversized_timeout(monkeypatch):
