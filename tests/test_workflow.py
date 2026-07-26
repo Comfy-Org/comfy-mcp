@@ -144,26 +144,28 @@ def test_workflow_tools_reject_embedded_nul(monkeypatch):
             call()
 
 
-def test_vary_workflow_option_values_are_not_guarded(patched_run):
-    """Option VALUES stay unguarded on purpose — only bare positionals are injectable.
+def test_vary_workflow_option_value_guards_read_the_first_char_only(patched_run):
+    """The `slots`/`out_dir` guards refuse a LEADING dash and nothing more.
 
-    comfy-cli is Click-backed and Click takes the token after a value-taking
-    option verbatim, so `--out-dir --slot` parses as `out_dir="--slot"` rather
-    than shifting anything. `slots`/`out_dir` therefore ride through untouched;
-    the guard above them is for `workflow_path`, which IS a bare positional.
+    Those two are option VALUES, which Click takes verbatim (`--out-dir --slot`
+    parses as `out_dir="--slot"`, not as a shift), so they were injection-safe
+    unguarded. They are guarded anyway as input hygiene — the same call
+    `search_templates` makes for its filters — which makes over-rejection the
+    real risk here rather than injection: a dash INSIDE a slot value, and a
+    relative path that merely contains one, must still ride through.
     """
     calls = patched_run(envelope(data={"variants": 2}))
 
-    server.vary_workflow("/tmp/flux.json", ["-3.seed=[1,2]"], out_dir="-out")
+    server.vary_workflow("/tmp/flux.json", ["6.text=[a -b,c]"], out_dir="./out-dir")
 
     assert calls[0]["cmd"][4:] == [
         "workflow",
         "vary",
         "/tmp/flux.json",
         "--slot",
-        "-3.seed=[1,2]",
+        "6.text=[a -b,c]",
         "--out-dir",
-        "-out",
+        "./out-dir",
     ]
 
 
@@ -221,3 +223,30 @@ def test_vary_workflow_forwards_out_dir(patched_run, tmp_path):
         "--out-dir",
         str(out),
     ]
+
+
+def test_vary_workflow_rejects_option_like_slot_and_out_dir(monkeypatch):
+    """`--slot` values and `--out-dir` are guarded as input hygiene.
+
+    Click takes an option's value verbatim, so neither is an injection vector
+    (unlike the sibling `workflow_path` positional, covered above). They are
+    still refused so a dash-leading slot expression or output directory fails
+    with a named error instead of a comfy-cli usage error or `--help` text that
+    then fails envelope parsing — the same call `search_templates` makes for its
+    filters.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.vary_workflow("/tmp/flux.json", ["--help"])
+
+    # The guard scans every slot, not just the first.
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]", "--help"])
+
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"], out_dir="--help")

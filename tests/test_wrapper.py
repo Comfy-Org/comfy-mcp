@@ -3238,3 +3238,60 @@ def test_get_logs_caps_oversized_line(patched_run):
     # TOTAL length (content + marker) never exceeds the hard cap.
     assert len(lines[1]) <= server._MAX_LOG_LINE_CHARS
     assert lines[1].endswith(server._TRACEBACK_TRUNCATION_MARKER)
+
+
+def test_validate_workflow_rejects_option_like_path(monkeypatch):
+    """A leading-dash `--workflow` value is refused before any child spawns."""
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        server.validate_workflow("--help")
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_run_workflow_rejects_option_like_path_on_both_paths(monkeypatch, wait):
+    """The guard sits at function entry, so it covers submit AND streaming.
+
+    `wait=False` goes through `_run_comfy` and `wait=True` through
+    `_run_comfy_streaming`; guarding once up front covers both, and fails before
+    the credential retry loop can re-raise it.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+    monkeypatch.setattr(server, "_run_comfy_streaming", boom)
+
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        asyncio.run(server.run_workflow("--help", wait=wait))
+
+
+def test_validate_workflow_argv_unchanged_by_the_guard(patched_run):
+    """Happy-path argv is untouched: `validate --workflow <path>`."""
+    calls = patched_run(envelope(data={"valid": True}))
+
+    server.validate_workflow("./-wf.json")
+
+    assert calls[0]["cmd"][4:] == ["validate", "--workflow", "./-wf.json"]
+
+
+def test_run_and_validate_workflow_reject_embedded_nul(monkeypatch):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+    monkeypatch.setattr(server, "_run_comfy_streaming", boom)
+
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.validate_workflow("/tmp/w\0f.json")
+
+    for wait in (True, False):
+        with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+            asyncio.run(server.run_workflow("/tmp/w\0f.json", wait=wait))
