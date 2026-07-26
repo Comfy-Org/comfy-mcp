@@ -7,38 +7,17 @@ contract) against a stubbed ``subprocess.run``, plus one error-envelope path
 
 from __future__ import annotations
 
-import json
-import subprocess
-
 import pytest
+from conftest import envelope
 
 from comfy_local_mcp import server
 
 
-def _stub_comfy(monkeypatch, envelope: dict):
-    """Stub shutil.which + subprocess.run; return the list that records each argv."""
-    calls: list[list[str]] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append(cmd)
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(envelope), stderr=""
-        )
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
-    return calls
-
-
-def _ok(data):
-    return {"type": "envelope", "ok": True, "data": data}
-
-
-def test_search_nodes_argv(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([{"name": "KSampler"}]))
+def test_search_nodes_argv(patched_run):
+    calls = patched_run(envelope(data=[{"name": "KSampler"}]))
     assert server.search_nodes("sampler") == [{"name": "KSampler"}]
     # global flags first, then the subcommand + query verbatim
-    assert calls[0] == [
+    assert calls[0]["cmd"] == [
         server.COMFY_BIN,
         "--json",
         "--where",
@@ -49,21 +28,21 @@ def test_search_nodes_argv(monkeypatch):
     ]
 
 
-def test_get_node_argv(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok({"name": "KSampler", "inputs": {}}))
+def test_get_node_argv(patched_run):
+    calls = patched_run(envelope(data={"name": "KSampler", "inputs": {}}))
     assert server.get_node("KSampler") == {"name": "KSampler", "inputs": {}}
-    assert calls[0][4:] == ["nodes", "show", "KSampler"]
+    assert calls[0]["cmd"][4:] == ["nodes", "show", "KSampler"]
 
 
-def test_list_nodes_no_filters_bare_ls(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([{"name": "KSampler"}]))
+def test_list_nodes_no_filters_bare_ls(patched_run):
+    calls = patched_run(envelope(data=[{"name": "KSampler"}]))
     assert server.list_nodes() == [{"name": "KSampler"}]
     # no filters -> a bare `nodes ls`, no stray flags
-    assert calls[0][4:] == ["nodes", "ls"]
+    assert calls[0]["cmd"][4:] == ["nodes", "ls"]
 
 
-def test_list_nodes_all_filters_in_order(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_list_nodes_all_filters_in_order(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.list_nodes(
         produces="IMAGE",
         accepts="MODEL",
@@ -71,7 +50,7 @@ def test_list_nodes_all_filters_in_order(monkeypatch):
         pack="was-suite",
         label="Load",
     )
-    assert calls[0][4:] == [
+    assert calls[0]["cmd"][4:] == [
         "nodes",
         "ls",
         "--produces",
@@ -87,11 +66,11 @@ def test_list_nodes_all_filters_in_order(monkeypatch):
     ]
 
 
-def test_list_nodes_omits_empty_filters(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_list_nodes_omits_empty_filters(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.list_nodes(produces="IMAGE", category="sampling")
     # only the two non-empty filters are passed, in declared order
-    assert calls[0][4:] == [
+    assert calls[0]["cmd"][4:] == [
         "nodes",
         "ls",
         "--produces",
@@ -101,35 +80,35 @@ def test_list_nodes_omits_empty_filters(monkeypatch):
     ]
 
 
-def test_nodes_upstream_without_limit(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([{"name": "CheckpointLoaderSimple"}]))
+def test_nodes_upstream_without_limit(patched_run):
+    calls = patched_run(envelope(data=[{"name": "CheckpointLoaderSimple"}]))
     assert server.nodes_upstream("KSampler") == [{"name": "CheckpointLoaderSimple"}]
-    assert calls[0][4:] == ["nodes", "upstream", "KSampler"]
+    assert calls[0]["cmd"][4:] == ["nodes", "upstream", "KSampler"]
 
 
-def test_nodes_upstream_with_limit(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_nodes_upstream_with_limit(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.nodes_upstream("KSampler", limit=5)
-    assert calls[0][4:] == ["nodes", "upstream", "KSampler", "--limit", "5"]
+    assert calls[0]["cmd"][4:] == ["nodes", "upstream", "KSampler", "--limit", "5"]
 
 
-def test_nodes_downstream_without_limit(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([{"name": "VAEDecode"}]))
+def test_nodes_downstream_without_limit(patched_run):
+    calls = patched_run(envelope(data=[{"name": "VAEDecode"}]))
     assert server.nodes_downstream("KSampler") == [{"name": "VAEDecode"}]
-    assert calls[0][4:] == ["nodes", "downstream", "KSampler"]
+    assert calls[0]["cmd"][4:] == ["nodes", "downstream", "KSampler"]
 
 
-def test_nodes_downstream_with_limit(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_nodes_downstream_with_limit(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.nodes_downstream("KSampler", limit=3)
-    assert calls[0][4:] == ["nodes", "downstream", "KSampler", "--limit", "3"]
+    assert calls[0]["cmd"][4:] == ["nodes", "downstream", "KSampler", "--limit", "3"]
 
 
-def test_nodes_path_defaults(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_nodes_path_defaults(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.nodes_path("MODEL", "IMAGE")
     # concrete int defaults are always passed, so the argv is deterministic
-    assert calls[0][4:] == [
+    assert calls[0]["cmd"][4:] == [
         "nodes",
         "path",
         "MODEL",
@@ -141,10 +120,10 @@ def test_nodes_path_defaults(monkeypatch):
     ]
 
 
-def test_nodes_path_overrides(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_nodes_path_overrides(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.nodes_path("LATENT", "IMAGE", max_depth=3, max_paths=2)
-    assert calls[0][4:] == [
+    assert calls[0]["cmd"][4:] == [
         "nodes",
         "path",
         "LATENT",
@@ -156,56 +135,54 @@ def test_nodes_path_overrides(monkeypatch):
     ]
 
 
-def test_nodes_types_argv(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok(["MODEL", "IMAGE", "LATENT"]))
+def test_nodes_types_argv(patched_run):
+    calls = patched_run(envelope(data=["MODEL", "IMAGE", "LATENT"]))
     assert server.nodes_types() == ["MODEL", "IMAGE", "LATENT"]
-    assert calls[0][4:] == ["nodes", "types"]
+    assert calls[0]["cmd"][4:] == ["nodes", "types"]
 
 
-def test_nodes_categories_argv(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok({"loaders": {}}))
+def test_nodes_categories_argv(patched_run):
+    calls = patched_run(envelope(data={"loaders": {}}))
     assert server.nodes_categories() == {"loaders": {}}
-    assert calls[0][4:] == ["nodes", "categories"]
+    assert calls[0]["cmd"][4:] == ["nodes", "categories"]
 
 
-def test_search_models_query_uses_search(monkeypatch):
+def test_search_models_query_uses_search(patched_run):
     # BE-2952: comfy-cli 1.12's `models search` takes the query as `--text`,
     # not a positional — a positional exits 2 ("returned no JSON (exit 2)").
-    calls = _stub_comfy(monkeypatch, _ok(["sd_xl_base.safetensors"]))
+    calls = patched_run(envelope(data=["sd_xl_base.safetensors"]))
     assert server.search_models(query="xl") == ["sd_xl_base.safetensors"]
-    assert calls[0][4:] == ["models", "search", "--text", "xl"]
+    assert calls[0]["cmd"][4:] == ["models", "search", "--text", "xl"]
 
 
-def test_search_models_folder_uses_list_folder(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok(["model.ckpt"]))
+def test_search_models_folder_uses_list_folder(patched_run):
+    calls = patched_run(envelope(data=["model.ckpt"]))
     assert server.search_models(folder="checkpoints") == ["model.ckpt"]
-    assert calls[0][4:] == ["models", "list-folder", "checkpoints"]
+    assert calls[0]["cmd"][4:] == ["models", "list-folder", "checkpoints"]
 
 
-def test_search_models_empty_lists_folders(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok(["checkpoints", "loras"]))
+def test_search_models_empty_lists_folders(patched_run):
+    calls = patched_run(envelope(data=["checkpoints", "loras"]))
     assert server.search_models() == ["checkpoints", "loras"]
-    assert calls[0][4:] == ["models", "list-folders"]
+    assert calls[0]["cmd"][4:] == ["models", "list-folders"]
 
 
-def test_search_models_query_takes_precedence_over_folder(monkeypatch):
-    calls = _stub_comfy(monkeypatch, _ok([]))
+def test_search_models_query_takes_precedence_over_folder(patched_run):
+    calls = patched_run(envelope(data=[]))
     server.search_models(query="xl", folder="checkpoints")
-    assert calls[0][4:] == ["models", "search", "--text", "xl"]
+    assert calls[0]["cmd"][4:] == ["models", "search", "--text", "xl"]
 
 
-def test_discovery_surfaces_error_envelope(monkeypatch):
+def test_discovery_surfaces_error_envelope(patched_run):
     """A local server-not-running envelope must raise, not return silently."""
-    _stub_comfy(
-        monkeypatch,
-        {
-            "type": "envelope",
-            "ok": False,
-            "error": {
+    patched_run(
+        envelope(
+            ok=False,
+            error={
                 "code": "server_not_running",
                 "message": "local ComfyUI not running",
             },
-        },
+        )
     )
     with pytest.raises(server.ComfyCliError, match="server_not_running"):
         server.search_nodes("sampler")

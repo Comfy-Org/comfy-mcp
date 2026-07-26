@@ -702,6 +702,27 @@ def _parse_version(text: str) -> tuple[int, int, int] | None:
     return int(major), int(minor), int(patch)
 
 
+def _spawn_comfy_version() -> subprocess.CompletedProcess:
+    """Run ``comfy --version`` and return the completed process.
+
+    The single spawn site shared by the two ``--version`` probes —
+    :func:`_check_comfy_version` (the hard ``>= 1.12.0`` floor) and
+    :func:`_detect_comfy_cli_version` (the opt-in ``COMFY_CLI_MIN_VERSION``
+    report). It deliberately does NOT catch anything: the two callers have
+    different, load-bearing failure policies (fail-open with a latched timeout
+    and a macOS TCC translation vs. best-effort ``None``), so each keeps its own
+    ``try``/``except`` around this call. Only the invocation itself is shared.
+    """
+    return subprocess.run(
+        [COMFY_BIN, "--version"],
+        capture_output=True,
+        text=True,
+        errors="replace",  # never crash on undecodable `--version` bytes
+        timeout=30.0,
+        check=False,
+    )
+
+
 def _check_comfy_version() -> None:
     """Guard: refuse to run against a comfy-cli older than :data:`_MIN_COMFY_CLI`.
 
@@ -717,14 +738,7 @@ def _check_comfy_version() -> None:
     if _version_checked:
         return
     try:
-        proc = subprocess.run(
-            [COMFY_BIN, "--version"],
-            capture_output=True,
-            text=True,
-            errors="replace",  # never crash on undecodable `--version` bytes
-            timeout=30.0,
-            check=False,
-        )
+        proc = _spawn_comfy_version()
     except subprocess.TimeoutExpired:
         # A hung `--version` is latched so we don't re-block every later call on
         # the same 30s wait; fail OPEN for the rest of the process.
@@ -1918,15 +1932,12 @@ def _detect_comfy_cli_version() -> str | None:
     if shutil.which(COMFY_BIN) is None:
         return None
     try:
-        proc = subprocess.run(
-            [COMFY_BIN, "--version"],
-            capture_output=True,
-            text=True,
-            errors="replace",  # never crash on non-UTF-8 bytes; report None instead
-            timeout=30.0,
-            check=False,
-        )
+        proc = _spawn_comfy_version()
     except (subprocess.SubprocessError, OSError):
+        # Best-effort by design: this broad catch also swallows the
+        # TimeoutExpired / PermissionError cases that _check_comfy_version
+        # translates, because an undetermined version here is reported as
+        # "unknown" rather than raised. Do not narrow it to match that guard.
         return None
     # Only trust stdout on a clean exit: a non-zero exit or a stderr warning can
     # carry an unrelated dotted number (an embedded Python / ComfyUI core version)
@@ -2908,6 +2919,25 @@ async def _resolve_spend_consent(
     return confirm_spend
 
 
+def _validate_param_key(
+    key: str, *, empty_msg: str, invalid_msg: str, nul_label: str
+) -> None:
+    """Shared key-shape gate for the two argv param marshalers.
+
+    Order is load-bearing and identical in both callers: empty-or-leading-dash,
+    then ``=``-or-whitespace, then NUL. Each caller passes its own fully rendered
+    messages so its error text survives byte-for-byte, and keeps its own comment
+    for WHY the ``=``/whitespace check matters for its argv shape. If the two
+    gates ever need to diverge, split this back into the callers rather than
+    growing parameters here.
+    """
+    if not key or key.startswith("-"):
+        raise ComfyCliError(empty_msg)
+    if "=" in key or any(ch.isspace() for ch in key):
+        raise ComfyCliError(invalid_msg)
+    _reject_nul(nul_label, key)
+
+
 def _generate_param_args(params: dict[str, Any]) -> list[str]:
     """Marshal per-model ``params`` into ``comfy generate`` ``--name=value`` tokens.
 
@@ -2926,29 +2956,23 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
     """
     argv: list[str] = []
     for name, value in params.items():
-        if not name:
-            raise ComfyCliError(
+        # `=`/whitespace in a NAME is argv-integrity here: comfy-cli splits
+        # `--<body>` at the FIRST `=`, so a key carrying its own `=` would land
+        # as a run-level flag, smuggling past the meta-flag check below (which
+        # only ever sees the whole key).
+        _validate_param_key(
+            name,
+            empty_msg=(
                 f"invalid parameter name: {name!r} — expected a model parameter "
                 "name (e.g. 'prompt'), not an empty or option-like value."
-            )
-        _reject_option_like(
-            "parameter name",
-            name,
-            expected="a model parameter name (e.g. 'prompt')",
-        )
-        # A name carrying its own `=` (or whitespace) is not a parameter name:
-        # comfy-cli splits `--<body>` at the FIRST `=`, so `{"output-prefix=/tmp/x":
-        # v}` renders `--output-prefix=/tmp/x=v` and lands as the run-level
-        # `output-prefix` flag — smuggling past the meta-flag check below, which
-        # only ever sees the whole key. Refuse the shape instead of trying to
-        # out-parse comfy-cli's splitter.
-        if "=" in name or any(ch.isspace() for ch in name):
-            raise ComfyCliError(
+            ),
+            invalid_msg=(
                 f"invalid parameter name: {name!r} — a parameter name cannot "
                 "contain '=' or whitespace. Pass the value as the dict value, "
                 "not inside the key."
-            )
-        _reject_nul(f"parameter name {name!r}", name)
+            ),
+            nul_label=f"parameter name {name!r}",
+        )
         # Compare hyphen-normalized so `api_key` / `emit_workflow` are caught
         # too; agents naturally spell CLI flags with underscores. Case is NOT
         # normalized: comfy-cli matches its run-level flags case-sensitively in
@@ -3235,31 +3259,24 @@ def _run_template_param_args(params: dict[str, Any]) -> list[str]:
     """
     argv: list[str] = []
     for key, value in params.items():
-        if not key:
-            raise ComfyCliError(
+        # `=` is the load-bearing check here: comfy-cli splits the `--param`
+        # value on its FIRST `=` to separate slot key from value. Whitespace is
+        # refused for a weaker reason — KEY rides inside the single
+        # `--param=KEY=VALUE` token so it is never argv-ambiguous, but a clear
+        # error beats the engine's "matches no slot".
+        _validate_param_key(
+            key,
+            empty_msg=(
                 f"invalid param key: {key!r} — expected a slot address (e.g. "
                 "'6.text') or a slot name (e.g. 'prompt'), not an empty or "
                 "option-like value."
-            )
-        _reject_option_like(
-            "param key",
-            key,
-            expected="a slot address (e.g. '6.text') or a slot name (e.g. 'prompt')",
-        )
-        # `=` is the load-bearing one: comfy-cli splits the `--param` value on
-        # its FIRST `=` to separate slot key from value, so a key carrying its
-        # own `=` mis-splits. Refuse the shape rather than out-parse the
-        # splitter. Whitespace is refused for a weaker reason — KEY rides inside
-        # the single `--param=KEY=VALUE` token, so it is never argv-ambiguous,
-        # but comfy-cli `.strip()`s the key and slot names come from node input
-        # names (0 of the 574 gallery templates carry whitespace or a leading
-        # dash in one). A clear error here beats the engine's "matches no slot".
-        if "=" in key or any(ch.isspace() for ch in key):
-            raise ComfyCliError(
+            ),
+            invalid_msg=(
                 f"invalid param key: {key!r} — a slot key cannot contain '=' or "
                 "whitespace. Pass the value as the dict value, not in the key."
-            )
-        _reject_nul(f"param key {key!r}", key)
+            ),
+            nul_label=f"param key {key!r}",
+        )
         if value is None:
             continue
         # json.dumps escapes a NUL inside a string value (so it can't crash
@@ -4475,6 +4492,16 @@ def list_workflow_slots(workflow_path: str) -> Any:
     ``run_workflow`` accepts. Pass a slot's ``ADDR`` back to ``set_workflow_slot``
     (or ``vary_workflow``) to change it.
     """
+    # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
+    # as a flag rather than the path comfy-cli is meant to read.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
 
 
@@ -4499,9 +4526,20 @@ def set_workflow_slot(
         modified = set_workflow_slot(path, ["6.text=a red bicycle", "3.seed=42"])
         # write `modified` to disk (or call with stdout=False), then run_workflow
     """
-    # Each override is splatted in as a positional, so a leading-dash entry is
-    # read by comfy-cli as a flag — e.g. `"--stdout"` would flip the
-    # non-destructive/in-place behavior this tool's `stdout` argument owns.
+    # `workflow_path` and each override are splatted in as bare positionals, so
+    # a leading-dash entry is read by comfy-cli as a flag — e.g. `"--stdout"`
+    # would flip the non-destructive/in-place behavior this tool's `stdout`
+    # argument owns. Guarding only the overrides would leave the path as an
+    # equivalent way in: consumed as a flag, it shifts the first override into
+    # the path slot.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
     for o in overrides:
         _reject_option_like(
             "override",
@@ -4532,6 +4570,18 @@ def vary_workflow(
     forward ``--out-dir``). Run each variant with ``run_workflow`` to sweep a
     parameter grid.
     """
+    # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
+    # as a flag (`"--out-dir"` would swallow the following `--slot` token and
+    # redirect where variants land). `slots` ride behind `--slot`, so they are
+    # option VALUES rather than positionals and need no such guard.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
     args = ["workflow", "vary", workflow_path]
     for slot in slots:
         args += ["--slot", slot]

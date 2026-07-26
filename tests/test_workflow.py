@@ -13,33 +13,16 @@ they own on top of the passthrough:
 
 from __future__ import annotations
 
-import json
-import subprocess
-
 import pytest
+from conftest import envelope
 
 from comfy_local_mcp import server
 
 
-def _fake_run(envelope: dict):
-    """Return a subprocess.run stand-in that captures the call and emits an envelope."""
-    calls: list[dict] = []
-
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env})
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(envelope), stderr=""
-        )
-
-    return fake, calls
-
-
-def test_list_workflow_slots_argv(monkeypatch):
+def test_list_workflow_slots_argv(patched_run):
     """Passthrough: `comfy --json --where local workflow slots <path>`."""
     data = [{"addr": "6.text", "value": "a cat"}, {"addr": "3.seed", "value": 42}]
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": data})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data=data))
 
     assert server.list_workflow_slots("/tmp/flux.json") == data
 
@@ -48,13 +31,9 @@ def test_list_workflow_slots_argv(monkeypatch):
     assert cmd[4:] == ["workflow", "slots", "/tmp/flux.json"]  # subcommand after
 
 
-def test_set_workflow_slot_argv_default_stdout(monkeypatch):
+def test_set_workflow_slot_argv_default_stdout(patched_run):
     """Default: positional ADDR=VALUE overrides + trailing --stdout (non-destructive)."""
-    fake, calls = _fake_run(
-        {"type": "envelope", "ok": True, "data": {"modified": True}}
-    )
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data={"modified": True}))
 
     result = server.set_workflow_slot(
         "/tmp/flux.json", ["6.text=a red bicycle", "3.seed=42"]
@@ -71,11 +50,9 @@ def test_set_workflow_slot_argv_default_stdout(monkeypatch):
     ]
 
 
-def test_set_workflow_slot_stdout_false_writes_in_place(monkeypatch):
+def test_set_workflow_slot_stdout_false_writes_in_place(patched_run):
     """stdout=False drops --stdout so comfy-cli writes the change back to the file."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": None})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data=None))
 
     server.set_workflow_slot("/tmp/flux.json", ["3.seed=7"], stdout=False)
 
@@ -103,13 +80,48 @@ def test_set_workflow_slot_rejects_option_like_override(monkeypatch):
         server.set_workflow_slot("/tmp/flux.json", ["6.text=x", "--stdout"])
 
 
-def test_set_workflow_slot_guard_leaves_valid_overrides_alone(monkeypatch):
+def test_workflow_path_positional_rejects_option_like(monkeypatch):
+    """The sibling `workflow_path` positional is guarded too, not just the overrides.
+
+    All three tools splat the path in bare, so a leading-dash path is read as a
+    flag: for `set-slot` that shifts the first override into the path slot,
+    which is the very injection the override guard exists to stop. The error
+    names the escape hatch — a genuinely dash-leading filename works as `./-x`.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        server.set_workflow_slot("--stdout", ["6.text=x"])
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.list_workflow_slots("--stdout")
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.vary_workflow("--out-dir", ["3.seed=[1,2]"])
+
+
+def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
+    """The documented escape hatch actually works: `./-flux.json` is not refused."""
+    calls = patched_run(envelope(data={"modified": True}))
+
+    server.set_workflow_slot("./-flux.json", ["6.text=x"])
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "set-slot",
+        "./-flux.json",
+        "6.text=x",
+        "--stdout",
+    ]
+
+
+def test_set_workflow_slot_guard_leaves_valid_overrides_alone(patched_run):
     """The guard reads the override's FIRST character only: `-` inside a VALUE is fine."""
-    fake, calls = _fake_run(
-        {"type": "envelope", "ok": True, "data": {"modified": True}}
-    )
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data={"modified": True}))
 
     server.set_workflow_slot("/tmp/flux.json", ["6.text=x", "4.ckpt=sd-xl --turbo"])
 
@@ -123,11 +135,9 @@ def test_set_workflow_slot_guard_leaves_valid_overrides_alone(monkeypatch):
     ]
 
 
-def test_vary_workflow_argv_repeats_slot_flag(monkeypatch):
+def test_vary_workflow_argv_repeats_slot_flag(patched_run):
     """Each address becomes its own `--slot "ADDR=[...]"`; no --out-dir when unset."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": {"variants": 3}})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data={"variants": 3}))
 
     result = server.vary_workflow(
         "/tmp/flux.json", ["3.seed=[1,2,3]", "6.text=[cat,dog,fish]"]
@@ -147,11 +157,9 @@ def test_vary_workflow_argv_repeats_slot_flag(monkeypatch):
     assert "--out-dir" not in cmd  # stdout NDJSON mode when out_dir is unset
 
 
-def test_vary_workflow_forwards_out_dir(monkeypatch, tmp_path):
+def test_vary_workflow_forwards_out_dir(patched_run, tmp_path):
     """out_dir appends `--out-dir <dir>` so variants are written to files."""
-    fake, calls = _fake_run({"type": "envelope", "ok": True, "data": None})
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", fake)
+    calls = patched_run(envelope(data=None))
 
     out = tmp_path / "variants"
     server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"], out_dir=str(out))
