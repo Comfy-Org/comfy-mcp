@@ -4178,11 +4178,30 @@ def download_model(
         #
         # `splitdrive` then covers what no separator reveals: a drive-relative
         # `C:evil` resolves against drive C:'s own working directory.
+        #
+        # Segments are matched as a DOT RUN rather than by `seg == ".."`, because
+        # Windows strips trailing spaces and periods from every path component at
+        # syscall time (`normpath` does not — it leaves them in place, which is
+        # exactly why the string check has to). So `".. "` and `"..."` reach the
+        # filesystem as `..` and traverse out of the models dir while comparing
+        # unequal to it. `strip(" .")` leaves something behind for any real name
+        # — `".hidden"`, `"v1.5"`, `"loras"` — so only those disguised forms fall
+        # out empty. Empty segments are skipped so a doubled or trailing slash
+        # (`models//loras`, `models/loras/`) keeps working as before; a LEADING
+        # empty segment is the separator case `parts[0] == ""` already catches.
+        #
+        # This deliberately sweeps in a bare `.` component too (`./models`), one
+        # step wider than the escape strictly requires. Drawing the line exactly
+        # where Windows' stripping lands would mean modelling how many trailing
+        # dots survive per component — precisely the reasoning you do not want
+        # load-bearing in a traversal guard — and a `.` segment carries no
+        # meaning here that plain `models/loras` does not, so the caller loses
+        # nothing but a spelling.
         parts = relative_path.replace("\\", "/").split("/")
         if (
             parts[0] == ""
             or ntpath.splitdrive(relative_path)[0] != ""
-            or ".." in parts
+            or any(seg and not seg.strip(" .") for seg in parts)
             or ":" in relative_path
         ):
             raise ComfyCliError(
@@ -4197,9 +4216,12 @@ def download_model(
         # can't redirect the write out of the target directory. These already
         # subsume an `ntpath.splitdrive` test — every string it reports a drive
         # for is either `X:…` (caught by `:`) or a UNC `\\host\share…` (caught by
-        # `\`) — so a bare name needs no separate drive check.
+        # `\`) — so a bare name needs no separate drive check. The `.`/`..` case
+        # is matched as a dot run for the same reason as `relative_path` above:
+        # Windows strips a component's trailing spaces and periods at syscall
+        # time, so `".. "` and `"..."` arrive as `..` yet compare unequal to it.
         if (
-            filename in (".", "..")
+            not filename.strip(" .")
             or "/" in filename
             or "\\" in filename
             or ":" in filename
