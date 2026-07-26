@@ -1828,7 +1828,9 @@ async def generate_image(
     prompt / checkpoint slot keys are overridable alongside it via
     ``COMFY_T2I_PROMPT_SLOT`` / ``COMFY_T2I_CHECKPOINT_SLOT``, and must be
     overridden together with the template since slot keys describe one specific
-    graph. Pass ``checkpoint`` to swap the template's checkpoint model (it must
+    graph; the two must name DIFFERENT slots (one key for both is refused rather
+    than silently dropping the prompt). Pass ``checkpoint`` to swap the
+    template's checkpoint model (it must
     already be installed locally — see ``search_models`` / ``download_model``);
     omit it to use the template's own default. The default template is a free,
     fully local OSS graph: nothing here spends Comfy credits, so no spend
@@ -1874,11 +1876,12 @@ async def generate_image(
             # (a plausible wrong image). Only reachable via a misconfigured
             # override pair; refuse it by name instead.
             raise ComfyCliError(
-                f"COMFY_T2I_PROMPT_SLOT and COMFY_T2I_CHECKPOINT_SLOT are both "
-                f"{prompt_slot!r} — the checkpoint would overwrite the prompt. "
-                "Point them at the two different slots of template "
-                f"{template!r} (list them with `comfy templates fetch "
-                f"{template} -o wf.json && comfy workflow slots wf.json`)."
+                f"generate_image's prompt slot and checkpoint slot both resolve "
+                f"to {prompt_slot!r} — the checkpoint would overwrite the "
+                "prompt. Set COMFY_T2I_PROMPT_SLOT / COMFY_T2I_CHECKPOINT_SLOT "
+                f"to the two different slots of template {template!r} (list "
+                f"them with `comfy templates fetch {template} -o wf.json && "
+                "comfy workflow slots wf.json`)."
             )
         params[checkpoint_slot] = checkpoint
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_TEMPLATE_TIMEOUT)
