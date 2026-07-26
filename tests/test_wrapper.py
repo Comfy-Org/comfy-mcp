@@ -22,7 +22,7 @@ import threading
 import time
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx
+from conftest import _OK_STREAM, _FakeProc, _RecordingCtx
 
 from comfy_local_mcp import server
 
@@ -1029,6 +1029,215 @@ def test_plain_ok_still_honors_a_real_envelope(patched_run):
     patched_run({"type": "envelope", "ok": True, "data": {"pid": 7}})
 
     assert server._run_comfy("launch", "--background", plain_ok=True) == {"pid": 7}
+
+
+# --- envelope-failure messages must carry BOTH stream tails -----------------
+# A comfy-cli that dies without emitting an envelope used to raise a message
+# that showed only the HEAD of stderr and nothing at all about stdout — so a
+# plain-text diagnostic printed to stdout was lost, a traceback was clipped
+# right before the exception that explains it, and an empty stderr rendered as
+# a dangling `stderr: ` indistinguishable from truncation.
+
+
+def test_stream_tail_marks_empty_and_truncation():
+    """`_stream_tail` marks a blank capture and a clipped one, and keeps the END."""
+    assert server._stream_tail("") == "<empty>"
+    assert server._stream_tail(None) == "<empty>"
+    assert server._stream_tail("   \n  ") == "<empty>"  # whitespace-only is empty
+    # A capture that fits the bound is passed through verbatim — no marker.
+    assert server._stream_tail("  short  ") == "short"
+    assert server._stream_tail("x" * 500, limit=500) == "x" * 500  # exactly at bound
+    # One char over the bound: clipped, marked, and it is the TAIL that survives.
+    clipped = server._stream_tail("HEAD" + "x" * 600 + "FINAL_ERROR_LINE", limit=500)
+    assert clipped.startswith("...")
+    assert clipped.endswith("FINAL_ERROR_LINE")
+    assert "HEAD" not in clipped
+    assert len(clipped) == 503  # bounded: the marker plus exactly `limit` chars
+    # bytes are decoded defensively, same as `_tail`
+    assert server._stream_tail(b"cafe\xff") == "cafe\ufffd"
+    # A non-positive bound yields no tail rather than defeating itself: the
+    # single-pass implementation asks `_tail` for `limit + 1`, so a 0 would slip
+    # past its guard and `[-0:]` would return the whole capture unbounded.
+    assert server._stream_tail("x" * 100, limit=0) == "<empty>"
+    assert server._stream_tail("x" * 100, limit=-1) == "<empty>"
+
+
+def test_no_envelope_error_marks_both_empty_streams(patched_plain_run):
+    """Nothing on either stream still renders explicitly, never a dangling colon."""
+    patched_plain_run(1, stdout="", stderr="")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+
+    msg = str(excinfo.value)
+    assert "exit 1" in msg
+    assert "stderr: <empty>" in msg
+    assert "stdout: <empty>" in msg
+
+
+def test_no_envelope_error_surfaces_plain_stdout_diagnostic(patched_plain_run):
+    """comfy-cli's plain-text stdout diagnosis survives `_last_json_object`."""
+    patched_plain_run(
+        1,
+        stdout="Traceback (most recent call last):\n  ...\nValueError: boom\n",
+        stderr="",
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+
+    msg = str(excinfo.value)
+    assert "ValueError: boom" in msg  # the whole point: stdout is no longer dropped
+    assert "stderr: <empty>" in msg
+
+
+def test_no_envelope_error_keeps_the_stderr_tail_not_the_head(patched_plain_run):
+    """A long traceback is clipped from the FRONT — the exception is at the END."""
+    patched_plain_run(1, stderr="HEAD_MARKER" + "x" * 600 + "FINAL_ERROR_LINE")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+
+    msg = str(excinfo.value)
+    assert "FINAL_ERROR_LINE" in msg  # the useful end survived
+    assert "HEAD_MARKER" not in msg  # the useless start did not
+    assert "stderr: ..." in msg  # truncation is visibly marked
+
+
+def test_error_envelope_falls_back_to_marked_empty_not_bare_colon():
+    """`ok: false` with no message and no stderr must not end in a bare colon."""
+    envelope = {"type": "envelope", "ok": False, "error": {"code": "x"}}
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+
+    assert str(excinfo.value) == "comfy env failed [x]: <empty>"
+
+
+def test_error_envelope_stderr_fallback_keeps_its_tail():
+    """The stderr fallback on `ok: false` is bounded from the END, marker intact."""
+    stderr = "HEAD_MARKER" + "x" * 900 + "FINAL_ERROR_LINE"
+    envelope = {"type": "envelope", "ok": False, "error": {"code": "x"}}
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, stderr)
+
+    msg = str(excinfo.value)
+    assert msg.endswith("FINAL_ERROR_LINE")  # the cap must not re-clip the tail off
+    assert "HEAD_MARKER" not in msg
+    assert "[x]: ..." in msg
+
+
+def test_streaming_no_envelope_error_includes_both_stream_tails(monkeypatch):
+    """The streaming EOF path produces the same enriched message as `_run_comfy`."""
+    procs: list[_FakeProc] = []
+
+    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+        proc = _FakeProc(
+            cmd,
+            "starting run...\ncomfy-cli crashed before emitting a result\n",
+            stderr_text="Traceback (most recent call last):\nRuntimeError: nope",
+            env=env,
+            encoding=encoding,
+        )
+        proc.returncode = 1
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        asyncio.run(
+            server._run_comfy_streaming("run", "--workflow", "wf.json", timeout=5.0)
+        )
+
+    msg = str(excinfo.value)
+    assert "returned no JSON (exit 1)" in msg
+    assert "RuntimeError: nope" in msg  # stderr tail
+    assert "comfy-cli crashed before emitting a result" in msg  # stdout tail
+
+
+def test_streaming_eof_ignores_a_trailing_progress_event(monkeypatch):
+    """A crash whose last stdout line is a progress EVENT still reports both tails.
+
+    The streaming path reads NDJSON, so at EOF `_last_json_object`'s fallback is
+    typically the run's last progress/custom-node event — not a result. Unwrapping
+    it would swallow the diagnostics this branch exists to surface (and an event
+    carrying `ok: true` would be read as a successful run on a spend-capable
+    tool), so it is filtered to None and the no-envelope branch fires instead.
+    """
+
+    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+        proc = _FakeProc(
+            cmd,
+            # An event that both parses AND claims success — the worst case.
+            '{"type": "progress", "ok": true, "data": {"value": 3}}\n'
+            "comfy-cli crashed mid-run\n",
+            stderr_text="RuntimeError: nope",
+            env=env,
+            encoding=encoding,
+        )
+        proc.returncode = 1
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        asyncio.run(
+            server._run_comfy_streaming("run", "--workflow", "wf.json", timeout=5.0)
+        )
+
+    msg = str(excinfo.value)
+    assert "returned no JSON (exit 1)" in msg  # not silently "succeeded"
+    assert "RuntimeError: nope" in msg
+    assert "comfy-cli crashed mid-run" in msg
+
+
+def test_streaming_eof_still_refuses_an_incompatible_envelope(monkeypatch):
+    """The filter keeps REAL envelopes: a bad `schema` still raises the version error.
+
+    `_pump` only stops on `envelope/1`, so an envelope declaring another major
+    reaches EOF. It is a genuine envelope, so it must flow through and be refused
+    with the incompatible-version message — not demoted to "returned no JSON".
+    """
+
+    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+        proc = _FakeProc(
+            cmd,
+            '{"schema": "envelope/2", "type": "envelope", "ok": true, "data": {}}\n',
+            env=env,
+            encoding=encoding,
+        )
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(server.ComfyCliError, match="incompatible comfy-cli envelope"):
+        asyncio.run(
+            server._run_comfy_streaming("run", "--workflow", "wf.json", timeout=5.0)
+        )
+
+
+def test_error_envelope_whitespace_message_falls_back_to_stderr():
+    """A whitespace-only `error.message` is truthy but renders as a dangling colon."""
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": "x", "message": "   "},
+    }
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "the real reason")
+
+    assert str(excinfo.value) == "comfy env failed [x]: the real reason"
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+
+    assert str(excinfo.value) == "comfy env failed [x]: <empty>"
 
 
 # --- download_model: no JSON envelope on a successful fetch (BE-3345) -------

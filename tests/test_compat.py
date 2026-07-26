@@ -279,6 +279,26 @@ def test_server_info_raises_on_version_below_floor(patched_env, monkeypatch):
         server.server_info()
 
 
+def test_server_info_rejects_a_stray_non_envelope_json(patched_env, monkeypatch):
+    """An incidental non-envelope JSON line from `comfy env` is not server info.
+
+    `_run_comfy_raw` hands back `_last_json_object`'s answer, which falls back to
+    ANY JSON object on stdout. `server_info` must apply the same `type==envelope`
+    contract `_run_comfy` does — otherwise a diagnostic line that happens to
+    carry `ok: true` would be reported as a valid environment report, and the
+    no-envelope diagnostics (both stream tails) would never be shown.
+    """
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
+    patched_env({"ok": True, "data": {"running": True}})
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.server_info()
+
+    msg = str(excinfo.value)
+    assert "returned no JSON" in msg
+    assert "stdout: " in msg  # the raw line is surfaced, not swallowed
+
+
 def test_server_info_wraps_non_dict_env_data(patched_env, monkeypatch):
     """If `comfy env` ever returns non-dict data, it is still returned with compat."""
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
