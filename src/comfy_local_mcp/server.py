@@ -3988,10 +3988,17 @@ def list_nodes(
     - ``produces`` → ``--produces <TYPE>``: nodes whose outputs include ``<TYPE>``
       (e.g. ``IMAGE``, ``MODEL``).
     - ``accepts`` → ``--accepts <TYPE>``: nodes with an input of ``<TYPE>``.
-    - ``category`` → ``--category <path>``: nodes under a menu category
-      (e.g. ``loaders``).
-    - ``pack`` → ``--pack <name>``: nodes from a given custom-node pack.
-    - ``label`` → ``--label <text>``: nodes matching a display-label substring.
+    - ``category`` → ``--category <glob>``: glob match on the category path, so
+      ``loaders`` matches only that exact category while ``loaders*`` /
+      ``sampling/*`` match a subtree (``%`` also works as the wildcard).
+    - ``pack`` → ``--pack <name>``: nodes from a custom-node pack, matched on the
+      pack's whole name, case-insensitively (e.g. ``core``,
+      ``comfyui-impact-pack``).
+    - ``label`` → ``--label <Label>``: nodes carrying one of comfy-cli's curated
+      *behavioral* labels — ``WritesToDisk``, ``NetworkAccess``,
+      ``ReadsArbitraryFile``, … — matched exactly, and only on the nodes
+      comfy-cli annotates (a purely local custom node carries none). This is not
+      a display-name search; use ``search_nodes`` for that.
 
     Reads the user's live install, so results include installed custom nodes —
     the broad "what nodes can do X?" companion to ``search_nodes``' name search.
