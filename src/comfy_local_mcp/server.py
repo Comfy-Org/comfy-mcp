@@ -49,17 +49,16 @@ import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from typing import Any
 from urllib.parse import urlparse
 
 from mcp import types
 from mcp.server.fastmcp import Context, FastMCP, Image
 from pydantic import BaseModel, Field
+
+from . import failure_log, tcc, textutil
 
 # Rides every client handshake — teach an agent the canonical flows up front so
 # it does not have to rediscover them tool-by-tool. Keep this short.
@@ -126,76 +125,6 @@ mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
 # reads straight off the environment ``_comfy_env`` forwards (precedence:
 # comfy-cli flags > env > background record > ``127.0.0.1:8188``).
 COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
-
-# --- opt-in local failure log -------------------------------------------------
-# `COMFY_LOCAL_MCP_DEBUG_LOG` turns on a rotating, local-only JSONL record of
-# every comfy-cli failure this server surfaces, so a tester can zip up a durable
-# diagnostic trail instead of scraping an MCP client's transcript after the fact.
-# Failure-only (a successful call writes nothing), local-only (nothing is
-# transmitted anywhere), and OFF by default — while disabled there are ZERO
-# filesystem effects: no directory is created and no handler is ever opened.
-#
-#   unset / "" / "0"  -> disabled (the default)
-#   "1"               -> enabled at the per-OS default path
-#   anything else     -> enabled, and the value IS the log file path
-_FAILURE_LOG_ENV = "COMFY_LOCAL_MCP_DEBUG_LOG"
-
-# Chars kept per stream tail, deliberately far larger than the
-# `_MAX_ERROR_FIELD_CHARS` cap an error *message* carries: preserving more output
-# than the message can is this log's whole reason to exist.
-_FAILURE_LOG_TAIL_CHARS = 4000
-
-# Cap on the recorded `message` (the sentence the MCP client displayed) so a
-# pathological envelope cannot write an unbounded line.
-_FAILURE_LOG_MESSAGE_CHARS = 2000
-
-# Rotation, via the stdlib handler: 1 MiB per file plus two older generations,
-# so the log is self-limiting at ~3 MiB no matter how long a tester leaves it on.
-_FAILURE_LOG_MAX_BYTES = 1_048_576
-_FAILURE_LOG_BACKUPS = 2
-
-# A dedicated logger with `propagate = False`. Non-propagation is not cosmetic:
-# this is an MCP **stdio** server, so stdout is the protocol transport, and a
-# record reaching a default root handler could corrupt the session.
-_FAILURE_LOGGER_NAME = "comfy_local_mcp.failures"
-
-
-def _default_failure_log_path() -> str:
-    """Per-OS default path for the failure log. Creates nothing.
-
-    Mirrors comfy-cli's own local-state convention (its ``constants.py``
-    ``DEFAULT_CONFIG``) with a ``comfy-local-mcp`` leaf, hand-rolled rather than
-    imported: comfy-cli is the *engine* this server shells out to, not a Python
-    dependency of it (``mcp`` is the only one), so there is nothing to import.
-
-    Deliberately NOT under the ComfyUI workspace: resolving that requires
-    *running* comfy-cli, and this log's prime scenarios — a missing binary, a
-    crash before any JSON, a timeout — are exactly when comfy-cli cannot answer.
-    """
-    home = os.path.expanduser("~")
-    if sys.platform == "darwin":
-        base = os.path.join(home, "Library", "Application Support")
-    elif sys.platform == "win32":
-        base = os.path.join(home, "AppData", "Local")
-    else:
-        base = os.path.join(home, ".config")
-    return os.path.join(base, "comfy-local-mcp", "failures.jsonl")
-
-
-def _resolve_failure_log_path(value: str | None) -> str | None:
-    """The log path ``COMFY_LOCAL_MCP_DEBUG_LOG=<value>`` selects, else ``None``."""
-    value = (value or "").strip()
-    if not value or value == "0":
-        return None
-    if value == "1":
-        return _default_failure_log_path()
-    return value
-
-
-# Single source of truth for "is the failure log on, and where" — ``None`` means
-# disabled. One global rather than a separate enabled flag plus a path, so the
-# two can never disagree (enabled-with-no-path would be a live tripwire).
-_FAILURE_LOG_PATH = _resolve_failure_log_path(os.environ.get(_FAILURE_LOG_ENV))
 
 # Optional: point the run/queue tools at a ComfyUI running ELSEWHERE (e.g. a GPU
 # box reachable over a private network / tailnet) instead of the implicit local
@@ -366,9 +295,11 @@ def _in_pipe_pool(func, *args):
 # radius to partner generation itself, exactly as `_PIPE_EXECUTOR` does for the
 # streaming pipe reads.
 #
-# Shared with `run_template`, which is the same class of call: a blocking
-# comfy-cli run bounded only by the hour-long ceiling, on a tool that is async
-# for its own spend-consent round-trip.
+# Shared with the `run_template` / `generate_image` submit paths, which are the
+# same class of call: a blocking `subprocess.run` on a tool that is async for its
+# own spend-consent round-trip. Their `wait=True` runs stream instead (see
+# `_run_comfy_streaming`), so what those two park here is the short
+# fire-and-return submit, not the hour-long wait.
 #
 # Sized like the pipe pool. Saturating it queues further partner runs rather
 # than growing threads without bound — deliberate backpressure on a paid,
@@ -463,144 +394,6 @@ def _comfy_env() -> dict[str, str]:
     }
 
 
-# --- macOS protected-folder (TCC) diagnostics --------------------------------
-#
-# macOS gates ~/Documents, ~/Desktop and ~/Downloads behind TCC (Transparency,
-# Consent & Control). An app without Full Disk Access cannot read them, and
-# neither can the processes it spawns — so when a ComfyUI install (and its
-# venv) lives under one of those folders, the `comfy` binary an MCP client
-# spawns dies during interpreter startup:
-#
-#     Fatal Python error: init_import_site: Failed to import the site module
-#     PermissionError: [Errno 1] Operation not permitted: '.../venv/pyvenv.cfg'
-#
-# That is a macOS privacy setting, not a ComfyUI/comfy-cli fault, so the helpers
-# below detect the signature and answer with the fix instead of relaying a raw
-# Python traceback the user can do nothing with.
-_MACOS_PROTECTED_DIRS = ("Documents", "Desktop", "Downloads")
-
-# The denied path as CPython prints it in the OSError above. CPython's format is
-# ``[Errno 1] <strerror>: <repr(path)>`` and macOS can localize ``<strerror>``,
-# so match on the errno marker first and fall back to the English phrase for a
-# denial reported without one. `repr` quotes with `'` unless the path itself
-# contains one (then `"`), so accept either; the capture stops at a newline and
-# is bounded well past macOS's PATH_MAX so a garbled stderr line cannot drag an
-# unbounded blob into the message.
-_TCC_PATH_RE = re.compile(
-    r"(?:\[Errno 1\][^:\n]*|Operation not permitted):[ \t]*"
-    r"b?(?:'([^'\n]{0,1024})'|\"([^\"\n]{0,1024})\")"
-)
-
-# EPERM as it reaches us in text. `[errno 1]` is here because the strerror text
-# next to it comes from libc and macOS translates it under a non-English
-# `LC_MESSAGES` — the bracketed errno is what stays constant. It cannot collide
-# with another errno: the closing bracket rules out `[Errno 13]` and friends.
-_EPERM_MARKERS = ("operation not permitted", "[errno 1]")
-
-# CPython's own marker for "the interpreter died before `site` was imported",
-# which is the shape a venv under a protected folder takes.
-_STARTUP_CRASH_MARKER = "init_import_site"
-
-
-def _is_macos() -> bool:
-    """True on macOS. Read at call time so tests can patch ``sys.platform``."""
-    return sys.platform == "darwin"
-
-
-def _macos_protected_dir(path: str | bytes | None) -> str | None:
-    """Name of the protected home folder ``path`` sits under, else ``None``.
-
-    Compared case-insensitively: macOS volumes are case-insensitive by default,
-    so ``~/downloads/ComfyUI`` is the very same TCC-protected folder as
-    ``~/Downloads/ComfyUI`` and must be named as such rather than silently
-    falling through to the generic wording.
-    """
-    if not path:
-        return None
-    # An OSError raised on a bytes path carries a bytes `filename`; decode it
-    # rather than let a str/bytes comparison raise TypeError below.
-    resolved = os.path.abspath(os.path.expanduser(os.fsdecode(path))).lower()
-    home = os.path.expanduser("~")
-    for name in _MACOS_PROTECTED_DIRS:
-        root = os.path.join(home, name).lower()
-        if resolved == root or resolved.startswith(root + os.sep):
-            return name
-    return None
-
-
-def _looks_like_tcc_denial(text: str | None) -> bool:
-    """True if ``text`` carries the macOS protected-folder denial signature.
-
-    macOS-only by design: EPERM ("operation not permitted") means something
-    else entirely on Linux, and the guidance below is System-Settings-specific,
-    so a non-macOS failure must keep its original message.
-
-    EPERM alone is NOT enough even on macOS — SIP, the app sandbox and signalling
-    a protected process all raise it, and rewriting one of those with Full Disk
-    Access guidance would send the user off fixing the wrong thing. Require
-    corroboration: either CPython's startup-crash marker (the venv-under-a-
-    protected-folder shape this exists for) or a denied path that really does
-    resolve under one of the three folders. Anything else keeps its own message.
-    """
-    if not text or not _is_macos():
-        return False
-    lowered = text.lower()
-    if not any(marker in lowered for marker in _EPERM_MARKERS):
-        return False
-    return (
-        _STARTUP_CRASH_MARKER in lowered
-        or _macos_protected_dir(_tcc_path_from(text)) is not None
-    )
-
-
-def _tcc_path_from(text: str | None) -> str | None:
-    """The denied path CPython named in ``text``, when it named one."""
-    match = _TCC_PATH_RE.search(text or "")
-    if match is None:
-        return None
-    # Exactly one of the two quote-style alternatives captured.
-    return match.group(1) if match.group(1) is not None else match.group(2)
-
-
-def _tcc_guidance(path: str | bytes | None = None) -> str:
-    """Actionable fix for a macOS protected-folder denial, as one message.
-
-    ``path`` is the denied file when we know it (parsed out of the child's
-    stderr, or an unreadable ``COMFY_BIN``); naming its protected folder makes
-    the message concrete. Without one — or with one outside the protected set —
-    the wording stays general rather than asserting a location we haven't
-    verified. A ``bytes`` path (what an ``OSError`` from a bytes-path syscall
-    carries) is decoded, so it reads as a path rather than as ``b'...'``.
-    """
-    if path is not None:
-        path = os.fsdecode(path)
-    folder = _macos_protected_dir(path)
-    if folder:
-        where = (
-            f"{path} is under ~/{folder}, which macOS protects (TCC): an app — "
-            "and every process it spawns — cannot read it unless that app has "
-            "Full Disk Access."
-        )
-    else:
-        where = (
-            "macOS protects ~/Documents, ~/Desktop and ~/Downloads (TCC): an "
-            "app — and every process it spawns — cannot read them unless that "
-            "app has Full Disk Access, so a ComfyUI install or venv under one "
-            "of them is unreadable from here."
-        )
-    return (
-        f"macOS denied access to a protected folder. {where}\n"
-        "Fix it either way:\n"
-        "  1. Grant your MCP client Full Disk Access — System Settings > "
-        "Privacy & Security > Full Disk Access > add the app (Claude Desktop, "
-        "Cursor, or the terminal you launch the client from) — then quit and "
-        "reopen it.\n"
-        "  2. Or move the ComfyUI folder somewhere unprotected (e.g. ~/ComfyUI) "
-        "and re-point comfy-cli at it with `comfy set-default <path>`.\n"
-        "This is a macOS privacy setting, not a ComfyUI or comfy-cli fault."
-    )
-
-
 class ComfyCliError(RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope.
 
@@ -664,7 +457,7 @@ def _tcc_blocked_comfy_bin() -> str | None:
     being mislabelled as a Full Disk Access problem it isn't.
     """
     for candidate in _comfy_bin_candidates():
-        if _macos_protected_dir(candidate) is None:
+        if tcc._macos_protected_dir(candidate) is None:
             continue
         try:
             os.stat(candidate)
@@ -686,19 +479,21 @@ def _require_comfy_bin() -> None:
     """
     if shutil.which(COMFY_BIN) is not None:
         return
-    if _is_macos():
+    if tcc._is_macos():
         blocked = _tcc_blocked_comfy_bin()
         if blocked is not None:
-            message = f"`{COMFY_BIN}` could not be read.\n\n{_tcc_guidance(blocked)}"
+            message = (
+                f"`{COMFY_BIN}` could not be read.\n\n{tcc._tcc_guidance(blocked)}"
+            )
             # `args=()` on both raises: no comfy-cli invocation ever happened, so
             # there is no argv to record — the failure IS that there is no binary.
-            _log_failure("binary_missing", (), message=message)
+            failure_log._log_failure("binary_missing", (), message=message)
             raise ComfyCliError(message)
     message = (
         f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
         "(`pip install comfy-cli`) or set the COMFY_BIN env var."
     )
-    _log_failure("binary_missing", (), message=message)
+    failure_log._log_failure("binary_missing", (), message=message)
     raise ComfyCliError(message)
 
 
@@ -771,12 +566,13 @@ def _check_comfy_version() -> None:
         # this branch the generic handler below fails open and the raw EPERM
         # escapes from the real spawn a moment later, unexplained. Must precede
         # the OSError handler: PermissionError is a subclass of it.
-        denied = getattr(exc, "filename", None) or _tcc_path_from(str(exc))
-        if _is_macos() and (
-            _looks_like_tcc_denial(str(exc)) or _macos_protected_dir(denied) is not None
+        denied = getattr(exc, "filename", None) or tcc._tcc_path_from(str(exc))
+        if tcc._is_macos() and (
+            tcc._looks_like_tcc_denial(str(exc))
+            or tcc._macos_protected_dir(denied) is not None
         ):
             raise ComfyCliError(
-                f"`{COMFY_BIN}` could not be started.\n\n{_tcc_guidance(denied)}\n\n"
+                f"`{COMFY_BIN}` could not be started.\n\n{tcc._tcc_guidance(denied)}\n\n"
                 f"Original error: {exc}"
             ) from exc
         return  # any other permission problem: fail OPEN, exactly as before
@@ -784,7 +580,7 @@ def _check_comfy_version() -> None:
         # A transient spawn failure fails OPEN for THIS call but is NOT latched —
         # a later call re-checks rather than permanently disabling the guard.
         return
-    if proc.returncode != 0 and _looks_like_tcc_denial(proc.stderr):
+    if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
         # comfy-cli's own interpreter could not start because macOS denied it
         # its venv — the reported failure for a ComfyUI install under
         # ~/Documents. This guard runs before the first tool call of the
@@ -793,8 +589,8 @@ def _check_comfy_version() -> None:
         # Full Disk Access and retrying in the same process must re-check.
         raise ComfyCliError(
             f"`{COMFY_BIN}` could not start.\n\n"
-            f"{_tcc_guidance(_tcc_path_from(proc.stderr))}\n\n"
-            f"Original error: {_tail(proc.stderr)}"
+            f"{tcc._tcc_guidance(tcc._tcc_path_from(proc.stderr))}\n\n"
+            f"Original error: {textutil._tail(proc.stderr)}"
         )
     version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
     if version is not None and version < _MIN_COMFY_CLI:
@@ -820,28 +616,6 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     recognizes the error when only the human-readable string carries the marker.
     """
     return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
-
-
-def _redact_url(url: str) -> str:
-    """Return ``url`` with any ``user:pass@`` userinfo masked to ``***@``.
-
-    :class:`ComfyCliError` messages echo the offending config value and may reach
-    the MCP client or logs, so a credential embedded in ``COMFYUI_URL`` (e.g.
-    ``http://user:token@host``) must not be surfaced raw. Only the netloc
-    (scheme-separator up to the first path/query/fragment delimiter) is inspected
-    so a stray ``@`` in a path can't confuse the masking.
-    """
-    scheme_sep = url.find("://")
-    start = scheme_sep + 3 if scheme_sep != -1 else 0
-    end = len(url)
-    for delim in ("/", "?", "#"):
-        i = url.find(delim, start)
-        if i != -1:
-            end = min(end, i)
-    netloc = url[start:end]
-    if "@" in netloc:
-        return url[:start] + "***@" + netloc.rsplit("@", 1)[1] + url[end:]
-    return url
 
 
 def _strip_brackets(host: str) -> str:
@@ -883,31 +657,31 @@ def _comfy_target() -> tuple[str, int, str] | None:
             host, port = parsed.hostname, parsed.port
         except ValueError as exc:  # bad port, or malformed URL (IPv6 brackets)
             raise ComfyCliError(
-                f"COMFYUI_URL is malformed: {_redact_url(url)!r} ({exc})."
+                f"COMFYUI_URL is malformed: {textutil._redact_url(url)!r} ({exc})."
             ) from exc
         if parsed.scheme and parsed.scheme != "http":
             raise ComfyCliError(
                 f"COMFYUI_URL scheme {parsed.scheme!r} is not supported "
-                f"({_redact_url(url)!r}): comfy-cli's --host/--port speak plain "
+                f"({textutil._redact_url(url)!r}): comfy-cli's --host/--port speak plain "
                 "http only, so an https:// target would be silently downgraded. "
                 "Use http://<host>:<port>."
             )
         if parsed.path not in ("", "/"):
             raise ComfyCliError(
-                f"COMFYUI_URL must not include a path ({_redact_url(url)!r}): "
+                f"COMFYUI_URL must not include a path ({textutil._redact_url(url)!r}): "
                 "comfy-cli forwards only host/port, so a reverse-proxy base path "
                 "would be dropped. Point COMFYUI_URL at the bare host:port."
             )
         if not host:
             raise ComfyCliError(
-                f"COMFYUI_URL is set but names no host: {_redact_url(url)!r}. "
+                f"COMFYUI_URL is set but names no host: {textutil._redact_url(url)!r}. "
                 "Use e.g. http://<host>:8188 (or set COMFYUI_HOST/COMFYUI_PORT)."
             )
         # `port or DEFAULT` alone would treat an explicit :0 as absent and
         # silently target 8188; reject it to match the COMFYUI_PORT path.
         if port == 0:
             raise ComfyCliError(
-                f"COMFYUI_URL port is out of range (1-65535): {_redact_url(url)!r}."
+                f"COMFYUI_URL port is out of range (1-65535): {textutil._redact_url(url)!r}."
             )
         return _strip_brackets(host), port or DEFAULT_COMFYUI_PORT, "COMFYUI_URL"
 
@@ -1006,13 +780,13 @@ def _run_comfy_raw(
         # from a genuinely slow one. See BE-3343.
         message = (
             f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
-            f"stderr tail: {_tail(exc.stderr) or '<empty>'}; "
-            f"stdout tail: {_tail(exc.stdout) or '<empty>'}"
+            f"stderr tail: {textutil._tail(exc.stderr) or '<empty>'}; "
+            f"stdout tail: {textutil._tail(exc.stdout) or '<empty>'}"
         )
         # `exit_code=None`: the child was killed at the deadline, so it never
         # reported one. The log keeps a longer slice of both streams than the
-        # message above does — see `_FAILURE_LOG_TAIL_CHARS`.
-        _log_failure(
+        # message above does — see `failure_log._FAILURE_LOG_TAIL_CHARS`.
+        failure_log._log_failure(
             "timeout",
             args,
             message=message,
@@ -1089,216 +863,6 @@ def _envelope_major(envelope: dict) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _tail(text: str | bytes | None, limit: int = 500) -> str:
-    """Bounded tail of captured output; decodes bytes defensively.
-
-    On POSIX, ``TimeoutExpired.stdout``/``.stderr`` arrive as *bytes* even under
-    ``text=True`` (CPython quirk: ``communicate()`` raises with raw bytes; on
-    Windows ``run()`` re-communicates after the kill and returns ``str``), so
-    callers can hand us either. The ``limit`` hard-bounds the result so a chatty
-    child cannot inflate an error payload.
-    """
-    if not text or limit <= 0:
-        # ``[-0:]`` is ``[0:]`` (the whole string), so a non-positive limit would
-        # silently defeat the hard-bound; treat it as "no tail".
-        return ""
-    if isinstance(text, bytes):
-        # Slice the raw bytes before decoding so a huge capture doesn't incur a
-        # full decode+copy just to keep the last ``limit`` chars. UTF-8 is at
-        # most 4 bytes/char, so the last ``4 * limit`` bytes always contain
-        # enough to yield ``limit`` decoded chars (a leading byte may be dropped,
-        # which ``errors="replace"`` handles cleanly).
-        text = text[-4 * limit :].decode("utf-8", errors="replace")
-    return text.strip()[-limit:]
-
-
-def _stream_tail(text: str | bytes | None, limit: int = 500) -> str:
-    """Bounded tail of a captured stream, with explicit empty/truncation markers.
-
-    The error-message dressing over :func:`_tail`, for the messages a user
-    actually reads when comfy-cli fails:
-
-    - a blank/absent capture renders as ``<empty>`` rather than nothing, so a
-      message can never end in a dangling ``stderr:`` that is indistinguishable
-      from a capture we truncated away;
-    - a capture that WAS clipped is prefixed with ``...`` so the truncation is
-      visible instead of looking like the whole stream.
-
-    The *tail* is what's kept (not the head): a CLI traceback puts the
-    exception — the part that says what actually went wrong — last.
-    """
-    if limit <= 0:
-        # Mirror `_tail`'s own non-positive guard. It matters more here: we ask
-        # `_tail` for `limit + 1`, so a `limit` of 0 would slip past its check
-        # and the `[-limit:]` below would then be `[0:]` — the WHOLE capture,
-        # exactly the unbounded payload the limit exists to prevent.
-        return "<empty>"
-    # `_tail` clips silently, so ask it ONCE for one char more than the bound:
-    # an over-long answer is itself the evidence that something was dropped, and
-    # re-slicing it locally costs nothing (asking `_tail` twice would re-run the
-    # strip and any bytes-decode over the whole capture just to learn that).
-    tail = _tail(text, limit=limit + 1)
-    if not tail:
-        return "<empty>"
-    return "..." + tail[-limit:] if len(tail) > limit else tail
-
-
-def _scrub_arg(arg: str) -> str:
-    """A comfy-cli argv token, safe to record in the failure log.
-
-    A URL argument gets two treatments and everything else passes through
-    verbatim (an arg is usually a path or a subcommand, and mangling those would
-    defeat the log):
-
-    - :func:`_redact_url` masks ``user:pass@`` userinfo, exactly as it does for
-      the config values the error messages echo;
-    - the query string and fragment are dropped entirely. That mirrors
-      comfy-cli's own ``tracking.py`` scrubber, which exists because a CivitAI
-      model URL carries its credential as ``?token=…`` — a secret no amount of
-      userinfo masking would catch.
-    """
-    if not arg.lower().startswith(("http://", "https://")):
-        return arg
-    scrubbed = _redact_url(arg)
-    # Cut at whichever of `?` / `#` comes first: a fragment can precede a
-    # (meaningless, but present) query, and slicing on each in turn would leave
-    # the earlier delimiter's contents behind.
-    cut = min(
-        (i for i in (scrubbed.find("?"), scrubbed.find("#")) if i != -1),
-        default=-1,
-    )
-    return scrubbed if cut == -1 else scrubbed[:cut]
-
-
-# A URL anywhere in a recorded `message`. Anchored on the literal scheme so the
-# engine can skip ahead to a candidate rather than re-scan from every offset,
-# and `\S+` is a possessive-free single-pass match — no backtracking risk on a
-# multi-KB message.
-_MESSAGE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-
-
-def _scrub_message(message: str) -> str:
-    """Apply :func:`_scrub_arg`'s URL scrubbing to every URL inside ``message``.
-
-    Scrubbing ``args`` alone would be theatre: the error-envelope message this log
-    records is built by :func:`_unwrap_envelope` as ``comfy <args> failed …``, so
-    the RAW argv — including a signed ``?token=…`` model URL — is echoed right
-    back into it. That string is already what the MCP client sees (unchanged
-    here), but this log PERSISTS it to disk for a tester to zip up and share, so
-    the same masking has to reach it.
-
-    Only URL-shaped substrings are touched; the surrounding prose (the point of
-    keeping ``message`` at all) is preserved byte-for-byte.
-    """
-    return _MESSAGE_URL_RE.sub(lambda match: _scrub_arg(match.group(0)), message)
-
-
-# The path the currently-open rotating handler writes to; ``None`` until the
-# first failure is logged. Keyed on the path rather than a bare "set up yet?"
-# flag so the handler is rebuilt if `_FAILURE_LOG_PATH` is ever repointed, and
-# so nothing here touches the filesystem while the log is disabled.
-_failure_handler_path: str | None = None
-
-# Serializes the setup below. Tool calls reach `_run_comfy` from several worker
-# pools (`_in_pipe_pool` / `_in_generate_pool`), so two threads can fail at once
-# and race here. `logging` makes *emitting* thread-safe but not this
-# check-then-swap: interleaved remove-all/add passes can leave the logger holding
-# BOTH handlers, which would duplicate every subsequent line for the life of the
-# process. Only the (once-per-path) setup takes the lock; the common case is the
-# unguarded `!=` comparison plus a normal `.info()`.
-_failure_handler_lock = threading.Lock()
-
-
-def _failure_logger(path: str) -> logging.Logger:
-    """The dedicated failure logger, opening its rotating handler on first use.
-
-    Created lazily — the handler opens the file, so building it eagerly at import
-    would give a disabled log a filesystem footprint. ``path`` is passed in
-    rather than read from the global so this can never be reached without one.
-    """
-    global _failure_handler_path
-    logger = logging.getLogger(_FAILURE_LOGGER_NAME)
-    if _failure_handler_path != path:
-        with _failure_handler_lock:
-            # Re-check under the lock: the thread that lost the race must not
-            # tear down and rebuild the handler the winner just installed.
-            if _failure_handler_path != path:
-                for existing in list(logger.handlers):
-                    logger.removeHandler(existing)
-                    existing.close()
-                # Cleared BEFORE the (fallible) setup below, so a handler that
-                # fails to open cannot leave the global claiming a path nothing
-                # is actually writing to.
-                _failure_handler_path = None
-                parent = os.path.dirname(path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                handler = RotatingFileHandler(
-                    path,
-                    maxBytes=_FAILURE_LOG_MAX_BYTES,
-                    backupCount=_FAILURE_LOG_BACKUPS,
-                    encoding="utf-8",
-                )
-                # Bare `%(message)s`: every line must be pure JSON, so `jq` can
-                # read the file directly with no level/timestamp prefix to strip
-                # first (the record carries its own `ts`).
-                handler.setFormatter(logging.Formatter("%(message)s"))
-                logger.addHandler(handler)
-                logger.setLevel(logging.INFO)
-                logger.propagate = False
-                _failure_handler_path = path
-    return logger
-
-
-def _log_failure(
-    kind: str,
-    args: tuple[str, ...] | list[str],
-    exit_code: int | None = None,
-    error_code: str | None = None,
-    message: str = "",
-    stdout: str | bytes | None = None,
-    stderr: str | bytes | None = None,
-    streaming: bool = False,
-) -> None:
-    """Append one JSONL record for a comfy-cli failure, if the log is enabled.
-
-    Called immediately before each raise, so every line recorded corresponds to a
-    failure a caller actually saw. ``kind`` is one of ``error_envelope`` /
-    ``no_json`` / ``timeout`` / ``binary_missing`` / ``schema_mismatch``.
-
-    The record is STRUCTURED, not just the formatted sentence, so the log is
-    ``jq``/grep-able without parsing prose — ``message`` is kept alongside it so
-    QA can correlate a line with what the MCP client displayed. Stream tails go
-    through :func:`_stream_tail` (tail-not-head, ``<empty>`` marker, ``...``
-    truncation prefix) for consistency with those messages.
-
-    Best-effort by construction: a disabled log returns before touching
-    anything, and ANY error while writing is swallowed — a diagnostic aid must
-    never mask, replace, or delay the real error.
-    """
-    path = _FAILURE_LOG_PATH
-    if path is None:
-        return
-    try:
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "kind": kind,
-            "args": [_scrub_arg(arg) for arg in args],
-            "exit_code": exit_code,
-            "error_code": error_code,
-            # Cap first, then scrub: bounding the work keeps the regex pass off a
-            # pathological multi-MB message, and a URL that survives the cap is
-            # still scrubbed in full.
-            "message": _scrub_message(message[:_FAILURE_LOG_MESSAGE_CHARS]),
-            "stdout_tail": _stream_tail(stdout, _FAILURE_LOG_TAIL_CHARS),
-            "stderr_tail": _stream_tail(stderr, _FAILURE_LOG_TAIL_CHARS),
-            "streaming": streaming,
-        }
-        _failure_logger(path).info(json.dumps(entry, ensure_ascii=False))
-    except Exception:
-        pass  # diagnostics are best-effort; never mask the real error
-
-
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
     """Kill the child *and* any grandchildren it spawned.
 
@@ -1358,10 +922,11 @@ def _unwrap_envelope(
     failure legible; it defaults to ``""`` (rendered ``<empty>``) so a caller
     that genuinely has no stdout still produces a well-formed message.
 
-    ``streaming`` only tags the failure-log record (:func:`_log_failure`) with
-    which spawn path produced it — ``_run_comfy`` (``--json``) or
-    ``_run_comfy_streaming`` (``--json-stream``) — since this function is shared
-    by both and the raised error is otherwise identical either way.
+    ``streaming`` only tags the failure-log record
+    (``failure_log._log_failure``) with which spawn path produced it —
+    ``_run_comfy`` (``--json``) or ``_run_comfy_streaming`` (``--json-stream``)
+    — since this function is shared by both and the raised error is otherwise
+    identical either way.
 
     Also the envelope-version assertion: if comfy-cli declares an envelope
     ``schema`` whose major differs from :data:`ENVELOPE_SCHEMA_MAJOR`, the whole
@@ -1370,26 +935,27 @@ def _unwrap_envelope(
     with no declared schema is assumed compatible.
     """
     if envelope is None:
-        if _looks_like_tcc_denial(stderr):
+        if tcc._looks_like_tcc_denial(stderr):
             # comfy-cli emitted no envelope because macOS denied it a protected
             # folder (see the TCC block above) — a permission problem the user
             # can fix, not the opaque "returned no JSON" this would otherwise be.
             message = (
                 f"comfy-cli could not run (exit {returncode}).\n\n"
-                f"{_tcc_guidance(_tcc_path_from(stderr))}\n\n"
-                # `_stream_tail` for the truncation marker: `_looks_like_tcc_denial`
-                # only fires on a non-empty stderr, so the `<empty>` half is
-                # unreachable here — but a long denial traceback still gets
-                # clipped, and silently is how you misread it as the whole thing.
+                f"{tcc._tcc_guidance(tcc._tcc_path_from(stderr))}\n\n"
+                # `textutil._stream_tail` for the truncation marker:
+                # `tcc._looks_like_tcc_denial` only fires on a non-empty stderr,
+                # so the `<empty>` half is unreachable here — but a long denial
+                # traceback still gets clipped, and silently is how you misread
+                # it as the whole thing.
                 # No stdout here on purpose: this branch has already identified
                 # the cause, so its curated guidance beats a second raw stream.
-                f"Original error: {_stream_tail(stderr)}"
+                f"Original error: {textutil._stream_tail(stderr)}"
             )
             # Still `no_json` — a TCC denial is the *reason* comfy-cli emitted no
             # envelope, not a different kind of failure. Unlike the message, the
             # record keeps the raw stdout too: a diagnostic trail is read after
             # the fact, when a curated guidance string is no longer enough.
-            _log_failure(
+            failure_log._log_failure(
                 "no_json",
                 args,
                 exit_code=returncode,
@@ -1407,9 +973,10 @@ def _unwrap_envelope(
         # nothing at all — is what made this error opaque.
         message = (
             f"comfy-cli returned no JSON (exit {returncode}). "
-            f"stderr: {_stream_tail(stderr)} | stdout: {_stream_tail(stdout)}"
+            f"stderr: {textutil._stream_tail(stderr)} | "
+            f"stdout: {textutil._stream_tail(stdout)}"
         )
-        _log_failure(
+        failure_log._log_failure(
             "no_json",
             args,
             exit_code=returncode,
@@ -1430,7 +997,7 @@ def _unwrap_envelope(
             f"this server speaks envelope/{ENVELOPE_SCHEMA_MAJOR}. "
             "Upgrade or pin comfy-cli to a version whose envelope contract matches."
         )
-        _log_failure(
+        failure_log._log_failure(
             "schema_mismatch",
             args,
             exit_code=returncode,
@@ -1459,23 +1026,23 @@ def _unwrap_envelope(
         # credential) — dropping them was the exact workaround testers needed.
         # Each field is length-capped so a huge/malformed envelope can't bloat
         # the message propagated to the MCP client.
-        # The stderr fallback goes through `_stream_tail` so an envelope with an
-        # empty `error.message` AND an empty stderr can't render a bare trailing
-        # colon with nothing after it. Note the cap is applied to the envelope's
-        # own message only — `_stream_tail` already bounds its result, and
-        # re-slicing its HEAD here would chop off the truncation marker plus the
-        # very end of the tail, i.e. the part worth keeping.
+        # The stderr fallback goes through `textutil._stream_tail` so an envelope
+        # with an empty `error.message` AND an empty stderr can't render a bare
+        # trailing colon with nothing after it. Note the cap is applied to the
+        # envelope's own message only — `textutil._stream_tail` already bounds
+        # its result, and re-slicing its HEAD here would chop off the truncation
+        # marker plus the very end of the tail, i.e. the part worth keeping.
         # Strip BEFORE the truthiness test: a whitespace-only `error.message`
         # ("   ") is truthy, so it would keep the fallback from firing and render
         # exactly the dangling-colon message this branch exists to prevent —
-        # `_stream_tail` already treats a whitespace-only capture as `<empty>`,
-        # so treat the envelope's own field the same way.
+        # `textutil._stream_tail` already treats a whitespace-only capture as
+        # `<empty>`, so treat the envelope's own field the same way.
         raw_message = err.get("message")
         message = str(raw_message).strip() if raw_message else ""
         message = (
             message[:_MAX_ERROR_FIELD_CHARS]
             if message
-            else _stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
+            else textutil._stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
         )
         parts = [f"comfy {' '.join(args)} failed [{code or 'unknown'}]: {message}"]
         hint = err.get("hint")
@@ -1488,7 +1055,7 @@ def _unwrap_envelope(
         # `error_code` carries the envelope's own `error.code` as a first-class
         # field, so a tester can `jq 'select(.error_code == "…")'` a run's
         # failures instead of string-matching the rendered sentence.
-        _log_failure(
+        failure_log._log_failure(
             "error_envelope",
             args,
             exit_code=returncode,
@@ -1661,7 +1228,9 @@ class _StreamProgress:
 
         State (``total`` / ``done`` / ``_last``) is updated unconditionally so a
         bounded, ctx-less watch still reports real progress in its timed-out
-        :meth:`snapshot`; the MCP notification is the only ctx-gated part.
+        :meth:`snapshot`; the MCP notification is the only ctx-gated part, and it
+        is best-effort — a send that fails is dropped rather than propagated, so
+        it can never abort the run it is only describing.
         """
         etype = event.get("type")
         if etype == "queued":
@@ -1688,9 +1257,27 @@ class _StreamProgress:
         progress = max(progress, self._last)
         self._last = progress
         if ctx is not None:
-            await ctx.report_progress(
-                progress=progress, total=self.total, message=message
-            )
+            try:
+                await ctx.report_progress(
+                    progress=progress, total=self.total, message=message
+                )
+            except Exception:  # noqa: BLE001 - telemetry must not abort the run
+                # A notification is best-effort; the run's RESULT is the
+                # deliverable. Any exception out of the pump reaches
+                # `_run_comfy_streaming`'s `finally`, which kills the comfy-cli
+                # tree — so letting a failed send (a disconnected client, a host
+                # that rejects the notification) escape would abort a live run
+                # over undelivered telemetry. On `run_template`'s paid path that
+                # means abandoning a run whose credits are already spent, with no
+                # `prompt_id` returned to recover the outputs. Drop the tick and
+                # keep reading the stream; the state above is already advanced, so
+                # a later `snapshot()` stays accurate. `CancelledError` is a
+                # BaseException and still propagates, so a real MCP cancellation
+                # is unaffected.
+                logging.getLogger(__name__).debug(
+                    "progress notification failed; continuing the run",
+                    exc_info=True,
+                )
 
 
 async def _run_comfy_streaming(
@@ -1850,9 +1437,10 @@ async def _run_comfy_streaming(
                 _kill_proc_tree(proc)
                 await _in_pipe_pool(_reap, proc)
             # Keep the drained text itself, not only its 500-char message tail:
-            # the failure log records a much longer slice (`_stream_tail` at
-            # `_FAILURE_LOG_TAIL_CHARS`), and pre-truncating here would silently
-            # cap it back down to the message's bound.
+            # the failure log records a much longer slice
+            # (`textutil._stream_tail` at `failure_log._FAILURE_LOG_TAIL_CHARS`),
+            # and pre-truncating here would silently cap it back down to the
+            # message's bound.
             stderr_text = ""
             if stderr_future is not None:
                 try:
@@ -1873,10 +1461,10 @@ async def _run_comfy_streaming(
                 f"Progress so far: {tracker.snapshot()}. The run may still be "
                 "going — check `job_status`, or for long generations submit "
                 "with `wait=False` and poll `wait_for_job` / `watch_job`. "
-                f"stderr tail: {_tail(stderr_text) or '<empty>'}; "
-                f"stdout tail: {_tail(timeout_stdout) or '<empty>'}"
+                f"stderr tail: {textutil._tail(stderr_text) or '<empty>'}; "
+                f"stdout tail: {textutil._tail(timeout_stdout) or '<empty>'}"
             )
-            _log_failure(
+            failure_log._log_failure(
                 "timeout",
                 args,
                 message=message,
@@ -1928,9 +1516,11 @@ async def _run_comfy_streaming(
         )
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
-        # (timeout, a report_progress error, or normal completion). Kill the
-        # whole process tree (not just the direct child) so a descendant
-        # holding the stderr write fd can't keep the pipe from EOFing — see
+        # (timeout, cancellation, or normal completion — a failed progress
+        # notification is swallowed in `_StreamProgress.report` and reaches
+        # neither this block nor the caller). Kill the whole process tree (not
+        # just the direct child) so a descendant holding the stderr write fd
+        # can't keep the pipe from EOFing — see
         # _kill_proc_tree. (BE-3343) Reap on the dedicated pipe pool, not the
         # default `to_thread` pool, so this wait can never contend with (or be
         # confused for) unrelated `to_thread` callers.
@@ -3408,8 +2998,10 @@ async def run_template(
     ``prompt_id`` needed to track it rather than re-running it.
 
     With ``wait=True`` (default) this waits until the run finishes and returns the
-    result (``prompt_id`` + outputs); with ``wait=False`` it submits ``--async``
-    and returns immediately with a ``prompt_id`` to poll via ``job_status`` /
+    result (``prompt_id`` + outputs), streaming live progress as MCP progress
+    notifications (per-node execution + sampler step counts) so a long run is not
+    a silent block; with ``wait=False`` it submits ``--async`` and returns
+    immediately with a ``prompt_id`` to poll via ``job_status`` /
     ``wait_for_job`` / ``watch_job`` — use that for long (e.g. video) runs that
     may exceed your MCP client's tool timeout. OSS templates need their referenced
     models installed locally; a missing model surfaces the run path's per-node
@@ -3440,15 +3032,29 @@ async def run_template(
         # comfy-cli's paid-node consent for run-template; a bare boolean flag.
         args.append("--allow-spend")
     if not wait:
-        # Fire-and-return: submit and hand back a prompt_id to poll.
+        # Fire-and-return: submit and hand back a prompt_id to poll. No stream to
+        # follow, so keep the plain --json path — off the event loop, in the
+        # dedicated pool `generate_image`'s submit branch uses.
         args.append("--async")
-    # The parent stays the backstop only: a little slack past the budget so
-    # comfy-cli reports its own error rather than dying to a signal. Runs off
-    # the event loop in the dedicated pool for the same reason
-    # `partner_generate` does: this blocks for as long as the template takes (up
-    # to an hour) and the tool is async for the consent round-trip above.
-    return await _in_generate_pool(
-        _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+        return await _in_generate_pool(
+            _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+        )
+    # wait=True streams. `comfy run-template` hands the filled graph to the same
+    # comfy-cli run path `comfy run` uses, so under `--json-stream` it emits the
+    # same per-node events — which is what `generate_image` already rides for
+    # this very verb. A template run can block for up to an hour (its own
+    # docstring calls out long video runs), so it must report progress rather
+    # than sit silent.
+    #
+    # Same grace as the submit path above (and as `generate_image`): the child
+    # was handed `--timeout=min(budget, 120)`, so for a budget at or under
+    # comfy-cli's 120s cap the engine's deadline and the parent's kill land on
+    # the SAME instant. Without slack the parent can SIGKILL comfy-cli mid-write
+    # of its own structured timeout / `server_not_running` result, replacing an
+    # actionable error with a generic parent kill (and orphaning an
+    # already-enqueued run). The engine must be the side that gives up.
+    return await _run_comfy_streaming(
+        *args, ctx=ctx, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
     )
 
 
@@ -4659,13 +4265,14 @@ def main() -> None:
         # Prefer the exception's structured `filename` over re-parsing its text:
         # it is the authoritative path, and it is present for errnos the text
         # signature alone would not claim (TCC can surface as EACCES too).
-        path = getattr(exc, "filename", None) or _tcc_path_from(str(exc))
-        if not _is_macos() or not (
-            _looks_like_tcc_denial(str(exc)) or _macos_protected_dir(path) is not None
+        path = getattr(exc, "filename", None) or tcc._tcc_path_from(str(exc))
+        if not tcc._is_macos() or not (
+            tcc._looks_like_tcc_denial(str(exc))
+            or tcc._macos_protected_dir(path) is not None
         ):
             raise
         print(
-            f"comfy-local-mcp: {exc}\n\n{_tcc_guidance(path)}",
+            f"comfy-local-mcp: {exc}\n\n{tcc._tcc_guidance(path)}",
             file=sys.stderr,
             flush=True,
         )
