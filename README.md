@@ -56,6 +56,7 @@ Cloud MCP** — comfy-cli is the engine.
 - [Quickstart](#quickstart)
 - [Tools](#tools)
 - [Troubleshooting](#troubleshooting)
+- [Failure log (opt-in)](#failure-log-opt-in)
 - [Smoke test](#smoke-test)
 - [Contributing](#contributing)
 - [License](#license)
@@ -538,6 +539,49 @@ Where it can, the server says this for you: a tool call blocked this way returns
 instead of the raw traceback. The one case it cannot catch is **its own** interpreter startup (this
 server installed under a protected folder) — Python dies before any of its code runs, so that one
 surfaces as the raw traceback in your client's MCP logs. Same fix.
+
+## Failure log (opt-in)
+
+When you're diagnosing a flaky setup, an MCP client's transcript is a poor record: it scrolls, it
+truncates, and the interesting failures (a missing `comfy` binary, a crash before any JSON, a
+timeout) are exactly the ones that leave the least behind. Set **`COMFY_LOCAL_MCP_DEBUG_LOG`** and
+the server appends one JSON object per comfy-cli **failure** to a local file you can `jq`, grep, or
+zip up and attach to a bug report.
+
+| Value | Behavior |
+| --- | --- |
+| unset, empty, or `0` | **Off (the default).** Nothing is created and no log file is opened. |
+| `1` | On, at the default path for your OS (below). |
+| anything else | On, and the value is used as the log file path (parent directories are created). |
+
+Default paths — the same per-OS local-state convention comfy-cli itself uses:
+
+| OS | Path |
+| --- | --- |
+| macOS | `~/Library/Application Support/comfy-local-mcp/failures.jsonl` |
+| Windows | `~/AppData/Local/comfy-local-mcp/failures.jsonl` |
+| Linux / other | `~/.config/comfy-local-mcp/failures.jsonl` |
+
+Each line records the failure `kind` (`error_envelope`, `no_json`, `timeout`, `binary_missing`,
+`schema_mismatch`), a UTC `ts`, the comfy-cli `args`, its `exit_code` and the envelope's
+`error_code`, the message you saw in your client, and up to 4,000 characters of `stdout_tail` /
+`stderr_tail` — deliberately more output than an error message can carry:
+
+```console
+$ COMFY_LOCAL_MCP_DEBUG_LOG=1 …            # in your MCP client config's env block
+$ jq -r 'select(.kind == "timeout") | .ts + "  " + (.args | join(" "))' \
+    ~/Library/Application\ Support/comfy-local-mcp/failures.jsonl
+```
+
+The file rotates itself: 1 MiB per file with two older generations kept (`failures.jsonl.1`,
+`failures.jsonl.2`), so it stops growing at roughly 3 MiB no matter how long you leave it on.
+Successful calls are never recorded, and nothing is ever transmitted anywhere — the log is local,
+full stop.
+
+> **Privacy — review before sharing.** The log contains local file paths and comfy-cli's own
+> command output, which can include the workflow or prompt text comfy-cli echoed back. Credentials
+> in a URL argument are masked (`user:pass@` userinfo, and the whole query string, are stripped),
+> but read a file over before you attach it to an issue.
 
 ## Smoke test
 
