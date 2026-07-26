@@ -249,6 +249,57 @@ def test_version_guard_latches_on_timeout(monkeypatch):
     assert server._version_checked is True
 
 
+def test_spawn_comfy_version_keeps_the_bounded_decode_safe_invocation(monkeypatch):
+    """The one shared spawn site: right argv, bounded, and decode-safe."""
+    seen: dict[str, object] = {}
+
+    def fake(cmd, capture_output, text, errors, timeout, check):
+        seen.update(
+            cmd=cmd,
+            capture_output=capture_output,
+            text=text,
+            errors=errors,
+            timeout=timeout,
+            check=check,
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", fake)
+    server._spawn_comfy_version()
+
+    assert seen == {
+        "cmd": [server.COMFY_BIN, "--version"],
+        "capture_output": True,
+        "text": True,
+        "errors": "replace",
+        "timeout": 30.0,
+        "check": False,
+    }
+
+
+def test_both_version_probes_go_through_the_shared_spawn(monkeypatch):
+    """The floor guard and the best-effort detector share ONE spawn site, so the
+    invocation can never drift between them (they keep their own policies)."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    calls: list[str] = []
+
+    def fake_spawn():
+        calls.append("spawn")
+        return subprocess.CompletedProcess(
+            [server.COMFY_BIN, "--version"],
+            0,
+            stdout="comfy-cli, version 1.12.0\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+
+    server._check_comfy_version()  # no raise: at the floor
+    assert server._detect_comfy_cli_version() == "1.12.0"
+    assert len(calls) == 2
+
+
 def test_parse_version_reads_two_and_three_part_and_none():
     assert server._parse_version("comfy-cli, version 1.12") == (1, 12, 0)
     assert server._parse_version("v2.0.5 extra") == (2, 0, 5)
