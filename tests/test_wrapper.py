@@ -685,6 +685,114 @@ def test_download_model_rejects_traversal_relative_path(bad_path):
         server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
 
 
+# --- Windows-shaped escapes are refused on EVERY host, including Linux CI ----
+#
+# The guard runs wherever the MCP server runs; the write happens wherever
+# comfy-cli runs. Judging these from the string's own shape plus
+# `ntpath.splitdrive` — never the host's `os.path` — is what makes them fail on a
+# POSIX box too, so these cases are the regression pins for that: to `posixpath`
+# on Linux CI every string below is an ordinary relative name.
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "C:evil",  # drive-RELATIVE: no separator, resolves against C:'s cwd
+        "C:/Windows",  # drive-absolute with a forward slash
+        "C:\\Windows",  # drive-absolute with a backslash
+        "\\\\server\\share",  # UNC root — no `:` at all, so `:`-checks miss it
+        "\\\\server\\share\\evil",  # UNC with a trailing path
+        "\\evil",  # root-relative on the current drive
+    ],
+)
+def test_download_model_rejects_windows_drive_relative_path(bad_path, patched_run):
+    """A Windows drive/UNC/root-relative ``relative_path`` is refused before any
+    child spawns — on Linux CI as much as on Windows."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+# --- A `..` wearing trailing spaces/periods is still a `..` ------------------
+#
+# Windows strips trailing spaces and periods from every path component at
+# syscall time, so `".. "` and `"..."` reach the filesystem as `..` while an
+# equality check against `".."` says they are something else. `normpath` does
+# not collapse them either, which is why the guard has to match the dot RUN
+# rather than the exact string. Like the drive cases above, these have to be
+# refused from a POSIX host too — Linux keeps `".. "` as a literal directory
+# name, so nothing here fires locally on CI unless the string check does it.
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "models/.. /evil",  # trailing space: normalizes back to `..` on Windows
+        "models/.../evil",  # dot run: strips to `..`
+        "models/... /evil",  # both
+        ".. ",  # the whole value is a disguised `..`
+        "models/. /evil",  # a disguised `.` — not an escape, but not a real name
+    ],
+)
+def test_download_model_rejects_dot_run_relative_path(bad_path, patched_run):
+    """A `..` disguised by trailing spaces/periods is refused before any child
+    spawns — on Linux CI as much as on Windows."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "good_path",
+    [
+        "models/.hidden",  # a leading dot is an ordinary name, not a dot run
+        "models/v1.5",  # interior periods survive `strip(" .")`
+        "models/loras/",  # trailing slash: an EMPTY segment, still accepted
+        "models//loras",  # doubled slash, likewise
+    ],
+)
+def test_download_model_accepts_dotted_but_ordinary_relative_path(
+    good_path, patched_run
+):
+    """The dot-run check must not widen into ordinary names or empty segments —
+    only a component that is *nothing but* dots and spaces is a disguised `..`."""
+    calls = patched_run(envelope(data={}))
+
+    server.download_model("https://hf.co/x.safetensors", relative_path=good_path)
+
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--relative-path") + 1] == good_path
+
+
+@pytest.mark.parametrize("bad_name", [".. ", "...", ". ", "... ", " "])
+def test_download_model_rejects_dot_run_filename(bad_name, patched_run):
+    """Same disguise on the bare-name side: `".. "` is a `..`, not a filename."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid filename"):
+        server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("good_name", [".gitkeep", "v1.5.safetensors", "model."])
+def test_download_model_accepts_dotted_but_ordinary_filename(good_name, patched_run):
+    """Regression pin for the dot-run filename check: a name that merely
+    *contains* dots still has something left after `strip(" .")`."""
+    calls = patched_run(envelope(data={}))
+
+    server.download_model("https://hf.co/x.safetensors", filename=good_name)
+
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--filename") + 1] == good_name
+
+
 @pytest.mark.parametrize(
     "bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b", "C:evil.dll"]
 )
@@ -694,6 +802,44 @@ def test_download_model_rejects_pathy_filename(bad_name):
     Windows)."""
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "C:evil.exe",  # drive-RELATIVE: a bare-name check alone lets this pass
+        "C:/evil.exe",
+        "\\\\server\\share\\evil.exe",  # UNC
+        "\\evil.exe",  # root-relative on the current drive
+    ],
+)
+def test_download_model_rejects_windows_drive_relative_filename(bad_name, patched_run):
+    """A Windows drive/UNC/root-relative ``filename`` is refused before any child
+    spawns — on Linux CI as much as on Windows."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid filename"):
+        server.download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+    assert calls == []
+
+
+def test_download_model_still_accepts_ordinary_path_and_name(patched_run):
+    """Regression pin: the Windows-shaped rejections above must not catch the
+    ordinary values these tools are actually called with."""
+    calls = patched_run(envelope(data={}))
+
+    server.download_model(
+        "https://hf.co/x.safetensors",
+        relative_path="models/loras",
+        filename="x.safetensors",
+    )
+
+    cmd = calls[0]["cmd"]
+    assert "--relative-path" in cmd and cmd[cmd.index("--relative-path") + 1] == (
+        "models/loras"
+    )
+    assert "--filename" in cmd and cmd[cmd.index("--filename") + 1] == "x.safetensors"
 
 
 def test_download_model_rejects_embedded_nul_url():
