@@ -288,8 +288,29 @@ def _reject_nul(label: str, value: str) -> str:
 
 
 def _reject_option_like(label: str, value: str, expected: str = "") -> str:
-    """Reject a leading-dash value that comfy-cli would parse as an option/flag
-    instead of the intended positional or flag value (argument injection)."""
+    """Reject a leading-dash value comfy-cli would parse as an option, not data.
+
+    Two different jobs share this helper, and the distinction is worth keeping
+    straight when adding a call site:
+
+    - **A bare POSITIONAL is an argument-injection vector.** A leading-dash entry
+      IS read as a flag, and every later positional shifts up one slot — how
+      ``upload_file(paths=["--overwrite"])`` becomes the overwrite flag, and how a
+      dash-leading ``workflow_path`` would let the first ``set-slot`` override land
+      in the path slot. Guarding these is mandatory.
+    - **An option VALUE (``--flag VALUE``) is NOT.** comfy-cli is Click-backed, and
+      Click takes the token after a value-taking option verbatim — even one that is
+      itself a valid option name (``--out-dir --slot`` parses as
+      ``out_dir="--slot"``, not as a missing value). So ``vary_workflow``'s
+      ``slots`` / ``out_dir`` need no guard to be injection-safe.
+
+    Where a call site guards an option value anyway (``search_templates``'s
+    filters, ``download_model``'s ``relative_path`` / ``filename``), that is input
+    hygiene rather than injection defense: a dash-leading provider filter or output
+    filename is a caller mistake, and a named error beats comfy-cli matching zero
+    rows or writing a file named ``-x``. Read those as belt-and-braces, not as
+    evidence that option values are unsafe.
+    """
     if value.startswith("-"):
         hint = f" — expected {expected}" if expected else ""
         raise ComfyCliError(f"invalid {label}: {value!r} (leading '-'){hint}")
@@ -4571,9 +4592,10 @@ def vary_workflow(
     parameter grid.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
-    # as a flag (`"--out-dir"` would swallow the following `--slot` token and
-    # redirect where variants land). `slots` ride behind `--slot`, so they are
-    # option VALUES rather than positionals and need no such guard.
+    # as a flag rather than the path. `slots` and `out_dir` ride behind `--slot`
+    # / `--out-dir` as option VALUES, which Click takes verbatim, so they are
+    # injection-safe unguarded; see `_reject_option_like` for why the two cases
+    # differ.
     _reject_option_like(
         "workflow_path",
         workflow_path,

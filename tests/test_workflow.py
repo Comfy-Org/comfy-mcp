@@ -119,6 +119,29 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     ]
 
 
+def test_vary_workflow_option_values_are_not_guarded(patched_run):
+    """Option VALUES stay unguarded on purpose — only bare positionals are injectable.
+
+    comfy-cli is Click-backed and Click takes the token after a value-taking
+    option verbatim, so `--out-dir --slot` parses as `out_dir="--slot"` rather
+    than shifting anything. `slots`/`out_dir` therefore ride through untouched;
+    the guard above them is for `workflow_path`, which IS a bare positional.
+    """
+    calls = patched_run(envelope(data={"variants": 2}))
+
+    server.vary_workflow("/tmp/flux.json", ["-3.seed=[1,2]"], out_dir="-out")
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        "-3.seed=[1,2]",
+        "--out-dir",
+        "-out",
+    ]
+
+
 def test_set_workflow_slot_guard_leaves_valid_overrides_alone(patched_run):
     """The guard reads the override's FIRST character only: `-` inside a VALUE is fine."""
     calls = patched_run(envelope(data={"modified": True}))
