@@ -791,6 +791,37 @@ def test_wait_for_job_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
     assert polled is False
 
 
+def test_wait_for_job_always_polls_at_least_once(monkeypatch):
+    """A bound that expires before the first poll still reports a real status.
+
+    The per-poll cap re-checks the deadline at the top of the loop; that check
+    must not short-circuit the very first poll and return the degenerate
+    `{"timed_out": True, "status": None}` with nothing ever asked of comfy-cli.
+    """
+    calls = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"status": "running"}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    # A clock that is already past the deadline by the loop's first read: the
+    # bound is set at t=0 and every later read is t=1.
+    reads = iter([0.0])
+
+    def fake_monotonic():
+        return next(reads, 1.0)
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server.wait_for_job("pid", timeout_seconds=1e-9)
+
+    assert calls == 1
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+
+
 def test_wait_for_job_caps_each_poll_to_the_remaining_bound(monkeypatch):
     """A single poll never gets a longer subprocess budget than the wait itself.
 

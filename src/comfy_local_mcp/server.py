@@ -3632,8 +3632,11 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     poll_interval = 2.0
     last: Any = None
     while True:
+        # `last is not None` keeps the one-poll minimum: a bound small enough to
+        # expire before the first poll (`timeout_seconds=1e-9`) must still report
+        # a real status rather than the degenerate `{"status": None}`.
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining <= 0 and last is not None:
             return {"timed_out": True, "status": last}
         # Cap each poll's own subprocess budget to what is left of the caller's
         # bound. With a fixed 60s per poll the overall wait was only bounded
