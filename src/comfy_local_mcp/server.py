@@ -1897,9 +1897,12 @@ def server_info() -> Any:
     node, or template seems missing, tell the user to update FIRST
     (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
     before concluding the catalog lacks it; silent staleness is the usual
-    culprit. The probe is best-effort and degrades two ways — ``server_info``
-    itself still succeeds either way. On a comfy-cli that lacks the ``outdated``
-    verb (no release through 1.12.0 has it), ``freshness`` is
+    culprit. The ``update_comfyui`` tool runs that update from here
+    (``target="comfy"`` for core, ``target="all"`` for the node packs; the
+    per-pack form is terminal-only), and ``restart_comfyui`` afterwards is what
+    makes the updated code take effect. The probe is best-effort and degrades
+    two ways — ``server_info`` itself still succeeds either way. On a comfy-cli
+    that lacks the ``outdated`` verb (no release through 1.12.0 has it), ``freshness`` is
     ``{"error": "freshness unavailable: ...", "unsupported": true}``:
     ``unsupported: true`` means SKIP staleness advice entirely and do NOT tell
     the user anything is broken — nothing failed, this comfy-cli just cannot
@@ -3744,6 +3747,77 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
         if not _is_no_recorded_server(exc):
             raise
     return launch_comfyui(extra_args)
+
+
+# The exact targets `comfy update` accepts (comfy-cli `cmdline.py`:
+# `update(target: str = typer.Argument("comfy", help="[all|comfy|cli]"))`, which
+# refuses anything else with `Invalid target: …` and exit 1). Mirrored here so an
+# unrecognized value is named and rejected BEFORE a subprocess is spawned,
+# instead of surfacing as a bare non-zero exit from the CLI.
+_UPDATE_TARGETS = ("all", "comfy", "cli")
+
+# `comfy update` can pull a git repo and then `pip install -r requirements.txt`
+# (multi-GB torch wheels), or walk every installed custom node pack for
+# `target="all"` — far longer than `launch_comfyui`'s 180s boot. Use the same
+# generous ceiling as `download_model`, whose work is the same shape (a large
+# network fetch that must not be killed halfway).
+_UPDATE_TIMEOUT = 1800.0
+
+
+@mcp.tool()
+def update_comfyui(target: str = "comfy") -> Any:
+    """Update the LOCAL install — ComfyUI core, the custom node packs, or comfy-cli itself.
+
+    Thin passthrough to ``comfy update <target>``. The three targets are
+    comfy-cli's own, and they do different things:
+
+    * ``"comfy"`` (default) — updates **ComfyUI core** in the selected workspace
+      (``git pull`` + reinstall of its ``requirements.txt``).
+    * ``"all"`` — updates the installed **custom node packs** (via the node
+      manager), not core.
+    * ``"cli"`` — updates **comfy-cli** itself, the binary this whole server
+      shells out to.
+
+    ``server_info``'s ``freshness`` block is the signal that motivates calling
+    this: ``freshness.core.outdated`` true means the core install is stale (call
+    with ``target="comfy"``), and any ``packs`` row with ``outdated: true`` means
+    node packs are stale (``target="all"``, or the narrower ``comfy node update
+    <pack>`` in a terminal, which this server does not wrap). If ``freshness``
+    reports ``unsupported: true``, that comfy-cli simply cannot answer the
+    staleness question — nothing is broken and there is nothing here to act on.
+
+    **This can take a while.** A core update re-installs requirements (torch
+    wheels are multi-GB) and an ``"all"`` update walks every installed pack, so
+    the timeout is a generous 30 minutes — much longer than ``launch_comfyui``'s
+    180s boot. Expect the call to block for minutes, not seconds.
+
+    **Restart afterwards.** A running ComfyUI keeps executing the code it loaded
+    at boot, so an update does not take effect until the server is restarted —
+    call ``restart_comfyui`` once this returns (``target="cli"`` updates the
+    comfy-cli binary rather than ComfyUI, so no restart is needed for that one).
+
+    ``target`` is validated against comfy-cli's accepted set before anything is
+    spawned; an unrecognized value raises a :class:`ComfyCliError` naming the
+    allowed targets, and only the matched value — never the caller's raw string
+    — is forwarded on the command line.
+
+    Like ``launch_comfyui`` / ``stop_comfyui``, ``comfy update`` prints human
+    text and exits 0 without a JSON envelope, so success returns a synthesized
+    ``{"ok": True, ...}`` payload carrying that text. A failed update (a dirty
+    git tree, a broken requirements install, an unreachable network) exits
+    non-zero and still raises a :class:`ComfyCliError`.
+    """
+    normalized = target.strip().lower() if isinstance(target, str) else ""
+    if normalized not in _UPDATE_TARGETS:
+        raise ComfyCliError(
+            f"invalid update target: {target!r} — expected one of "
+            f"{', '.join(repr(name) for name in _UPDATE_TARGETS)} "
+            "('comfy' = ComfyUI core, 'all' = installed custom node packs, "
+            "'cli' = comfy-cli itself)."
+        )
+    # Forward `normalized` (a member of `_UPDATE_TARGETS`), not `target`: the
+    # caller's raw string never reaches argv.
+    return _run_comfy("update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True)
 
 
 # comfy-cli's `logs` reports this error code when no persisted log file exists

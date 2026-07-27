@@ -2567,6 +2567,112 @@ def test_restart_comfyui_returns_new_server_status(monkeypatch):
     assert server.restart_comfyui() == {"pid": 42, "port": 8188}
 
 
+# --- update_comfyui (`comfy update [all|comfy|cli]`) ------------------------
+
+
+def test_update_comfyui_defaults_to_core_target(patched_plain_run):
+    """Bare call updates ComfyUI core: `comfy … update comfy`, plain-exit success.
+
+    `comfy update` never emits an envelope — it prints through comfy-cli's
+    rprint shim (which routes to stderr in `--json` mode) and exits 0 — so this
+    rides the same `plain_ok` synthesis as launch/stop.
+    """
+    calls = patched_plain_run(
+        0, stderr="Updating ComfyUI in /ws...\nAlready up to date."
+    )
+
+    result = server.update_comfyui()
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
+    assert cmd[4:] == ["update", "comfy"]
+    assert result["ok"] is True
+    assert result["action"] == "update comfy"
+    assert "Already up to date" in result["message"]
+
+
+@pytest.mark.parametrize("target", ["all", "comfy", "cli"])
+def test_update_comfyui_forwards_each_accepted_target(patched_plain_run, target):
+    """Every target comfy-cli accepts is forwarded verbatim."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui(target)
+
+    assert calls[0]["cmd"][4:] == ["update", target]
+
+
+def test_update_comfyui_nonzero_exit_raises(patched_plain_run):
+    """A failed update (non-zero exit, no envelope) must still raise, not synthesize."""
+    calls = patched_plain_run(
+        1, stderr="error: Your local changes would be overwritten"
+    )
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.update_comfyui()
+
+    assert len(calls) == 1  # it really did run, and the failure was not swallowed
+
+
+def test_update_comfyui_surfaces_error_envelope(patched_run):
+    """If comfy-cli does emit an error envelope, its code still propagates."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "workspace_not_found", "message": "no ComfyUI path"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.update_comfyui("comfy")
+    assert excinfo.value.code == "workspace_not_found"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["nodes", "", "  ", "comfy; rm -rf /", "--help", "core"],
+)
+def test_update_comfyui_rejects_unknown_target_before_spawning(patched_run, target):
+    """An unaccepted target is named and refused BEFORE any subprocess runs."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid update target"):
+        server.update_comfyui(target)
+
+    assert calls == []  # nothing was forwarded to comfy-cli
+
+
+def test_update_comfyui_error_names_the_allowed_targets(patched_run):
+    """The rejection is explicit about what IS accepted, not a bare refusal."""
+    patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.update_comfyui("everything")
+    message = str(excinfo.value)
+    assert "'everything'" in message  # the offending value, echoed back
+    for allowed in ("'all'", "'comfy'", "'cli'"):
+        assert allowed in message
+
+
+def test_update_comfyui_normalizes_case_and_whitespace(patched_plain_run):
+    """`" Comfy "` resolves to the canonical target; the raw string never hits argv."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui("  COMFY ")
+
+    assert calls[0]["cmd"][4:] == ["update", "comfy"]
+
+
+def test_update_comfyui_timeout_is_generous(patched_plain_run):
+    """The update timeout must comfortably exceed launch_comfyui's 180s boot."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui()
+
+    assert calls[0]["timeout"] >= 180.0
+    assert calls[0]["timeout"] == server._UPDATE_TIMEOUT
+
+
 # --- fetch_outputs inline image return -------------------------------------
 
 # A few bytes standing in for a PNG — Image just base64-encodes the file, it
