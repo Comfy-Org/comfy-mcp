@@ -705,14 +705,55 @@ def _check_comfy_version() -> None:
 # stop failure ``restart_comfyui`` treats as benign (see its docstring).
 _NO_RECORDED_SERVER_CODE = "no_recorded_server"
 
+# The SAME condition as comfy-cli actually prints it in the common case: `comfy
+# stop` with no recorded background server prints "No ComfyUI is running in the
+# background." and exits 1 WITHOUT an envelope (comfy-cli 1.12.0 `cmdline.stop`),
+# so there is no structured ``code`` for the check above to see and the literal
+# marker string never appears in the message either. That gap is what stopped
+# ``restart_comfyui`` from recycling a server it did not background-launch — a
+# foreground ``comfy launch``, the desktop app, a manual ``python main.py``, or
+# nothing running at all — even though its docstring has always promised to
+# swallow "nothing to stop".
+#
+# Matched with a case-insensitive REGEX on the stable part of the phrase rather
+# than by equality against the exact sentence: this is comfy-cli's human output,
+# free to drift in capitalization, punctuation, or an inserted word ("No ComfyUI
+# *server* is running in the background"), and pinning the exact bytes is what
+# made the original check brittle in the first place. It is deliberately still
+# narrow — it requires BOTH halves, a negated ComfyUI subject AND "running in the
+# background", inside a single sentence (``[^.\n]*?`` cannot cross a period or a
+# newline) — so it identifies "nothing was recorded to stop" and nothing else. A
+# permission error, a process that could not be killed, or any other comfy-cli
+# malfunction still re-raises: none of them claim no ComfyUI is running.
+_NO_RECORDED_SERVER_TEXT_RE = re.compile(
+    r"\bno\s+comfyui\b[^.\n]*?\brunning\s+in\s+the\s+background\b",
+    re.IGNORECASE,
+)
+
 
 def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     """True when ``exc`` is comfy-cli's benign 'nothing recorded to stop' error.
 
     Prefers the structured ``code`` and falls back to the message so it also
-    recognizes the error when only the human-readable string carries the marker.
+    recognizes the error when only the human-readable string carries it — either
+    as the literal marker code, or as comfy-cli's own printed phrasing on the
+    bare non-zero exit that emits no envelope (see
+    :data:`_NO_RECORDED_SERVER_TEXT_RE`).
+
+    The text fallback is deliberately NOT gated on ``exc.no_envelope``, and it
+    searches the whole rendered message rather than a single stream: the phrase
+    itself is the signal, and which reporting path comfy-cli happens to use for
+    it is exactly the detail that should not matter here. It genuinely varies —
+    comfy-cli prints this one through Rich, i.e. on STDOUT, while the wrapper's
+    no-envelope message renders stdout and stderr side by side.
     """
-    return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
+    if exc.code == _NO_RECORDED_SERVER_CODE:
+        return True
+    message = str(exc)
+    return (
+        _NO_RECORDED_SERVER_CODE in message
+        or _NO_RECORDED_SERVER_TEXT_RE.search(message) is not None
+    )
 
 
 def _strip_brackets(host: str) -> str:
@@ -3720,6 +3761,32 @@ def stop_comfyui() -> Any:
     return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
 
+# A launch that lost the port race. Matched loosely (the substring, not a fixed
+# sentence) because comfy-cli and ComfyUI phrase it differently — "The 8188 port
+# is already in use." from comfy-cli's own preflight, "Address already in use"
+# from the socket bind underneath. Over-matching is cheap here and cannot mask a
+# failure: this only decides whether ``restart_comfyui`` APPENDS an explanation
+# to an error it is re-raising either way.
+_PORT_IN_USE_TEXT_RE = re.compile(r"\balready\s+in\s+use\b", re.IGNORECASE)
+
+# Appended when a restart's stop found nothing recorded AND the relaunch then
+# lost the port: together those two facts identify a server that is running but
+# was not started by comfy-cli, which the bare "port already in use" text does
+# not explain on its own. comfy-cli will not kill a process it did not start
+# (``stop_comfyui``'s ownership semantics), so the way out is the user's own
+# shell or a different port — this server exposes no stop-by-port/pid tool.
+_UNTRACKED_SERVER_GUIDANCE = (
+    "Something is already serving this port, but comfy-cli has no record of "
+    "launching it — so there was nothing for the restart to stop, and the fresh "
+    "launch then hit the occupied port. That server was almost certainly started "
+    "outside comfy-cli (a foreground `comfy launch`, the ComfyUI desktop app, or "
+    "`python main.py`), and comfy-cli only ever stops a server it started itself. "
+    "Either stop it the way you started it and retry, or bring one up alongside it "
+    'on a free port: restart_comfyui(extra_args=["--port", "8189"]). '
+    "`server_info` shows what is answering right now."
+)
+
+
 @mcp.tool()
 def restart_comfyui(extra_args: list[str] | None = None) -> Any:
     """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
@@ -3733,17 +3800,40 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
 
     The stop step is best-effort ONLY for the benign "nothing to stop" case: if
     comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
-    started outside comfy-cli) it returns the ``no_recorded_server`` code, which
-    is swallowed so the restart still brings the server up. Any OTHER stop
-    failure (a process that couldn't be killed, a permission error, a comfy-cli
-    malfunction) is re-raised rather than silently masked behind the launch.
+    started outside comfy-cli) it reports that — as the ``no_recorded_server``
+    code, or as a bare non-zero exit printing "No ComfyUI is running in the
+    background" — and either form is swallowed so the restart still brings the
+    server up. Any OTHER stop failure (a process that couldn't be killed, a
+    permission error, a comfy-cli malfunction) is re-raised rather than silently
+    masked behind the launch.
+
+    When that benign stop is followed by a launch that loses the port, the port
+    error is re-raised with an explanation of the combined situation: a server is
+    running that comfy-cli did not start and therefore cannot stop.
     """
+    nothing_to_stop = False
     try:
         stop_comfyui()
     except ComfyCliError as exc:
         if not _is_no_recorded_server(exc):
             raise
-    return launch_comfyui(extra_args)
+        nothing_to_stop = True
+    try:
+        return launch_comfyui(extra_args)
+    except ComfyCliError as exc:
+        # Only when BOTH halves happened — nothing recorded to stop, then the
+        # port was taken anyway. A port clash after a stop that genuinely killed
+        # comfy-cli's own server is a different problem (a lingering process, a
+        # second ComfyUI), so it keeps its original message untouched.
+        if not nothing_to_stop or not _PORT_IN_USE_TEXT_RE.search(str(exc)):
+            raise
+        raise ComfyCliError(
+            f"{exc}\n\n{_UNTRACKED_SERVER_GUIDANCE}",
+            code=exc.code,
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+            timed_out=exc.timed_out,
+        ) from exc
 
 
 # comfy-cli's `logs` reports this error code when no persisted log file exists

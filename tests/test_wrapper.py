@@ -2542,6 +2542,175 @@ def test_restart_comfyui_reraises_genuine_stop_failure(monkeypatch):
     assert launched == []  # genuine failure is not masked by a relaunch
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_restart_comfyui_tolerates_plain_no_comfyui_running_text(
+    patched_plain_run, monkeypatch, stream
+):
+    """The REAL shape of "nothing to stop": non-zero exit, no envelope, human text.
+
+    comfy-cli (1.12.0 `cmdline.stop`) does not emit a `no_recorded_server`
+    envelope when it has no background server recorded — it prints "No ComfyUI is
+    running in the background." and exits 1, which carries neither a structured
+    code nor the literal marker string. That is the common real-world case (a
+    foreground `comfy launch`, the desktop app, `python main.py`, or nothing
+    running), and it used to abort the restart before it ever reached the launch
+    step.
+
+    Parametrized over the stream because comfy-cli prints this one through Rich
+    (stdout) while the QA report captured it on stderr — the match must not care
+    which, so neither does this test.
+    """
+    calls = patched_plain_run(1, **{stream: "No ComfyUI is running in the background."})
+    launched: list = []
+
+    def fake_launch(extra_args=None):
+        launched.append(extra_args)
+        return {"pid": 3}
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    assert server.restart_comfyui(["--cpu"]) == {"pid": 3}
+
+    assert calls[0]["cmd"][4:] == ["stop"]  # the stop really was attempted
+    assert launched == [["--cpu"]]  # and the relaunch still happened
+
+
+def test_stop_comfyui_plain_no_comfyui_running_carries_no_structured_code(
+    patched_plain_run,
+):
+    """Pin the gap this fix closes: that failure has no code and no envelope."""
+    patched_plain_run(1, stdout="No ComfyUI is running in the background.")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert excinfo.value.code is None  # nothing structured to branch on
+    assert excinfo.value.no_envelope is True
+    assert server._NO_RECORDED_SERVER_CODE not in str(excinfo.value)
+    assert server._is_no_recorded_server(excinfo.value)  # matched on the text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # comfy-cli 1.12.0, as the wrapper renders it — on either stream.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: No "
+        "ComfyUI is running in the background.",
+        "comfy-cli returned no JSON (exit 1). stderr: No ComfyUI is running in "
+        "the background. | stdout: <empty>",
+        "No ComfyUI is running in the background.",
+        "no comfyui is running in the background",  # casing drift
+        "No ComfyUI server is running in the background.",  # inserted word
+        "No ComfyUI running in the background",  # dropped copula
+        "comfy stop failed [no_recorded_server]: none",  # the pre-existing marker
+    ],
+)
+def test_is_no_recorded_server_matches_wording_drift(message):
+    """The benign case is matched on the stable phrase, not one exact sentence."""
+    assert server._is_no_recorded_server(server.ComfyCliError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "comfy stop failed [permission_denied]: cannot kill pid 7",
+        # comfy-cli's OTHER stop message, verbatim: it DID have a server
+        # recorded and could not kill it. Nothing benign about that one.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: Failed "
+        "to stop ComfyUI in the background.",
+        "comfy-cli returned no JSON (exit 1). stderr: Failed to stop ComfyUI "
+        "running in the background: operation not permitted | stdout: <empty>",
+        "comfy-cli returned no JSON (exit 2). stderr: Traceback (most recent "
+        "call last): RuntimeError | stdout: <empty>",
+        # Two unrelated sentences: the match must not span the sentence break.
+        "No ComfyUI workspace is configured. Something is running in the background.",
+    ],
+)
+def test_is_no_recorded_server_rejects_other_failures(message):
+    """Every OTHER stop failure stays outside the benign net."""
+    assert not server._is_no_recorded_server(server.ComfyCliError(message))
+
+
+def test_restart_comfyui_reraises_unrelated_plain_stop_failure(
+    patched_plain_run, monkeypatch
+):
+    """A plain non-zero stop whose text ISN'T the benign phrase still aborts."""
+    patched_plain_run(1, stderr="Failed to kill pid 7: operation not permitted")
+    launched: list = []
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="operation not permitted"):
+        server.restart_comfyui()
+    assert launched == []
+
+
+def test_restart_comfyui_explains_port_clash_after_nothing_to_stop(monkeypatch):
+    """Nothing to stop + port taken = a running server comfy-cli never launched."""
+
+    def fake_stop():
+        raise server.ComfyCliError("No ComfyUI is running in the background.")
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError(
+            "comfy-cli returned no JSON (exit 1). stderr: The 8188 port is "
+            "already in use. | stdout: <empty>",
+            no_envelope=True,
+            returncode=1,
+        )
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    message = str(excinfo.value)
+    assert "The 8188 port is already in use." in message  # original kept verbatim
+    assert "comfy-cli has no record of launching it" in message
+    assert "restart_comfyui" in message  # the different-port way out
+    # Provenance of the underlying failure survives the re-wrap.
+    assert excinfo.value.no_envelope is True
+    assert excinfo.value.returncode == 1
+
+
+def test_restart_comfyui_leaves_port_clash_alone_after_a_real_stop(monkeypatch):
+    """A port clash after a stop that DID kill comfy-cli's server is a different bug."""
+    monkeypatch.setattr(server, "stop_comfyui", lambda: {"ok": True})
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("The 8188 port is already in use.")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "The 8188 port is already in use."
+
+
+def test_restart_comfyui_leaves_non_port_launch_failure_alone(monkeypatch):
+    """A launch failure that isn't a port clash keeps its own message."""
+    monkeypatch.setattr(
+        server,
+        "stop_comfyui",
+        lambda: (_ for _ in ()).throw(
+            server.ComfyCliError("No ComfyUI is running in the background.")
+        ),
+    )
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("ComfyUI exited during startup: missing torch")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "ComfyUI exited during startup: missing torch"
+
+
 def test_error_envelope_populates_structured_code(patched_run):
     """ComfyCliError from an error envelope carries the code as an attribute, not just text."""
     patched_run(
