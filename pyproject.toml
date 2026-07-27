@@ -26,7 +26,7 @@ dependencies = [
 # src/comfy_local_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.15,<0.16"]
+dev = ["pytest>=8", "ruff>=0.15,<0.17"]
 
 [project.scripts]
 comfy-local-mcp = "comfy_local_mcp.server:main"
@@ -45,3 +45,16 @@ markers = [
 
 [tool.ruff]
 target-version = "py310"
+
+[tool.ruff.lint]
+# Pin the rule selection EXPLICITLY rather than inheriting ruff's defaults.
+#
+# ruff 0.16 expanded its default selection from 59 rules to 413. With no
+# `select` this repo silently inherited all of them, so a routine dev-dependency
+# bump turned a green tree red with 60 findings — 52 of them stale `# noqa: ARG0xx`
+# directives for a rule that was never enabled, plus 8 genuine ones.
+#
+# These four are ruff's historical defaults: the set this codebase was written
+# and reviewed against. Widening them is a deliberate decision, not something a
+# linter release should make on our behalf — so widen here, in a PR, on purpose.
+select = ["E4", "E7", "E9", "F"]
