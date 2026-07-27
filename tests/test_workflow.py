@@ -66,18 +66,12 @@ def test_set_workflow_slot_stdout_false_writes_in_place(patched_run):
     assert "--stdout" not in cmd
 
 
-def test_set_workflow_slot_rejects_option_like_override(monkeypatch):
+def test_set_workflow_slot_rejects_option_like_override(no_spawn):
     """A leading-dash override is refused before any child spawns.
 
     Splatted in as a positional it would BE the flag — `"--stdout"` would flip
     the in-place-write behavior the ``stdout`` argument owns.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
         server.set_workflow_slot("/tmp/flux.json", ["--stdout"])
 
@@ -85,7 +79,7 @@ def test_set_workflow_slot_rejects_option_like_override(monkeypatch):
         server.set_workflow_slot("/tmp/flux.json", ["6.text=x", "--stdout"])
 
 
-def test_workflow_path_positional_rejects_option_like(monkeypatch):
+def test_workflow_path_positional_rejects_option_like(no_spawn):
     """The sibling `workflow_path` positional is guarded too, not just the overrides.
 
     All three tools splat the path in bare, so a leading-dash path is read as a
@@ -93,12 +87,6 @@ def test_workflow_path_positional_rejects_option_like(monkeypatch):
     which is the very injection the override guard exists to stop. The error
     names the escape hatch — a genuinely dash-leading filename works as `./-x`.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
         server.set_workflow_slot("--stdout", ["6.text=x"])
 
@@ -124,19 +112,13 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     ]
 
 
-def test_workflow_tools_reject_embedded_nul(monkeypatch):
+def test_workflow_tools_reject_embedded_nul(no_spawn):
     """A NUL anywhere surfaces as ComfyCliError, not subprocess's bare ValueError.
 
     Orthogonal to the leading-dash guard: `subprocess` cannot carry a NUL in
     argv at all, so it is refused on option values (`--slot`, `--out-dir`) too,
     not just on the bare positionals.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     for call in (
         lambda: server.list_workflow_slots("/tmp/f\0.json"),
         lambda: server.set_workflow_slot("/tmp/f\0.json", ["6.text=x"]),
@@ -232,7 +214,7 @@ def test_vary_workflow_forwards_out_dir(patched_run, tmp_path):
     ]
 
 
-def test_vary_workflow_rejects_option_like_slot_and_out_dir(monkeypatch):
+def test_vary_workflow_rejects_option_like_slot_and_out_dir(no_spawn):
     """`--slot` values and `--out-dir` are guarded as input hygiene.
 
     Click takes an option's value verbatim, so neither is an injection vector
@@ -242,12 +224,6 @@ def test_vary_workflow_rejects_option_like_slot_and_out_dir(monkeypatch):
     then fails envelope parsing — the same call `search_templates` makes for its
     filters.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
         server.vary_workflow("/tmp/flux.json", ["--help"])
 
@@ -285,7 +261,7 @@ def test_vary_workflow_accepts_json_quoted_comma_bearing_prompt(patched_run):
     ]
 
 
-def test_vary_workflow_rejects_unquoted_comma_bearing_slot_value(monkeypatch):
+def test_vary_workflow_rejects_unquoted_comma_bearing_slot_value(no_spawn):
     """The failing form from the field, named before any child spawns.
 
     `[a lighthouse at dawn, oil painting]` is not valid JSON, so comfy-cli reads
@@ -294,12 +270,6 @@ def test_vary_workflow_rejects_unquoted_comma_bearing_slot_value(monkeypatch):
     with ComfyUI down the real mistake never surfaces at all. The pre-flight
     names WHICH entry is wrong and shows the quoted form that fixes it.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError) as excinfo:
         server.vary_workflow(
             "/tmp/flux.json",
@@ -314,18 +284,12 @@ def test_vary_workflow_rejects_unquoted_comma_bearing_slot_value(monkeypatch):
     assert '"a lighthouse at dawn, oil painting"' in message  # ...and the fix
 
 
-def test_vary_workflow_rejects_non_array_json_slot_value(monkeypatch):
+def test_vary_workflow_rejects_non_array_json_slot_value(no_spawn):
     """Valid JSON that isn't an array is refused too, with the type named.
 
     comfy-cli parses `3.seed=42` fine — as an int — then rejects it, because
     `vary` zips LISTS. The one-element-array fix is spelled out.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError, match=r"slots\[0\].*must be a JSON array"):
         server.vary_workflow("/tmp/flux.json", ["3.seed=42"])
 
@@ -336,31 +300,19 @@ def test_vary_workflow_rejects_non_array_json_slot_value(monkeypatch):
         server.vary_workflow("/tmp/flux.json", ["3.seed=42"])
 
 
-def test_vary_workflow_rejects_slot_without_equals(monkeypatch):
+def test_vary_workflow_rejects_slot_without_equals(no_spawn):
     """An entry with no `=` can't be split into ADDR and value — say so here.
 
     comfy-cli's own message for this (`Expected ADDR=VALUE`) never mentions the
     JSON-array half of the contract, so a caller who fixes only the `=` walks
     straight into the second error.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError, match=r"slots\[0\].*ADDR=\[v1,v2"):
         server.vary_workflow("/tmp/flux.json", ["3.seed"])
 
 
-def test_vary_workflow_slot_error_is_bounded(monkeypatch):
+def test_vary_workflow_slot_error_is_bounded(no_spawn):
     """A huge malformed slot can't produce an unbounded error string."""
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     with pytest.raises(server.ComfyCliError) as excinfo:
         server.vary_workflow("/tmp/flux.json", ["6.text=[" + "x" * 10_000 + "]"])
 
@@ -373,7 +325,7 @@ def test_vary_workflow_slot_error_is_bounded(monkeypatch):
     [("42", "got int"), ("[bad", "not valid JSON")],
     ids=["non-array", "invalid-json"],
 )
-def test_vary_workflow_slot_error_bounds_the_address_too(monkeypatch, value, marker):
+def test_vary_workflow_slot_error_bounds_the_address_too(no_spawn, value, marker):
     """The ADDRESS half is caller-sized as well, and is clipped like the value.
 
     Everything before the first `=` is whatever the caller sent — nothing
@@ -381,12 +333,6 @@ def test_vary_workflow_slot_error_bounds_the_address_too(monkeypatch, value, mar
     other side and, with the opt-in failure log on, write a multi-KB line per
     attempt. Both error branches interpolate the address, so both are checked.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     address = "A" * 10_000
     with pytest.raises(server.ComfyCliError) as excinfo:
         server.vary_workflow("/tmp/flux.json", [f"{address}={value}"])
@@ -458,8 +404,16 @@ def test_vary_workflow_survives_a_real_recursion_error(patched_run):
     Skipped rather than silently vacuous if the interpreter happens to swallow
     the depth: the threshold moved between 3.10 and 3.14 and may move again.
     """
-    depth = 200_000
+    # The whole entry must stay UNDER the spawn-size gate, or the guard abstains
+    # there and never reaches `json.loads` — the assertions below would still
+    # pass while proving nothing about recursion. Derived from the gate and
+    # asserted, so it cannot drift back over if either number changes.
+    prefix = "6.text="
+    depth = (server._MAX_PRECHECKED_SLOT_BYTES - len(prefix)) // 2
     nested = "[" * depth + "]" * depth
+    slot = prefix + nested
+    assert len(slot.encode("utf-8")) <= server._MAX_PRECHECKED_SLOT_BYTES
+
     try:
         json.loads(nested)
     except RecursionError:
@@ -469,7 +423,7 @@ def test_vary_workflow_survives_a_real_recursion_error(patched_run):
 
     calls = patched_run(envelope(data={"count": 1}))
 
-    server.vary_workflow("/tmp/flux.json", [f"6.text={nested}"])
+    server.vary_workflow("/tmp/flux.json", [slot])
     server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"])
 
     assert len(calls) == 2
@@ -495,7 +449,7 @@ def test_vary_workflow_defers_oversized_int_literal_to_the_engine(patched_run):
     assert calls[0]["cmd"][4:] == ["workflow", "vary", "/tmp/flux.json", "--slot", slot]
 
 
-def test_vary_workflow_slot_error_bound_survives_repr_escaping(monkeypatch):
+def test_vary_workflow_slot_error_bound_survives_repr_escaping(no_spawn):
     """The cap has to hold on the RENDERED field, not the pre-quoted content.
 
     `repr` turns one control character into a 4-character escape, so clipping
@@ -503,12 +457,6 @@ def test_vary_workflow_slot_error_bound_survives_repr_escaping(monkeypatch):
     the message — a bound that reads as if it holds while the field blows past
     it. The other bounded tests use printable characters and would not catch it.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     # NUL is rejected earlier by `_reject_nul`; \x01 is not, and reprs as `\x01`.
     with pytest.raises(server.ComfyCliError) as excinfo:
         server.vary_workflow("/tmp/flux.json", ["6.text=[" + "\x01" * 10_000 + "]"])
@@ -576,26 +524,48 @@ def test_vary_workflow_defers_unspawnably_long_slot_to_the_engine(patched_run):
     """
     calls = patched_run(envelope(data={"count": 1}))
 
-    oversized = "[" + "9" * (server._MAX_PRECHECKED_SLOT_CHARS + 1) + "]"
+    # Deliberately a value the contract check would REFUSE (a JSON string, not
+    # an array): forwarding it is only possible if the gate abstained before the
+    # parse. A well-formed array here would ride through either way and prove
+    # nothing about which branch ran.
+    oversized = '"' + "9" * (server._MAX_PRECHECKED_SLOT_BYTES + 1) + '"'
     slot = f"3.seed={oversized}"
     server.vary_workflow("/tmp/flux.json", [slot])
 
     assert calls[0]["cmd"][4:] == ["workflow", "vary", "/tmp/flux.json", "--slot", slot]
 
 
-def test_vary_workflow_still_checks_a_slot_just_under_the_spawn_limit(monkeypatch):
+def test_vary_workflow_size_gate_counts_bytes_not_characters(patched_run):
+    """`MAX_ARG_STRLEN` is a BYTE cap, so the gate has to encode before measuring.
+
+    A value of astral characters is four bytes each: well under the limit by
+    `len()` and well over it once `execve` sees it. Counting characters would
+    let exactly the largest values — the ones the gate exists for — slip through
+    and be parsed in the parent anyway.
+    """
+    calls = patched_run(envelope(data={"count": 1}))
+
+    # A quarter of the byte budget in characters, four bytes each => over it.
+    # A JSON string rather than an array, so reaching the parse would REFUSE it
+    # and forwarding proves the gate measured bytes and abstained.
+    chars = (server._MAX_PRECHECKED_SLOT_BYTES // 4) + 100
+    value = '"' + "\U0001f600" * chars + '"'
+    slot = f"6.text={value}"
+    assert len(slot) < server._MAX_PRECHECKED_SLOT_BYTES  # under, counted wrong
+    assert len(slot.encode("utf-8")) > server._MAX_PRECHECKED_SLOT_BYTES  # over
+
+    server.vary_workflow("/tmp/flux.json", [slot])
+
+    assert calls[0]["cmd"][4:] == ["workflow", "vary", "/tmp/flux.json", "--slot", slot]
+
+
+def test_vary_workflow_still_checks_a_slot_just_under_the_spawn_limit(no_spawn):
     """The abstain threshold is a ceiling, not a hole — just under it still checks.
 
     Guards against the size gate silently swallowing the ordinary contract check
     for any value large enough to matter.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-
     # Well-formed JSON, not an array, at a length the gate still inspects.
-    value = '"' + "p" * (server._MAX_PRECHECKED_SLOT_CHARS - 100) + '"'
+    value = '"' + "p" * (server._MAX_PRECHECKED_SLOT_BYTES - 100) + '"'
     with pytest.raises(server.ComfyCliError, match="got str"):
         server.vary_workflow("/tmp/flux.json", [f"6.text={value}"])
