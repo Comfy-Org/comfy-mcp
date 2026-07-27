@@ -2,7 +2,7 @@
 
 The comfy-cli version guard (`server._check_comfy_version`) shells out to
 `comfy --version` once per process from inside `_run_comfy`. The unit tests stub
-`subprocess.run` to emit canned envelopes and assert the exact argv — a stray
+the comfy-cli spawn to emit canned envelopes and assert the exact argv — a stray
 `comfy --version` call would consume that stub and pollute those assertions. So
 by default we mark the guard "already checked" for every test; the dedicated
 guard tests (`test_wrapper.py`) re-enable it explicitly and mock `--version`.
@@ -13,11 +13,14 @@ This module also holds the shared test helpers for both comfy-cli spawn paths,
 so a change to how ``server`` shells out lands in ONE fake rather than in a
 copy per test file:
 
-* the plain ``--json`` path (``subprocess.run``) — ``envelope`` +
-  ``patched_run`` / ``patched_plain_run``;
-* the streaming ``--json-stream`` path (``subprocess.Popen``) —
-  ``patched_stream``. ``run_workflow``, ``watch_job`` and ``generate_image``
-  all drive the same NDJSON stream.
+* the plain ``--json`` path (``subprocess.Popen`` + a bounded
+  ``communicate``) — ``envelope`` + ``patched_run`` / ``patched_plain_run``;
+* the streaming ``--json-stream`` path (``subprocess.Popen`` + incremental
+  reads) — ``patched_stream``. ``run_workflow``, ``watch_job`` and
+  ``generate_image`` all drive the same NDJSON stream.
+
+Both paths spawn with ``start_new_session=True`` so a timeout can kill the whole
+process group; the fakes model that too (see ``_FakeRunProc``).
 """
 
 from __future__ import annotations
@@ -25,7 +28,6 @@ from __future__ import annotations
 import io
 import json
 import logging
-import subprocess
 
 import pytest
 
@@ -44,7 +46,7 @@ def _skip_spend_gate_probe(monkeypatch):
 
     Same reason as the version guard above: the probe shells out to
     ``comfy generate consent show`` before the first spending call, which would
-    consume the stubbed ``subprocess.run`` and shift every exact-argv assertion.
+    consume the stubbed spawn and shift every exact-argv assertion.
     The dedicated probe tests (`test_partner_generate.py`) re-enable it.
     """
     monkeypatch.setattr(server, "_spend_gate_probed", True)
@@ -55,7 +57,7 @@ def _skip_engine_auto_confirm_probe(monkeypatch):
     """Answer ``partner_generate``'s per-call ``spend.auto_confirm`` read as OFF.
 
     Third once-per-call shell-out on the spending path (``comfy generate consent
-    show --json``); it would consume the stubbed ``subprocess.run`` and shift the
+    show --json``); it would consume the stubbed spawn and shift the
     exact-argv assertions the same way the two guards above would. ``False`` is
     also the default posture under test — the engine has no durable
     always-proceed, so consent has to come from the call itself. The dedicated
@@ -139,33 +141,118 @@ def envelope(*, ok: bool = True, data=_UNSET, error=None) -> dict:
     return body
 
 
-def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
-    """The one ``subprocess.run`` stand-in for the plain (non-streaming) path.
+def _raises_at_spawn(exc: BaseException) -> bool:
+    """Whether the real :class:`subprocess.Popen` would raise ``exc`` itself.
 
-    Its parameter list mirrors ``_run_comfy``'s exact ``subprocess.run`` kwargs
-    — which is precisely why it lives here: a kwarg added or renamed there (the
-    ``encoding=`` pin was the last one) is a one-line edit instead of a sweep
-    across every test file.
+    The constructor fails with an ``OSError`` (no such binary, EPERM, a
+    wrong-arch exec) or the bare ``ValueError`` an embedded NUL in argv
+    produces; a deadline (``TimeoutExpired``) and a strict-UTF-8
+    ``UnicodeDecodeError`` on the child's output both surface from the bounded
+    ``communicate`` instead. The fakes place an injected exception where the
+    real pair would, so it reaches the handler it would reach in production —
+    ``UnicodeDecodeError`` is explicitly excluded because it is a ``ValueError``
+    subclass and would otherwise be mistaken for the NUL case.
+    """
+    return isinstance(exc, (OSError, ValueError)) and not isinstance(
+        exc, UnicodeDecodeError
+    )
 
-    Each call is recorded as ``{"cmd", "env", "timeout", "encoding", "stdin"}`` —
-    a superset of what any caller asserts on — BEFORE ``raises`` fires, so a test
-    for a spawn that blows up can still see the argv it blew up on.
+
+class _FakeRunProc:
+    """A ``Popen`` stand-in for the plain path: one canned result, no real pipes.
+
+    ``_run_comfy_raw`` spawns with :class:`subprocess.Popen` and bounds the run
+    with ``communicate(timeout=…)``, so the fake models both halves — the spawn
+    (argv / env / stdin / encoding) and the wait (the timeout, the canned
+    output, and on the timeout path the kill → reap → drain sequence).
+
+    It deliberately carries NO ``pid``, exactly like :class:`_FakeProc`: that
+    sends ``server._kill_proc_tree`` down its ``AttributeError`` fallback to
+    ``proc.kill()`` instead of calling ``os.killpg`` on a made-up pid, which on
+    a real machine could signal an unrelated process group. The dedicated
+    group-kill test supplies its own fake with a pid and stubs ``os.killpg``.
     """
 
-    def fake(cmd, capture_output, stdin, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append(
-            {
-                "cmd": cmd,
-                "env": env,
-                "timeout": timeout,
-                "encoding": encoding,
-                "stdin": stdin,
-            }
-        )
-        if raises is not None:
+    def __init__(self, cmd, record, *, stdout, stderr, returncode, raises):
+        self.args = cmd
+        self.record = record
+        # Back-reference so a test can assert on what the timeout/failure
+        # handler did to the process it spawned (``calls[0]["proc"].killed``).
+        record["proc"] = self
+        self.stdout = None  # `communicate` hands back the canned text directly
+        self.stderr = None
+        self.returncode = None
+        self.killed = False
+        self._stdout = stdout
+        self._stderr = stderr
+        self._exit_code = returncode
+        self._raises = raises
+        self._communicates = 0
+
+    def communicate(self, timeout=None):
+        self._communicates += 1
+        if self._communicates > 1:
+            # The post-kill drain. A real ``communicate()`` after a timeout
+            # resumes the buffers it was filling when the deadline fired, so it
+            # returns the partial output ``subprocess.run`` used to attach to
+            # the ``TimeoutExpired`` — replay the exception's captures.
+            return getattr(self._raises, "stdout", None), getattr(
+                self._raises, "stderr", None
+            )
+        self.record["timeout"] = timeout  # the bound only reaches us here
+        if self._raises is not None:
+            raise self._raises
+        self.returncode = self._exit_code
+        return self._stdout, self._stderr
+
+    def poll(self):
+        return self.returncode  # None until it exits or is killed
+
+    def wait(self, timeout=None):  # noqa: ARG002
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
+    """The one ``subprocess.Popen`` stand-in for the plain (non-streaming) path.
+
+    Its parameter list mirrors ``_run_comfy_raw``'s exact ``subprocess.Popen``
+    kwargs — which is precisely why it lives here: a kwarg added or renamed
+    there (``start_new_session=`` was the last one, when the timeout handler
+    started reaping the whole process group) is a one-line edit instead of a
+    sweep across every test file.
+
+    Each call is recorded as ``{"cmd", "env", "timeout", "encoding", "stdin",
+    "start_new_session", "proc"}`` — a superset of what any caller asserts on —
+    BEFORE ``raises`` fires, so a test for a spawn that blows up can still see
+    the argv it blew up on. ``timeout`` is filled in by ``communicate``, which
+    is where the bound now lands, and ``proc`` is the spawned
+    :class:`_FakeRunProc` (absent when the spawn itself raised).
+    """
+    canned_stdout, canned_stderr = stdout, stderr
+
+    def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):  # noqa: ARG001
+        record = {
+            "cmd": cmd,
+            "env": env,
+            "timeout": None,
+            "encoding": encoding,
+            "stdin": stdin,
+            "start_new_session": start_new_session,
+        }
+        calls.append(record)
+        if raises is not None and _raises_at_spawn(raises):
             raise raises
-        return subprocess.CompletedProcess(
-            cmd, returncode, stdout=stdout, stderr=stderr
+        return _FakeRunProc(
+            cmd,
+            record,
+            stdout=canned_stdout,
+            stderr=canned_stderr,
+            returncode=returncode,
+            raises=raises,
         )
 
     return fake
@@ -173,7 +260,7 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
 
 @pytest.fixture
 def patched_run(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.run`` for the plain ``--json`` path.
+    """Patch ``shutil.which`` + ``subprocess.Popen`` for the plain ``--json`` path.
 
     Returns ``setup(stdout=…, returncode=…, stderr=…, raises=…) -> calls``:
 
@@ -181,7 +268,9 @@ def patched_run(monkeypatch):
       :func:`envelope`) or a raw string; defaults to an empty-``data`` success
       envelope.
     * ``raises`` — an exception instance the fake raises instead of returning,
-      for the spawn-failure paths (``TimeoutExpired`` and friends).
+      from the spawn or from the wait per :func:`_raises_at_spawn`. A
+      ``TimeoutExpired`` comes out of the wait, and the fake then plays out the
+      kill → reap → drain the handler runs against it.
 
     ``calls`` is the live list every invocation is recorded into, for the exact
     argv assertions this suite is built on.
@@ -196,7 +285,7 @@ def patched_run(monkeypatch):
         monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
         monkeypatch.setattr(
             server.subprocess,
-            "run",
+            "Popen",
             _canonical_run(
                 calls,
                 stdout=stdout,

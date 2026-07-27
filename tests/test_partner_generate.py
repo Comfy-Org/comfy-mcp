@@ -383,20 +383,20 @@ def test_engine_auto_confirms_is_false_when_the_probe_cannot_run(monkeypatch):
         UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
     ],
 )
-def test_engine_auto_confirms_is_false_when_the_probe_blows_up(monkeypatch, exc):
+def test_engine_auto_confirms_is_false_when_the_probe_blows_up(patched_run, exc):
     """The docstring promises EVERY failure answers False — including non-CLI ones.
 
     `_run_comfy_raw` converts a timeout and a missing binary into `ComfyCliError`,
     but a present-but-unusable one (`PermissionError`/`OSError`) and invalid-UTF-8
     child output (`UnicodeDecodeError`) escape it raw. Crashing `partner_generate`
     on those is strictly worse than falling back to asking the user.
+
+    The shared fake raises each of these from the place the real spawn would —
+    the two `OSError`s from `Popen`, the decode error from `communicate` — so
+    this also covers the handler that kills the process group on a non-timeout
+    failure.
     """
-
-    def boom(*args, **kwargs):  # noqa: ARG001
-        raise exc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "run", boom)
+    patched_run(raises=exc)
 
     assert _real_engine_auto_confirms() is False
 

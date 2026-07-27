@@ -99,14 +99,15 @@ class _FakeCtx:
 def patched_streamed_run(patched_stream, monkeypatch):
     """``setup(stdout=...) -> calls`` — the same recorder over the STREAMING path.
 
-    ``wait=True`` spawns comfy-cli with ``subprocess.Popen`` and reads NDJSON, so
-    ``patched_run``'s ``subprocess.run`` stub never sees it. This wraps the shared
-    ``patched_stream`` fixture and spies on :func:`server._run_comfy_streaming`
-    (delegating to the real one, so the whole streaming path still runs) to record
-    the same ``{"cmd", "timeout"}`` shape the plain-path tests assert — ``cmd``
-    from the spawned fake process, ``timeout`` being the parent's backstop budget,
-    which the streaming path takes as an argument rather than handing to
-    ``subprocess.run``.
+    ``wait=True`` reads NDJSON incrementally off the ``Popen`` pipes rather than
+    draining them with one bounded ``communicate``, so ``patched_run``'s
+    canned-result stub cannot serve it. This wraps the shared ``patched_stream``
+    fixture and spies on :func:`server._run_comfy_streaming` (delegating to the
+    real one, so the whole streaming path still runs) to record the same
+    ``{"cmd", "timeout"}`` shape the plain-path tests assert — ``cmd`` from the
+    spawned fake process, ``timeout`` being the parent's backstop budget, which
+    the streaming path bounds the read loop with rather than handing to
+    ``communicate``.
 
     ``stdout`` mirrors ``patched_run``'s contract — a dict (an :func:`envelope`,
     NDJSON-encoded as the stream's final line for you) or a raw NDJSON string;

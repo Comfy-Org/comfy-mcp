@@ -195,7 +195,7 @@ def _bounded_timeout(timeout_seconds: float, ceiling: float) -> float:
 
     ``min(max(t, 0.0), ceiling)`` looks like it does this and does not: every
     NaN comparison is False, so ``max(nan, 0.0)`` returns ``nan``, ``min`` keeps
-    it, and it reaches ``subprocess.run(timeout=nan)`` — where the selector
+    it, and it reaches ``Popen.communicate(timeout=nan)`` — where the selector
     raises a bare :class:`ValueError` that no caller catches (only
     ``TimeoutExpired`` is handled). The one value the ceiling exists to stop was
     the one that slipped through, and NaN is reachable because JSON and pydantic
@@ -221,7 +221,7 @@ def _reject_nul(label: str, value: str) -> str:
     """Reject an embedded NUL, which ``subprocess`` cannot carry in argv.
 
     A NUL is a valid character in a JSON (and so MCP) string, but
-    ``subprocess.run`` raises a bare ``ValueError: embedded null byte`` on one —
+    ``subprocess.Popen`` raises a bare ``ValueError: embedded null byte`` on one —
     uncaught here, so it would surface as an internal error rather than the
     :class:`ComfyCliError` every other bad input produces. Only NUL is refused:
     values are free-form model input (a prompt legitimately spans lines).
@@ -315,7 +315,7 @@ def _guard_prompt_id(prompt_id: str) -> str:
     *parsing*: a leading dash reaches comfy-cli as an option rather than an id,
     most sharply in ``fetch_outputs`` where it sits beside that command's own
     ``-o`` / ``--url-only``. An embedded NUL is a legal JSON (and so MCP) string
-    but makes ``subprocess.run`` raise a bare ``ValueError``, which would surface
+    but makes ``subprocess.Popen`` raise a bare ``ValueError``, which would surface
     as an internal error instead of the :class:`ComfyCliError` every other bad
     input produces. An empty id can only ever be a caller mistake, and is
     refused like every other positional this module guards. A wildly oversized
@@ -341,6 +341,12 @@ def _guard_prompt_id(prompt_id: str) -> str:
 # its own, then fall through to the `finally` that kills it — never block on a
 # lingering child once the answer is already parsed.
 _POST_ENVELOPE_REAP_GRACE = 5.0
+
+# Ceiling on the post-kill drain of a timed-out plain spawn (`_drain_timed_out`).
+# The group is already dead by then, so the pipes are at EOF and the read
+# returns immediately; the bound only exists so a child that survived SIGKILL
+# (uninterruptible sleep) cannot hold the tool call open past its deadline.
+_DRAIN_TIMEOUT = 5.0
 
 # Dedicated, bounded thread pool for the blocking pipe reads / process waits in
 # `_run_comfy_streaming` (`stdout.readline`, `stderr.read`, `proc.wait`).
@@ -376,7 +382,7 @@ def _in_pipe_pool(func, *args):
 # generate` run.
 #
 # That run is the longest blocking call in this server — up to
-# `_MAX_GENERATE_TIMEOUT` (an hour) parked in `subprocess.run`. Cancelling the
+# `_MAX_GENERATE_TIMEOUT` (an hour) parked in `_run_comfy_raw`. Cancelling the
 # awaiting coroutine (an MCP cancellation, a client disconnect) does NOT
 # interrupt the OS thread, so on asyncio's shared *default* executor a handful
 # of abandoned partner runs could occupy that pool for an hour and starve every
@@ -385,7 +391,7 @@ def _in_pipe_pool(func, *args):
 # streaming pipe reads.
 #
 # Shared with the `run_template` / `generate_image` submit paths, which are the
-# same class of call: a blocking `subprocess.run` on a tool that is async for its
+# same class of call: a blocking `_run_comfy_raw` on a tool that is async for its
 # own spend-consent round-trip. Their `wait=True` runs stream instead (see
 # `_run_comfy_streaming`), so what those two park here is the short
 # fire-and-return submit, not the hour-long wait.
@@ -527,11 +533,11 @@ class ComfyCliError(RuntimeError):
     timeout).
 
     ``timed_out`` marks the one failure that is not comfy-cli misbehaving but us
-    running out of patience: the child was killed at the ``timeout=`` we handed
-    :func:`subprocess.run`. A caller that *chose* that budget can then tell its
-    own deadline firing from a genuine comfy-cli error without matching on the
-    message — :func:`wait_for_job`, which caps each poll to the time left on the
-    caller's bound, is exactly that caller.
+    running out of patience: the child's whole process group was killed at the
+    ``timeout=`` we handed ``communicate``. A caller that *chose* that budget
+    can then tell its own deadline firing from a genuine comfy-cli error without
+    matching on the message — :func:`wait_for_job`, which caps each poll to the
+    time left on the caller's bound, is exactly that caller.
     """
 
     def __init__(
@@ -969,39 +975,53 @@ def _run_comfy_raw(
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        # This process speaks JSON-RPC over stdio, so the parent's stdin IS
+        # the protocol channel. A child that inherits it (the subprocess
+        # default) can consume request bytes the client sent us — silently
+        # corrupting the session — or block on a prompt nobody can answer.
+        # No comfy-cli invocation here is interactive, so close it outright;
+        # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
+        # child that WOULD have prompted fails fast instead of hanging.
+        stdin=subprocess.DEVNULL,
+        text=True,
+        # Pin the parent-side decode to UTF-8 so it matches what the child
+        # is forced to emit (_comfy_env). Without this, text=True decodes
+        # the pipe with the system locale (cp1252 on a default Windows
+        # console) and the non-ASCII catalog output raises UnicodeDecodeError
+        # or yields mojibake before _unwrap_envelope — the exact crash this
+        # fix targets, just moved to the reader.
+        encoding="utf-8",
+        env=env,
+        # Own process group so a timeout can kill the whole TREE, exactly as the
+        # streaming path has since BE-3343. comfy-cli's long verbs fork real
+        # work — `update` runs `git pull` and then a multi-GB
+        # `pip install -r requirements.txt`, `model download` streams a large
+        # file — and `subprocess.run` (which this used to be) kills only the
+        # direct `comfy` child on a timeout, so those grandchildren kept
+        # mutating the ComfyUI workspace and Python environment long after the
+        # tool reported failure. `Popen` is what exposes the pid the group kill
+        # needs. See `_kill_proc_tree`.
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            # This process speaks JSON-RPC over stdio, so the parent's stdin IS
-            # the protocol channel. A child that inherits it (the subprocess
-            # default) can consume request bytes the client sent us — silently
-            # corrupting the session — or block on a prompt nobody can answer.
-            # No comfy-cli invocation here is interactive, so close it outright;
-            # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
-            # child that WOULD have prompted fails fast instead of hanging.
-            stdin=subprocess.DEVNULL,
-            text=True,
-            # Pin the parent-side decode to UTF-8 so it matches what the child
-            # is forced to emit (_comfy_env). Without this, text=True decodes
-            # the pipe with the system locale (cp1252 on a default Windows
-            # console) and the non-ASCII catalog output raises UnicodeDecodeError
-            # or yields mojibake before _unwrap_envelope — the exact crash this
-            # fix targets, just moved to the reader.
-            encoding="utf-8",
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        # subprocess.run attaches whatever the child wrote before being killed
-        # (capture_output=True) to the exception — surface it so a crashed,
-        # wedged comfy-cli (e.g. a traceback on stderr) is not indistinguishable
-        # from a genuinely slow one. See BE-3343.
+        # Kill the GROUP, not just `comfy`, then reap on a bounded wait so a
+        # child stuck in D state cannot park this call forever.
+        _kill_proc_tree(proc)
+        _reap(proc)
+        # Whatever the child wrote before being killed — surface it so a
+        # crashed, wedged comfy-cli (e.g. a traceback on stderr) is not
+        # indistinguishable from a genuinely slow one. See BE-3343.
+        stdout, stderr = _drain_timed_out(proc, exc)
         message = (
             f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
-            f"stderr tail: {textutil._tail(exc.stderr) or '<empty>'}; "
-            f"stdout tail: {textutil._tail(exc.stdout) or '<empty>'}"
+            f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
+            f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
         )
         # `exit_code=None`: the child was killed at the deadline, so it never
         # reported one. The log keeps a longer slice of both streams than the
@@ -1010,17 +1030,28 @@ def _run_comfy_raw(
             "timeout",
             args,
             message=message,
-            stdout=exc.stdout,
-            stderr=exc.stderr,
+            stdout=stdout,
+            stderr=stderr,
         )
         raise ComfyCliError(message, timed_out=True) from exc
+    except BaseException:
+        # Mirrors `subprocess.run`'s own bare `except` (it kills the child and
+        # lets `Popen.__exit__` clean up): anything else raised while draining
+        # the pipes — a strict-UTF-8 `UnicodeDecodeError` on the child's output,
+        # a `KeyboardInterrupt` — must not leave the child running either. This
+        # kills the whole group and bounds the wait, where `run` killed only the
+        # direct child and then waited on it without a deadline.
+        _kill_proc_tree(proc)
+        _reap(proc)
+        _close_pipes(proc)
+        raise
 
     return (
-        _last_json_object(proc.stdout),
-        proc.stdout,
+        _last_json_object(stdout),
+        stdout,
         args,
         proc.returncode,
-        proc.stderr,
+        stderr,
     )
 
 
@@ -1086,14 +1117,22 @@ def _envelope_major(envelope: dict) -> int | None:
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
     """Kill the child *and* any grandchildren it spawned.
 
-    comfy-cli can fork a ComfyUI/helper grandchild that inherits the stderr
-    pipe's write-end; killing only the direct child leaves that fd open, so the
-    blocking ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees
-    EOF and the thread leaks — repeated timeouts then exhaust the default
-    ``to_thread`` pool and wedge the server. Killing the whole process group
-    (the child is spawned with ``start_new_session=True``, so it leads its own
-    group) closes every copy of the pipe. Falls back to a plain ``kill`` on
-    Windows / test fakes, where ``killpg`` is unavailable. (BE-3343)
+    Shared by both spawn sites — :func:`_run_comfy_raw` and
+    :func:`_run_comfy_streaming` both pass ``start_new_session=True``, so the
+    child leads its own process group and one ``killpg`` reaps the whole tree.
+
+    On the streaming path that closes every copy of the stderr pipe: comfy-cli
+    can fork a ComfyUI/helper grandchild that inherits the pipe's write-end, and
+    killing only the direct child leaves that fd open, so the blocking
+    ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees EOF and
+    the thread leaks — repeated timeouts then exhaust the default ``to_thread``
+    pool and wedge the server. On the plain path the stake is the work itself:
+    ``comfy update``'s ``git pull`` + ``pip install`` and ``comfy model
+    download``'s transfer keep mutating the workspace after the tool has already
+    reported a timeout, so they have to die with their parent.
+
+    Falls back to a plain ``kill`` on Windows / test fakes, where ``killpg`` is
+    unavailable. (BE-3343)
     """
     if proc.poll() is not None:
         return
@@ -1118,6 +1157,53 @@ def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _close_pipes(proc: subprocess.Popen) -> None:
+    """Close a spawn's stdout/stderr pipes, best-effort.
+
+    ``communicate()`` closes them itself on both of its normal exits, so this is
+    only for the path where it raised something other than a timeout: without it
+    the parent would leak two fds per failed spawn in a long-lived server.
+    ``subprocess.run`` got this from the ``with Popen(...)`` block it wrapped
+    every call in; :func:`_run_comfy_raw` manages the process by hand (that
+    block's ``__exit__`` waits on the child WITHOUT a deadline, which is the
+    wedge :func:`_reap` exists to bound), so it closes them here instead.
+    """
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _drain_timed_out(
+    proc: subprocess.Popen, exc: subprocess.TimeoutExpired
+) -> tuple[Any, Any]:
+    """Whatever a killed-at-the-deadline child wrote before it died.
+
+    ``subprocess.run`` handed this back attached to the ``TimeoutExpired`` it
+    re-raised; with ``Popen`` we drain it ourselves. A ``communicate()`` after a
+    timeout resumes the same accumulation buffers, so it returns the FULL
+    partial output rather than only what arrived after the deadline — and it is
+    bounded, because a child that survived ``SIGKILL`` (D state) could otherwise
+    hold the pipes open forever. The exception's own captures are the fallback
+    for exactly that case; either stream may be ``None`` (nothing written) or
+    ``bytes`` (POSIX attaches the undecoded partial read), both of which
+    ``textutil._tail`` and ``failure_log`` already handle.
+    """
+    try:
+        stdout, stderr = proc.communicate(timeout=_DRAIN_TIMEOUT)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # The drain itself gave up, so nothing else will close these.
+        _close_pipes(proc)
+        return exc.stdout, exc.stderr
+    return (
+        exc.stdout if stdout is None else stdout,
+        exc.stderr if stderr is None else stderr,
+    )
 
 
 def _unwrap_envelope(
@@ -3813,7 +3899,7 @@ def fetch_outputs(
     prompt_id = _guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
     # as the id, so it needs the same NUL refusal: `_run_comfy_raw` only converts
-    # `TimeoutExpired`, leaving `subprocess.run`'s bare "embedded null byte"
+    # `TimeoutExpired`, leaving `subprocess.Popen`'s bare "embedded null byte"
     # ValueError to escape as an internal error. A leading dash is NOT rejected
     # here — `-o` takes a value, so comfy-cli reads even a dash-led one as this
     # option's argument, and a relative path is legitimate input.
