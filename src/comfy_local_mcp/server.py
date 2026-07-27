@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from mcp import types
@@ -96,9 +96,12 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   Treat credentials as GOOD if `signed_in` is true OR
   `registration_env_key_present` is true — a registration-env key authenticates
   partner-API runs even though whoami can't see it, so do NOT nag the user to
-  re-auth in that case. Only when BOTH are false, tell the USER to
-  authenticate, in this order: (1) run `comfy cloud login` in a terminal
-  (canonical), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
+  re-auth in that case. Only when BOTH are false, get the USER
+  authenticated, in this order: (1) call `auth_login` — it starts the sign-in
+  and returns a `login_url` to hand to the user; ask them to open it, complete
+  sign-in, then confirm with `auth_status` (prefer this over asking them to run
+  `comfy cloud login` in a terminal themselves, though that stays a valid
+  fallback), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
   or (3) persist a key with `comfy auth set comfy-cloud-api-key --key <KEY>`.
   Never put a key in a workflow file. If a run still hits a credential error
   despite good `auth_status`, it is retried briefly and surfaces a hint with
@@ -206,7 +209,7 @@ def _bounded_timeout(timeout_seconds: float, ceiling: float) -> float:
 
     ``min(max(t, 0.0), ceiling)`` looks like it does this and does not: every
     NaN comparison is False, so ``max(nan, 0.0)`` returns ``nan``, ``min`` keeps
-    it, and it reaches ``subprocess.run(timeout=nan)`` — where the selector
+    it, and it reaches ``Popen.communicate(timeout=nan)`` — where the selector
     raises a bare :class:`ValueError` that no caller catches (only
     ``TimeoutExpired`` is handled). The one value the ceiling exists to stop was
     the one that slipped through, and NaN is reachable because JSON and pydantic
@@ -232,7 +235,7 @@ def _reject_nul(label: str, value: str) -> str:
     """Reject an embedded NUL, which ``subprocess`` cannot carry in argv.
 
     A NUL is a valid character in a JSON (and so MCP) string, but
-    ``subprocess.run`` raises a bare ``ValueError: embedded null byte`` on one —
+    ``subprocess.Popen`` raises a bare ``ValueError: embedded null byte`` on one —
     uncaught here, so it would surface as an internal error rather than the
     :class:`ComfyCliError` every other bad input produces. Only NUL is refused:
     values are free-form model input (a prompt legitimately spans lines).
@@ -283,9 +286,10 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
     - **A dash-leading slot ADDR** (``vary_workflow``'s ``slots``). An ``ADDR``
       begins with the node id, which comfy-cli surfaces non-negative via
       ``list_workflow_slots``, so no reachable address starts with ``-``. It also
-      costs no capability: ``set_workflow_slot``'s overrides and both param
-      marshalers (:func:`_validate_param_key`) already refuse one, so every other
-      way to name a slot in this module rejects it too.
+      costs no capability: ``set_workflow_slot``'s overrides, the structured
+      forms' ``address`` (:func:`_slot_address_arg`), and both param marshalers
+      (:func:`_validate_param_key`) already refuse one, so every other way to
+      name a slot in this module rejects it too.
 
     And one deliberate NON-rejection, which is what "nearly" above is doing:
 
@@ -326,7 +330,7 @@ def _guard_prompt_id(prompt_id: str) -> str:
     *parsing*: a leading dash reaches comfy-cli as an option rather than an id,
     most sharply in ``fetch_outputs`` where it sits beside that command's own
     ``-o`` / ``--url-only``. An embedded NUL is a legal JSON (and so MCP) string
-    but makes ``subprocess.run`` raise a bare ``ValueError``, which would surface
+    but makes ``subprocess.Popen`` raise a bare ``ValueError``, which would surface
     as an internal error instead of the :class:`ComfyCliError` every other bad
     input produces. An empty id can only ever be a caller mistake, and is
     refused like every other positional this module guards. A wildly oversized
@@ -352,6 +356,12 @@ def _guard_prompt_id(prompt_id: str) -> str:
 # its own, then fall through to the `finally` that kills it — never block on a
 # lingering child once the answer is already parsed.
 _POST_ENVELOPE_REAP_GRACE = 5.0
+
+# Ceiling on the post-kill drain of a timed-out plain spawn (`_drain_timed_out`).
+# The group is already dead by then, so the pipes are at EOF and the read
+# returns immediately; the bound only exists so a child that survived SIGKILL
+# (uninterruptible sleep) cannot hold the tool call open past its deadline.
+_DRAIN_TIMEOUT = 5.0
 
 # Dedicated, bounded thread pool for the blocking pipe reads / process waits in
 # `_run_comfy_streaming` (`stdout.readline`, `stderr.read`, `proc.wait`).
@@ -387,7 +397,7 @@ def _in_pipe_pool(func, *args):
 # generate` run.
 #
 # That run is the longest blocking call in this server — up to
-# `_MAX_GENERATE_TIMEOUT` (an hour) parked in `subprocess.run`. Cancelling the
+# `_MAX_GENERATE_TIMEOUT` (an hour) parked in `_run_comfy_raw`. Cancelling the
 # awaiting coroutine (an MCP cancellation, a client disconnect) does NOT
 # interrupt the OS thread, so on asyncio's shared *default* executor a handful
 # of abandoned partner runs could occupy that pool for an hour and starve every
@@ -396,7 +406,7 @@ def _in_pipe_pool(func, *args):
 # streaming pipe reads.
 #
 # Shared with the `run_template` / `generate_image` submit paths, which are the
-# same class of call: a blocking `subprocess.run` on a tool that is async for its
+# same class of call: a blocking `_run_comfy_raw` on a tool that is async for its
 # own spend-consent round-trip. Their `wait=True` runs stream instead (see
 # `_run_comfy_streaming`), so what those two park here is the short
 # fire-and-return submit, not the hour-long wait.
@@ -598,11 +608,11 @@ class ComfyCliError(RuntimeError):
     timeout).
 
     ``timed_out`` marks the one failure that is not comfy-cli misbehaving but us
-    running out of patience: the child was killed at the ``timeout=`` we handed
-    :func:`subprocess.run`. A caller that *chose* that budget can then tell its
-    own deadline firing from a genuine comfy-cli error without matching on the
-    message — :func:`wait_for_job`, which caps each poll to the time left on the
-    caller's bound, is exactly that caller.
+    running out of patience: the child's whole process group was killed at the
+    ``timeout=`` we handed ``communicate``. A caller that *chose* that budget
+    can then tell its own deadline firing from a genuine comfy-cli error without
+    matching on the message — :func:`wait_for_job`, which caps each poll to the
+    time left on the caller's bound, is exactly that caller.
     """
 
     def __init__(
@@ -1040,39 +1050,53 @@ def _run_comfy_raw(
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        # This process speaks JSON-RPC over stdio, so the parent's stdin IS
+        # the protocol channel. A child that inherits it (the subprocess
+        # default) can consume request bytes the client sent us — silently
+        # corrupting the session — or block on a prompt nobody can answer.
+        # No comfy-cli invocation here is interactive, so close it outright;
+        # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
+        # child that WOULD have prompted fails fast instead of hanging.
+        stdin=subprocess.DEVNULL,
+        text=True,
+        # Pin the parent-side decode to UTF-8 so it matches what the child
+        # is forced to emit (_comfy_env). Without this, text=True decodes
+        # the pipe with the system locale (cp1252 on a default Windows
+        # console) and the non-ASCII catalog output raises UnicodeDecodeError
+        # or yields mojibake before _unwrap_envelope — the exact crash this
+        # fix targets, just moved to the reader.
+        encoding="utf-8",
+        env=env,
+        # Own process group so a timeout can kill the whole TREE, exactly as the
+        # streaming path has since BE-3343. comfy-cli's long verbs fork real
+        # work — `update` runs `git pull` and then a multi-GB
+        # `pip install -r requirements.txt`, `model download` streams a large
+        # file — and `subprocess.run` (which this used to be) kills only the
+        # direct `comfy` child on a timeout, so those grandchildren kept
+        # mutating the ComfyUI workspace and Python environment long after the
+        # tool reported failure. `Popen` is what exposes the pid the group kill
+        # needs. See `_kill_proc_tree`.
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            # This process speaks JSON-RPC over stdio, so the parent's stdin IS
-            # the protocol channel. A child that inherits it (the subprocess
-            # default) can consume request bytes the client sent us — silently
-            # corrupting the session — or block on a prompt nobody can answer.
-            # No comfy-cli invocation here is interactive, so close it outright;
-            # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
-            # child that WOULD have prompted fails fast instead of hanging.
-            stdin=subprocess.DEVNULL,
-            text=True,
-            # Pin the parent-side decode to UTF-8 so it matches what the child
-            # is forced to emit (_comfy_env). Without this, text=True decodes
-            # the pipe with the system locale (cp1252 on a default Windows
-            # console) and the non-ASCII catalog output raises UnicodeDecodeError
-            # or yields mojibake before _unwrap_envelope — the exact crash this
-            # fix targets, just moved to the reader.
-            encoding="utf-8",
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        # subprocess.run attaches whatever the child wrote before being killed
-        # (capture_output=True) to the exception — surface it so a crashed,
-        # wedged comfy-cli (e.g. a traceback on stderr) is not indistinguishable
-        # from a genuinely slow one. See BE-3343.
+        # Kill the GROUP, not just `comfy`, then reap on a bounded wait so a
+        # child stuck in D state cannot park this call forever.
+        _kill_proc_tree(proc)
+        _reap(proc)
+        # Whatever the child wrote before being killed — surface it so a
+        # crashed, wedged comfy-cli (e.g. a traceback on stderr) is not
+        # indistinguishable from a genuinely slow one. See BE-3343.
+        stdout, stderr = _drain_timed_out(proc, exc)
         message = (
             f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
-            f"stderr tail: {textutil._tail(exc.stderr) or '<empty>'}; "
-            f"stdout tail: {textutil._tail(exc.stdout) or '<empty>'}"
+            f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
+            f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
         )
         # `exit_code=None`: the child was killed at the deadline, so it never
         # reported one. The log keeps a longer slice of both streams than the
@@ -1081,17 +1105,28 @@ def _run_comfy_raw(
             "timeout",
             args,
             message=message,
-            stdout=exc.stdout,
-            stderr=exc.stderr,
+            stdout=stdout,
+            stderr=stderr,
         )
         raise ComfyCliError(message, timed_out=True) from exc
+    except BaseException:
+        # Mirrors `subprocess.run`'s own bare `except` (it kills the child and
+        # lets `Popen.__exit__` clean up): anything else raised while draining
+        # the pipes — a strict-UTF-8 `UnicodeDecodeError` on the child's output,
+        # a `KeyboardInterrupt` — must not leave the child running either. This
+        # kills the whole group and bounds the wait, where `run` killed only the
+        # direct child and then waited on it without a deadline.
+        _kill_proc_tree(proc)
+        _reap(proc)
+        _close_pipes(proc)
+        raise
 
     return (
-        _last_json_object(proc.stdout),
-        proc.stdout,
+        _last_json_object(stdout),
+        stdout,
         args,
         proc.returncode,
-        proc.stderr,
+        stderr,
     )
 
 
@@ -1157,23 +1192,54 @@ def _envelope_major(envelope: dict) -> int | None:
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
     """Kill the child *and* any grandchildren it spawned.
 
-    comfy-cli can fork a ComfyUI/helper grandchild that inherits the stderr
-    pipe's write-end; killing only the direct child leaves that fd open, so the
-    blocking ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees
-    EOF and the thread leaks — repeated timeouts then exhaust the default
-    ``to_thread`` pool and wedge the server. Killing the whole process group
-    (the child is spawned with ``start_new_session=True``, so it leads its own
-    group) closes every copy of the pipe. Falls back to a plain ``kill`` on
-    Windows / test fakes, where ``killpg`` is unavailable. (BE-3343)
+    Shared by both spawn sites — :func:`_run_comfy_raw` and
+    :func:`_run_comfy_streaming` both pass ``start_new_session=True``, so the
+    child leads its own process group and one ``killpg`` reaps the whole tree.
+
+    On the streaming path that closes every copy of the stderr pipe: comfy-cli
+    can fork a ComfyUI/helper grandchild that inherits the pipe's write-end, and
+    killing only the direct child leaves that fd open, so the blocking
+    ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees EOF and
+    the thread leaks — repeated timeouts then exhaust the default ``to_thread``
+    pool and wedge the server. On the plain path the stake is the work itself:
+    ``comfy update``'s ``git pull`` + ``pip install`` and ``comfy model
+    download``'s transfer keep mutating the workspace after the tool has already
+    reported a timeout, so they have to die with their parent.
+
+    The group kill is UNCONDITIONAL — deliberately NOT gated on ``proc.poll()``.
+    A dead leader does not mean a dead tree: the case that matters most is
+    precisely the one where ``comfy`` itself has already exited but a forked
+    grandchild (``update``'s ``git pull`` / ``pip install``, a ``model
+    download``'s transfer) is still running and still holding the pipe open —
+    which is *why* ``communicate()`` blew its deadline. A ``poll()`` gate would
+    read that survivor's exited parent and skip the kill exactly when the
+    descendant most needs reaping, defeating the point of the group. The
+    zombie leader keeps the process group alive for its members, so the
+    ``killpg`` still lands.
+
+    Callers must therefore invoke this BEFORE anything reaps the child (a
+    ``wait``/``poll`` that returns a code). Once reaped, the pid is free for the
+    OS to reuse and ``killpg`` could signal an unrelated group; the streaming
+    path's two call sites gate on ``proc.poll() is None`` for that reason (they
+    can run after a completed ``proc.wait``), while :func:`_run_comfy_raw` calls
+    in straight off a ``communicate()`` that never reaped.
+
+    Signals ``proc.pid`` directly rather than ``os.getpgid(proc.pid)``: with
+    ``start_new_session=True`` the child IS its own group leader, so the two are
+    the same number, and ``getpgid`` on an already-reaped child raises — turning
+    the lookup itself into a way to skip the kill.
+
+    Falls back to a plain ``kill`` on Windows / test fakes, where ``killpg`` is
+    unavailable. That fallback reaches only the direct child; a Windows tree
+    kill needs ``taskkill /T`` or a Job Object and is tracked separately.
+    (BE-3343)
     """
-    if proc.poll() is not None:
-        return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)
     except (OSError, AttributeError, ValueError):
         try:
             proc.kill()
-        except (OSError, AttributeError):
+        except (OSError, AttributeError, ValueError):
             pass
 
 
@@ -1189,6 +1255,87 @@ def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _close_pipes(proc: subprocess.Popen) -> None:
+    """Close a spawn's stdout/stderr pipes, best-effort.
+
+    ``communicate()`` closes them itself on both of its normal exits, so this is
+    only for the path where it raised something other than a timeout: without it
+    the parent would leak two fds per failed spawn in a long-lived server.
+    ``subprocess.run`` got this from the ``with Popen(...)`` block it wrapped
+    every call in; :func:`_run_comfy_raw` manages the process by hand (that
+    block's ``__exit__`` waits on the child WITHOUT a deadline, which is the
+    wedge :func:`_reap` exists to bound), so it closes them here instead.
+
+    Swallows ``ValueError`` alongside ``OSError``: closing a text wrapper whose
+    underlying buffer was already detached raises the former, and this runs from
+    the ``except BaseException`` cleanup whose whole job is that nothing escapes
+    it — matching the same tolerance in :func:`_kill_proc_tree` and
+    :func:`_drain_timed_out`.
+    """
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _longer_capture(first: Any, second: Any) -> Any:
+    """Whichever of two partial captures of the SAME stream carries more.
+
+    Both come from consecutive ``TimeoutExpired``s on one pipe, so they are the
+    same type (``bytes`` on POSIX, which is what CPython attaches even in text
+    mode) or ``None`` for "nothing written" — never a mix worth guarding.
+    """
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return second if len(second) > len(first) else first
+
+
+def _drain_timed_out(
+    proc: subprocess.Popen, exc: subprocess.TimeoutExpired
+) -> tuple[Any, Any]:
+    """Whatever a killed-at-the-deadline child wrote before it died.
+
+    ``subprocess.run`` handed this back attached to the ``TimeoutExpired`` it
+    re-raised; with ``Popen`` we drain it ourselves. A ``communicate()`` after a
+    timeout resumes the same accumulation buffers, so it returns the FULL
+    partial output rather than only what arrived after the deadline — and it is
+    bounded, because a child that survived ``SIGKILL`` (D state) could otherwise
+    hold the pipes open forever. The exception's own captures are the fallback
+    for exactly that case; either stream may be ``None`` (nothing written) or
+    ``bytes`` (POSIX attaches the undecoded partial read), both of which
+    ``textutil._tail`` and ``failure_log`` already handle.
+    """
+    try:
+        stdout, stderr = proc.communicate(timeout=_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired as second:
+        # The drain blew its own deadline — a descendant survived `SIGKILL` and
+        # is still holding the pipes. `communicate()` resumes the SAME
+        # accumulation buffers, so what it attaches to this second exception is
+        # a superset of the first's: keep the longer capture rather than
+        # discarding everything that arrived after the original deadline.
+        _close_pipes(proc)
+        return (
+            _longer_capture(exc.stdout, second.stdout),
+            _longer_capture(exc.stderr, second.stderr),
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # The drain itself gave up, so nothing else will close these. Unlike the
+        # second-timeout case above, these carry no partial capture of their own
+        # (a `UnicodeDecodeError` holds only the chunk it choked on), so the
+        # first exception's is genuinely the best available.
+        _close_pipes(proc)
+        return exc.stdout, exc.stderr
+    return (
+        exc.stdout if stdout is None else stdout,
+        exc.stderr if stderr is None else stderr,
+    )
 
 
 def _unwrap_envelope(
@@ -2078,6 +2225,17 @@ def server_info() -> Any:
     and, to see the dropped warning, run ``COMFY_LOCAL_URL=<value> comfy env``
     in a terminal.
 
+    ``workspace.manager_mode`` describes the cm-cli integration comfy-cli can
+    use, not whether ComfyUI-Manager exists: it reflects a per-user config
+    override first and otherwise whether the ``comfyui_manager`` pip package is
+    importable in the workspace venv. A Manager installed the legacy way —
+    cloned into ``custom_nodes/`` — is fully functional server-side yet still
+    reports ``"not-installed"`` here, and a stale config value can report a
+    mode for a Manager that was since removed. Treat ``"not-installed"`` as
+    "comfy-cli's Manager commands are unavailable", never as "Manager is
+    absent" — do not advise the user to install ComfyUI-Manager on the strength
+    of this field alone.
+
     Also the compatibility gate for the unpinned comfy-cli this server shells
     out to: it asserts comfy-cli's envelope schema major matches the
     ``envelope/N`` this wrapper parses, and — when a ``COMFY_CLI_MIN_VERSION``
@@ -2214,6 +2372,480 @@ def auth_status() -> Any:
     if isinstance(data, dict):
         return {**data, "registration_env_key_present": present}
     return {"whoami": data, "registration_env_key_present": present}
+
+
+# --------------------------------------------------------------------------
+# `auth_login` — drive `comfy cloud login` and hand its OAuth URL to the agent
+# --------------------------------------------------------------------------
+#
+# No OAuth logic lives here (thin-wrapper rule): comfy-cli owns the PKCE flow
+# AND the loopback server the browser redirects back to, so all this does is
+# spawn the CLI, lift the authorize URL out of its machine stream, and leave the
+# child running while the user signs in. For a LOCAL MCP the child's loopback
+# listener is on the same host as the user's browser, which is what makes the
+# handoff work at all.
+
+# Forwarded as comfy-cli's `--timeout`: how long the child waits for the browser
+# callback before giving up with its own `oauth`-family error envelope. Ten
+# minutes is generous for a human who has to switch to a browser, read a consent
+# screen, and possibly sign in first — and because the child polices its own
+# deadline, nothing here has to.
+_LOGIN_TIMEOUT_S = 600
+
+# Bounded wait for the `login_url` event. comfy-cli builds the authorize URL and
+# FLUSHES the event before it blocks on the callback (see its docs/json-output.md),
+# so this budget only has to cover process start-up — an interpreter plus imports
+# — never the sign-in itself. Keeping it short is what makes `auth_login` a
+# normal, fast tool call instead of a ten-minute block.
+_LOGIN_URL_WAIT_S = 15.0
+
+# Grace for a login child that has already exited but whose reader task has not
+# stored the terminal result yet — both its streams have EOF'd by then, so this
+# is a scheduling hop, not a wait on the child.
+_LOGIN_REAP_GRACE = 5.0
+
+# How long past its OWN `--timeout` a child may still be running before we stop
+# believing it will ever finish and reap it (see `_login_is_overdue`). comfy-cli
+# polices the callback deadline itself, so a child alive well past it is wedged,
+# not waiting — and because only ONE login may be in flight, a wedged child would
+# otherwise make `auth_login` return `awaiting_browser` with a long-dead URL for
+# the rest of the process's life, with no way for the agent or the user to reset
+# it. The margin covers the child's own shutdown (write the error envelope, exit)
+# so this can never pre-empt a child that is merely finishing up.
+_LOGIN_OVERDUE_GRACE_S = 60.0
+
+# Cap on the retained stdout/stderr of a login child, mirroring
+# `_STDERR_MAX_CHARS` on the streaming path. The terminal envelope is the LAST
+# stdout line, so keeping the tail keeps the part that decides the outcome while
+# bounding memory for a child parked for ten minutes.
+_LOGIN_STREAM_MAX_CHARS = _STDERR_MAX_CHARS
+
+# asyncio's StreamReader raises `ValueError` once a single line exceeds its
+# buffer limit (64 KiB by default) — and the line we MUST NOT lose is the one
+# carrying the URL. An authorize URL (PKCE challenge + scopes + redirect URI) is
+# long by URL standards and nowhere near either bound; raising the limit just
+# means a future event line can never turn a login into a parse crash.
+_LOGIN_LINE_LIMIT = 1024 * 1024
+
+# What the agent should do next, per terminal state. Kept as constants so the
+# tool's contract reads in one place.
+_LOGIN_NEXT_PENDING = "open the URL, complete sign-in, then call auth_status"
+_LOGIN_NEXT_DONE = "call auth_status to confirm the session"
+_LOGIN_NEXT_RETRY = (
+    "call auth_login again to retry, or have the user run `comfy cloud login` "
+    "in a terminal"
+)
+
+
+class _LoginChild:
+    """The ONE in-flight ``comfy cloud login`` child and its stream reader.
+
+    Parked in module state (:data:`_login_child`) between tool calls: the whole
+    point of this tool is that the child OUTLIVES the call that started it —
+    it holds the loopback listener the browser redirects back to, so killing it
+    when ``auth_login`` returns would break the sign-in it just handed out.
+
+    ``result`` is written exactly once, by :func:`_tail_login_child`, as
+    ``(returncode, stdout_tail, stderr_tail)``; it stays ``None`` while the user
+    is still in the browser. Reading it is how a later ``auth_login`` call tells
+    "still waiting" from "finished" without touching the child.
+    """
+
+    __slots__ = (
+        "proc",
+        "args",
+        "login_url",
+        "expires_at",
+        "prefix",
+        "stderr_task",
+        "reader",
+        "result",
+    )
+
+    def __init__(
+        self,
+        proc: Any,
+        args: tuple[str, ...],
+        login_url: str,
+        timeout_s: float,
+        prefix: list[str],
+        stderr_task: Any,
+    ) -> None:
+        self.proc = proc
+        self.args = args
+        self.login_url = login_url
+        self.expires_at = time.monotonic() + timeout_s
+        self.prefix = prefix
+        self.stderr_task = stderr_task
+        self.reader: Any = None
+        self.result: tuple[int | None, str, str] | None = None
+
+    def expires_in_s(self) -> int:
+        """Seconds left on the child's own callback deadline (never negative).
+
+        Recomputed per call rather than echoing the constant: a second
+        ``auth_login`` five minutes into the flow must not tell the agent it
+        still has the full ten minutes.
+        """
+        return max(0, round(self.expires_at - time.monotonic()))
+
+    def pending_payload(self) -> dict:
+        return {
+            "status": "awaiting_browser",
+            "login_url": self.login_url,
+            "expires_in_s": self.expires_in_s(),
+            "next": _LOGIN_NEXT_PENDING,
+        }
+
+    def is_overdue(self) -> bool:
+        """True for a child still running well past its own callback deadline.
+
+        The wedge detector for the one-at-a-time guard: comfy-cli owns the
+        deadline we handed it, so a child that has neither exited nor written its
+        terminal envelope by ``deadline + _LOGIN_OVERDUE_GRACE_S`` is not going
+        to. Left alone it would hold the only login slot forever and keep
+        handing back a URL that expired long ago.
+        """
+        if self.proc.returncode is not None or self.result is not None:
+            return False
+        return time.monotonic() > self.expires_at + _LOGIN_OVERDUE_GRACE_S
+
+
+# The single in-flight login, or None. Module state on purpose: MCP tool calls
+# are independent, so this is the only place a child can survive between them.
+_login_child: _LoginChild | None = None
+
+# Serializes the check-then-spawn in `auth_login` so two concurrent calls cannot
+# both miss the state and start two OAuth flows (the second child's loopback
+# bind would collide, and the user would be handed a URL for a race loser).
+# Created lazily and re-created if the running loop ever changes: an
+# `asyncio.Lock` binds to the first loop that awaits it and raises on any other,
+# which would turn a loop swap into a hard failure of the tool rather than of
+# the (already broken) child it guards.
+_login_lock: asyncio.Lock | None = None
+_login_lock_loop: Any = None
+
+
+def _login_lock_for_loop() -> asyncio.Lock:
+    global _login_lock, _login_lock_loop
+    loop = asyncio.get_running_loop()
+    if _login_lock is None or _login_lock_loop is not loop:
+        _login_lock = asyncio.Lock()
+        _login_lock_loop = loop
+    return _login_lock
+
+
+def _kill_login_child(proc: Any) -> None:
+    """Kill a login child and any grandchildren, best-effort.
+
+    The async-subprocess twin of :func:`_kill_proc_tree` — same rationale (the
+    child leads its own process group via ``start_new_session=True``, so killing
+    the group closes every inherited copy of the stderr pipe and lets the drain
+    EOF), against :class:`asyncio.subprocess.Process`, which exposes
+    ``returncode`` rather than ``poll()``.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError, ValueError):
+        try:
+            proc.kill()
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
+async def _drain_capped_async(stream: Any, limit: int) -> str:
+    """Read an asyncio stream to EOF keeping only the trailing ``limit`` bytes.
+
+    The async counterpart of :func:`_drain_capped`, and there for the same
+    reason: draining keeps the child from wedging on a full pipe, and slicing
+    per chunk bounds memory however much it spams. Decoding once at the end (not
+    per chunk) keeps a multi-byte character split across a chunk boundary from
+    becoming a replacement character.
+    """
+    tail = b""
+    while True:
+        chunk = await stream.read(_STDERR_READ_CHUNK)
+        if not chunk:
+            break
+        tail = (tail + chunk)[-limit:]
+    return tail.decode("utf-8", "replace")
+
+
+async def _tail_login_child(child: _LoginChild) -> None:
+    """Consume the rest of a login child's output and park its terminal result.
+
+    Runs as a detached task for as long as the user is in the browser (up to
+    :data:`_LOGIN_TIMEOUT_S`). It exists to do two things a finished-and-returned
+    tool call cannot: keep reading stdout so the child never blocks on a full
+    pipe mid-flow, and capture the terminal envelope so the NEXT ``auth_login``
+    can report how the sign-in ended.
+
+    Every step is defensive — this task has no caller to raise into, and losing
+    the result would strand the stored child in a permanent "pending" state.
+    """
+    rest = ""
+    try:
+        rest = await _drain_capped_async(child.proc.stdout, _LOGIN_STREAM_MAX_CHARS)
+    except Exception:  # noqa: BLE001 - a lost tail must not lose the result
+        logging.getLogger(__name__).debug("login stdout drain failed", exc_info=True)
+    try:
+        returncode = await child.proc.wait()
+    except Exception:  # noqa: BLE001 - fall back to whatever the proc reports
+        returncode = child.proc.returncode
+    stderr_text = ""
+    try:
+        stderr_text = await child.stderr_task
+    except Exception:  # noqa: BLE001 - stderr is diagnostics, never the verdict
+        logging.getLogger(__name__).debug("login stderr drain failed", exc_info=True)
+    stdout_text = ("".join(child.prefix) + rest)[-_LOGIN_STREAM_MAX_CHARS:]
+    child.result = (returncode, stdout_text, stderr_text)
+
+
+async def _login_terminal_report(child: _LoginChild) -> dict | None:
+    """Terminal payload for a login child that has exited, else ``None``.
+
+    ``None`` means "still awaiting the browser" — the caller re-reports the
+    stored URL. Otherwise the child's own envelope decides the verdict, unwrapped
+    through :func:`_unwrap_envelope` so comfy-cli's ``error.code`` and hint reach
+    the agent verbatim. Nothing from ``data`` is echoed: a successful login
+    envelope carries the (already comfy-cli-redacted) session, and this tool's
+    contract is status fields only.
+    """
+    if child.result is None:
+        if child.proc.returncode is None:
+            return None
+        # Exited, but the reader task has not stored the result yet. Both
+        # streams have EOF'd, so this is a scheduling hop; `shield` keeps the
+        # timeout from cancelling the reader itself and losing the result.
+        try:
+            await asyncio.wait_for(asyncio.shield(child.reader), _LOGIN_REAP_GRACE)
+        except Exception:  # noqa: BLE001 - fall through to the report below
+            logging.getLogger(__name__).debug("login reader join failed", exc_info=True)
+    if child.result is None:
+        return {
+            "status": "failed",
+            "error_code": None,
+            "message": (
+                f"`comfy cloud login` exited (status {child.proc.returncode}) but its "
+                "output could not be collected, so the outcome is unknown."
+            ),
+            "next": _LOGIN_NEXT_RETRY,
+        }
+    returncode, stdout_text, stderr_text = child.result
+    try:
+        _unwrap_envelope(
+            _real_envelope(_last_json_object(stdout_text)),
+            child.args,
+            returncode,
+            stderr_text,
+            stdout=stdout_text,
+        )
+    except ComfyCliError as exc:
+        return {
+            "status": "failed",
+            "error_code": exc.code,
+            "message": str(exc),
+            "next": _LOGIN_NEXT_RETRY,
+        }
+    return {"status": "completed", "next": _LOGIN_NEXT_DONE}
+
+
+async def _start_login() -> tuple[_LoginChild | None, dict]:
+    """Spawn ``comfy cloud login`` and read up to its ``login_url`` event.
+
+    Returns ``(child, payload)``: a live child plus its ``awaiting_browser``
+    payload in the normal case, or ``(None, payload)`` for a child that finished
+    the whole flow before emitting a URL (nothing left to park). A child that
+    FAILS raises :class:`ComfyCliError` from its own envelope, so the CLI's error
+    code and hint are what the agent sees.
+    """
+    _require_comfy_bin()
+    # Same offload as the streaming path: the guard shells out to
+    # `comfy --version` (up to 30s on the first call per process) and must not
+    # block the event loop.
+    await asyncio.to_thread(_check_comfy_version)
+    args = ("cloud", "login", "--no-browser", "--timeout", str(_LOGIN_TIMEOUT_S))
+    proc = await asyncio.create_subprocess_exec(
+        COMFY_BIN,
+        # Global flags precede the subcommand, as everywhere else. `--json` is
+        # what makes comfy-cli emit the machine `login_url` event (it upgrades
+        # itself to the NDJSON stream to do so); `--where` is deliberately not
+        # forwarded — this verb targets the cloud by definition.
+        "--json",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        # Never let a child inherit the stdio transport's stdin and eat JSON-RPC
+        # request bytes. Same reason as both synchronous spawn sites.
+        stdin=asyncio.subprocess.DEVNULL,
+        env=_comfy_env(),
+        # Own process group so `_kill_login_child` can take the whole tree and
+        # close every copy of the stderr pipe. See `_kill_proc_tree`.
+        start_new_session=True,
+        limit=_LOGIN_LINE_LIMIT,
+    )
+    prefix: list[str] = []
+    stderr_task = asyncio.ensure_future(
+        _drain_capped_async(proc.stderr, _LOGIN_STREAM_MAX_CHARS)
+    )
+
+    async def _await_url() -> tuple[str, float] | None:
+        """The URL + the child's own deadline, or None on stdout EOF."""
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:  # EOF: the child died before emitting a URL
+                return None
+            line = raw.decode("utf-8", "replace")
+            prefix.append(line)
+            event = _parse_event(line)
+            if event is None or event.get("type") != "login_url":
+                continue
+            url = event.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            # Prefer the child's OWN reported deadline over the flag we passed,
+            # so `expires_in_s` can never over-promise if the CLI clamps it.
+            reported = event.get("timeout_s")
+            timeout_s = (
+                float(reported)
+                if isinstance(reported, (int, float))
+                and not isinstance(reported, bool)
+                and reported > 0
+                else float(_LOGIN_TIMEOUT_S)
+            )
+            return url, timeout_s
+
+    try:
+        found = await asyncio.wait_for(_await_url(), _LOGIN_URL_WAIT_S)
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        # No URL within the budget, and the child is still alive — it is blocked
+        # on something that is not the browser (most likely a comfy-cli without
+        # the `login_url` event). Reap it rather than leave an OAuth flow the
+        # agent has no URL for, and point at the path that still works.
+        _kill_login_child(proc)
+        await _reap_login_child(proc, stderr_task)
+        raise ComfyCliError(
+            f"`comfy cloud login` emitted no `login_url` within {_LOGIN_URL_WAIT_S:g}s. "
+            "This server needs a comfy-cli that emits the machine-readable "
+            "`login_url` event under `--json`; upgrade comfy-cli, or have the "
+            "user run `comfy cloud login` in a terminal and then call auth_status."
+        ) from exc
+    except BaseException:
+        # Cancellation (a disconnected client) must not leak a child holding a
+        # loopback port the user can never reach.
+        _kill_login_child(proc)
+        stderr_task.cancel()
+        raise
+    if found is None:
+        # stdout EOF with no URL: the child is done. Unwrap its envelope so a
+        # failure surfaces comfy-cli's own code/hint instead of a bare exit code.
+        returncode = await proc.wait()
+        try:
+            stderr_text = await stderr_task
+        except Exception:  # noqa: BLE001 - diagnostics only
+            stderr_text = ""
+        stdout_text = "".join(prefix)[-_LOGIN_STREAM_MAX_CHARS:]
+        _unwrap_envelope(
+            _real_envelope(_last_json_object(stdout_text)),
+            args,
+            returncode,
+            stderr_text,
+            stdout=stdout_text,
+        )
+        # A SUCCESS envelope with no URL means the flow completed without ever
+        # needing the browser. Nothing to park; report it terminally.
+        return None, {"status": "completed", "next": _LOGIN_NEXT_DONE}
+    url, timeout_s = found
+    child = _LoginChild(proc, args, url, timeout_s, prefix, stderr_task)
+    child.reader = asyncio.ensure_future(_tail_login_child(child))
+    return child, child.pending_payload()
+
+
+async def _reap_login_child(proc: Any, stderr_task: Any) -> None:
+    """Best-effort, bounded cleanup of a killed login child."""
+    try:
+        await asyncio.wait_for(proc.wait(), _LOGIN_REAP_GRACE)
+    except Exception:  # noqa: BLE001 - a stuck child is left to the OS
+        logging.getLogger(__name__).debug("login child reap failed", exc_info=True)
+    stderr_task.cancel()
+
+
+async def _abandon_login_child(child: _LoginChild) -> None:
+    """Tear down a PARKED child (kill, reap, stop its reader) — see `is_overdue`.
+
+    The parked case needs more than :func:`_reap_login_child`: a parked child has
+    a reader task holding its stdout, and that task would otherwise outlive the
+    child it is reading and keep the pipe (and its own frame) alive for the rest
+    of the process. Cancelling it is also what frees the loopback port before the
+    replacement login tries to bind one.
+    """
+    _kill_login_child(child.proc)
+    await _reap_login_child(child.proc, child.stderr_task)
+    if child.reader is not None:
+        child.reader.cancel()
+        await asyncio.gather(child.reader, return_exceptions=True)
+
+
+@mcp.tool()
+async def auth_login() -> Any:
+    """Start Comfy Cloud sign-in and return an OAuth URL for the USER to open.
+
+    Wraps ``comfy cloud login --no-browser`` and returns as soon as comfy-cli
+    hands over the authorize URL — the sign-in itself keeps running in the
+    background, so this is a fast call, not a ten-minute block. Use it instead
+    of telling the user to run ``comfy cloud login`` by hand: give them the
+    ``login_url``, let them complete the flow in their browser, then confirm
+    with ``auth_status``. ``--no-browser`` is deliberate — this server may be
+    headless relative to the person using the agent, so the URL is handed back
+    rather than opened here.
+
+    Returns while the flow is live::
+
+        {"status": "awaiting_browser", "login_url": "https://…",
+         "expires_in_s": 600, "next": "open the URL, …"}
+
+    ``expires_in_s`` counts down comfy-cli's own callback deadline. Calling this
+    again while a sign-in is pending returns the SAME URL and does not start a
+    second flow (only one at a time — a second child's loopback listener would
+    collide with the first). Calling it after the child has finished reports the
+    outcome once — ``{"status": "completed"}`` or ``{"status": "failed",
+    "error_code": …, "message": …}`` — and clears the state, so the call after
+    that starts a fresh sign-in. A pending child that is still running well past
+    its own deadline is treated as wedged: it is reaped and this call starts a
+    fresh sign-in, so the one-at-a-time guard can never strand the tool on a
+    long-dead URL.
+
+    Never returns secrets: only status fields cross this boundary, and the
+    session in comfy-cli's login envelope (already redacted upstream) is not
+    echoed at all. ``auth_status`` is the authority on whether credentials are
+    good — this tool only reports how the CLI's login process ended.
+
+    Raises :class:`ComfyCliError` if the login process fails before producing a
+    URL (comfy-cli's error code and hint are carried through), or if it produces
+    no URL at all — e.g. a comfy-cli too old to emit the machine-readable
+    ``login_url`` event, where the fallback is the manual
+    ``comfy cloud login`` in a terminal.
+    """
+    global _login_child
+    async with _login_lock_for_loop():
+        child = _login_child
+        if child is not None and child.is_overdue():
+            # Wedged past its own deadline: drop it and fall through to a fresh
+            # spawn rather than report a URL nobody can still use.
+            _login_child = None
+            await _abandon_login_child(child)
+            child = None
+        if child is not None:
+            report = await _login_terminal_report(child)
+            if report is None:
+                return child.pending_payload()
+            _login_child = None
+            return report
+        child, payload = await _start_login()
+        _login_child = child
+        return payload
 
 
 @mcp.tool()
@@ -3892,7 +4524,7 @@ def fetch_outputs(
     prompt_id = _guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
     # as the id, so it needs the same NUL refusal: `_run_comfy_raw` only converts
-    # `TimeoutExpired`, leaving `subprocess.run`'s bare "embedded null byte"
+    # `TimeoutExpired`, leaving `subprocess.Popen`'s bare "embedded null byte"
     # ValueError to escape as an internal error. A leading dash is NOT rejected
     # here — `-o` takes a value, so comfy-cli reads even a dash-led one as this
     # option's argument, and a relative path is legitimate input.
@@ -4763,6 +5395,17 @@ def download_model(
     directory, optionally under ``relative_path`` (e.g. ``models/loras`` to place
     a LoRA in the right folder) and optionally renamed via ``filename``.
 
+    ``relative_path`` is resolved from the WORKSPACE ROOT, so it must name the
+    models dir or a subfolder of it — its first segment has to be ``models``
+    (``models``, ``models/loras``, ``models/checkpoints``). A bare folder name
+    like ``loras`` is REJECTED rather than assumed: pass ``models/loras``. Paths
+    into a sibling workspace directory (``custom_nodes/…``, ``input``,
+    ``output``, ``user``) are refused — this tool only downloads models. To put a
+    source image/mask in the ``input`` dir, use ``upload_file`` instead. Separate
+    segments with ``/`` on every host, Windows included (``models/loras``, never
+    ``models\\loras``) — it names the same folder there and is the only spelling
+    that survives to the download unchanged.
+
     DOWNLOAD-BY-URL ONLY: this is a fetch of a known URL, not a hub search —
     there is no HuggingFace/CivitAI browse or discovery here (comfy-cli has no
     such search), so the caller must already have the direct model URL.
@@ -4790,10 +5433,15 @@ def download_model(
     if relative_path:
         _reject_option_like("relative_path", relative_path)
         _reject_nul("relative_path", relative_path)
-        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`); keep the
-        # write inside the models dir by rejecting absolute paths, `..`, and a
-        # Windows drive prefix (`C:evil` has no separator but is drive-relative
-        # on that platform, same escape as the bare `filename` case below).
+        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`), enforced
+        # in two stages. FIRST, below: keep the value inside the WORKSPACE by
+        # rejecting absolute paths, `..`, and a Windows drive prefix (`C:evil`
+        # has no separator but is drive-relative on that platform, same escape as
+        # the bare `filename` case below). That is a containment check, not a
+        # destination check — it says where the value cannot go, not where it
+        # must land — so a SECOND stage after it confines the write to the models
+        # tree itself (and refuses the `\` spelling that would let the forwarded
+        # value miss that tree anyway); see those checks for why both are needed.
         #
         # Decide this the same way on every host rather than deferring to
         # `os.path.isabs`: the guard runs wherever the MCP server runs, but the
@@ -4839,6 +5487,76 @@ def download_model(
         ):
             raise ComfyCliError(
                 f"invalid relative_path: {relative_path!r} (path traversal)"
+            )
+        # The checks above only prove the value cannot climb OUT of the
+        # workspace — they never required it to land in the models tree.
+        # comfy-cli joins `--relative-path` to the WORKSPACE ROOT, not to the
+        # models dir (`local_filepath = get_workspace() / relative_path /
+        # local_filename`, defaulting to `DEFAULT_COMFY_MODEL_PATH = "models"`),
+        # which is why the documented shape is `models/loras` and not a bare
+        # `loras`. So a value that is perfectly traversal-clean can still write
+        # anywhere in the workspace: `custom_nodes/pwn` + `__init__.py` puts
+        # attacker-controlled code on ComfyUI's import path, which it executes on
+        # the next start. Require the first segment to be `models` so the write
+        # lands where the tool says it does.
+        #
+        # Ordered AFTER the traversal checks so a traversal string still reports
+        # as traversal, and safe to state as a plain segment comparison only
+        # because those checks have already run: by here the value has no leading
+        # separator, no drive prefix, and no dot-run component, so the first
+        # non-empty segment really is the first directory the write enters.
+        #
+        # Empty segments are dropped for the same reason they are skipped above —
+        # `models/loras/` and `models//loras` are ordinary spellings of a real
+        # subfolder. Matched exactly, not case-folded: a case-insensitive match
+        # would only ever LOOSEN a security guard, and the error text names the
+        # shape to use, so the caller loses nothing but a spelling.
+        #
+        # A bare `loras` is REJECTED rather than normalized to `models/loras`.
+        # Normalizing would have to rewrite an untrusted argument, and it would
+        # quietly turn the sibling-dir names this check exists to refuse into
+        # accepted-but-nonsense paths (`input` -> `models/input`) instead of an
+        # error the caller can act on.
+        #
+        # KNOWN LIMITATION, stated rather than silently trusted: this is a
+        # LEXICAL check on the string, so it cannot see a symlink or junction
+        # that already exists inside the models tree. If `models/link` is already
+        # a link to `custom_nodes`, then `models/link/pwn` passes here and the
+        # write follows it out. Resolving the path for real is deliberately NOT
+        # done: the guard runs wherever the MCP server runs while the write
+        # happens wherever comfy-cli runs, so resolution would consult the wrong
+        # filesystem (the same host-independence the traversal checks above are
+        # built around). Planting that link already requires write access inside
+        # the models tree, which is the thing this tool is allowed to grant.
+        segs = [seg for seg in parts if seg]
+        if not segs or segs[0] != "models":
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} "
+                "(must be the models dir or a subfolder of it, e.g. 'models/loras')"
+            )
+        # Every check above reads `\` as a separator (`parts` splits on it), but
+        # the value is forwarded VERBATIM — so on a POSIX host the check and the
+        # write disagree. `models\loras` validates as segments `models` + `loras`,
+        # then pathlib treats the backslash as an ordinary character and writes to
+        # a workspace-root directory literally NAMED `models\loras` — a sibling of
+        # the models dir, outside the tree the check just claimed to enforce.
+        # (Only the guard's invariant breaks, not containment: the literal name is
+        # forced to start with `models`, and a `models\..\custom_nodes` escape is
+        # already dead because the same `\`->`/` split turns it into a `..` the
+        # traversal check rejects.)
+        #
+        # Refuse the separator rather than rewrite the argument, matching both the
+        # bare-`loras` reasoning above and `filename` below, which rejects `\` too.
+        # It costs no capability on any host: pathlib on Windows resolves
+        # `models/loras` and `models\loras` to the same directory, so a Windows
+        # caller loses a spelling, not a destination — and the message names the
+        # spelling to use. Ordered LAST so the security-meaningful diagnoses win:
+        # `models\..\evil` still reports as traversal and `custom_nodes\pwn` still
+        # reports as outside the models tree.
+        if "\\" in relative_path:
+            raise ComfyCliError(
+                f"invalid relative_path: {relative_path!r} "
+                "(use '/' as the path separator, e.g. 'models/loras')"
             )
     if filename:
         _reject_option_like("filename", filename)
@@ -4984,26 +5702,193 @@ def list_workflow_slots(workflow_path: str) -> Any:
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
 
 
+class SlotOverride(BaseModel):
+    """One ``set_workflow_slot`` override, as structured data instead of a string.
+
+    The reason this form exists: comfy-cli splits an override on its first ``=``
+    and runs the value portion through ``json.loads``, falling back to the
+    literal string when that fails. So the ``"ADDR=VALUE"`` string form
+    COERCES — ``"6.text=true"`` sets the boolean ``true``, ``"6.text=123"`` sets
+    the integer ``123``, and there is no way to spell the literal strings
+    ``"true"`` / ``"123"`` through it. Sending the value as DATA is lossless in
+    both directions: this server JSON-encodes it, and comfy-cli's ``json.loads``
+    decodes exactly what was sent.
+    """
+
+    address: str = Field(
+        description=(
+            "The slot address to set, exactly as `list_workflow_slots` reports "
+            "it in a slot's `address` field (e.g. '6.text')."
+        )
+    )
+    value: Any = Field(
+        description=(
+            "The value to set, as JSON data. Its type is preserved exactly: a "
+            "string stays a string (even 'true' or '42'), a number stays a "
+            "number, a boolean stays a boolean."
+        )
+    )
+
+
+class SlotVariants(BaseModel):
+    """One ``vary_workflow`` slot — an address and the values to sweep over it.
+
+    The structured counterpart to the ``"ADDR=[v1,v2,...]"`` string form, and
+    the same lossless-vs-coercing trade-off as :class:`SlotOverride`: comfy-cli
+    requires the value portion to parse to a JSON array, so ``values`` is sent
+    as one and every element keeps its type. It also removes the quoting
+    footgun the string form carries — a comma inside a prompt no longer has to
+    be hand-quoted to stay part of its value.
+    """
+
+    address: str = Field(
+        description=(
+            "The slot address to vary, exactly as `list_workflow_slots` reports "
+            "it in a slot's `address` field (e.g. '3.seed')."
+        )
+    )
+    values: list[Any] = Field(
+        description=(
+            "The values to sweep over this address, as JSON data. comfy-cli "
+            "ZIPS the lists across slots, so every slot's list must be the same "
+            "length. Must be non-empty."
+        )
+    )
+
+
+def _slot_address_arg(label: str, address: str) -> str:
+    """Validate a structured slot item's ``address`` and return it normalized.
+
+    A structured item's address becomes the portion before the first ``=`` of an
+    argv entry, so it inherits every constraint the string form's entry already
+    carries — hence the same ``_reject_option_like`` / ``_reject_nul`` pair the
+    string path runs, applied to the address specifically so the error names the
+    field the caller actually sent.
+
+    Two checks are new here because only the structured form can express them.
+    An empty (or all-whitespace) address would produce a bare ``"=value"`` entry
+    that comfy-cli splits into an address of ``""``; and an address containing
+    ``=`` would silently re-split, so ``{"address": "6.text=x", "value": "y"}``
+    would reach the engine as address ``6.text`` with value ``x="y"`` rather
+    than failing. Both are caller mistakes worth naming rather than forwarding.
+
+    The dash-leading rejection is defense in depth: a node id is non-negative
+    where ``list_workflow_slots`` surfaces it, so no reachable address starts
+    with ``-`` (see :func:`_reject_option_like`'s note on slot ADDRs). It is
+    guarded anyway for parity with the string path.
+    """
+    _reject_nul(f"{label} address", address)
+    stripped = address.strip()
+    expected = (
+        "a '<node_id>.<input>' address as `list_workflow_slots` reports it "
+        "(e.g. '6.text')"
+    )
+    if not stripped:
+        raise ComfyCliError(f"invalid {label} address: empty — expected {expected}")
+    if "=" in stripped:
+        raise ComfyCliError(
+            f"invalid {label} address: {_clip_for_error(stripped)} contains "
+            f"'=' — the address is only the part BEFORE the first '=', and the "
+            f"value belongs in its own field; expected {expected}"
+        )
+    return _reject_option_like(f"{label} address", stripped, expected=expected)
+
+
+def _slot_value_json(label: str, value: Any) -> str:
+    """JSON-encode a structured slot value, naming a non-encodable one.
+
+    Everything arriving over MCP is JSON already, so this can only fire for a
+    direct in-process caller that passed a Python object with no JSON form (a
+    ``set``, a ``datetime``). Naming it beats letting ``TypeError`` escape a
+    tool that reports every other input mistake as :class:`ComfyCliError`.
+
+    Note what encoding does to the NUL guard, since the asymmetry is deliberate:
+    the string form refuses a NUL because a raw one cannot ride in argv at all,
+    while ``json.dumps`` escapes it to ``\\u0000`` — so a structured value may
+    carry one, and comfy-cli's ``json.loads`` decodes it back on the far side.
+    That is the encoding doing its job (argv stays clean), not a hole in the
+    guard: the reason to refuse it never applies to an encoded value.
+    """
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        raise ComfyCliError(
+            f"invalid {label}: a {type(value).__name__} is not JSON data — send "
+            "a string, number, boolean, null, array, or object."
+        ) from exc
+
+
+_SlotModel = TypeVar("_SlotModel", bound=BaseModel)
+
+
+def _as_slot_model(item: Any, model: type[_SlotModel]) -> _SlotModel:
+    """Coerce one structured slot item to its model.
+
+    Over MCP, FastMCP has already validated the item into ``model``. A plain
+    mapping only reaches here from an in-process caller (this module's own
+    tests, a script importing the tool), so it is validated through the same
+    model rather than read key-by-key — one definition of the shape, one set of
+    error messages.
+    """
+    return item if isinstance(item, model) else model.model_validate(item)
+
+
+def _slot_override_arg(item: str | SlotOverride) -> str:
+    """Render one ``set_workflow_slot`` override as the ``ADDR=VALUE`` argv entry.
+
+    A string passes through byte-for-byte — that is the pre-existing form and
+    its coercing-but-established behavior is unchanged. A structured item is
+    serialized with ``json.dumps``, which is exactly what makes it lossless:
+    comfy-cli's ``json.loads`` is the inverse, so ``"true"`` arrives as the
+    string ``"true"`` (encoded ``"true"`` with its quotes) and ``42`` as the
+    integer.
+    """
+    if isinstance(item, str):
+        return item
+    override = _as_slot_model(item, SlotOverride)
+    address = _slot_address_arg("override", override.address)
+    return f"{address}={_slot_value_json('override value', override.value)}"
+
+
 @mcp.tool()
 def set_workflow_slot(
-    workflow_path: str, overrides: list[str], stdout: bool = True
+    workflow_path: str,
+    overrides: list[str | SlotOverride],
+    stdout: bool = True,
 ) -> Any:
     """Set one or more slot values on a frontend-format workflow.
 
     Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]`` — call
-    it as ``set_workflow_slot(workflow_path=..., overrides=[...])``, where
-    ``overrides`` is a list of ``"ADDR=VALUE"`` strings (the ``ADDR``s come from
-    ``list_workflow_slots``). This is the parameterize step of the template
-    on-ramp — change the prompt / seed / steps / model of a fetched template
-    without hand-editing its JSON.
+    it as ``set_workflow_slot(workflow_path=..., overrides=[...])``. This is the
+    parameterize step of the template on-ramp — change the prompt / seed /
+    steps / model of a fetched template without hand-editing its JSON.
+
+    Each entry of ``overrides`` may be EITHER form, and the two can be mixed in
+    one list:
+
+    - **Structured (preferred)** — ``{"address": "6.text", "value": "a cat"}``.
+      The value's type is PRESERVED EXACTLY, because this server JSON-encodes it
+      and comfy-cli decodes it with ``json.loads``. Feed ``list_workflow_slots``'
+      ``address`` straight in.
+    - **String** — ``"6.text=a cat"``, the original form. comfy-cli parses the
+      part after the first ``=`` as JSON and falls back to the literal string,
+      so this form COERCES: ``"6.text=true"`` sets the boolean ``true`` and
+      ``"6.text=123"`` sets the integer ``123``. Use the structured form when
+      you mean the literal strings ``"true"`` / ``"123"``.
 
     ``stdout`` defaults to ``True`` (``--stdout``), so the tool is
     NON-DESTRUCTIVE: comfy-cli returns the modified workflow instead of mutating
     ``workflow_path`` in place. Set ``stdout=False`` to write the change back to
-    the file. Canonical loop::
+    the file. Canonical loop, driven off the slot list::
 
         path = fetch_template("flux_dev", "/tmp/flux.json")
-        modified = set_workflow_slot(path, ["6.text=a red bicycle", "3.seed=42"])
+        wanted = {"6.text": "a red bicycle", "3.seed": 42}
+        overrides = [
+            {"address": slot["address"], "value": wanted[slot["address"]]}
+            for slot in list_workflow_slots(path)["slots"]
+            if slot["address"] in wanted
+        ]
+        modified = set_workflow_slot(path, overrides)
         # write `modified` to disk (or call with stdout=False), then run_workflow
     """
     # `workflow_path` and each override are splatted in as bare positionals, so
@@ -5021,14 +5906,21 @@ def set_workflow_slot(
         ),
     )
     _reject_nul("workflow_path", workflow_path)
-    for o in overrides:
+    rendered = []
+    for item in overrides:
+        # Rendered per item, then guarded, so the argv guards read what actually
+        # reaches argv — a structured item is held to the same bar as a string
+        # one rather than to a laxer one on the strength of having been typed —
+        # and the first bad entry is still the one reported.
+        o = _slot_override_arg(item)
         _reject_option_like(
             "override",
             o,
             expected="an 'ADDR=VALUE' string (e.g. '6.text=a red bicycle')",
         )
         _reject_nul("override", o)
-    args = ["workflow", "set-slot", workflow_path, *overrides]
+        rendered.append(o)
+    args = ["workflow", "set-slot", workflow_path, *rendered]
     if stdout:
         args.append("--stdout")
     return _run_comfy(*args, timeout=60.0)
@@ -5173,24 +6065,76 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
         )
 
 
+def _slot_variants_arg(index: int, item: str | SlotVariants) -> str:
+    """Render one ``vary_workflow`` slot as the ``ADDR=[v1,v2,...]`` argv entry.
+
+    A string passes through byte-for-byte, into the existing
+    :func:`_reject_non_json_array_slot` pre-check. A structured item is
+    serialized with ``json.dumps(values)`` — which IS the wire form comfy-cli
+    wants, since it requires the value portion to parse to a JSON array — so the
+    quoting gotcha the string form carries cannot arise: a comma inside a prompt
+    stays inside its value with nothing for the caller to escape.
+
+    An empty ``values`` is refused here rather than forwarded. comfy-cli zips
+    the lists, so an empty one yields zero variants: the run "succeeds" having
+    done nothing, which reads as a broken sweep rather than as the input mistake
+    it is.
+    """
+    if isinstance(item, str):
+        return item
+    variants = _as_slot_model(item, SlotVariants)
+    address = _slot_address_arg("slot", variants.address)
+    if not variants.values:
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {_clip_for_error(address)}: "
+            "`values` is empty — comfy-cli zips the value lists, so an empty "
+            "one produces zero variants. Give at least one value (and the same "
+            "count as every other slot)."
+        )
+    return f"{address}={_slot_value_json(f'slots[{index}] values', variants.values)}"
+
+
 @mcp.tool()
 def vary_workflow(
-    workflow_path: str, slots: list[str], out_dir: str | None = None
+    workflow_path: str,
+    slots: list[str | SlotVariants],
+    out_dir: str | None = None,
 ) -> Any:
     """Fan a frontend-format workflow out into variants over slot value lists.
 
     Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]`` —
-    call it as ``vary_workflow(workflow_path=..., slots=[...])``.
-    ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
-    ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
-    so every list MUST be the same length — e.g. ``['3.seed=[1,2,3]',
-    '6.text=["a cat", "a dog", "a fish"]']`` yields three variants pairing seed
-    1/cat, 2/dog, 3/fish.
+    call it as ``vary_workflow(workflow_path=..., slots=[...])``, one entry per
+    address (the addresses come from ``list_workflow_slots``). comfy-cli ZIPS
+    the value lists, so every list MUST be the same length — a seed list of 3
+    and a prompt list of 3 yield three variants pairing seed 1/cat, 2/dog,
+    3/fish.
 
-    **Each entry's value portion (everything after the first ``=``) must be
-    valid JSON, and must parse to a JSON ARRAY.** That is the whole gotcha, and
-    it bites hardest on prompts: a value containing a comma or spaces has to be
-    JSON-quoted, or it is not a list at all. Concretely::
+    Each entry of ``slots`` may be EITHER form, and the two can be mixed in one
+    list:
+
+    - **Structured (preferred)** — ``{"address": "6.text", "values": ["a cat",
+      "a dog"]}``. Each value's type is PRESERVED EXACTLY (this server encodes
+      the list with ``json.dumps``, which is the wire form comfy-cli wants), and
+      the JSON-quoting gotcha below cannot arise at all: a comma or spaces
+      inside a prompt stay part of that value with nothing to escape. ``values``
+      must be non-empty. Feed ``list_workflow_slots``' ``address`` straight in::
+
+          slots = [
+              {"address": slot["address"], "values": ["a cat", "a dog"]}
+              for slot in list_workflow_slots(path)["slots"]
+              if slot["address"] == "6.text"
+          ]
+          vary_workflow(path, slots)
+
+    - **String** — ``'6.text=["a cat", "a dog"]'``, the original form. Its value
+      portion is parsed as JSON by comfy-cli, so it COERCES (``'6.text=[true]'``
+      is a boolean, not the string ``"true"``) and it has the quoting gotcha
+      spelled out next.
+
+    **In the STRING form, each entry's value portion (everything after the first
+    ``=``) must be valid JSON, and must parse to a JSON ARRAY.** That is the
+    whole gotcha, and it bites hardest on prompts: a value containing a comma or
+    spaces has to be JSON-quoted, or it is not a list at all. Concretely::
 
         # WRONG — not valid JSON; comfy-cli reads it as one bare string and
         # fails with `value must be a JSON array (got str)`
@@ -5224,7 +6168,10 @@ def vary_workflow(
     )
     _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
-    for index, slot in enumerate(slots):
+    for index, item in enumerate(slots):
+        # Rendered first so every guard below reads what actually reaches argv,
+        # structured and string entries alike (same order as `set_workflow_slot`).
+        slot = _slot_variants_arg(index, item)
         _reject_option_like(
             "slot",
             slot,

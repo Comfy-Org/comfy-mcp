@@ -20,6 +20,7 @@ import os
 import subprocess
 
 import pytest
+from conftest import _FakeRunProc
 
 from comfy_local_mcp import server, tcc
 
@@ -336,12 +337,15 @@ def test_version_guard_ignores_a_healthy_comfy_cli(on_macos, monkeypatch):
 
 
 def _patch_failing_run(monkeypatch, stderr: str) -> None:
+    """A comfy-cli spawn that exits 1 with ``stderr`` and no envelope."""
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    def fake_run(cmd, **kwargs):  # noqa: ARG001
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=stderr)
+    def fake_popen(cmd, **kwargs):  # noqa: ARG001
+        return _FakeRunProc(
+            cmd, {}, stdout="", stderr=stderr, returncode=1, raises=None
+        )
 
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
 
 
 def test_tool_call_surfaces_the_fix_instead_of_returned_no_json(on_macos, monkeypatch):
@@ -379,9 +383,9 @@ def test_a_real_error_envelope_is_untouched(on_macos, monkeypatch):
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(
         server.subprocess,
-        "run",
-        lambda cmd, **kw: subprocess.CompletedProcess(  # noqa: ARG005
-            cmd, 1, stdout=envelope, stderr=_FATAL_STDERR
+        "Popen",
+        lambda cmd, **kw: _FakeRunProc(  # noqa: ARG005
+            cmd, {}, stdout=envelope, stderr=_FATAL_STDERR, returncode=1, raises=None
         ),
     )
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import subprocess
 
 import pytest
+from conftest import _FakeRunProc, _raises_at_spawn
 
 from comfy_local_mcp import server
 
@@ -329,25 +330,37 @@ def patched_env_then_outdated(monkeypatch):
 
     ``server_info`` shells out twice — ``comfy env`` then ``comfy outdated`` —
     so unlike ``patched_env`` (same envelope every call) this queues ONE reply
-    per call: each entry is a ``CompletedProcess``-shaping tuple
-    ``(returncode, stdout, stderr)`` or an exception instance to raise.
+    per call: each entry is a result-shaping tuple ``(returncode, stdout,
+    stderr)`` or an exception instance to raise.
+
+    Sequenced replies are the carve-out AGENTS.md allows for a local stub, but
+    it still mirrors the shared fake's spawn signature and reuses its
+    :class:`_FakeRunProc`, so a change to how ``server`` shells out breaks here
+    loudly rather than drifting.
     """
 
     def setup(replies: list) -> list[dict]:
         calls: list[dict] = []
 
-        def fake(cmd, capture_output, stdin, text, encoding, timeout, env, check):  # noqa: ARG001
-            calls.append({"cmd": cmd, "timeout": timeout})
+        def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):  # noqa: ARG001
+            record = {"cmd": cmd, "timeout": None}
+            calls.append(record)
             reply = replies[len(calls) - 1]
-            if isinstance(reply, BaseException):
+            failed = isinstance(reply, BaseException)
+            if failed and _raises_at_spawn(reply):
                 raise reply
-            returncode, stdout, stderr = reply
-            return subprocess.CompletedProcess(
-                cmd, returncode, stdout=stdout, stderr=stderr
+            returncode, out, err = (None, None, None) if failed else reply
+            return _FakeRunProc(
+                cmd,
+                record,
+                stdout=out,
+                stderr=err,
+                returncode=returncode,
+                raises=reply if failed else None,
             )
 
         monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "run", fake)
+        monkeypatch.setattr(server.subprocess, "Popen", fake)
         monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
         monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
         return calls
