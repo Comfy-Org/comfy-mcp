@@ -4554,11 +4554,15 @@ def _clip_for_error(text: str) -> str:
     rendered form is what :func:`_render_error_details` does too.
 
     The source text is sliced BEFORE ``repr`` so an MB-sized value never
-    materializes an expanded copy just to have it thrown away: the first
-    ``_MAX_ERROR_FIELD_CHARS`` characters of ``repr(text)`` can only depend on
-    the first ``_MAX_ERROR_FIELD_CHARS`` characters of ``text``, since every
-    source character contributes at least one character to the repr. The
-    ellipsis is counted inside the cap, so the returned field never exceeds it.
+    materializes an expanded copy just to have it thrown away. That is safe for
+    the characters shown: every source character contributes at least one
+    character to the repr, so the escaping of the retained prefix cannot depend
+    on anything past the cap. The one thing it does change is ``repr``'s choice
+    of surrounding quote — it switches to double quotes for a string containing
+    an apostrophe and no double quote, and that decision is now made over the
+    slice, so an apostrophe past the cap flips it. Cosmetic, in a preview that
+    is already truncated. The ellipsis is counted inside the cap, so the
+    returned field never exceeds it.
     """
     rendered = repr(text[:_MAX_ERROR_FIELD_CHARS])
     if len(rendered) <= _MAX_ERROR_FIELD_CHARS:

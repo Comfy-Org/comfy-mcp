@@ -534,14 +534,35 @@ def test_clip_for_error_matches_an_unsliced_repr():
     """Slicing the source before `repr` must not change the rendered prefix.
 
     The pre-slice is an allocation guard, not a behavior change: every source
-    character contributes at least one character to the repr, so the first
-    `_MAX_ERROR_FIELD_CHARS` of `repr(text)` cannot depend on anything past the
-    first `_MAX_ERROR_FIELD_CHARS` of `text`.
+    character contributes at least one character to the repr, so the escaping of
+    the retained prefix cannot depend on anything past the cap.
+
+    Stated over quote-free input on purpose — the surrounding quote character is
+    the one part that CAN differ, which the next test pins down.
     """
     for text in ("\x01" * 10_000, "y" * 10_000, "a, b" * 5_000):
         clipped = server._clip_for_error(text)
         assert clipped.endswith("…")
         assert repr(text).startswith(clipped[:-1])
+
+
+def test_clip_for_error_quote_style_follows_the_slice():
+    """The one thing the pre-slice changes, pinned so it stays cosmetic.
+
+    `repr` switches to double quotes for a string containing an apostrophe and
+    no double quote. That decision is now made over the SLICED prefix, so an
+    apostrophe past the cap flips it relative to an unsliced `repr`. Harmless in
+    an already-truncated preview — but asserted rather than assumed, so it stays
+    a quoting difference and does not quietly become an escaping one.
+    """
+    cap = server._MAX_ERROR_FIELD_CHARS
+    text = "a" * (cap + 100) + "'"
+
+    clipped = server._clip_for_error(text)
+
+    assert len(clipped) <= cap
+    assert not repr(text).startswith(clipped[:-1])  # the quote char differs...
+    assert repr(text[:cap]).startswith(clipped[:-1])  # ...and nothing else does
 
 
 def test_vary_workflow_defers_unspawnably_long_slot_to_the_engine(patched_run):
