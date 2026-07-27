@@ -2074,6 +2074,24 @@ async def run_workflow(
     maximum, and a non-positive / NaN value is rejected outright; ``wait=False``
     ignores it entirely (that submit runs on its own fixed budget).
 
+    CAUTION — a workflow whose nodes request a huge TOTAL allocation (e.g. an
+    ``EmptyImage`` / ``EmptyLatentImage`` with a very large width x height x
+    ``batch_size``) can pass ALL validation — every input is within its declared
+    range, and no layer estimates memory — and then crash the whole local
+    ComfyUI process mid-run when the OS kills it on the allocation. When that
+    happens there is no node-level error to fetch: this tool surfaces a
+    connection-loss / timeout error, and subsequent ``job_status`` /
+    ``get_execution_error`` calls report ``server_not_running`` (both query the
+    live server, which is gone). The evidence is still on disk — ``get_logs``
+    reads comfy-cli's captured log file rather than the server, so it keeps
+    working across the crash whenever the server was started with
+    ``launch_comfyui``; call it to confirm the kill. If you get
+    ``server_not_running`` right after running a workflow with large
+    image/latent dimensions or batch sizes, assume that workflow killed the
+    server: reduce width/height/``batch_size``, and relaunch with
+    ``launch_comfyui`` (or ``restart_comfyui`` if a stale server record remains)
+    before retrying.
+
     Partner-API nodes (Seedream/Veo/Kling/Gemini/…) need a Comfy credential in
     the server's environment (``COMFY_API_KEY`` in the client registration). A
     transient credential failure is retried up to twice with a short backoff;
@@ -3217,6 +3235,13 @@ def job_status(prompt_id: str) -> Any:
 
     Wraps ``comfy jobs status <prompt_id>``. Returns the job status and, when
     finished, its output references. Poll this after ``run_workflow(wait=False)``.
+
+    A ``server_not_running`` error from this tool immediately after a
+    ``run_workflow`` most likely means that run crashed the server (commonly an
+    out-of-memory kill from an oversized allocation) — this tool queries the
+    live server, so it has no history left to read, but ``get_logs`` reads the
+    captured log file and still works across the crash; check it, then relaunch
+    the server and reduce the workflow's allocation sizes before retrying.
     """
     prompt_id = _guard_prompt_id(prompt_id)
     return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
@@ -3305,6 +3330,13 @@ def get_execution_error(prompt_id: str) -> Any:
     On a healthy prompt (completed / queued / running — no ``error``) it returns
     ``{"prompt_id", "status", "error": None}`` rather than raising, so it is safe
     to call speculatively.
+
+    A ``server_not_running`` error from this tool immediately after a
+    ``run_workflow`` most likely means that run crashed the server (commonly an
+    out-of-memory kill from an oversized allocation) — this tool queries the
+    live server, so it has no history left to read, but ``get_logs`` reads the
+    captured log file and still works across the crash; check it, then relaunch
+    the server and reduce the workflow's allocation sizes before retrying.
     """
     prompt_id = _guard_prompt_id(prompt_id)
 
@@ -4564,6 +4596,11 @@ def validate_workflow(workflow_path: str) -> Any:
        and the result is vacuously valid. Ignore those ``non_node_key``
        warnings (do not "fix" the file); export API format (or rely on
        ``run_workflow``'s auto-conversion) if validation fidelity matters.
+    4. No memory/allocation estimate — a graph whose individual inputs are all
+       in-range can still request an impossible TOTAL allocation (e.g. 16384 x
+       16384 at ``batch_size`` 64, roughly 206 GB) and will validate clean here
+       AND on the server, then OOM-kill the ComfyUI process at execution time.
+       See ``run_workflow``'s CAUTION for how that failure reads.
 
     Treat ``valid:true`` as necessary-not-sufficient and rely on
     ``run_workflow`` errors for final authority.
