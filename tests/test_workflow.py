@@ -9,6 +9,9 @@ they own on top of the passthrough:
    defaults to ``--stdout`` (non-destructive), togglable off.
 2. ``vary_workflow`` repeats ``--slot`` per address and forwards ``--out-dir``
    only when given.
+3. ``vary_workflow`` pre-checks each slot entry's value against the JSON-array
+   contract comfy-cli enforces, so an unquoted comma-bearing prompt is named
+   here instead of failing opaquely (or behind a server-connection error) later.
 """
 
 from __future__ import annotations
@@ -156,14 +159,16 @@ def test_vary_workflow_option_value_guards_read_the_first_char_only(patched_run)
     """
     calls = patched_run(envelope(data={"variants": 2}))
 
-    server.vary_workflow("/tmp/flux.json", ["6.text=[a -b,c]"], out_dir="./out-dir")
+    server.vary_workflow(
+        "/tmp/flux.json", ['6.text=["a -b", "c"]'], out_dir="./out-dir"
+    )
 
     assert calls[0]["cmd"][4:] == [
         "workflow",
         "vary",
         "/tmp/flux.json",
         "--slot",
-        "6.text=[a -b,c]",
+        '6.text=["a -b", "c"]',
         "--out-dir",
         "./out-dir",
     ]
@@ -190,7 +195,7 @@ def test_vary_workflow_argv_repeats_slot_flag(patched_run):
     calls = patched_run(envelope(data={"variants": 3}))
 
     result = server.vary_workflow(
-        "/tmp/flux.json", ["3.seed=[1,2,3]", "6.text=[cat,dog,fish]"]
+        "/tmp/flux.json", ["3.seed=[1,2,3]", '6.text=["cat","dog","fish"]']
     )
     assert result == {"variants": 3}
 
@@ -202,7 +207,7 @@ def test_vary_workflow_argv_repeats_slot_flag(patched_run):
         "--slot",
         "3.seed=[1,2,3]",
         "--slot",
-        "6.text=[cat,dog,fish]",
+        '6.text=["cat","dog","fish"]',
     ]
     assert "--out-dir" not in cmd  # stdout NDJSON mode when out_dir is unset
 
@@ -250,3 +255,112 @@ def test_vary_workflow_rejects_option_like_slot_and_out_dir(monkeypatch):
 
     with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
         server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"], out_dir="--help")
+
+
+def test_vary_workflow_accepts_json_quoted_comma_bearing_prompt(patched_run):
+    """The working form from the field: commas INSIDE a JSON-quoted prompt.
+
+    This is the case the contract exists for — a prompt naturally contains
+    commas, and only JSON quoting keeps them part of one value instead of
+    splitting it. Two prompts, one seed each, zipped into two variants.
+    """
+    calls = patched_run(envelope(data={"count": 2}))
+
+    slot = (
+        '1.prompt=["a lighthouse at dawn, oil painting", '
+        '"a lighthouse at noon, watercolor"]'
+    )
+    server.vary_workflow("/tmp/flux.json", [slot, "3.seed=[1,2]"])
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        slot,  # forwarded byte-for-byte; the guard parses, it never rewrites
+        "--slot",
+        "3.seed=[1,2]",
+    ]
+
+
+def test_vary_workflow_rejects_unquoted_comma_bearing_slot_value(monkeypatch):
+    """The failing form from the field, named before any child spawns.
+
+    `[a lighthouse at dawn, oil painting]` is not valid JSON, so comfy-cli reads
+    it as one bare string and dies with `value must be a JSON array (got str)`
+    — after it has already loaded the workflow and fetched `object_info`, so
+    with ComfyUI down the real mistake never surfaces at all. The pre-flight
+    names WHICH entry is wrong and shows the quoted form that fixes it.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.vary_workflow(
+            "/tmp/flux.json",
+            ["3.seed=[1,2]", "1.prompt=[a lighthouse at dawn, oil painting]"],
+        )
+
+    message = str(excinfo.value)
+    assert "slots[1]" in message  # names the offending entry, not just "a value"
+    assert "1.prompt" in message  # ...and its address
+    assert "must be a JSON array" in message  # ...and the contract it broke
+    assert "not valid JSON" in message
+    assert '"a lighthouse at dawn, oil painting"' in message  # ...and the fix
+
+
+def test_vary_workflow_rejects_non_array_json_slot_value(monkeypatch):
+    """Valid JSON that isn't an array is refused too, with the type named.
+
+    comfy-cli parses `3.seed=42` fine — as an int — then rejects it, because
+    `vary` zips LISTS. The one-element-array fix is spelled out.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match=r"slots\[0\].*must be a JSON array"):
+        server.vary_workflow("/tmp/flux.json", ["3.seed=42"])
+
+    with pytest.raises(server.ComfyCliError, match="got int"):
+        server.vary_workflow("/tmp/flux.json", ["3.seed=42"])
+
+    with pytest.raises(server.ComfyCliError, match=r"3\.seed=\[42\]"):
+        server.vary_workflow("/tmp/flux.json", ["3.seed=42"])
+
+
+def test_vary_workflow_rejects_slot_without_equals(monkeypatch):
+    """An entry with no `=` can't be split into ADDR and value — say so here.
+
+    comfy-cli's own message for this (`Expected ADDR=VALUE`) never mentions the
+    JSON-array half of the contract, so a caller who fixes only the `=` walks
+    straight into the second error.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match=r"slots\[0\].*ADDR=\[v1,v2"):
+        server.vary_workflow("/tmp/flux.json", ["3.seed"])
+
+
+def test_vary_workflow_slot_error_is_bounded(monkeypatch):
+    """A huge malformed slot can't produce an unbounded error string."""
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.vary_workflow("/tmp/flux.json", ["6.text=[" + "x" * 10_000 + "]"])
+
+    assert "x" * 10_000 not in str(excinfo.value)
+    assert len(str(excinfo.value)) < 2_000
