@@ -2595,6 +2595,426 @@ def test_restart_comfyui_reraises_genuine_stop_failure(monkeypatch):
     assert launched == []  # genuine failure is not masked by a relaunch
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_restart_comfyui_tolerates_plain_no_comfyui_running_text(
+    patched_plain_run, monkeypatch, stream
+):
+    """The REAL shape of "nothing to stop": non-zero exit, no envelope, human text.
+
+    comfy-cli (1.12.0 `cmdline.stop`) does not emit a `no_recorded_server`
+    envelope when it has no background server recorded — it prints "No ComfyUI is
+    running in the background." and exits 1, which carries neither a structured
+    code nor the literal marker string. That is the common real-world case (a
+    foreground `comfy launch`, the desktop app, `python main.py`, or nothing
+    running), and it used to abort the restart before it ever reached the launch
+    step.
+
+    Parametrized over the stream because comfy-cli prints this one through Rich
+    (stdout) while the QA report captured it on stderr — the match must not care
+    which, so neither does this test.
+    """
+    calls = patched_plain_run(1, **{stream: "No ComfyUI is running in the background."})
+    launched: list = []
+
+    def fake_launch(extra_args=None):
+        launched.append(extra_args)
+        return {"pid": 3}
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    assert server.restart_comfyui(["--cpu"]) == {"pid": 3}
+
+    assert calls[0]["cmd"][4:] == ["stop"]  # the stop really was attempted
+    assert launched == [["--cpu"]]  # and the relaunch still happened
+
+
+def test_stop_comfyui_plain_no_comfyui_running_carries_no_structured_code(
+    patched_plain_run,
+):
+    """Pin the gap this fix closes: that failure has no code and no envelope."""
+    patched_plain_run(1, stdout="No ComfyUI is running in the background.")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert excinfo.value.code is None  # nothing structured to branch on
+    assert excinfo.value.no_envelope is True
+    assert server._NO_RECORDED_SERVER_CODE not in str(excinfo.value)
+    assert server._is_no_recorded_server(excinfo.value)  # matched on the text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # comfy-cli 1.12.0, as the wrapper renders it — on either stream.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: No "
+        "ComfyUI is running in the background.",
+        "comfy-cli returned no JSON (exit 1). stderr: No ComfyUI is running in "
+        "the background. | stdout: <empty>",
+        "No ComfyUI is running in the background.",
+        "no comfyui is running in the background",  # casing drift
+        "No ComfyUI server is running in the background.",  # inserted word
+        "No ComfyUI running in the background",  # dropped copula
+        # Rich soft-wrapping the sentence at a narrow width: a line break inside
+        # the phrase is a wrap, not a clause break.
+        "No ComfyUI is running in the\nbackground.",
+        # A clipped capture: `textutil._stream_tail` prefixes `...`, which can
+        # land directly against the sentence. That marker opens a field.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: ...No "
+        "ComfyUI is running in the background.",
+        "comfy stop failed [no_recorded_server]: none",  # the pre-existing marker
+    ],
+)
+def test_is_no_recorded_server_matches_wording_drift(message):
+    """The benign case is matched on the stable phrase, not one exact sentence."""
+    assert server._is_no_recorded_server(server.ComfyCliError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "comfy stop failed [permission_denied]: cannot kill pid 7",
+        # comfy-cli's OTHER stop message, verbatim: it DID have a server
+        # recorded and could not kill it. Nothing benign about that one.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: Failed "
+        "to stop ComfyUI in the background.",
+        "comfy-cli returned no JSON (exit 1). stderr: Failed to stop ComfyUI "
+        "running in the background: operation not permitted | stdout: <empty>",
+        "comfy-cli returned no JSON (exit 2). stderr: Traceback (most recent "
+        "call last): RuntimeError | stdout: <empty>",
+        # Two unrelated sentences: the match must not span the sentence break.
+        "No ComfyUI workspace is configured. Something is running in the background.",
+        # A failed stop whose clauses are separated by a semicolon, not a period:
+        # this one says the server IS still running, the opposite of benign.
+        "No ComfyUI process could be stopped; it is still running in the background.",
+        # The two halves living in DIFFERENT streams of the wrapper's rendering —
+        # the match must not stitch across the ` | ` delimiter.
+        "comfy-cli returned no JSON (exit 1). stderr: No ComfyUI workspace "
+        "configured | stdout: a server is running in the background",
+        # ...nor across a field label on its own line.
+        "comfy stop failed\nstderr: No ComfyUI workspace configured\n"
+        "stdout: a server is running in the background",
+        # The phrase as ADVICE inside another failure's hint, not as a report
+        # that nothing was recorded: it does not open a message, line, or field.
+        "comfy stop failed: cannot kill pid 7 (operation not permitted); "
+        "check permissions and ensure no ComfyUI is running in the background",
+        # Opposite-meaning reports joined WITHOUT punctuation — a conjunction or
+        # a dash. The halves must be joined by the sentence's grammar, not just
+        # sit near each other.
+        "No ComfyUI process was stopped and remains running in the background",
+        "No ComfyUI process could be stopped — it is still running in the background",
+        "No ComfyUI was stopped so something else is running in the background",
+        # A longer, unrelated structured code that merely starts with the marker.
+        "comfy stop failed [no_recorded_server_pid]: none",
+    ],
+)
+def test_is_no_recorded_server_rejects_other_failures(message):
+    """Every OTHER stop failure stays outside the benign net."""
+    assert not server._is_no_recorded_server(server.ComfyCliError(message))
+
+
+def test_is_no_recorded_server_lets_a_structured_code_outrank_the_text():
+    """comfy-cli said structurally what broke; stray prose does not overrule it."""
+    exc = server.ComfyCliError(
+        "No ComfyUI is running in the background.", code="permission_denied"
+    )
+
+    assert not server._is_no_recorded_server(exc)
+
+
+def test_is_no_recorded_server_rejects_a_stop_we_timed_out():
+    """A stop killed at OUR deadline never finished, so it reported nothing."""
+    exc = server.ComfyCliError(
+        "comfy stop timed out after 60s. stdout: No ComfyUI is running in the "
+        "background.",
+        timed_out=True,
+    )
+
+    assert not server._is_no_recorded_server(exc)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # The gate has to sit above BOTH text reads, not between them: a message
+        # quoting the literal marker must not slip past a timeout or a different
+        # structured code.
+        server.ComfyCliError(
+            "comfy stop timed out after 60s. stdout: comfy stop failed "
+            "[no_recorded_server]: none",
+            timed_out=True,
+        ),
+        server.ComfyCliError(
+            "comfy stop failed [permission_denied]: cannot kill pid 7 "
+            "(previous run reported no_recorded_server)",
+            code="permission_denied",
+        ),
+    ],
+)
+def test_is_no_recorded_server_gate_outranks_the_literal_marker_too(exc):
+    """A quoted marker does not make a timeout or a coded failure benign."""
+    assert not server._is_no_recorded_server(exc)
+
+
+def test_is_no_recorded_server_accepts_an_envelope_without_a_code():
+    """An envelope carrying the sentence but no `error.code` is the same case."""
+    exc = server.ComfyCliError(
+        "comfy stop failed: No ComfyUI is running in the background."
+    )
+
+    assert exc.no_envelope is False  # not gated on provenance, only on code
+    assert server._is_no_recorded_server(exc)
+
+
+def test_restart_comfyui_reraises_a_timed_out_stop_that_printed_the_phrase(monkeypatch):
+    """The gate is load-bearing: a timed-out stop must not be relaunched over."""
+
+    def fake_stop():
+        raise server.ComfyCliError(
+            "comfy stop timed out after 60s. stdout: No ComfyUI is running in "
+            "the background.",
+            timed_out=True,
+        )
+
+    launched: list = []
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.restart_comfyui()
+    assert launched == []
+
+
+def test_restart_comfyui_reraises_unrelated_plain_stop_failure(
+    patched_plain_run, monkeypatch
+):
+    """A plain non-zero stop whose text ISN'T the benign phrase still aborts."""
+    patched_plain_run(1, stderr="Failed to kill pid 7: operation not permitted")
+    launched: list = []
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="operation not permitted"):
+        server.restart_comfyui()
+    assert launched == []
+
+
+def test_restart_comfyui_explains_port_clash_after_nothing_to_stop(monkeypatch):
+    """Nothing to stop + port taken = a running server comfy-cli never launched."""
+
+    def fake_stop():
+        raise server.ComfyCliError("No ComfyUI is running in the background.")
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError(
+            "comfy-cli returned no JSON (exit 1). stderr: The 8188 port is "
+            "already in use. | stdout: <empty>",
+            no_envelope=True,
+            returncode=1,
+        )
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    message = str(excinfo.value)
+    assert "The 8188 port is already in use." in message  # original kept verbatim
+    assert "comfy-cli has no record of launching it" in message
+    assert "restart_comfyui" in message  # the different-port way out
+    # Provenance of the underlying failure survives the re-wrap.
+    assert excinfo.value.no_envelope is True
+    assert excinfo.value.returncode == 1
+
+
+def test_restart_comfyui_leaves_port_clash_alone_after_a_real_stop(monkeypatch):
+    """A port clash after a stop that DID kill comfy-cli's server is a different bug."""
+    monkeypatch.setattr(server, "stop_comfyui", lambda: {"ok": True})
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("The 8188 port is already in use.")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "The 8188 port is already in use."
+
+
+def test_restart_comfyui_leaves_non_port_launch_failure_alone(monkeypatch):
+    """A launch failure that isn't a port clash keeps its own message."""
+    monkeypatch.setattr(
+        server,
+        "stop_comfyui",
+        lambda: (_ for _ in ()).throw(
+            server.ComfyCliError("No ComfyUI is running in the background.")
+        ),
+    )
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("ComfyUI exited during startup: missing torch")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "ComfyUI exited during startup: missing torch"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The 8188 port is already in use.",  # comfy-cli's own preflight
+        "OSError: [Errno 48] Address already in use",  # the socket bind under it
+        "error while attempting to bind on address ('0.0.0.0', 8188): "
+        "address already in use",
+        "Port 8188 is already in use",
+    ],
+)
+def test_port_in_use_matches_the_real_phrasings(message):
+    """Both layers word the port clash differently; both must be recognized."""
+    assert server._PORT_IN_USE_TEXT_RE.search(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # "already in use" with a subject that is NOT a port: appending the port
+        # guidance here would assert something plainly false about the failure.
+        "Cannot load model: the file is already in use by another process",
+        "CUDA device 0 is already in use",
+        "The output directory is already in use",
+        # A `--port` echoed back from the command in one stream must not be
+        # stitched to an unrelated "already in use" in the other.
+        "comfy-cli returned no JSON (exit 1). stderr: launch --background -- "
+        "--port 8188 | stdout: CUDA device 0 is already in use",
+        "comfy-cli returned no JSON (exit 1). stderr: could not bind port | "
+        "stdout: the model file is already in use",
+    ],
+)
+def test_port_in_use_ignores_non_port_conflicts(message):
+    """A busy file or GPU is not a port clash, so it gets no port guidance."""
+    assert not server._PORT_IN_USE_TEXT_RE.search(message)
+
+
+def test_restart_comfyui_leaves_a_non_port_resource_clash_alone(monkeypatch):
+    """End to end: a busy model file after nothing-to-stop keeps its own message."""
+    monkeypatch.setattr(
+        server,
+        "stop_comfyui",
+        lambda: (_ for _ in ()).throw(
+            server.ComfyCliError("No ComfyUI is running in the background.")
+        ),
+    )
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("Cannot load model: the file is already in use")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "Cannot load model: the file is already in use"
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        (None, None),
+        ([], None),
+        (["--cpu"], None),
+        (["--port", "8189"], 8189),
+        (["--port=8189"], 8189),
+        (["--cpu", "--port", "8300", "--lowvram"], 8300),
+        (["--port", "8189", "--port", "8300"], 8300),  # last one wins
+        (["--port"], None),  # dangling flag, no value
+        (["--port", "not-a-number"], None),
+        (["--port", "0"], None),  # out of range
+        (["--port", "70000"], None),
+        (["--portable"], None),  # a different flag that merely shares the prefix
+        # A trailing unparseable --port supersedes an earlier good one: it means
+        # we do not know the requested port, not that 8189 still stands.
+        (["--port", "8189", "--port", "bad"], None),
+        (["--port", "8189", "--port", "99999"], None),
+    ],
+)
+def test_requested_port_reads_the_forwarded_port(extra_args, expected):
+    """Best-effort read of the caller's `--port`; anything odd yields None."""
+    assert server._requested_port(extra_args) == expected
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        (None, ["--port", "8189"]),
+        ([], ["--port", "8189"]),
+        (["--cpu"], ["--cpu", "--port", "8189"]),  # other flags survive
+        (["--cpu", "--port", "8188"], ["--cpu", "--port", "8189"]),
+        (["--port=8188", "--lowvram"], ["--lowvram", "--port", "8189"]),
+        (["--port"], ["--port", "8189"]),  # dangling flag dropped, not doubled
+    ],
+)
+def test_suggested_relaunch_args_swaps_the_port_and_keeps_the_rest(
+    extra_args, expected
+):
+    """The pasteable suggestion must not silently drop the caller's own flags."""
+    assert server._suggested_relaunch_args(extra_args, 8189) == expected
+
+
+def test_untracked_server_guidance_keeps_the_callers_other_flags():
+    """A user pasting the suggestion should not lose `--cpu` along the way."""
+    guidance = server._untracked_server_guidance(["--cpu", "--port", "8188"])
+
+    assert 'extra_args=["--cpu", "--port", "8189"]' in guidance
+
+
+def test_untracked_server_guidance_falls_back_when_the_args_are_long():
+    """Past the cap the suggestion degrades to the bare port rather than noise."""
+    guidance = server._untracked_server_guidance(["--some-very-long-flag"] * 12)
+
+    assert 'extra_args=["--port", "8189"]' in guidance
+    assert "--some-very-long-flag" not in guidance
+
+
+def test_untracked_server_guidance_avoids_suggesting_the_port_that_just_failed():
+    """Suggesting the exact launch that just lost the race is useless advice."""
+    default = server._untracked_server_guidance(["--cpu"])
+    assert f'"--port", "{server._ALT_PORT_SUGGESTION}"' in default
+
+    collided = server._untracked_server_guidance(
+        ["--port", str(server._ALT_PORT_SUGGESTION)]
+    )
+    assert f'"--port", "{server._ALT_PORT_SUGGESTION}"' not in collided
+    assert f'"--port", "{server._ALT_PORT_FALLBACK}"' in collided
+
+
+def test_restart_comfyui_port_guidance_reflects_the_requested_port(monkeypatch):
+    """The suggestion the caller actually sees is derived from their own args."""
+
+    def fake_stop():
+        raise server.ComfyCliError("No ComfyUI is running in the background.")
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("The 8189 port is already in use.")
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui(["--port", str(server._ALT_PORT_SUGGESTION)])
+
+    message = str(excinfo.value)
+    assert "The 8189 port is already in use." in message  # original kept verbatim
+    assert f'"--port", "{server._ALT_PORT_FALLBACK}"' in message
+
+
 def test_error_envelope_populates_structured_code(patched_run):
     """ComfyCliError from an error envelope carries the code as an attribute, not just text."""
     patched_run(

@@ -723,14 +723,111 @@ def _check_comfy_version() -> None:
 # stop failure ``restart_comfyui`` treats as benign (see its docstring).
 _NO_RECORDED_SERVER_CODE = "no_recorded_server"
 
+# The same marker as it appears rendered INSIDE a message (e.g. "comfy stop
+# failed [no_recorded_server]: none"), for the failures that carry it as text
+# without a structured ``code``. Word-bounded rather than a bare substring test
+# so a longer, unrelated code that merely starts with it — ``no_recorded_server_pid``
+# — is not read as this one. (``_`` is a word character, so ``\b`` does not fire
+# between "server" and "_pid".)
+_NO_RECORDED_SERVER_CODE_RE = re.compile(rf"\b{re.escape(_NO_RECORDED_SERVER_CODE)}\b")
+
+# The SAME condition as comfy-cli actually prints it in the common case: `comfy
+# stop` with no recorded background server prints "No ComfyUI is running in the
+# background." and exits 1 WITHOUT an envelope (comfy-cli 1.12.0 `cmdline.stop`),
+# so there is no structured ``code`` for the check above to see and the literal
+# marker string never appears in the message either. That gap is what stopped
+# ``restart_comfyui`` from recycling a server it did not background-launch — a
+# foreground ``comfy launch``, the desktop app, a manual ``python main.py``, or
+# nothing running at all — even though its docstring has always promised to
+# swallow "nothing to stop".
+#
+# Matched with a case-insensitive REGEX on the stable part of the phrase rather
+# than by equality against the exact sentence: this is comfy-cli's human output,
+# free to drift in capitalization, punctuation, or an inserted word ("No ComfyUI
+# *server* is running in the background"), and pinning the exact bytes is what
+# made the original check brittle in the first place. It is deliberately still
+# narrow — it requires BOTH halves, a negated ComfyUI subject AND "running in the
+# background", within one short clause — so it identifies "nothing was recorded to
+# stop" and nothing else. A permission error, a process that could not be killed,
+# or any other comfy-cli malfunction still re-raises: none of them claim no
+# ComfyUI is running.
+#
+# Two details keep "one short clause" honest, because the string it runs against
+# is the wrapper's ``stderr: … | stdout: …`` rendering of BOTH streams, not one
+# tidy sentence:
+#
+#   * The subject must OPEN a message, a line, or a field — start-of-string, a
+#     newline, the ``:`` / ``|`` the wrapper delimits streams with, or the
+#     ``...`` ``textutil._stream_tail`` prefixes a clipped capture with (a
+#     truncation marker is where a field begins, not prose). comfy-cli prints
+#     this sentence on its own; a hint buried mid-sentence in some other failure
+#     ("…, and ensure no ComfyUI is running in the background") is advice, not a
+#     report that nothing was recorded, and must not be swallowed.
+#   * The two halves must be joined by the GRAMMAR of the sentence, not merely
+#     sit near each other: at most two inserted words and an optional copula
+#     ("No ComfyUI *server is* running…", "No ComfyUI running…"). Because that
+#     gap is built from ``\s`` and ``\w`` only, it cannot cross ANY punctuation —
+#     so the halves can never be stitched out of two different streams
+#     (``… | stdout: …``), two different clauses ("No ComfyUI process could be
+#     stopped; it is still running in the background"), or across a conjunction
+#     or dash ("No ComfyUI process was stopped and remains running in the
+#     background"). Every one of those reports a stop that FAILED — the exact
+#     opposite case — and none of them survives this shape.
+#
+#     A character-class gap was tried first and is what this replaces: excluding
+#     punctuation one mark at a time is whack-a-mole, whereas admitting only
+#     word characters is closed by construction. Newlines still pass (``\s``
+#     covers them), so a Rich soft-wrap inside the sentence still matches — a
+#     wrap is not a clause break.
+_NO_RECORDED_SERVER_TEXT_RE = re.compile(
+    r"(?:\A|[\n|:]|\.\.\.)\s*no\s+comfyui\b"
+    r"(?:\s+\w+){0,2}(?:\s+(?:is|was))?\s+running\s+in\s+the\s+background\b",
+    re.IGNORECASE,
+)
+
 
 def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     """True when ``exc`` is comfy-cli's benign 'nothing recorded to stop' error.
 
     Prefers the structured ``code`` and falls back to the message so it also
-    recognizes the error when only the human-readable string carries the marker.
+    recognizes the error when only the human-readable string carries it — either
+    as the literal marker code, or as comfy-cli's own printed phrasing on the
+    bare non-zero exit that emits no envelope (see
+    :data:`_NO_RECORDED_SERVER_TEXT_RE`).
+
+    The text fallback searches the whole rendered message rather than a single
+    stream, and is deliberately NOT gated on ``exc.no_envelope``: the phrase
+    itself is the signal, and which reporting path comfy-cli happens to use for
+    it is exactly the detail that should not matter here. It genuinely varies —
+    comfy-cli prints this one through Rich, i.e. on STDOUT, while the wrapper's
+    no-envelope message renders stdout and stderr side by side, and an envelope
+    that carries the sentence but omits ``error.code`` is the same benign case.
+
+    BOTH text reads — the marker and the phrase — are gated on the two signals
+    that outrank anything in the message, because reading text over them would
+    let a real failure be swallowed:
+
+    * ``exc.code`` set to something else. comfy-cli told us structurally what
+      went wrong; text in the message does not overrule it (the
+      ``code == _NO_RECORDED_SERVER_CODE`` branch above already took the benign
+      case).
+    * ``exc.timed_out``. We killed the stop at our own deadline, so whatever it
+      printed before dying says nothing about whether a server is recorded — and
+      a stop that never finished is precisely the case ``restart_comfyui`` must
+      not relaunch over.
+
+    The gate therefore sits ABOVE both reads rather than between them: a
+    timed-out stop whose output happens to quote the marker is still a timeout.
     """
-    return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
+    if exc.code == _NO_RECORDED_SERVER_CODE:
+        return True
+    if exc.code is not None or exc.timed_out:
+        return False
+    message = str(exc)
+    return (
+        _NO_RECORDED_SERVER_CODE_RE.search(message) is not None
+        or _NO_RECORDED_SERVER_TEXT_RE.search(message) is not None
+    )
 
 
 def _strip_brackets(host: str) -> str:
@@ -3784,6 +3881,125 @@ def stop_comfyui() -> Any:
     return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
 
+# A launch that lost the port race. Matched on the phrasing rather than a fixed
+# sentence because comfy-cli and ComfyUI word it differently — "The 8188 port is
+# already in use." from comfy-cli's own preflight, "[Errno 48] Address already in
+# use" from the socket bind underneath — but it still requires the *subject* to
+# be a port or an address. A bare "already in use" also describes a locked model
+# file or a busy GPU, and the guidance below would then assert something false
+# ("Something is already serving this port") about a launch failure that has
+# nothing to do with the port. Failing to match only costs the explanation: the
+# original error is re-raised verbatim either way.
+#
+# The subject and the complaint must be joined grammatically, by the same
+# word-characters-only gap :data:`_NO_RECORDED_SERVER_TEXT_RE` uses and for the
+# same reason: it cannot cross punctuation, so a `port` mentioned in one rendered
+# stream (or in a `--port` echoed back from the command) can never be stitched to
+# an `already in use` belonging to some other failure in another — `stderr: ...
+# --port 8188 ... | stdout: CUDA device 0 is already in use` no longer matches.
+_PORT_IN_USE_TEXT_RE = re.compile(
+    r"\b(?:port|address)\b(?:\s+\w+){0,3}\s+already\s+in\s+use\b",
+    re.IGNORECASE,
+)
+
+# The alternate port the guidance below offers, and the fallback for the one case
+# where it would be useless advice: the caller already asked for it and that is
+# the launch that just lost the race.
+_ALT_PORT_SUGGESTION = 8189
+_ALT_PORT_FALLBACK = 8190
+
+
+def _requested_port(extra_args: list[str] | None) -> int | None:
+    """The ``--port`` the caller asked ``launch``/``restart`` to forward, if any.
+
+    Best-effort and read-only — it exists so the guidance below does not suggest
+    the very port that just failed. comfy-cli's own parser owns the real
+    interpretation of ``extra_args``; anything unparseable here simply yields
+    ``None`` and the default suggestion, never an error on top of an error.
+    """
+    if not extra_args:
+        return None
+    port: int | None = None
+    for index, arg in enumerate(extra_args):
+        if not isinstance(arg, str):
+            continue
+        if arg == "--port" and index + 1 < len(extra_args):
+            raw = extra_args[index + 1]
+        elif arg.startswith("--port="):
+            raw = arg[len("--port=") :]
+        else:
+            continue
+        # The LAST --port is the one an argument parser would act on, so it
+        # supersedes an earlier one whether or not it parses: a trailing
+        # `--port bad` means we do not know the requested port, not that the
+        # previous value is still in effect.
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            port = None
+            continue
+        port = value if 1 <= value <= 65535 else None
+    return port
+
+
+# Past this many characters the rendered relaunch stops being copy-pasteable
+# guidance and starts being noise inside an error message, so a long
+# ``extra_args`` falls back to the bare ``--port`` form.
+_MAX_SUGGESTED_ARGS_LEN = 120
+
+
+def _suggested_relaunch_args(extra_args: list[str] | None, port: int) -> list[str]:
+    """``extra_args`` with any ``--port`` replaced by ``port``.
+
+    Keeping the caller's OTHER flags matters because the guidance is meant to be
+    pasted: a user who failed with ``["--cpu", "--port", "8188"]`` and copies a
+    suggestion that dropped ``--cpu`` relaunches with different behavior than
+    they asked for.
+    """
+    kept: list[str] = []
+    skip_next = False
+    for arg in extra_args or []:
+        if skip_next:
+            skip_next = False
+            continue
+        if not isinstance(arg, str):
+            continue
+        if arg == "--port":
+            skip_next = True  # drop its value too
+            continue
+        if arg.startswith("--port="):
+            continue
+        kept.append(arg)
+    return [*kept, "--port", str(port)]
+
+
+def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
+    """Explain a port clash that followed a stop with nothing recorded to stop.
+
+    Together those two facts identify a server that is running but was not
+    started by comfy-cli, which the bare "port already in use" text does not
+    explain on its own. comfy-cli will not kill a process it did not start
+    (``stop_comfyui``'s ownership semantics), so the way out is the user's own
+    shell or a different port — this server exposes no stop-by-port/pid tool.
+    """
+    suggested = _ALT_PORT_SUGGESTION
+    if _requested_port(extra_args) == suggested:
+        suggested = _ALT_PORT_FALLBACK
+    rendered = json.dumps(_suggested_relaunch_args(extra_args, suggested))
+    if len(rendered) > _MAX_SUGGESTED_ARGS_LEN:
+        rendered = json.dumps(["--port", str(suggested)])
+    return (
+        "Something is already serving this port, but comfy-cli has no record of "
+        "launching it — so there was nothing for the restart to stop, and the fresh "
+        "launch then hit the occupied port. That server was almost certainly started "
+        "outside comfy-cli (a foreground `comfy launch`, the ComfyUI desktop app, or "
+        "`python main.py`), and comfy-cli only ever stops a server it started itself. "
+        "Either stop it the way you started it and retry, or bring one up alongside it "
+        f"on some free port, e.g. restart_comfyui(extra_args={rendered}). "
+        "`server_info` shows what is answering right now."
+    )
+
+
 @mcp.tool()
 def restart_comfyui(extra_args: list[str] | None = None) -> Any:
     """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
@@ -3797,17 +4013,40 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
 
     The stop step is best-effort ONLY for the benign "nothing to stop" case: if
     comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
-    started outside comfy-cli) it returns the ``no_recorded_server`` code, which
-    is swallowed so the restart still brings the server up. Any OTHER stop
-    failure (a process that couldn't be killed, a permission error, a comfy-cli
-    malfunction) is re-raised rather than silently masked behind the launch.
+    started outside comfy-cli) it reports that — as the ``no_recorded_server``
+    code, or as a bare non-zero exit printing "No ComfyUI is running in the
+    background" — and either form is swallowed so the restart still brings the
+    server up. Any OTHER stop failure (a process that couldn't be killed, a
+    permission error, a comfy-cli malfunction) is re-raised rather than silently
+    masked behind the launch.
+
+    When that benign stop is followed by a launch that loses the port, the port
+    error is re-raised with an explanation of the combined situation: a server is
+    running that comfy-cli did not start and therefore cannot stop.
     """
+    nothing_to_stop = False
     try:
         stop_comfyui()
     except ComfyCliError as exc:
         if not _is_no_recorded_server(exc):
             raise
-    return launch_comfyui(extra_args)
+        nothing_to_stop = True
+    try:
+        return launch_comfyui(extra_args)
+    except ComfyCliError as exc:
+        # Only when BOTH halves happened — nothing recorded to stop, then the
+        # port was taken anyway. A port clash after a stop that genuinely killed
+        # comfy-cli's own server is a different problem (a lingering process, a
+        # second ComfyUI), so it keeps its original message untouched.
+        if not nothing_to_stop or not _PORT_IN_USE_TEXT_RE.search(str(exc)):
+            raise
+        raise ComfyCliError(
+            f"{exc}\n\n{_untracked_server_guidance(extra_args)}",
+            code=exc.code,
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+            timed_out=exc.timed_out,
+        ) from exc
 
 
 # The exact targets `comfy update` accepts (comfy-cli `cmdline.py`:
