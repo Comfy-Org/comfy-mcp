@@ -147,13 +147,21 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
     ``encoding=`` pin was the last one) is a one-line edit instead of a sweep
     across every test file.
 
-    Each call is recorded as ``{"cmd", "env", "timeout", "encoding"}`` — a
-    superset of what any caller asserts on — BEFORE ``raises`` fires, so a test
+    Each call is recorded as ``{"cmd", "env", "timeout", "encoding", "stdin"}`` —
+    a superset of what any caller asserts on — BEFORE ``raises`` fires, so a test
     for a spawn that blows up can still see the argv it blew up on.
     """
 
-    def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
-        calls.append({"cmd": cmd, "env": env, "timeout": timeout, "encoding": encoding})
+    def fake(cmd, capture_output, stdin, text, encoding, timeout, env, check):  # noqa: ARG001
+        calls.append(
+            {
+                "cmd": cmd,
+                "env": env,
+                "timeout": timeout,
+                "encoding": encoding,
+                "stdin": stdin,
+            }
+        )
         if raises is not None:
             raise raises
         return subprocess.CompletedProcess(
@@ -203,6 +211,23 @@ def patched_run(monkeypatch):
 
 
 @pytest.fixture
+def no_spawn(monkeypatch):
+    """Assert no comfy-cli child is spawned — an input guard must refuse first.
+
+    The counterpart to :func:`patched_run` for the guard tests: they are not
+    about what the CLI returns but about never reaching it, and the point of a
+    pre-flight check is lost if the argv still goes out. Failing inside the fake
+    puts the assertion at the moment of the spawn, so a guard that stops
+    refusing surfaces as a spawn, not as a vague missing error.
+    """
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+
+@pytest.fixture
 def patched_plain_run(patched_run):
     """``setup(returncode=…, stdout=…, stderr=…) -> calls`` for the NO-envelope path.
 
@@ -221,10 +246,13 @@ def patched_plain_run(patched_run):
 class _FakeProc:
     """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
 
-    def __init__(self, cmd, stdout_text, stderr_text="", env=None, encoding=None):
+    def __init__(
+        self, cmd, stdout_text, stderr_text="", env=None, encoding=None, stdin=None
+    ):
         self.cmd = cmd
         self.env = env
         self.encoding = encoding
+        self.stdin_arg = stdin  # what `server` asked for, not a writable pipe
         self.stdout = io.StringIO(stdout_text)
         self.stderr = io.StringIO(stderr_text)
         self.returncode = 0
@@ -261,8 +289,8 @@ def patched_stream(monkeypatch):
     def setup(stdout_text: str) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
-        def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding)
+        def fake_popen(cmd, stdout, stderr, text, encoding, env, stdin=None, **kwargs):  # noqa: ARG001
+            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding, stdin=stdin)
             procs.append(proc)
             return proc
 

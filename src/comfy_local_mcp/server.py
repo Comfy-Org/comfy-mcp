@@ -50,6 +50,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -472,14 +473,91 @@ def _comfy_env() -> dict[str, str]:
       ``UnicodeEncodeError`` printing the UTF-8 catalog output and wedges, so the
       discovery tools present as a 60s timeout. UTF-8 is already the practical
       default on macOS/Linux, so this is a no-op there.
+    - ``GIT_TERMINAL_PROMPT=0`` / ``PIP_NO_INPUT=1`` — never let a child stop to
+      ask a question. This is an MCP **stdio** server, so the parent's stdin is
+      the JSON-RPC transport; both spawn sites therefore pass
+      ``stdin=DEVNULL`` (see ``_run_comfy_raw`` / ``_run_comfy_streaming``) so a
+      child can never read protocol bytes out from under the client. With stdin
+      closed, an interactive git/pip prompt could not be answered anyway, so
+      these two turn "block invisibly until the timeout" into an immediate,
+      legible failure — which matters most for ``update_comfyui``, whose
+      ``git pull`` + ``pip install`` can hit an uncached private remote and
+      whose 30-minute ceiling makes a silent hang very expensive.
+
+      Deliberately NOT set here: ``GIT_ASKPASS`` / ``SSH_ASKPASS``. A GUI or
+      keychain credential helper does not use stdin, so it still works with
+      stdin closed; overriding it would break private-remote updates that
+      succeed today.
+
+    ``PATH`` is the one inherited variable this rewrites rather than injects
+    alongside: the directory of the RESOLVED ``COMFY_BIN`` is guaranteed to be
+    on the child's ``PATH``, first. This exists because ``comfy launch
+    --background`` re-invokes ``comfy`` by BARE NAME via ``PATH`` (comfy-cli
+    1.12's ``launch.py`` spawns ``Popen(["comfy", ...])`` for the detached
+    process). Without the prepend, an absolute ``COMFY_BIN`` pointing outside
+    the inherited ``PATH`` — the normal state for an MCP server launched by a
+    GUI client on macOS — crashes background launch with ``FileNotFoundError:
+    'comfy'`` before ComfyUI is ever spawned, surfacing here as the opaque
+    ``comfy-cli returned no JSON (exit 1)`` (BE-4735). Prepending rather than
+    appending is deliberate: it also stops a stale second comfy install earlier
+    on the user's ``PATH`` from shadowing the intended one inside the child
+    (BE-3780). The entry is absolutized because comfy-cli ``os.chdir``s to the
+    workspace in the child before that re-invocation resolves, so a relative
+    entry would point somewhere else by then.
+
+    The rewrite is strictly additive and never *shrinks* the child's search
+    path: it is skipped outright when the directory cannot be expressed as a
+    PATH entry (it contains ``os.pathsep``), and an absent inherited ``PATH``
+    falls back to ``os.defpath`` — CPython's own fallback — rather than
+    resolving to the binary's directory alone.
+
+    What it cannot fix: comfy-cli re-invokes the literal name ``comfy``, so a
+    ``COMFY_BIN`` pointing at a RENAMED binary (``comfy-1.12``) still leaves the
+    child's bare-name lookup to find some other ``comfy`` — or none. Hoisting
+    the directory is still correct there (a sibling ``comfy`` symlink, the
+    common venv shape, then wins), but the residual case belongs upstream: only
+    comfy-cli can stop re-invoking by bare name.
     """
-    return {
+    env = {
         **os.environ,
         "COMFY_WHERE": "local",
         "COMFY_NO_WATCH": "1",
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PIP_NO_INPUT": "1",
     }
+    # `shutil.which` handles both shapes of COMFY_BIN: a value carrying a
+    # directory separator is checked as that exact file, a bare name is resolved
+    # against PATH. None means we could not locate the binary at all — skip
+    # silently rather than guess, since `_require_comfy_bin` already raises the
+    # curated missing-binary error ahead of any spawn and this must not add a
+    # second failure mode.
+    resolved = shutil.which(COMFY_BIN)
+    if resolved:
+        bin_dir = os.path.dirname(os.path.abspath(resolved))
+        # A directory whose own name contains `os.pathsep` cannot be expressed as
+        # a PATH entry — the separator has no escape in either POSIX or Windows
+        # PATH syntax, so writing it would split into fragments: the intended
+        # directory is lost AND the tail becomes a RELATIVE entry, which the
+        # child resolves against the workspace comfy-cli chdir'd into. Skip, the
+        # same silent no-op as an unresolvable binary: leaving the inherited
+        # PATH intact is strictly better than corrupting it.
+        if os.pathsep not in bin_dir:
+            # `None` (no PATH inherited at all) is NOT the same as `""`. With no
+            # PATH in the environment, CPython resolves a child's bare-name exec
+            # against `os.defpath` (see `os.get_exec_path`), so writing `bin_dir`
+            # alone would REPLACE that implicit default and strip the child of
+            # the `git` / `python` / `uv` helpers comfy-cli shells out to.
+            # Substituting `os.defpath` keeps the prepend strictly additive there
+            # too. An empty STRING is a deliberate "search nothing" and is left
+            # to mean exactly that.
+            inherited = env.get("PATH")
+            path = os.defpath if inherited is None else inherited
+            entries = path.split(os.pathsep) if path else []
+            if not entries or entries[0] != bin_dir:
+                env["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    return env
 
 
 class ComfyCliError(RuntimeError):
@@ -705,14 +783,111 @@ def _check_comfy_version() -> None:
 # stop failure ``restart_comfyui`` treats as benign (see its docstring).
 _NO_RECORDED_SERVER_CODE = "no_recorded_server"
 
+# The same marker as it appears rendered INSIDE a message (e.g. "comfy stop
+# failed [no_recorded_server]: none"), for the failures that carry it as text
+# without a structured ``code``. Word-bounded rather than a bare substring test
+# so a longer, unrelated code that merely starts with it — ``no_recorded_server_pid``
+# — is not read as this one. (``_`` is a word character, so ``\b`` does not fire
+# between "server" and "_pid".)
+_NO_RECORDED_SERVER_CODE_RE = re.compile(rf"\b{re.escape(_NO_RECORDED_SERVER_CODE)}\b")
+
+# The SAME condition as comfy-cli actually prints it in the common case: `comfy
+# stop` with no recorded background server prints "No ComfyUI is running in the
+# background." and exits 1 WITHOUT an envelope (comfy-cli 1.12.0 `cmdline.stop`),
+# so there is no structured ``code`` for the check above to see and the literal
+# marker string never appears in the message either. That gap is what stopped
+# ``restart_comfyui`` from recycling a server it did not background-launch — a
+# foreground ``comfy launch``, the desktop app, a manual ``python main.py``, or
+# nothing running at all — even though its docstring has always promised to
+# swallow "nothing to stop".
+#
+# Matched with a case-insensitive REGEX on the stable part of the phrase rather
+# than by equality against the exact sentence: this is comfy-cli's human output,
+# free to drift in capitalization, punctuation, or an inserted word ("No ComfyUI
+# *server* is running in the background"), and pinning the exact bytes is what
+# made the original check brittle in the first place. It is deliberately still
+# narrow — it requires BOTH halves, a negated ComfyUI subject AND "running in the
+# background", within one short clause — so it identifies "nothing was recorded to
+# stop" and nothing else. A permission error, a process that could not be killed,
+# or any other comfy-cli malfunction still re-raises: none of them claim no
+# ComfyUI is running.
+#
+# Two details keep "one short clause" honest, because the string it runs against
+# is the wrapper's ``stderr: … | stdout: …`` rendering of BOTH streams, not one
+# tidy sentence:
+#
+#   * The subject must OPEN a message, a line, or a field — start-of-string, a
+#     newline, the ``:`` / ``|`` the wrapper delimits streams with, or the
+#     ``...`` ``textutil._stream_tail`` prefixes a clipped capture with (a
+#     truncation marker is where a field begins, not prose). comfy-cli prints
+#     this sentence on its own; a hint buried mid-sentence in some other failure
+#     ("…, and ensure no ComfyUI is running in the background") is advice, not a
+#     report that nothing was recorded, and must not be swallowed.
+#   * The two halves must be joined by the GRAMMAR of the sentence, not merely
+#     sit near each other: at most two inserted words and an optional copula
+#     ("No ComfyUI *server is* running…", "No ComfyUI running…"). Because that
+#     gap is built from ``\s`` and ``\w`` only, it cannot cross ANY punctuation —
+#     so the halves can never be stitched out of two different streams
+#     (``… | stdout: …``), two different clauses ("No ComfyUI process could be
+#     stopped; it is still running in the background"), or across a conjunction
+#     or dash ("No ComfyUI process was stopped and remains running in the
+#     background"). Every one of those reports a stop that FAILED — the exact
+#     opposite case — and none of them survives this shape.
+#
+#     A character-class gap was tried first and is what this replaces: excluding
+#     punctuation one mark at a time is whack-a-mole, whereas admitting only
+#     word characters is closed by construction. Newlines still pass (``\s``
+#     covers them), so a Rich soft-wrap inside the sentence still matches — a
+#     wrap is not a clause break.
+_NO_RECORDED_SERVER_TEXT_RE = re.compile(
+    r"(?:\A|[\n|:]|\.\.\.)\s*no\s+comfyui\b"
+    r"(?:\s+\w+){0,2}(?:\s+(?:is|was))?\s+running\s+in\s+the\s+background\b",
+    re.IGNORECASE,
+)
+
 
 def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     """True when ``exc`` is comfy-cli's benign 'nothing recorded to stop' error.
 
     Prefers the structured ``code`` and falls back to the message so it also
-    recognizes the error when only the human-readable string carries the marker.
+    recognizes the error when only the human-readable string carries it — either
+    as the literal marker code, or as comfy-cli's own printed phrasing on the
+    bare non-zero exit that emits no envelope (see
+    :data:`_NO_RECORDED_SERVER_TEXT_RE`).
+
+    The text fallback searches the whole rendered message rather than a single
+    stream, and is deliberately NOT gated on ``exc.no_envelope``: the phrase
+    itself is the signal, and which reporting path comfy-cli happens to use for
+    it is exactly the detail that should not matter here. It genuinely varies —
+    comfy-cli prints this one through Rich, i.e. on STDOUT, while the wrapper's
+    no-envelope message renders stdout and stderr side by side, and an envelope
+    that carries the sentence but omits ``error.code`` is the same benign case.
+
+    BOTH text reads — the marker and the phrase — are gated on the two signals
+    that outrank anything in the message, because reading text over them would
+    let a real failure be swallowed:
+
+    * ``exc.code`` set to something else. comfy-cli told us structurally what
+      went wrong; text in the message does not overrule it (the
+      ``code == _NO_RECORDED_SERVER_CODE`` branch above already took the benign
+      case).
+    * ``exc.timed_out``. We killed the stop at our own deadline, so whatever it
+      printed before dying says nothing about whether a server is recorded — and
+      a stop that never finished is precisely the case ``restart_comfyui`` must
+      not relaunch over.
+
+    The gate therefore sits ABOVE both reads rather than between them: a
+    timed-out stop whose output happens to quote the marker is still a timeout.
     """
-    return exc.code == _NO_RECORDED_SERVER_CODE or _NO_RECORDED_SERVER_CODE in str(exc)
+    if exc.code == _NO_RECORDED_SERVER_CODE:
+        return True
+    if exc.code is not None or exc.timed_out:
+        return False
+    message = str(exc)
+    return (
+        _NO_RECORDED_SERVER_CODE_RE.search(message) is not None
+        or _NO_RECORDED_SERVER_TEXT_RE.search(message) is not None
+    )
 
 
 def _strip_brackets(host: str) -> str:
@@ -858,6 +1033,14 @@ def _run_comfy_raw(
         proc = subprocess.run(
             cmd,
             capture_output=True,
+            # This process speaks JSON-RPC over stdio, so the parent's stdin IS
+            # the protocol channel. A child that inherits it (the subprocess
+            # default) can consume request bytes the client sent us — silently
+            # corrupting the session — or block on a prompt nobody can answer.
+            # No comfy-cli invocation here is interactive, so close it outright;
+            # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
+            # child that WOULD have prompted fails fast instead of hanging.
+            stdin=subprocess.DEVNULL,
             text=True,
             # Pin the parent-side decode to UTF-8 so it matches what the child
             # is forced to emit (_comfy_env). Without this, text=True decodes
@@ -1415,6 +1598,9 @@ async def _run_comfy_streaming(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        # Same reason as the plain path: never let a child inherit the stdio
+        # transport's stdin and eat JSON-RPC request bytes. See _run_comfy_raw.
+        stdin=subprocess.DEVNULL,
         text=True,
         # Match the child's forced UTF-8 output (see _comfy_env); otherwise
         # readline()/stderr.read() decode with the parent locale (cp1252 on
@@ -1897,9 +2083,12 @@ def server_info() -> Any:
     node, or template seems missing, tell the user to update FIRST
     (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
     before concluding the catalog lacks it; silent staleness is the usual
-    culprit. The probe is best-effort and degrades two ways — ``server_info``
-    itself still succeeds either way. On a comfy-cli that lacks the ``outdated``
-    verb (no release through 1.12.0 has it), ``freshness`` is
+    culprit. The ``update_comfyui`` tool runs that update from here
+    (``target="comfy"`` for core, ``target="all"`` for the node packs; the
+    per-pack form is terminal-only), and ``restart_comfyui`` afterwards is what
+    makes the updated code take effect. The probe is best-effort and degrades
+    two ways — ``server_info`` itself still succeeds either way. On a comfy-cli
+    that lacks the ``outdated`` verb (no release through 1.12.0 has it), ``freshness`` is
     ``{"error": "freshness unavailable: ...", "unsupported": true}``:
     ``unsupported: true`` means SKIP staleness advice entirely and do NOT tell
     the user anything is broken — nothing failed, this comfy-cli just cannot
@@ -2041,6 +2230,24 @@ async def run_workflow(
     rather than raising this bound. On the waiting path it is clamped to a sane
     maximum, and a non-positive / NaN value is rejected outright; ``wait=False``
     ignores it entirely (that submit runs on its own fixed budget).
+
+    CAUTION — a workflow whose nodes request a huge TOTAL allocation (e.g. an
+    ``EmptyImage`` / ``EmptyLatentImage`` with a very large width x height x
+    ``batch_size``) can pass ALL validation — every input is within its declared
+    range, and no layer estimates memory — and then crash the whole local
+    ComfyUI process mid-run when the OS kills it on the allocation. When that
+    happens there is no node-level error to fetch: this tool surfaces a
+    connection-loss / timeout error, and subsequent ``job_status`` /
+    ``get_execution_error`` calls report ``server_not_running`` (both query the
+    live server, which is gone). The evidence is still on disk — ``get_logs``
+    reads comfy-cli's captured log file rather than the server, so it keeps
+    working across the crash whenever the server was started with
+    ``launch_comfyui``; call it to confirm the kill. If you get
+    ``server_not_running`` right after running a workflow with large
+    image/latent dimensions or batch sizes, assume that workflow killed the
+    server: reduce width/height/``batch_size``, and relaunch with
+    ``launch_comfyui`` (or ``restart_comfyui`` if a stale server record remains)
+    before retrying.
 
     Partner-API nodes (Seedream/Veo/Kling/Gemini/…) need a Comfy credential in
     the server's environment (``COMFY_API_KEY`` in the client registration). A
@@ -3185,6 +3392,13 @@ def job_status(prompt_id: str) -> Any:
 
     Wraps ``comfy jobs status <prompt_id>``. Returns the job status and, when
     finished, its output references. Poll this after ``run_workflow(wait=False)``.
+
+    A ``server_not_running`` error from this tool immediately after a
+    ``run_workflow`` most likely means that run crashed the server (commonly an
+    out-of-memory kill from an oversized allocation) — this tool queries the
+    live server, so it has no history left to read, but ``get_logs`` reads the
+    captured log file and still works across the crash; check it, then relaunch
+    the server and reduce the workflow's allocation sizes before retrying.
     """
     prompt_id = _guard_prompt_id(prompt_id)
     return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
@@ -3273,6 +3487,13 @@ def get_execution_error(prompt_id: str) -> Any:
     On a healthy prompt (completed / queued / running — no ``error``) it returns
     ``{"prompt_id", "status", "error": None}`` rather than raising, so it is safe
     to call speculatively.
+
+    A ``server_not_running`` error from this tool immediately after a
+    ``run_workflow`` most likely means that run crashed the server (commonly an
+    out-of-memory kill from an oversized allocation) — this tool queries the
+    live server, so it has no history left to read, but ``get_logs`` reads the
+    captured log file and still works across the crash; check it, then relaunch
+    the server and reduce the workflow's allocation sizes before retrying.
     """
     prompt_id = _guard_prompt_id(prompt_id)
 
@@ -3695,6 +3916,23 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     in review upstream). On affected comfy-cli versions the crash surfaces here
     as a clean :class:`ComfyCliError` from the error envelope. Remove this note
     once the upstream fix ships.
+
+    NOTE (second upstream caveat, handled): ``comfy launch --background``
+    re-invokes ``comfy`` by BARE NAME via ``PATH`` to spawn the detached
+    process, so it needs to find itself on the child's ``PATH`` no matter how
+    this server was told to call it. This server therefore guarantees the
+    resolved ``COMFY_BIN``'s directory is first on the child ``PATH`` — see
+    :func:`_comfy_env`. Before that guarantee, an absolute ``COMFY_BIN``
+    pointing outside the inherited ``PATH`` (an MCP server started by a GUI
+    client plus a venv-installed comfy-cli) failed HERE, and only here, as
+    ``comfy-cli returned no JSON (exit 1)`` with a traceback whose first visible
+    frame is ``comfy_cli/tracking.py:334``. That frame is a red herring — it is
+    the ``track_command`` passthrough wrapper, not telemetry (typer's pretty
+    exceptions hide the frames above it, and the crash reproduces with
+    ``DO_NOT_TRACK=1``); the real exception is ``FileNotFoundError: 'comfy'``
+    from the inner re-invocation. See BE-4735. The upstream fix — re-invoking
+    via ``sys.executable -m comfy_cli`` instead of a bare name — is still
+    desirable, but this server no longer depends on it.
     """
     args = ["launch", "--background"]
     if extra_args:
@@ -3720,6 +3958,125 @@ def stop_comfyui() -> Any:
     return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
 
+# A launch that lost the port race. Matched on the phrasing rather than a fixed
+# sentence because comfy-cli and ComfyUI word it differently — "The 8188 port is
+# already in use." from comfy-cli's own preflight, "[Errno 48] Address already in
+# use" from the socket bind underneath — but it still requires the *subject* to
+# be a port or an address. A bare "already in use" also describes a locked model
+# file or a busy GPU, and the guidance below would then assert something false
+# ("Something is already serving this port") about a launch failure that has
+# nothing to do with the port. Failing to match only costs the explanation: the
+# original error is re-raised verbatim either way.
+#
+# The subject and the complaint must be joined grammatically, by the same
+# word-characters-only gap :data:`_NO_RECORDED_SERVER_TEXT_RE` uses and for the
+# same reason: it cannot cross punctuation, so a `port` mentioned in one rendered
+# stream (or in a `--port` echoed back from the command) can never be stitched to
+# an `already in use` belonging to some other failure in another — `stderr: ...
+# --port 8188 ... | stdout: CUDA device 0 is already in use` no longer matches.
+_PORT_IN_USE_TEXT_RE = re.compile(
+    r"\b(?:port|address)\b(?:\s+\w+){0,3}\s+already\s+in\s+use\b",
+    re.IGNORECASE,
+)
+
+# The alternate port the guidance below offers, and the fallback for the one case
+# where it would be useless advice: the caller already asked for it and that is
+# the launch that just lost the race.
+_ALT_PORT_SUGGESTION = 8189
+_ALT_PORT_FALLBACK = 8190
+
+
+def _requested_port(extra_args: list[str] | None) -> int | None:
+    """The ``--port`` the caller asked ``launch``/``restart`` to forward, if any.
+
+    Best-effort and read-only — it exists so the guidance below does not suggest
+    the very port that just failed. comfy-cli's own parser owns the real
+    interpretation of ``extra_args``; anything unparseable here simply yields
+    ``None`` and the default suggestion, never an error on top of an error.
+    """
+    if not extra_args:
+        return None
+    port: int | None = None
+    for index, arg in enumerate(extra_args):
+        if not isinstance(arg, str):
+            continue
+        if arg == "--port" and index + 1 < len(extra_args):
+            raw = extra_args[index + 1]
+        elif arg.startswith("--port="):
+            raw = arg[len("--port=") :]
+        else:
+            continue
+        # The LAST --port is the one an argument parser would act on, so it
+        # supersedes an earlier one whether or not it parses: a trailing
+        # `--port bad` means we do not know the requested port, not that the
+        # previous value is still in effect.
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            port = None
+            continue
+        port = value if 1 <= value <= 65535 else None
+    return port
+
+
+# Past this many characters the rendered relaunch stops being copy-pasteable
+# guidance and starts being noise inside an error message, so a long
+# ``extra_args`` falls back to the bare ``--port`` form.
+_MAX_SUGGESTED_ARGS_LEN = 120
+
+
+def _suggested_relaunch_args(extra_args: list[str] | None, port: int) -> list[str]:
+    """``extra_args`` with any ``--port`` replaced by ``port``.
+
+    Keeping the caller's OTHER flags matters because the guidance is meant to be
+    pasted: a user who failed with ``["--cpu", "--port", "8188"]`` and copies a
+    suggestion that dropped ``--cpu`` relaunches with different behavior than
+    they asked for.
+    """
+    kept: list[str] = []
+    skip_next = False
+    for arg in extra_args or []:
+        if skip_next:
+            skip_next = False
+            continue
+        if not isinstance(arg, str):
+            continue
+        if arg == "--port":
+            skip_next = True  # drop its value too
+            continue
+        if arg.startswith("--port="):
+            continue
+        kept.append(arg)
+    return [*kept, "--port", str(port)]
+
+
+def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
+    """Explain a port clash that followed a stop with nothing recorded to stop.
+
+    Together those two facts identify a server that is running but was not
+    started by comfy-cli, which the bare "port already in use" text does not
+    explain on its own. comfy-cli will not kill a process it did not start
+    (``stop_comfyui``'s ownership semantics), so the way out is the user's own
+    shell or a different port — this server exposes no stop-by-port/pid tool.
+    """
+    suggested = _ALT_PORT_SUGGESTION
+    if _requested_port(extra_args) == suggested:
+        suggested = _ALT_PORT_FALLBACK
+    rendered = json.dumps(_suggested_relaunch_args(extra_args, suggested))
+    if len(rendered) > _MAX_SUGGESTED_ARGS_LEN:
+        rendered = json.dumps(["--port", str(suggested)])
+    return (
+        "Something is already serving this port, but comfy-cli has no record of "
+        "launching it — so there was nothing for the restart to stop, and the fresh "
+        "launch then hit the occupied port. That server was almost certainly started "
+        "outside comfy-cli (a foreground `comfy launch`, the ComfyUI desktop app, or "
+        "`python main.py`), and comfy-cli only ever stops a server it started itself. "
+        "Either stop it the way you started it and retry, or bring one up alongside it "
+        f"on some free port, e.g. restart_comfyui(extra_args={rendered}). "
+        "`server_info` shows what is answering right now."
+    )
+
+
 @mcp.tool()
 def restart_comfyui(extra_args: list[str] | None = None) -> Any:
     """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
@@ -3733,17 +4090,144 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
 
     The stop step is best-effort ONLY for the benign "nothing to stop" case: if
     comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
-    started outside comfy-cli) it returns the ``no_recorded_server`` code, which
-    is swallowed so the restart still brings the server up. Any OTHER stop
-    failure (a process that couldn't be killed, a permission error, a comfy-cli
-    malfunction) is re-raised rather than silently masked behind the launch.
+    started outside comfy-cli) it reports that — as the ``no_recorded_server``
+    code, or as a bare non-zero exit printing "No ComfyUI is running in the
+    background" — and either form is swallowed so the restart still brings the
+    server up. Any OTHER stop failure (a process that couldn't be killed, a
+    permission error, a comfy-cli malfunction) is re-raised rather than silently
+    masked behind the launch.
+
+    When that benign stop is followed by a launch that loses the port, the port
+    error is re-raised with an explanation of the combined situation: a server is
+    running that comfy-cli did not start and therefore cannot stop.
     """
+    nothing_to_stop = False
     try:
         stop_comfyui()
     except ComfyCliError as exc:
         if not _is_no_recorded_server(exc):
             raise
-    return launch_comfyui(extra_args)
+        nothing_to_stop = True
+    try:
+        return launch_comfyui(extra_args)
+    except ComfyCliError as exc:
+        # Only when BOTH halves happened — nothing recorded to stop, then the
+        # port was taken anyway. A port clash after a stop that genuinely killed
+        # comfy-cli's own server is a different problem (a lingering process, a
+        # second ComfyUI), so it keeps its original message untouched.
+        if not nothing_to_stop or not _PORT_IN_USE_TEXT_RE.search(str(exc)):
+            raise
+        raise ComfyCliError(
+            f"{exc}\n\n{_untracked_server_guidance(extra_args)}",
+            code=exc.code,
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+            timed_out=exc.timed_out,
+        ) from exc
+
+
+# The exact targets `comfy update` accepts (comfy-cli `cmdline.py`:
+# `update(target: str = typer.Argument("comfy", help="[all|comfy|cli]"))`, which
+# refuses anything else with `Invalid target: …` and exit 1). Mirrored here so an
+# unrecognized value is named and rejected BEFORE a subprocess is spawned,
+# instead of surfacing as a bare non-zero exit from the CLI.
+_UPDATE_TARGETS = ("all", "comfy", "cli")
+
+# `comfy update` can pull a git repo and then `pip install -r requirements.txt`
+# (multi-GB torch wheels), or walk every installed custom node pack for
+# `target="all"` — far longer than `launch_comfyui`'s 180s boot. Use the same
+# generous ceiling as `download_model`, whose work is the same shape (a large
+# network fetch that must not be killed halfway).
+_UPDATE_TIMEOUT = 1800.0
+
+# Only one `comfy update` may be in flight per server process. FastMCP dispatches
+# sync tools onto a worker thread pool, so a client is free to issue a second
+# `update_comfyui` while the first is still running — and both would drive `git`
+# and `pip` against the SAME workspace and Python environment at once (a fight
+# over `index.lock`, or two installers writing the same `site-packages`), which
+# can leave a partially-installed ComfyUI. Held for the whole subprocess.
+_UPDATE_LOCK = threading.Lock()
+
+
+@mcp.tool()
+def update_comfyui(target: str = "comfy") -> Any:
+    """Update the LOCAL install — ComfyUI core, the custom node packs, or comfy-cli itself.
+
+    Thin passthrough to ``comfy update <target>``. The three targets are
+    comfy-cli's own, and they do different things:
+
+    * ``"comfy"`` (default) — updates **ComfyUI core** in the selected workspace
+      (``git pull`` + reinstall of its ``requirements.txt``).
+    * ``"all"`` — updates the installed **custom node packs** (via the node
+      manager), not core.
+    * ``"cli"`` — updates **comfy-cli** itself, the binary this whole server
+      shells out to.
+
+    ``server_info``'s ``freshness`` block is the signal that motivates calling
+    this: ``freshness.core.outdated`` true means the core install is stale (call
+    with ``target="comfy"``), and any ``packs`` row with ``outdated: true`` means
+    node packs are stale (``target="all"``, or the narrower ``comfy node update
+    <pack>`` in a terminal, which this server does not wrap). If ``freshness``
+    reports ``unsupported: true``, that comfy-cli simply cannot answer the
+    staleness question — nothing is broken and there is nothing here to act on.
+
+    **This can take a while.** A core update re-installs requirements (torch
+    wheels are multi-GB) and an ``"all"`` update walks every installed pack, so
+    the timeout is a generous 30 minutes — much longer than ``launch_comfyui``'s
+    180s boot. Expect the call to block for minutes, not seconds.
+
+    **Restart afterwards.** A running ComfyUI keeps executing the code it loaded
+    at boot, so an update does not take effect until the server is restarted —
+    call ``restart_comfyui`` once this returns (``target="cli"`` updates the
+    comfy-cli binary rather than ComfyUI, so no restart is needed for that one).
+
+    ``target`` is validated against comfy-cli's accepted set before anything is
+    spawned; an unrecognized value raises a :class:`ComfyCliError` naming the
+    allowed targets, and only the matched value — never the caller's raw string
+    — is forwarded on the command line.
+
+    **One update at a time.** An update rewrites the ComfyUI git checkout and
+    reinstalls into its Python environment, so a second concurrent call would
+    race the first over ``index.lock`` / ``site-packages`` and can leave a
+    half-installed workspace. A call made while another update is in flight is
+    refused immediately with a :class:`ComfyCliError` saying so, rather than
+    queued behind a job that may run for half an hour. Note this serializes
+    updates against each other only — do not call ``restart_comfyui`` (or
+    ``launch_comfyui``) while an update is running; wait for it to return, which
+    is the documented order anyway.
+
+    Like ``launch_comfyui`` / ``stop_comfyui``, ``comfy update`` prints human
+    text and exits 0 without a JSON envelope, so success returns a synthesized
+    ``{"ok": True, ...}`` payload carrying that text. A failed update (a dirty
+    git tree, a broken requirements install, an unreachable network) exits
+    non-zero and still raises a :class:`ComfyCliError`.
+    """
+    normalized = target.strip().lower() if isinstance(target, str) else ""
+    if normalized not in _UPDATE_TARGETS:
+        raise ComfyCliError(
+            f"invalid update target: {target!r} — expected one of "
+            f"{', '.join(repr(name) for name in _UPDATE_TARGETS)} "
+            "('comfy' = ComfyUI core, 'all' = installed custom node packs, "
+            "'cli' = comfy-cli itself)."
+        )
+    # Refuse rather than queue: blocking would park a FastMCP worker thread for
+    # up to 30 minutes behind an update the caller cannot see, and present as a
+    # hang. Failing immediately names what is happening and leaves retrying to
+    # the caller. Acquired AFTER target validation so a bad target is still
+    # rejected while an update is running.
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        raise ComfyCliError(
+            "an update is already running in this server; `comfy update` "
+            "mutates the ComfyUI git checkout and Python environment, so two "
+            "at once can corrupt the install. Wait for the in-flight update to "
+            "finish (up to 30 minutes for a core update) and call again."
+        )
+    try:
+        # Forward `normalized` (a member of `_UPDATE_TARGETS`), not `target`: the
+        # caller's raw string never reaches argv.
+        return _run_comfy("update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True)
+    finally:
+        _UPDATE_LOCK.release()
 
 
 # comfy-cli's `logs` reports this error code when no persisted log file exists
@@ -4514,6 +4998,11 @@ def validate_workflow(workflow_path: str) -> Any:
        and the result is vacuously valid. Ignore those ``non_node_key``
        warnings (do not "fix" the file); export API format (or rely on
        ``run_workflow``'s auto-conversion) if validation fidelity matters.
+    4. No memory/allocation estimate — a graph whose individual inputs are all
+       in-range can still request an impossible TOTAL allocation (e.g. 16384 x
+       16384 at ``batch_size`` 64, roughly 206 GB) and will validate clean here
+       AND on the server, then OOM-kill the ComfyUI process at execution time.
+       See ``run_workflow``'s CAUTION for how that failure reads.
 
     Treat ``valid:true`` as necessary-not-sufficient and rely on
     ``run_workflow`` errors for final authority.
@@ -4609,6 +5098,145 @@ def set_workflow_slot(
     return _run_comfy(*args, timeout=60.0)
 
 
+# A slot entry's value portion is fed to `json.loads` by comfy-cli, so the two
+# examples that make the contract concrete: the mechanical shape, and the one
+# that trips callers up — a string value containing a comma, which is ONLY a
+# single value when it is JSON-quoted.
+_SLOT_VALUE_EXAMPLE = "3.seed=[1,2,3]"
+_SLOT_QUOTED_EXAMPLE = '6.text=["a lighthouse at dawn, oil painting", "a cabin"]'
+
+# Past this, a slot cannot reach comfy-cli at all: Linux caps a SINGLE argv
+# entry at `MAX_ARG_STRLEN` (32 pages = 128 KiB) regardless of the roomier total
+# `ARG_MAX`, so the spawn fails before comfy-cli parses anything. That makes this
+# a bound the pre-check can honor without inventing a policy — it is the engine's
+# own reachability limit, not a taste call about sweep size. The kernel counts
+# BYTES, so this must be measured after encoding: a value of multibyte
+# characters is several times its character count on the wire.
+_MAX_PRECHECKED_SLOT_BYTES = 128 * 1024
+
+
+def _clip_for_error(text: str) -> str:
+    """Render a caller-supplied fragment for an error message, bounded.
+
+    A slot's value list is caller-sized — a sweep over long prompts is KBs of
+    text — and the whole point of naming the offending entry is lost if the
+    message it rides in is unreadable. Same per-field cap the envelope errors use.
+
+    This quotes the fragment itself rather than leaving that to an ``!r`` at the
+    call site, because the cap has to apply to what is actually RENDERED. ``repr``
+    expands a control or non-printable character into a 4-to-10-character escape
+    (``\\x00``, ``\\uXXXX``, ``\\U000XXXXX``), so clipping the raw text first and
+    quoting after would let 500 such characters land as ~2000+ in the message —
+    the bound would read as if it held while the field blew past it. Clipping the
+    rendered form is what :func:`_render_error_details` does too.
+
+    The source text is sliced BEFORE ``repr`` so an MB-sized value never
+    materializes an expanded copy just to have it thrown away. That is safe for
+    the characters shown: every source character contributes at least one
+    character to the repr, so the escaping of the retained prefix cannot depend
+    on anything past the cap. The one thing it does change is ``repr``'s choice
+    of surrounding quote — it switches to double quotes for a string containing
+    an apostrophe and no double quote, and that decision is now made over the
+    slice, so an apostrophe past the cap flips it. Cosmetic, in a preview that
+    is already truncated. The ellipsis is counted inside the cap, so the
+    returned field never exceeds it.
+    """
+    rendered = repr(text[:_MAX_ERROR_FIELD_CHARS])
+    if len(rendered) <= _MAX_ERROR_FIELD_CHARS:
+        return rendered
+    return rendered[: _MAX_ERROR_FIELD_CHARS - 1] + "…"
+
+
+def _reject_non_json_array_slot(index: int, slot: str) -> None:
+    """Reject a ``vary_workflow`` slot whose value is not a JSON array.
+
+    comfy-cli splits each ``--slot`` entry on its first ``=`` and runs the value
+    portion through :func:`json.loads`, *falling back to the literal string* when
+    that fails — then rejects anything that did not parse to a list. So the
+    natural first attempt at a text sweep,
+    ``6.text=[a lighthouse at dawn, oil painting]``, is not a two-element list at
+    all: it is invalid JSON, comes back as one bare string, and dies as
+    ``value must be a JSON array (got str)`` with nothing pointing at the missing
+    quotes.
+
+    Checking here rather than passing the failure through buys two things. The
+    message can name WHICH entry was malformed and show the quoted form that
+    fixes it (comfy-cli sees only the value it already failed to parse), and the
+    check lands before the subprocess: ``comfy workflow vary`` loads the file and
+    fetches ``object_info`` from the live ComfyUI *before* it parses ``--slot``,
+    so with the server down a malformed slot surfaces as a connection failure
+    that hides the real mistake entirely.
+
+    This mirrors comfy-cli's own parse exactly — ``json.loads`` on the value
+    portion, accept only a ``list`` — so it can only refuse input comfy-cli would
+    also refuse — with one deliberate exception. A failure that is a property of
+    the PARSING PROCESS rather than of the input (recursion depth, an interpreter
+    limit like ``sys.get_int_max_str_digits``) says nothing about how comfy-cli's
+    own fresh subprocess will fare, so those are handed to the engine untouched
+    rather than guessed at. Only a genuine syntax error — a
+    :class:`json.JSONDecodeError` — is refused here.
+
+    A value too long to survive ``execve`` abstains the same way: see
+    :data:`_MAX_PRECHECKED_SLOT_BYTES`. That keeps the parse — the one piece of
+    real work this thin wrapper does in-process rather than in the disposable
+    subprocess — bounded by what the engine could actually have received.
+    """
+    fix = (
+        f"quote each value as JSON — e.g. '{_SLOT_VALUE_EXAMPLE}', or "
+        f"'{_SLOT_QUOTED_EXAMPLE}' when a value contains a comma or spaces "
+        "(an unquoted comma splits the value, and unquoted text is not JSON)"
+    )
+    if "=" not in slot:
+        raise ComfyCliError(
+            f"invalid slots[{index}] {_clip_for_error(slot)}: expected an "
+            f"'ADDR=[v1,v2,...]' string whose value is a JSON array — {fix}"
+        )
+    # Measured over the whole entry, encoded: `slot` IS the argv string, and the
+    # kernel's limit is in bytes. `surrogatepass` because a lone surrogate can
+    # arrive over the wire and this guard must not be the thing that raises.
+    if len(slot.encode("utf-8", "surrogatepass")) > _MAX_PRECHECKED_SLOT_BYTES:
+        # Too long to survive `execve` (see `_MAX_PRECHECKED_SLOT_BYTES`), so
+        # there is no verdict worth computing: the spawn fails before comfy-cli
+        # reads it either way. Parsing it anyway would do real work in the
+        # long-lived parent for a value that cannot land — allocating an object
+        # graph several times its size, and on an interpreter without
+        # `sys.get_int_max_str_digits` converting a multi-million-digit literal
+        # in quadratic time. Abstaining costs nothing: this is the same
+        # engine-decides path the other unparseable cases take, so it cannot
+        # over-reject.
+        return
+    addr, _, raw = slot.partition("=")
+    # Clipped like every other caller-supplied fragment here: the address is the
+    # portion BEFORE the first `=` and is just as caller-sized as the value, so
+    # echoing it raw would hand back a multi-KB message and defeat the bound.
+    addr = _clip_for_error(addr.strip())
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, but {_clip_for_error(raw)} is not valid JSON — {fix}"
+        ) from None
+    except (ValueError, RecursionError):
+        # NOT a syntax error — the input is well-formed JSON that THIS
+        # interpreter declined to build: nesting deeper than the stack left us
+        # (`RecursionError`), or an integer literal over
+        # `sys.get_int_max_str_digits` (a plain `ValueError`, not a
+        # `JSONDecodeError`, since 3.11). Both are limits of the process doing
+        # the parsing, and this one parses several frames down from the MCP
+        # handler with whatever limits this interpreter was started with, while
+        # comfy-cli parses in a fresh subprocess of its own. Refusing here would
+        # reject values the engine accepts and break the invariant above, so
+        # abstain and let the engine's parse be the verdict.
+        return
+    if not isinstance(value, list):
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, got {type(value).__name__} — wrap a single value in a "
+            f"one-element array ('3.seed=[42]'), and {fix}"
+        )
+
+
 @mcp.tool()
 def vary_workflow(
     workflow_path: str, slots: list[str], out_dir: str | None = None
@@ -4618,9 +5246,26 @@ def vary_workflow(
     Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``.
     ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
     ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
-    so every list MUST be the same length — e.g. ``["3.seed=[1,2,3]",
-    "6.text=[cat,dog,fish]"]`` yields three variants pairing seed 1/cat, 2/dog,
-    3/fish.
+    so every list MUST be the same length — e.g. ``['3.seed=[1,2,3]',
+    '6.text=["a cat", "a dog", "a fish"]']`` yields three variants pairing seed
+    1/cat, 2/dog, 3/fish.
+
+    **Each entry's value portion (everything after the first ``=``) must be
+    valid JSON, and must parse to a JSON ARRAY.** That is the whole gotcha, and
+    it bites hardest on prompts: a value containing a comma or spaces has to be
+    JSON-quoted, or it is not a list at all. Concretely::
+
+        # WRONG — not valid JSON; comfy-cli reads it as one bare string and
+        # fails with `value must be a JSON array (got str)`
+        ["1.prompt=[a lighthouse at dawn, oil painting, a cabin at dusk]"]
+
+        # RIGHT — each value is a JSON string, so the commas INSIDE a value
+        # stay part of that value
+        ['1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]']
+
+    Numbers and booleans need no quoting (``"3.seed=[1,2,3]"``), and a single
+    value still needs its array (``"3.seed=[42]"``, not ``"3.seed=42"``). This
+    tool pre-checks each entry and names the offending one before shelling out.
 
     With ``out_dir`` unset (default) comfy-cli emits the variants as NDJSON to
     stdout; set ``out_dir`` to instead write ``<stem>_<N>.json`` files there (and
@@ -4642,13 +5287,16 @@ def vary_workflow(
     )
     _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
-    for slot in slots:
+    for index, slot in enumerate(slots):
         _reject_option_like(
             "slot",
             slot,
             expected="an 'ADDR=[v1,v2,...]' string (e.g. '3.seed=[1,2,3]')",
         )
         _reject_nul("slot", slot)
+        # After the argv guards, not before: a dash-leading or NUL-bearing entry
+        # is an argv problem first, and its named error is the more useful one.
+        _reject_non_json_array_slot(index, slot)
         args += ["--slot", slot]
     if out_dir:
         _reject_option_like(

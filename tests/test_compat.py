@@ -336,7 +336,7 @@ def patched_env_then_outdated(monkeypatch):
     def setup(replies: list) -> list[dict]:
         calls: list[dict] = []
 
-        def fake(cmd, capture_output, text, encoding, timeout, env, check):  # noqa: ARG001
+        def fake(cmd, capture_output, stdin, text, encoding, timeout, env, check):  # noqa: ARG001
             calls.append({"cmd": cmd, "timeout": timeout})
             reply = replies[len(calls) - 1]
             if isinstance(reply, BaseException):

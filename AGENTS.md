@@ -94,7 +94,11 @@ ruff format --check .     # format check (run `ruff format .` to fix)
 ```
 
 CI (`.github/workflows/ci.yml`) runs all three on Python 3.10 and 3.14 for every
-PR. Get them green locally before pushing.
+PR. Get them green locally before pushing. The workflow carries no path filter
+on `pull_request` — the `test (py3.10)` / `test (py3.14)` contexts are required
+by branch protection, so they have to report on every PR — and it decides
+internally whether to run the suite, no-opping when a PR changes only Markdown.
+Do not add a `paths` / `paths-ignore` filter to that trigger.
 
 ## Tests
 

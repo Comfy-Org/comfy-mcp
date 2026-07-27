@@ -86,7 +86,10 @@ Cloud MCP** — comfy-cli is the engine.
   clients launch the server with their own environment, which often does **not** include your
   shell's `PATH` — so if `comfy` lives in a virtualenv or a non-standard location, set
   `COMFY_BIN` to its absolute path (e.g. `/path/to/venv/bin/comfy`). Every client example below
-  shows where it goes.
+  shows where it goes. Setting it is sufficient on its own — you do **not** also have to put
+  that directory on the client's `PATH`. The server prepends the resolved binary's directory to
+  the `PATH` it hands comfy-cli, because some comfy-cli commands (notably the background
+  `launch`) re-invoke `comfy` by name and have to be able to find themselves.
 - **`COMFY_API_KEY` (optional — needed only for partner-API nodes).** Workflows that use
   partner-API nodes (Seedream / Seedance / Nano Banana / Gemini / Veo / Kling / …) need a Comfy
   credential, and — exactly like `COMFY_BIN` — an MCP client launches the server with its own
@@ -225,9 +228,9 @@ reports the configured target under a `comfy_target` block.
 
 **Not remoted (this repo is a thin wrapper and never opens its own socket):**
 
-- **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `get_logs`) — these manage a
-  **local** ComfyUI process and stay local-only; they cannot start/stop or read logs from a remote
-  box. Start ComfyUI on the remote host yourself.
+- **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `update_comfyui`, `get_logs`)
+  — these manage a **local** ComfyUI process/install and stay local-only; they cannot start/stop,
+  update, or read logs from a remote box. Start and update ComfyUI on the remote host yourself.
 - **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
   / `generate_image` / `run_template` / `partner_generate` — this server forwards **no**
   `--host`/`--port` to these verbs (most of them accept none at all), so they run
@@ -473,7 +476,7 @@ the originals stay in the ComfyUI workspace.
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
 | `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
 | `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
-| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
+| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. Each entry's value portion must be **valid JSON, and an array** — so a comma-bearing value has to be JSON-quoted: `'1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]'`, not `1.prompt=[a lighthouse at dawn, oil painting]`. |
 
 ### Discovery and templates
 
@@ -499,6 +502,7 @@ the originals stay in the ComfyUI workspace.
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
 | `restart_comfyui(extra_args=None)` | `comfy stop` then `comfy launch --background [-- <extras>]` | Stop-then-launch the local ComfyUI (best-effort stop); forwards `extra_args` to the fresh server. Handy for relaunching with different flags. |
+| `update_comfyui(target="comfy")` | `comfy update <all\|comfy\|cli>` | Update the local install: `"comfy"` = ComfyUI core, `"all"` = the installed custom node packs, `"cli"` = comfy-cli itself. This is what `server_info`'s `freshness` block points at when it reports a stale install. Slow (a core update re-installs requirements; 30-minute timeout) and the updated code only takes effect after a `restart_comfyui`. Any other `target` is rejected before comfy-cli is invoked, and a second update requested while one is still running is refused rather than run in parallel (concurrent `git`/`pip` against one workspace can leave it half-installed). |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
 | `download_model(url, relative_path=None, filename=None)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>]` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. `relative_path` resolves from the workspace root and must be the models dir or a subfolder of it — `models`, `models/loras` (a bare `loras` is rejected, not assumed); sibling dirs like `custom_nodes/…`, `input`, `output` are refused. Use `/` as the separator on every host, Windows included. |
 

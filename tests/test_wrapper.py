@@ -17,7 +17,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import PurePosixPath
@@ -90,6 +93,286 @@ def test_run_comfy_utf8_env_overrides_inherited(patched_run, monkeypatch):
 
     assert calls[0]["env"]["PYTHONUTF8"] == "1"
     assert calls[0]["env"]["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_run_comfy_closes_child_stdin(patched_run):
+    """The child never inherits the stdio transport's stdin.
+
+    This is an MCP **stdio** server: the parent's stdin carries JSON-RPC
+    requests. A child that inherits it (the subprocess default) can read those
+    bytes out from under the client, silently corrupting the session, or block
+    on a prompt nobody can answer. No comfy-cli call here is interactive.
+    """
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["stdin"] == subprocess.DEVNULL
+
+
+def test_run_comfy_sets_non_interactive_child_env(patched_run):
+    """git/pip are told never to prompt, so a would-be prompt fails fast.
+
+    With stdin closed an interactive prompt could not be answered anyway; these
+    turn "block invisibly until the timeout" into an immediate, legible error —
+    which matters most for `update_comfyui`'s 30-minute ceiling.
+    """
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert calls[0]["env"]["PIP_NO_INPUT"] == "1"
+
+
+def test_run_comfy_leaves_askpass_alone(patched_run, monkeypatch):
+    """A GUI/keychain credential helper still works — it does not use stdin.
+
+    Overriding `GIT_ASKPASS` would break private-remote updates that succeed
+    today, so the non-interactive pins deliberately stop at the terminal prompt.
+    """
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/local/bin/my-helper")
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["GIT_ASKPASS"] == "/usr/local/bin/my-helper"
+
+
+# --- COMFY_BIN's directory is guaranteed first on the child PATH -------------
+#
+# `comfy launch --background` re-invokes `comfy` by BARE NAME via PATH to spawn
+# the detached process, so an absolute COMFY_BIN whose directory is not on the
+# inherited PATH (an MCP server started by a GUI client + a venv-installed
+# comfy-cli) crashed the child with FileNotFoundError before ComfyUI was ever
+# started. See `_comfy_env` (BE-4735 / BE-3780).
+
+_needs_posix_exec = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX exec bit; which() needs a PATHEXT suffix on Windows",
+)
+
+# The spawn-site fixtures stub `shutil.which` to a fixed "/fake/comfy" (they
+# patch the shared module attribute), which would mask the real resolution the
+# two end-to-end tests below are checking. Captured at import, before any test
+# has had a chance to patch it, so they can put the genuine one back.
+_real_which = shutil.which
+
+
+def _dummy_comfy(tmp_path, dirname="venv-bin", name="comfy"):
+    """A real, executable file on disk standing in for the comfy-cli binary.
+
+    `shutil.which` checks the exec bit, so a bare `tmp_path.touch()` would
+    resolve to None and quietly exercise the skip path instead of the prepend.
+    """
+    bin_dir = tmp_path / dirname
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / name
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    return exe
+
+
+@_needs_posix_exec
+def test_comfy_env_prepends_absolute_comfy_bin_dir(tmp_path, monkeypatch):
+    """The QA case: absolute COMFY_BIN in a venv, minimal PATH that excludes it."""
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    inherited = os.pathsep.join(["/usr/bin", "/bin"])
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", inherited)
+
+    path = server._comfy_env()["PATH"]
+
+    assert path.startswith(bin_dir + os.pathsep)
+    # The inherited PATH is preserved behind it, not replaced.
+    assert path == bin_dir + os.pathsep + inherited
+
+
+@_needs_posix_exec
+def test_comfy_env_absolutizes_a_relative_comfy_bin(tmp_path, monkeypatch):
+    """comfy-cli chdirs to the workspace before re-resolving, so a relative entry
+    would point somewhere else by then — the prepended entry must be absolute."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", os.path.join(".", "venv-bin", "comfy"))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    first = server._comfy_env()["PATH"].split(os.pathsep)[0]
+
+    assert os.path.isabs(first)
+    assert os.path.realpath(first) == os.path.realpath(str(exe.parent))
+
+
+@_needs_posix_exec
+def test_comfy_env_does_not_duplicate_bin_dir_already_first(tmp_path, monkeypatch):
+    """Already first: PATH is left exactly as inherited — no repeated prepend."""
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    inherited = os.pathsep.join([bin_dir, "/usr/bin"])
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", inherited)
+
+    path = server._comfy_env()["PATH"]
+
+    assert path == inherited
+    assert path.split(os.pathsep).count(bin_dir) == 1
+
+
+@_needs_posix_exec
+def test_comfy_env_prepends_even_when_bin_dir_is_later_on_path(tmp_path, monkeypatch):
+    """Present but shadowed: prepend anyway so an earlier stale comfy can't win.
+
+    Prepending (rather than appending, or skipping on "already present") is the
+    deliberate half of this: inside the child, `comfy` must resolve to the SAME
+    install this server was pointed at, not to whichever one happens to be
+    earlier on the user's PATH.
+    """
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    stale = tmp_path / "stale-bin"
+    stale.mkdir()
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stale), bin_dir]))
+
+    path = server._comfy_env()["PATH"]
+
+    assert path.split(os.pathsep)[0] == bin_dir
+
+
+@_needs_posix_exec
+def test_comfy_env_prepends_dir_of_bare_name_resolved_on_path(tmp_path, monkeypatch):
+    """A bare COMFY_BIN is resolved through PATH, and ITS directory is hoisted."""
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    other = tmp_path / "other-bin"
+    other.mkdir()
+    monkeypatch.setattr(server, "COMFY_BIN", "comfy")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(other), bin_dir]))
+
+    # Sanity: the bare name really does resolve into bin_dir under this PATH.
+    assert shutil.which("comfy") == str(exe)
+
+    assert server._comfy_env()["PATH"].split(os.pathsep)[0] == bin_dir
+
+
+def test_comfy_env_leaves_path_alone_when_comfy_bin_unresolvable(tmp_path, monkeypatch):
+    """Unresolvable COMFY_BIN: skip silently, never raise, never touch PATH.
+
+    `_require_comfy_bin` already raises the curated missing-binary error before
+    any spawn, so `_comfy_env` must not add a second failure mode here.
+    """
+    inherited = os.pathsep.join([str(tmp_path / "a"), str(tmp_path / "b")])
+    monkeypatch.setattr(server, "COMFY_BIN", str(tmp_path / "nope" / "comfy"))
+    monkeypatch.setenv("PATH", inherited)
+
+    assert server._comfy_env()["PATH"] == inherited
+
+
+def test_comfy_env_skips_a_non_executable_comfy_bin(tmp_path, monkeypatch):
+    """A file that exists but is not executable is not a resolution — skip it."""
+    exe = tmp_path / "not-exec" / "comfy"
+    exe.parent.mkdir()
+    exe.write_text("")
+    exe.chmod(0o644)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    assert server._comfy_env()["PATH"] == "/usr/bin"
+
+
+def test_comfy_env_unresolvable_with_no_inherited_path(tmp_path, monkeypatch):
+    """No PATH at all and nothing to resolve: PATH stays absent, no KeyError."""
+    monkeypatch.setattr(server, "COMFY_BIN", str(tmp_path / "nope" / "comfy"))
+    monkeypatch.delenv("PATH", raising=False)
+
+    assert "PATH" not in server._comfy_env()
+
+
+@_needs_posix_exec
+def test_comfy_env_sets_bare_path_when_none_inherited(tmp_path, monkeypatch):
+    """An empty/absent inherited PATH yields the bin dir alone — no stray separator."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "")
+
+    assert server._comfy_env()["PATH"] == str(exe.parent)
+
+
+@_needs_posix_exec
+def test_comfy_env_falls_back_to_defpath_when_no_path_inherited(tmp_path, monkeypatch):
+    """No PATH inherited: keep the platform default behind the bin dir.
+
+    With no PATH in the environment CPython resolves a child's bare-name exec
+    against `os.defpath` (`os.get_exec_path`). Writing the bin dir ALONE would
+    replace that implicit default, leaving the child unable to find the `git` /
+    `python` / `uv` helpers comfy-cli shells out to — a strict regression on the
+    pre-prepend behavior. The prepend has to stay additive here too.
+    """
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.delenv("PATH", raising=False)
+
+    entries = server._comfy_env()["PATH"].split(os.pathsep)
+
+    assert entries[0] == str(exe.parent)
+    assert entries[1:] == os.defpath.split(os.pathsep)
+
+
+@_needs_posix_exec
+def test_comfy_env_skips_prepend_when_bin_dir_contains_pathsep(tmp_path, monkeypatch):
+    """A bin dir containing `os.pathsep` is unrepresentable — leave PATH alone.
+
+    There is no escape for the separator in PATH syntax, so writing such a
+    directory splits it into fragments: the intended entry is destroyed AND its
+    tail becomes a RELATIVE entry, which the child resolves against the
+    workspace comfy-cli chdir'd into. Skipping preserves the inherited PATH;
+    corrupting it would be strictly worse than not helping.
+    """
+    exe = _dummy_comfy(tmp_path, dirname="we" + os.pathsep + "ird")
+    inherited = os.pathsep.join(["/usr/bin", "/bin"])
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", inherited)
+
+    path = server._comfy_env()["PATH"]
+
+    assert path == inherited
+    # Nothing relative leaked in — that is the half with security weight.
+    assert all(os.path.isabs(entry) for entry in path.split(os.pathsep))
+
+
+@_needs_posix_exec
+def test_comfy_env_path_prepend_keeps_the_existing_pins(tmp_path, monkeypatch):
+    """The PATH rewrite is additive — every previously-injected pin still holds."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = server._comfy_env()
+
+    assert env["COMFY_WHERE"] == "local"
+    assert env["COMFY_NO_WATCH"] == "1"
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["PIP_NO_INPUT"] == "1"
+    assert env["PATH"].split(os.pathsep)[0] == str(exe.parent)
+
+
+@_needs_posix_exec
+def test_run_comfy_child_env_carries_the_bin_dir_on_path(
+    tmp_path, monkeypatch, patched_run
+):
+    """The plain `--json` spawn site really hands the child the rewritten PATH."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    calls = patched_run(envelope(data={"x": 1}))
+    monkeypatch.setattr(server.shutil, "which", _real_which)
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["PATH"].split(os.pathsep)[0] == str(exe.parent)
 
 
 def test_error_envelope_raises_with_code(patched_run):
@@ -2128,6 +2411,31 @@ def test_run_workflow_stream_forces_utf8_env(patched_stream):
     assert procs[0].encoding == "utf-8"
 
 
+@_needs_posix_exec
+def test_run_workflow_stream_carries_the_bin_dir_on_path(
+    tmp_path, monkeypatch, patched_stream
+):
+    """The streaming (Popen) spawn site hands the child the rewritten PATH too."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    procs = patched_stream(_OK_STREAM)
+    monkeypatch.setattr(server.shutil, "which", _real_which)
+
+    asyncio.run(server.run_workflow("wf.json", wait=True))
+
+    assert procs[0].env["PATH"].split(os.pathsep)[0] == str(exe.parent)
+
+
+def test_run_workflow_stream_closes_child_stdin(patched_stream):
+    """The streaming spawn also refuses to hand the child our JSON-RPC stdin."""
+    procs = patched_stream(_OK_STREAM)
+
+    asyncio.run(server.run_workflow("wf.json", wait=True))
+
+    assert procs[0].stdin_arg == subprocess.DEVNULL
+
+
 def test_run_workflow_stream_error_envelope_raises_with_code(patched_stream):
     """An error envelope on the final line raises ComfyCliError with its code."""
     stream = (
@@ -2715,6 +3023,426 @@ def test_restart_comfyui_reraises_genuine_stop_failure(monkeypatch):
     assert launched == []  # genuine failure is not masked by a relaunch
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_restart_comfyui_tolerates_plain_no_comfyui_running_text(
+    patched_plain_run, monkeypatch, stream
+):
+    """The REAL shape of "nothing to stop": non-zero exit, no envelope, human text.
+
+    comfy-cli (1.12.0 `cmdline.stop`) does not emit a `no_recorded_server`
+    envelope when it has no background server recorded — it prints "No ComfyUI is
+    running in the background." and exits 1, which carries neither a structured
+    code nor the literal marker string. That is the common real-world case (a
+    foreground `comfy launch`, the desktop app, `python main.py`, or nothing
+    running), and it used to abort the restart before it ever reached the launch
+    step.
+
+    Parametrized over the stream because comfy-cli prints this one through Rich
+    (stdout) while the QA report captured it on stderr — the match must not care
+    which, so neither does this test.
+    """
+    calls = patched_plain_run(1, **{stream: "No ComfyUI is running in the background."})
+    launched: list = []
+
+    def fake_launch(extra_args=None):
+        launched.append(extra_args)
+        return {"pid": 3}
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    assert server.restart_comfyui(["--cpu"]) == {"pid": 3}
+
+    assert calls[0]["cmd"][4:] == ["stop"]  # the stop really was attempted
+    assert launched == [["--cpu"]]  # and the relaunch still happened
+
+
+def test_stop_comfyui_plain_no_comfyui_running_carries_no_structured_code(
+    patched_plain_run,
+):
+    """Pin the gap this fix closes: that failure has no code and no envelope."""
+    patched_plain_run(1, stdout="No ComfyUI is running in the background.")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert excinfo.value.code is None  # nothing structured to branch on
+    assert excinfo.value.no_envelope is True
+    assert server._NO_RECORDED_SERVER_CODE not in str(excinfo.value)
+    assert server._is_no_recorded_server(excinfo.value)  # matched on the text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # comfy-cli 1.12.0, as the wrapper renders it — on either stream.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: No "
+        "ComfyUI is running in the background.",
+        "comfy-cli returned no JSON (exit 1). stderr: No ComfyUI is running in "
+        "the background. | stdout: <empty>",
+        "No ComfyUI is running in the background.",
+        "no comfyui is running in the background",  # casing drift
+        "No ComfyUI server is running in the background.",  # inserted word
+        "No ComfyUI running in the background",  # dropped copula
+        # Rich soft-wrapping the sentence at a narrow width: a line break inside
+        # the phrase is a wrap, not a clause break.
+        "No ComfyUI is running in the\nbackground.",
+        # A clipped capture: `textutil._stream_tail` prefixes `...`, which can
+        # land directly against the sentence. That marker opens a field.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: ...No "
+        "ComfyUI is running in the background.",
+        "comfy stop failed [no_recorded_server]: none",  # the pre-existing marker
+    ],
+)
+def test_is_no_recorded_server_matches_wording_drift(message):
+    """The benign case is matched on the stable phrase, not one exact sentence."""
+    assert server._is_no_recorded_server(server.ComfyCliError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "comfy stop failed [permission_denied]: cannot kill pid 7",
+        # comfy-cli's OTHER stop message, verbatim: it DID have a server
+        # recorded and could not kill it. Nothing benign about that one.
+        "comfy-cli returned no JSON (exit 1). stderr: <empty> | stdout: Failed "
+        "to stop ComfyUI in the background.",
+        "comfy-cli returned no JSON (exit 1). stderr: Failed to stop ComfyUI "
+        "running in the background: operation not permitted | stdout: <empty>",
+        "comfy-cli returned no JSON (exit 2). stderr: Traceback (most recent "
+        "call last): RuntimeError | stdout: <empty>",
+        # Two unrelated sentences: the match must not span the sentence break.
+        "No ComfyUI workspace is configured. Something is running in the background.",
+        # A failed stop whose clauses are separated by a semicolon, not a period:
+        # this one says the server IS still running, the opposite of benign.
+        "No ComfyUI process could be stopped; it is still running in the background.",
+        # The two halves living in DIFFERENT streams of the wrapper's rendering —
+        # the match must not stitch across the ` | ` delimiter.
+        "comfy-cli returned no JSON (exit 1). stderr: No ComfyUI workspace "
+        "configured | stdout: a server is running in the background",
+        # ...nor across a field label on its own line.
+        "comfy stop failed\nstderr: No ComfyUI workspace configured\n"
+        "stdout: a server is running in the background",
+        # The phrase as ADVICE inside another failure's hint, not as a report
+        # that nothing was recorded: it does not open a message, line, or field.
+        "comfy stop failed: cannot kill pid 7 (operation not permitted); "
+        "check permissions and ensure no ComfyUI is running in the background",
+        # Opposite-meaning reports joined WITHOUT punctuation — a conjunction or
+        # a dash. The halves must be joined by the sentence's grammar, not just
+        # sit near each other.
+        "No ComfyUI process was stopped and remains running in the background",
+        "No ComfyUI process could be stopped — it is still running in the background",
+        "No ComfyUI was stopped so something else is running in the background",
+        # A longer, unrelated structured code that merely starts with the marker.
+        "comfy stop failed [no_recorded_server_pid]: none",
+    ],
+)
+def test_is_no_recorded_server_rejects_other_failures(message):
+    """Every OTHER stop failure stays outside the benign net."""
+    assert not server._is_no_recorded_server(server.ComfyCliError(message))
+
+
+def test_is_no_recorded_server_lets_a_structured_code_outrank_the_text():
+    """comfy-cli said structurally what broke; stray prose does not overrule it."""
+    exc = server.ComfyCliError(
+        "No ComfyUI is running in the background.", code="permission_denied"
+    )
+
+    assert not server._is_no_recorded_server(exc)
+
+
+def test_is_no_recorded_server_rejects_a_stop_we_timed_out():
+    """A stop killed at OUR deadline never finished, so it reported nothing."""
+    exc = server.ComfyCliError(
+        "comfy stop timed out after 60s. stdout: No ComfyUI is running in the "
+        "background.",
+        timed_out=True,
+    )
+
+    assert not server._is_no_recorded_server(exc)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # The gate has to sit above BOTH text reads, not between them: a message
+        # quoting the literal marker must not slip past a timeout or a different
+        # structured code.
+        server.ComfyCliError(
+            "comfy stop timed out after 60s. stdout: comfy stop failed "
+            "[no_recorded_server]: none",
+            timed_out=True,
+        ),
+        server.ComfyCliError(
+            "comfy stop failed [permission_denied]: cannot kill pid 7 "
+            "(previous run reported no_recorded_server)",
+            code="permission_denied",
+        ),
+    ],
+)
+def test_is_no_recorded_server_gate_outranks_the_literal_marker_too(exc):
+    """A quoted marker does not make a timeout or a coded failure benign."""
+    assert not server._is_no_recorded_server(exc)
+
+
+def test_is_no_recorded_server_accepts_an_envelope_without_a_code():
+    """An envelope carrying the sentence but no `error.code` is the same case."""
+    exc = server.ComfyCliError(
+        "comfy stop failed: No ComfyUI is running in the background."
+    )
+
+    assert exc.no_envelope is False  # not gated on provenance, only on code
+    assert server._is_no_recorded_server(exc)
+
+
+def test_restart_comfyui_reraises_a_timed_out_stop_that_printed_the_phrase(monkeypatch):
+    """The gate is load-bearing: a timed-out stop must not be relaunched over."""
+
+    def fake_stop():
+        raise server.ComfyCliError(
+            "comfy stop timed out after 60s. stdout: No ComfyUI is running in "
+            "the background.",
+            timed_out=True,
+        )
+
+    launched: list = []
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.restart_comfyui()
+    assert launched == []
+
+
+def test_restart_comfyui_reraises_unrelated_plain_stop_failure(
+    patched_plain_run, monkeypatch
+):
+    """A plain non-zero stop whose text ISN'T the benign phrase still aborts."""
+    patched_plain_run(1, stderr="Failed to kill pid 7: operation not permitted")
+    launched: list = []
+    monkeypatch.setattr(
+        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+    )
+
+    with pytest.raises(server.ComfyCliError, match="operation not permitted"):
+        server.restart_comfyui()
+    assert launched == []
+
+
+def test_restart_comfyui_explains_port_clash_after_nothing_to_stop(monkeypatch):
+    """Nothing to stop + port taken = a running server comfy-cli never launched."""
+
+    def fake_stop():
+        raise server.ComfyCliError("No ComfyUI is running in the background.")
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError(
+            "comfy-cli returned no JSON (exit 1). stderr: The 8188 port is "
+            "already in use. | stdout: <empty>",
+            no_envelope=True,
+            returncode=1,
+        )
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    message = str(excinfo.value)
+    assert "The 8188 port is already in use." in message  # original kept verbatim
+    assert "comfy-cli has no record of launching it" in message
+    assert "restart_comfyui" in message  # the different-port way out
+    # Provenance of the underlying failure survives the re-wrap.
+    assert excinfo.value.no_envelope is True
+    assert excinfo.value.returncode == 1
+
+
+def test_restart_comfyui_leaves_port_clash_alone_after_a_real_stop(monkeypatch):
+    """A port clash after a stop that DID kill comfy-cli's server is a different bug."""
+    monkeypatch.setattr(server, "stop_comfyui", lambda: {"ok": True})
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("The 8188 port is already in use.")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "The 8188 port is already in use."
+
+
+def test_restart_comfyui_leaves_non_port_launch_failure_alone(monkeypatch):
+    """A launch failure that isn't a port clash keeps its own message."""
+    monkeypatch.setattr(
+        server,
+        "stop_comfyui",
+        lambda: (_ for _ in ()).throw(
+            server.ComfyCliError("No ComfyUI is running in the background.")
+        ),
+    )
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("ComfyUI exited during startup: missing torch")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "ComfyUI exited during startup: missing torch"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The 8188 port is already in use.",  # comfy-cli's own preflight
+        "OSError: [Errno 48] Address already in use",  # the socket bind under it
+        "error while attempting to bind on address ('0.0.0.0', 8188): "
+        "address already in use",
+        "Port 8188 is already in use",
+    ],
+)
+def test_port_in_use_matches_the_real_phrasings(message):
+    """Both layers word the port clash differently; both must be recognized."""
+    assert server._PORT_IN_USE_TEXT_RE.search(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # "already in use" with a subject that is NOT a port: appending the port
+        # guidance here would assert something plainly false about the failure.
+        "Cannot load model: the file is already in use by another process",
+        "CUDA device 0 is already in use",
+        "The output directory is already in use",
+        # A `--port` echoed back from the command in one stream must not be
+        # stitched to an unrelated "already in use" in the other.
+        "comfy-cli returned no JSON (exit 1). stderr: launch --background -- "
+        "--port 8188 | stdout: CUDA device 0 is already in use",
+        "comfy-cli returned no JSON (exit 1). stderr: could not bind port | "
+        "stdout: the model file is already in use",
+    ],
+)
+def test_port_in_use_ignores_non_port_conflicts(message):
+    """A busy file or GPU is not a port clash, so it gets no port guidance."""
+    assert not server._PORT_IN_USE_TEXT_RE.search(message)
+
+
+def test_restart_comfyui_leaves_a_non_port_resource_clash_alone(monkeypatch):
+    """End to end: a busy model file after nothing-to-stop keeps its own message."""
+    monkeypatch.setattr(
+        server,
+        "stop_comfyui",
+        lambda: (_ for _ in ()).throw(
+            server.ComfyCliError("No ComfyUI is running in the background.")
+        ),
+    )
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("Cannot load model: the file is already in use")
+
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui()
+
+    assert str(excinfo.value) == "Cannot load model: the file is already in use"
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        (None, None),
+        ([], None),
+        (["--cpu"], None),
+        (["--port", "8189"], 8189),
+        (["--port=8189"], 8189),
+        (["--cpu", "--port", "8300", "--lowvram"], 8300),
+        (["--port", "8189", "--port", "8300"], 8300),  # last one wins
+        (["--port"], None),  # dangling flag, no value
+        (["--port", "not-a-number"], None),
+        (["--port", "0"], None),  # out of range
+        (["--port", "70000"], None),
+        (["--portable"], None),  # a different flag that merely shares the prefix
+        # A trailing unparseable --port supersedes an earlier good one: it means
+        # we do not know the requested port, not that 8189 still stands.
+        (["--port", "8189", "--port", "bad"], None),
+        (["--port", "8189", "--port", "99999"], None),
+    ],
+)
+def test_requested_port_reads_the_forwarded_port(extra_args, expected):
+    """Best-effort read of the caller's `--port`; anything odd yields None."""
+    assert server._requested_port(extra_args) == expected
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        (None, ["--port", "8189"]),
+        ([], ["--port", "8189"]),
+        (["--cpu"], ["--cpu", "--port", "8189"]),  # other flags survive
+        (["--cpu", "--port", "8188"], ["--cpu", "--port", "8189"]),
+        (["--port=8188", "--lowvram"], ["--lowvram", "--port", "8189"]),
+        (["--port"], ["--port", "8189"]),  # dangling flag dropped, not doubled
+    ],
+)
+def test_suggested_relaunch_args_swaps_the_port_and_keeps_the_rest(
+    extra_args, expected
+):
+    """The pasteable suggestion must not silently drop the caller's own flags."""
+    assert server._suggested_relaunch_args(extra_args, 8189) == expected
+
+
+def test_untracked_server_guidance_keeps_the_callers_other_flags():
+    """A user pasting the suggestion should not lose `--cpu` along the way."""
+    guidance = server._untracked_server_guidance(["--cpu", "--port", "8188"])
+
+    assert 'extra_args=["--cpu", "--port", "8189"]' in guidance
+
+
+def test_untracked_server_guidance_falls_back_when_the_args_are_long():
+    """Past the cap the suggestion degrades to the bare port rather than noise."""
+    guidance = server._untracked_server_guidance(["--some-very-long-flag"] * 12)
+
+    assert 'extra_args=["--port", "8189"]' in guidance
+    assert "--some-very-long-flag" not in guidance
+
+
+def test_untracked_server_guidance_avoids_suggesting_the_port_that_just_failed():
+    """Suggesting the exact launch that just lost the race is useless advice."""
+    default = server._untracked_server_guidance(["--cpu"])
+    assert f'"--port", "{server._ALT_PORT_SUGGESTION}"' in default
+
+    collided = server._untracked_server_guidance(
+        ["--port", str(server._ALT_PORT_SUGGESTION)]
+    )
+    assert f'"--port", "{server._ALT_PORT_SUGGESTION}"' not in collided
+    assert f'"--port", "{server._ALT_PORT_FALLBACK}"' in collided
+
+
+def test_restart_comfyui_port_guidance_reflects_the_requested_port(monkeypatch):
+    """The suggestion the caller actually sees is derived from their own args."""
+
+    def fake_stop():
+        raise server.ComfyCliError("No ComfyUI is running in the background.")
+
+    def fake_launch(extra_args=None):  # noqa: ARG001
+        raise server.ComfyCliError("The 8189 port is already in use.")
+
+    monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.restart_comfyui(["--port", str(server._ALT_PORT_SUGGESTION)])
+
+    message = str(excinfo.value)
+    assert "The 8189 port is already in use." in message  # original kept verbatim
+    assert f'"--port", "{server._ALT_PORT_FALLBACK}"' in message
+
+
 def test_error_envelope_populates_structured_code(patched_run):
     """ComfyCliError from an error envelope carries the code as an attribute, not just text."""
     patched_run(
@@ -2738,6 +3466,193 @@ def test_restart_comfyui_returns_new_server_status(monkeypatch):
     )
 
     assert server.restart_comfyui() == {"pid": 42, "port": 8188}
+
+
+# --- update_comfyui (`comfy update [all|comfy|cli]`) ------------------------
+
+
+def test_update_comfyui_defaults_to_core_target(patched_plain_run):
+    """Bare call updates ComfyUI core: `comfy … update comfy`, plain-exit success.
+
+    `comfy update` never emits an envelope — it prints through comfy-cli's
+    rprint shim (which routes to stderr in `--json` mode) and exits 0 — so this
+    rides the same `plain_ok` synthesis as launch/stop.
+    """
+    calls = patched_plain_run(
+        0, stderr="Updating ComfyUI in /ws...\nAlready up to date."
+    )
+
+    result = server.update_comfyui()
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
+    assert cmd[4:] == ["update", "comfy"]
+    assert result["ok"] is True
+    assert result["action"] == "update comfy"
+    assert "Already up to date" in result["message"]
+
+
+@pytest.mark.parametrize("target", ["all", "comfy", "cli"])
+def test_update_comfyui_forwards_each_accepted_target(patched_plain_run, target):
+    """Every target comfy-cli accepts is forwarded verbatim."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui(target)
+
+    assert calls[0]["cmd"][4:] == ["update", target]
+
+
+def test_update_comfyui_nonzero_exit_raises(patched_plain_run):
+    """A failed update (non-zero exit, no envelope) must still raise, not synthesize."""
+    calls = patched_plain_run(
+        1, stderr="error: Your local changes would be overwritten"
+    )
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.update_comfyui()
+
+    assert len(calls) == 1  # it really did run, and the failure was not swallowed
+
+
+def test_update_comfyui_surfaces_error_envelope(patched_run):
+    """If comfy-cli does emit an error envelope, its code still propagates."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "workspace_not_found", "message": "no ComfyUI path"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.update_comfyui("comfy")
+    assert excinfo.value.code == "workspace_not_found"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["nodes", "", "  ", "comfy; rm -rf /", "--help", "core"],
+)
+def test_update_comfyui_rejects_unknown_target_before_spawning(patched_run, target):
+    """An unaccepted target is named and refused BEFORE any subprocess runs."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid update target"):
+        server.update_comfyui(target)
+
+    assert calls == []  # nothing was forwarded to comfy-cli
+
+
+def test_update_comfyui_error_names_the_allowed_targets(patched_run):
+    """The rejection is explicit about what IS accepted, not a bare refusal."""
+    patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.update_comfyui("everything")
+    message = str(excinfo.value)
+    assert "'everything'" in message  # the offending value, echoed back
+    for allowed in ("'all'", "'comfy'", "'cli'"):
+        assert allowed in message
+
+
+def test_update_comfyui_normalizes_case_and_whitespace(patched_plain_run):
+    """`" Comfy "` resolves to the canonical target; the raw string never hits argv."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui("  COMFY ")
+
+    assert calls[0]["cmd"][4:] == ["update", "comfy"]
+
+
+def test_update_comfyui_timeout_is_generous(patched_plain_run):
+    """The update timeout must comfortably exceed launch_comfyui's 180s boot."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui()
+
+    assert calls[0]["timeout"] >= 180.0
+    assert calls[0]["timeout"] == server._UPDATE_TIMEOUT
+
+
+def test_update_comfyui_is_non_interactive(patched_plain_run):
+    """An update must never stop to ask git/pip a question it cannot be answered.
+
+    The 30-minute ceiling makes a silent credential prompt the worst case: with
+    stdin inherited it would both eat JSON-RPC bytes and hang for half an hour.
+    """
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui()
+
+    assert calls[0]["stdin"] == subprocess.DEVNULL
+    assert calls[0]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert calls[0]["env"]["PIP_NO_INPUT"] == "1"
+
+
+def test_update_comfyui_refuses_a_concurrent_update(monkeypatch, patched_plain_run):
+    """A second update while one is in flight is refused, not run in parallel.
+
+    FastMCP dispatches sync tools onto a worker thread pool, so two calls really
+    can overlap — and both would then drive git/pip against the same checkout and
+    Python environment. A real second thread here, pinned inside the first
+    update's subprocess (i.e. while the lock is held).
+    """
+    calls = patched_plain_run(0, stderr="done")
+    inside = threading.Event()
+    release = threading.Event()
+    fixture_run = server.subprocess.run
+
+    def blocking_run(*args, **kwargs):
+        inside.set()  # the first update now holds the lock...
+        release.wait(5)  # ...and keeps holding it until this test lets go
+        return fixture_run(*args, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", blocking_run)
+    worker = threading.Thread(target=server.update_comfyui, args=("comfy",))
+    worker.start()
+    try:
+        assert inside.wait(5), "the first update never reached its subprocess"
+        with pytest.raises(server.ComfyCliError, match="already running"):
+            server.update_comfyui("all")
+    finally:
+        release.set()
+        worker.join(5)
+
+    # The refused call never reached comfy-cli; only the first update spawned.
+    assert [c["cmd"][4:] for c in calls] == [["update", "comfy"]]
+
+
+def test_update_comfyui_lock_is_released_after_failure(patched_plain_run):
+    """A failed update must not wedge every later update behind a held lock."""
+    patched_plain_run(1, stderr="error: local changes would be overwritten")
+
+    with pytest.raises(server.ComfyCliError):
+        server.update_comfyui()
+
+    # The lock is free again, so a retry proceeds instead of being refused.
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    server._UPDATE_LOCK.release()
+
+
+def test_update_comfyui_lock_is_released_after_success(patched_plain_run):
+    """The happy path releases too — two sequential updates are always allowed."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui("comfy")
+    server.update_comfyui("cli")
+
+    assert [c["cmd"][4:] for c in calls] == [["update", "comfy"], ["update", "cli"]]
+
+
+def test_update_comfyui_invalid_target_does_not_take_the_lock(patched_run):
+    """A rejected target leaves the lock untouched, so a good call still works."""
+    patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid update target"):
+        server.update_comfyui("nope")
+
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    server._UPDATE_LOCK.release()
 
 
 # --- fetch_outputs inline image return -------------------------------------
