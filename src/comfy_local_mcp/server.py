@@ -494,8 +494,37 @@ def _comfy_env() -> dict[str, str]:
       keychain credential helper does not use stdin, so it still works with
       stdin closed; overriding it would break private-remote updates that
       succeed today.
+
+    ``PATH`` is the one inherited variable this rewrites rather than injects
+    alongside: the directory of the RESOLVED ``COMFY_BIN`` is guaranteed to be
+    on the child's ``PATH``, first. This exists because ``comfy launch
+    --background`` re-invokes ``comfy`` by BARE NAME via ``PATH`` (comfy-cli
+    1.12's ``launch.py`` spawns ``Popen(["comfy", ...])`` for the detached
+    process). Without the prepend, an absolute ``COMFY_BIN`` pointing outside
+    the inherited ``PATH`` — the normal state for an MCP server launched by a
+    GUI client on macOS — crashes background launch with ``FileNotFoundError:
+    'comfy'`` before ComfyUI is ever spawned, surfacing here as the opaque
+    ``comfy-cli returned no JSON (exit 1)`` (BE-4735). Prepending rather than
+    appending is deliberate: it also stops a stale second comfy install earlier
+    on the user's ``PATH`` from shadowing the intended one inside the child
+    (BE-3780). The entry is absolutized because comfy-cli ``os.chdir``s to the
+    workspace in the child before that re-invocation resolves, so a relative
+    entry would point somewhere else by then.
+
+    The rewrite is strictly additive and never *shrinks* the child's search
+    path: it is skipped outright when the directory cannot be expressed as a
+    PATH entry (it contains ``os.pathsep``), and an absent inherited ``PATH``
+    falls back to ``os.defpath`` — CPython's own fallback — rather than
+    resolving to the binary's directory alone.
+
+    What it cannot fix: comfy-cli re-invokes the literal name ``comfy``, so a
+    ``COMFY_BIN`` pointing at a RENAMED binary (``comfy-1.12``) still leaves the
+    child's bare-name lookup to find some other ``comfy`` — or none. Hoisting
+    the directory is still correct there (a sibling ``comfy`` symlink, the
+    common venv shape, then wins), but the residual case belongs upstream: only
+    comfy-cli can stop re-invoking by bare name.
     """
-    return {
+    env = {
         **os.environ,
         "COMFY_WHERE": "local",
         "COMFY_NO_WATCH": "1",
@@ -504,6 +533,37 @@ def _comfy_env() -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "PIP_NO_INPUT": "1",
     }
+    # `shutil.which` handles both shapes of COMFY_BIN: a value carrying a
+    # directory separator is checked as that exact file, a bare name is resolved
+    # against PATH. None means we could not locate the binary at all — skip
+    # silently rather than guess, since `_require_comfy_bin` already raises the
+    # curated missing-binary error ahead of any spawn and this must not add a
+    # second failure mode.
+    resolved = shutil.which(COMFY_BIN)
+    if resolved:
+        bin_dir = os.path.dirname(os.path.abspath(resolved))
+        # A directory whose own name contains `os.pathsep` cannot be expressed as
+        # a PATH entry — the separator has no escape in either POSIX or Windows
+        # PATH syntax, so writing it would split into fragments: the intended
+        # directory is lost AND the tail becomes a RELATIVE entry, which the
+        # child resolves against the workspace comfy-cli chdir'd into. Skip, the
+        # same silent no-op as an unresolvable binary: leaving the inherited
+        # PATH intact is strictly better than corrupting it.
+        if os.pathsep not in bin_dir:
+            # `None` (no PATH inherited at all) is NOT the same as `""`. With no
+            # PATH in the environment, CPython resolves a child's bare-name exec
+            # against `os.defpath` (see `os.get_exec_path`), so writing `bin_dir`
+            # alone would REPLACE that implicit default and strip the child of
+            # the `git` / `python` / `uv` helpers comfy-cli shells out to.
+            # Substituting `os.defpath` keeps the prepend strictly additive there
+            # too. An empty STRING is a deliberate "search nothing" and is left
+            # to mean exactly that.
+            inherited = env.get("PATH")
+            path = os.defpath if inherited is None else inherited
+            entries = path.split(os.pathsep) if path else []
+            if not entries or entries[0] != bin_dir:
+                env["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    return env
 
 
 class ComfyCliError(RuntimeError):
@@ -3942,6 +4002,23 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     in review upstream). On affected comfy-cli versions the crash surfaces here
     as a clean :class:`ComfyCliError` from the error envelope. Remove this note
     once the upstream fix ships.
+
+    NOTE (second upstream caveat, handled): ``comfy launch --background``
+    re-invokes ``comfy`` by BARE NAME via ``PATH`` to spawn the detached
+    process, so it needs to find itself on the child's ``PATH`` no matter how
+    this server was told to call it. This server therefore guarantees the
+    resolved ``COMFY_BIN``'s directory is first on the child ``PATH`` — see
+    :func:`_comfy_env`. Before that guarantee, an absolute ``COMFY_BIN``
+    pointing outside the inherited ``PATH`` (an MCP server started by a GUI
+    client plus a venv-installed comfy-cli) failed HERE, and only here, as
+    ``comfy-cli returned no JSON (exit 1)`` with a traceback whose first visible
+    frame is ``comfy_cli/tracking.py:334``. That frame is a red herring — it is
+    the ``track_command`` passthrough wrapper, not telemetry (typer's pretty
+    exceptions hide the frames above it, and the crash reproduces with
+    ``DO_NOT_TRACK=1``); the real exception is ``FileNotFoundError: 'comfy'``
+    from the inner re-invocation. See BE-4735. The upstream fix — re-invoking
+    via ``sys.executable -m comfy_cli`` instead of a bare name — is still
+    desirable, but this server no longer depends on it.
     """
     args = ["launch", "--background"]
     if extra_args:
@@ -5021,6 +5098,145 @@ def set_workflow_slot(
     return _run_comfy(*args, timeout=60.0)
 
 
+# A slot entry's value portion is fed to `json.loads` by comfy-cli, so the two
+# examples that make the contract concrete: the mechanical shape, and the one
+# that trips callers up — a string value containing a comma, which is ONLY a
+# single value when it is JSON-quoted.
+_SLOT_VALUE_EXAMPLE = "3.seed=[1,2,3]"
+_SLOT_QUOTED_EXAMPLE = '6.text=["a lighthouse at dawn, oil painting", "a cabin"]'
+
+# Past this, a slot cannot reach comfy-cli at all: Linux caps a SINGLE argv
+# entry at `MAX_ARG_STRLEN` (32 pages = 128 KiB) regardless of the roomier total
+# `ARG_MAX`, so the spawn fails before comfy-cli parses anything. That makes this
+# a bound the pre-check can honor without inventing a policy — it is the engine's
+# own reachability limit, not a taste call about sweep size. The kernel counts
+# BYTES, so this must be measured after encoding: a value of multibyte
+# characters is several times its character count on the wire.
+_MAX_PRECHECKED_SLOT_BYTES = 128 * 1024
+
+
+def _clip_for_error(text: str) -> str:
+    """Render a caller-supplied fragment for an error message, bounded.
+
+    A slot's value list is caller-sized — a sweep over long prompts is KBs of
+    text — and the whole point of naming the offending entry is lost if the
+    message it rides in is unreadable. Same per-field cap the envelope errors use.
+
+    This quotes the fragment itself rather than leaving that to an ``!r`` at the
+    call site, because the cap has to apply to what is actually RENDERED. ``repr``
+    expands a control or non-printable character into a 4-to-10-character escape
+    (``\\x00``, ``\\uXXXX``, ``\\U000XXXXX``), so clipping the raw text first and
+    quoting after would let 500 such characters land as ~2000+ in the message —
+    the bound would read as if it held while the field blew past it. Clipping the
+    rendered form is what :func:`_render_error_details` does too.
+
+    The source text is sliced BEFORE ``repr`` so an MB-sized value never
+    materializes an expanded copy just to have it thrown away. That is safe for
+    the characters shown: every source character contributes at least one
+    character to the repr, so the escaping of the retained prefix cannot depend
+    on anything past the cap. The one thing it does change is ``repr``'s choice
+    of surrounding quote — it switches to double quotes for a string containing
+    an apostrophe and no double quote, and that decision is now made over the
+    slice, so an apostrophe past the cap flips it. Cosmetic, in a preview that
+    is already truncated. The ellipsis is counted inside the cap, so the
+    returned field never exceeds it.
+    """
+    rendered = repr(text[:_MAX_ERROR_FIELD_CHARS])
+    if len(rendered) <= _MAX_ERROR_FIELD_CHARS:
+        return rendered
+    return rendered[: _MAX_ERROR_FIELD_CHARS - 1] + "…"
+
+
+def _reject_non_json_array_slot(index: int, slot: str) -> None:
+    """Reject a ``vary_workflow`` slot whose value is not a JSON array.
+
+    comfy-cli splits each ``--slot`` entry on its first ``=`` and runs the value
+    portion through :func:`json.loads`, *falling back to the literal string* when
+    that fails — then rejects anything that did not parse to a list. So the
+    natural first attempt at a text sweep,
+    ``6.text=[a lighthouse at dawn, oil painting]``, is not a two-element list at
+    all: it is invalid JSON, comes back as one bare string, and dies as
+    ``value must be a JSON array (got str)`` with nothing pointing at the missing
+    quotes.
+
+    Checking here rather than passing the failure through buys two things. The
+    message can name WHICH entry was malformed and show the quoted form that
+    fixes it (comfy-cli sees only the value it already failed to parse), and the
+    check lands before the subprocess: ``comfy workflow vary`` loads the file and
+    fetches ``object_info`` from the live ComfyUI *before* it parses ``--slot``,
+    so with the server down a malformed slot surfaces as a connection failure
+    that hides the real mistake entirely.
+
+    This mirrors comfy-cli's own parse exactly — ``json.loads`` on the value
+    portion, accept only a ``list`` — so it can only refuse input comfy-cli would
+    also refuse — with one deliberate exception. A failure that is a property of
+    the PARSING PROCESS rather than of the input (recursion depth, an interpreter
+    limit like ``sys.get_int_max_str_digits``) says nothing about how comfy-cli's
+    own fresh subprocess will fare, so those are handed to the engine untouched
+    rather than guessed at. Only a genuine syntax error — a
+    :class:`json.JSONDecodeError` — is refused here.
+
+    A value too long to survive ``execve`` abstains the same way: see
+    :data:`_MAX_PRECHECKED_SLOT_BYTES`. That keeps the parse — the one piece of
+    real work this thin wrapper does in-process rather than in the disposable
+    subprocess — bounded by what the engine could actually have received.
+    """
+    fix = (
+        f"quote each value as JSON — e.g. '{_SLOT_VALUE_EXAMPLE}', or "
+        f"'{_SLOT_QUOTED_EXAMPLE}' when a value contains a comma or spaces "
+        "(an unquoted comma splits the value, and unquoted text is not JSON)"
+    )
+    if "=" not in slot:
+        raise ComfyCliError(
+            f"invalid slots[{index}] {_clip_for_error(slot)}: expected an "
+            f"'ADDR=[v1,v2,...]' string whose value is a JSON array — {fix}"
+        )
+    # Measured over the whole entry, encoded: `slot` IS the argv string, and the
+    # kernel's limit is in bytes. `surrogatepass` because a lone surrogate can
+    # arrive over the wire and this guard must not be the thing that raises.
+    if len(slot.encode("utf-8", "surrogatepass")) > _MAX_PRECHECKED_SLOT_BYTES:
+        # Too long to survive `execve` (see `_MAX_PRECHECKED_SLOT_BYTES`), so
+        # there is no verdict worth computing: the spawn fails before comfy-cli
+        # reads it either way. Parsing it anyway would do real work in the
+        # long-lived parent for a value that cannot land — allocating an object
+        # graph several times its size, and on an interpreter without
+        # `sys.get_int_max_str_digits` converting a multi-million-digit literal
+        # in quadratic time. Abstaining costs nothing: this is the same
+        # engine-decides path the other unparseable cases take, so it cannot
+        # over-reject.
+        return
+    addr, _, raw = slot.partition("=")
+    # Clipped like every other caller-supplied fragment here: the address is the
+    # portion BEFORE the first `=` and is just as caller-sized as the value, so
+    # echoing it raw would hand back a multi-KB message and defeat the bound.
+    addr = _clip_for_error(addr.strip())
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, but {_clip_for_error(raw)} is not valid JSON — {fix}"
+        ) from None
+    except (ValueError, RecursionError):
+        # NOT a syntax error — the input is well-formed JSON that THIS
+        # interpreter declined to build: nesting deeper than the stack left us
+        # (`RecursionError`), or an integer literal over
+        # `sys.get_int_max_str_digits` (a plain `ValueError`, not a
+        # `JSONDecodeError`, since 3.11). Both are limits of the process doing
+        # the parsing, and this one parses several frames down from the MCP
+        # handler with whatever limits this interpreter was started with, while
+        # comfy-cli parses in a fresh subprocess of its own. Refusing here would
+        # reject values the engine accepts and break the invariant above, so
+        # abstain and let the engine's parse be the verdict.
+        return
+    if not isinstance(value, list):
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, got {type(value).__name__} — wrap a single value in a "
+            f"one-element array ('3.seed=[42]'), and {fix}"
+        )
+
+
 @mcp.tool()
 def vary_workflow(
     workflow_path: str, slots: list[str], out_dir: str | None = None
@@ -5030,9 +5246,26 @@ def vary_workflow(
     Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``.
     ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
     ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
-    so every list MUST be the same length — e.g. ``["3.seed=[1,2,3]",
-    "6.text=[cat,dog,fish]"]`` yields three variants pairing seed 1/cat, 2/dog,
-    3/fish.
+    so every list MUST be the same length — e.g. ``['3.seed=[1,2,3]',
+    '6.text=["a cat", "a dog", "a fish"]']`` yields three variants pairing seed
+    1/cat, 2/dog, 3/fish.
+
+    **Each entry's value portion (everything after the first ``=``) must be
+    valid JSON, and must parse to a JSON ARRAY.** That is the whole gotcha, and
+    it bites hardest on prompts: a value containing a comma or spaces has to be
+    JSON-quoted, or it is not a list at all. Concretely::
+
+        # WRONG — not valid JSON; comfy-cli reads it as one bare string and
+        # fails with `value must be a JSON array (got str)`
+        ["1.prompt=[a lighthouse at dawn, oil painting, a cabin at dusk]"]
+
+        # RIGHT — each value is a JSON string, so the commas INSIDE a value
+        # stay part of that value
+        ['1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]']
+
+    Numbers and booleans need no quoting (``"3.seed=[1,2,3]"``), and a single
+    value still needs its array (``"3.seed=[42]"``, not ``"3.seed=42"``). This
+    tool pre-checks each entry and names the offending one before shelling out.
 
     With ``out_dir`` unset (default) comfy-cli emits the variants as NDJSON to
     stdout; set ``out_dir`` to instead write ``<stem>_<N>.json`` files there (and
@@ -5054,13 +5287,16 @@ def vary_workflow(
     )
     _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
-    for slot in slots:
+    for index, slot in enumerate(slots):
         _reject_option_like(
             "slot",
             slot,
             expected="an 'ADDR=[v1,v2,...]' string (e.g. '3.seed=[1,2,3]')",
         )
         _reject_nul("slot", slot)
+        # After the argv guards, not before: a dash-leading or NUL-bearing entry
+        # is an argv problem first, and its named error is the more useful one.
+        _reject_non_json_array_slot(index, slot)
         args += ["--slot", slot]
     if out_dir:
         _reject_option_like(

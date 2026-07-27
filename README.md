@@ -86,7 +86,10 @@ Cloud MCP** — comfy-cli is the engine.
   clients launch the server with their own environment, which often does **not** include your
   shell's `PATH` — so if `comfy` lives in a virtualenv or a non-standard location, set
   `COMFY_BIN` to its absolute path (e.g. `/path/to/venv/bin/comfy`). Every client example below
-  shows where it goes.
+  shows where it goes. Setting it is sufficient on its own — you do **not** also have to put
+  that directory on the client's `PATH`. The server prepends the resolved binary's directory to
+  the `PATH` it hands comfy-cli, because some comfy-cli commands (notably the background
+  `launch`) re-invoke `comfy` by name and have to be able to find themselves.
 - **`COMFY_API_KEY` (optional — needed only for partner-API nodes).** Workflows that use
   partner-API nodes (Seedream / Seedance / Nano Banana / Gemini / Veo / Kling / …) need a Comfy
   credential, and — exactly like `COMFY_BIN` — an MCP client launches the server with its own
@@ -473,7 +476,7 @@ the originals stay in the ComfyUI workspace.
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
 | `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
 | `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
-| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. |
+| `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. Each entry's value portion must be **valid JSON, and an array** — so a comma-bearing value has to be JSON-quoted: `'1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]'`, not `1.prompt=[a lighthouse at dawn, oil painting]`. |
 
 ### Discovery and templates
 
