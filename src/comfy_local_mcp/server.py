@@ -50,6 +50,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -472,6 +473,21 @@ def _comfy_env() -> dict[str, str]:
       ``UnicodeEncodeError`` printing the UTF-8 catalog output and wedges, so the
       discovery tools present as a 60s timeout. UTF-8 is already the practical
       default on macOS/Linux, so this is a no-op there.
+    - ``GIT_TERMINAL_PROMPT=0`` / ``PIP_NO_INPUT=1`` — never let a child stop to
+      ask a question. This is an MCP **stdio** server, so the parent's stdin is
+      the JSON-RPC transport; both spawn sites therefore pass
+      ``stdin=DEVNULL`` (see ``_run_comfy_raw`` / ``_run_comfy_streaming``) so a
+      child can never read protocol bytes out from under the client. With stdin
+      closed, an interactive git/pip prompt could not be answered anyway, so
+      these two turn "block invisibly until the timeout" into an immediate,
+      legible failure — which matters most for ``update_comfyui``, whose
+      ``git pull`` + ``pip install`` can hit an uncached private remote and
+      whose 30-minute ceiling makes a silent hang very expensive.
+
+      Deliberately NOT set here: ``GIT_ASKPASS`` / ``SSH_ASKPASS``. A GUI or
+      keychain credential helper does not use stdin, so it still works with
+      stdin closed; overriding it would break private-remote updates that
+      succeed today.
     """
     return {
         **os.environ,
@@ -479,6 +495,8 @@ def _comfy_env() -> dict[str, str]:
         "COMFY_NO_WATCH": "1",
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PIP_NO_INPUT": "1",
     }
 
 
@@ -858,6 +876,14 @@ def _run_comfy_raw(
         proc = subprocess.run(
             cmd,
             capture_output=True,
+            # This process speaks JSON-RPC over stdio, so the parent's stdin IS
+            # the protocol channel. A child that inherits it (the subprocess
+            # default) can consume request bytes the client sent us — silently
+            # corrupting the session — or block on a prompt nobody can answer.
+            # No comfy-cli invocation here is interactive, so close it outright;
+            # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
+            # child that WOULD have prompted fails fast instead of hanging.
+            stdin=subprocess.DEVNULL,
             text=True,
             # Pin the parent-side decode to UTF-8 so it matches what the child
             # is forced to emit (_comfy_env). Without this, text=True decodes
@@ -1415,6 +1441,9 @@ async def _run_comfy_streaming(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        # Same reason as the plain path: never let a child inherit the stdio
+        # transport's stdin and eat JSON-RPC request bytes. See _run_comfy_raw.
+        stdin=subprocess.DEVNULL,
         text=True,
         # Match the child's forced UTF-8 output (see _comfy_env); otherwise
         # readline()/stderr.read() decode with the parent locale (cp1252 on
@@ -3763,6 +3792,14 @@ _UPDATE_TARGETS = ("all", "comfy", "cli")
 # network fetch that must not be killed halfway).
 _UPDATE_TIMEOUT = 1800.0
 
+# Only one `comfy update` may be in flight per server process. FastMCP dispatches
+# sync tools onto a worker thread pool, so a client is free to issue a second
+# `update_comfyui` while the first is still running — and both would drive `git`
+# and `pip` against the SAME workspace and Python environment at once (a fight
+# over `index.lock`, or two installers writing the same `site-packages`), which
+# can leave a partially-installed ComfyUI. Held for the whole subprocess.
+_UPDATE_LOCK = threading.Lock()
+
 
 @mcp.tool()
 def update_comfyui(target: str = "comfy") -> Any:
@@ -3801,6 +3838,16 @@ def update_comfyui(target: str = "comfy") -> Any:
     allowed targets, and only the matched value — never the caller's raw string
     — is forwarded on the command line.
 
+    **One update at a time.** An update rewrites the ComfyUI git checkout and
+    reinstalls into its Python environment, so a second concurrent call would
+    race the first over ``index.lock`` / ``site-packages`` and can leave a
+    half-installed workspace. A call made while another update is in flight is
+    refused immediately with a :class:`ComfyCliError` saying so, rather than
+    queued behind a job that may run for half an hour. Note this serializes
+    updates against each other only — do not call ``restart_comfyui`` (or
+    ``launch_comfyui``) while an update is running; wait for it to return, which
+    is the documented order anyway.
+
     Like ``launch_comfyui`` / ``stop_comfyui``, ``comfy update`` prints human
     text and exits 0 without a JSON envelope, so success returns a synthesized
     ``{"ok": True, ...}`` payload carrying that text. A failed update (a dirty
@@ -3815,9 +3862,24 @@ def update_comfyui(target: str = "comfy") -> Any:
             "('comfy' = ComfyUI core, 'all' = installed custom node packs, "
             "'cli' = comfy-cli itself)."
         )
-    # Forward `normalized` (a member of `_UPDATE_TARGETS`), not `target`: the
-    # caller's raw string never reaches argv.
-    return _run_comfy("update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True)
+    # Refuse rather than queue: blocking would park a FastMCP worker thread for
+    # up to 30 minutes behind an update the caller cannot see, and present as a
+    # hang. Failing immediately names what is happening and leaves retrying to
+    # the caller. Acquired AFTER target validation so a bad target is still
+    # rejected while an update is running.
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        raise ComfyCliError(
+            "an update is already running in this server; `comfy update` "
+            "mutates the ComfyUI git checkout and Python environment, so two "
+            "at once can corrupt the install. Wait for the in-flight update to "
+            "finish (up to 30 minutes for a core update) and call again."
+        )
+    try:
+        # Forward `normalized` (a member of `_UPDATE_TARGETS`), not `target`: the
+        # caller's raw string never reaches argv.
+        return _run_comfy("update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True)
+    finally:
+        _UPDATE_LOCK.release()
 
 
 # comfy-cli's `logs` reports this error code when no persisted log file exists
