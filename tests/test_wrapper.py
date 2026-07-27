@@ -19,6 +19,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -1617,24 +1618,21 @@ def test_wait_for_job_reraises_a_non_timeout_poll_failure(monkeypatch):
         server.wait_for_job("pid", timeout_seconds=1.0)
 
 
-def test_run_comfy_marks_a_subprocess_timeout(monkeypatch):
+def test_run_comfy_marks_a_subprocess_timeout(patched_run):
     """The `timed_out` flag is set only where the child was killed at our budget.
 
     `wait_for_job` branches on it to tell its own deadline from a comfy-cli
     failure, so the flag has to come from the raise site rather than the message.
     """
-
-    def fake_subprocess_run(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
-
-    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(server, "_require_comfy_bin", lambda: None)
-    monkeypatch.setattr(server, "_check_comfy_version", lambda: None)
+    calls = patched_run(
+        raises=subprocess.TimeoutExpired([server.COMFY_BIN, "jobs"], 1.0)
+    )
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         server._run_comfy("jobs", "status", "pid", timeout=1.0)
 
     assert excinfo.value.timed_out is True
+    assert calls[0]["timeout"] == 1.0  # the caller's budget bounded the wait
 
 
 def test_prompt_id_guard_rejects_an_oversized_id(monkeypatch):
@@ -2810,6 +2808,213 @@ def test_sync_timeout_with_no_captures_is_sane(patched_run):
     assert "stdout tail: <empty>" in msg
 
 
+def test_plain_spawn_leads_its_own_process_group(patched_run):
+    """The plain path spawns with `start_new_session=True`, like the streaming one.
+
+    Prerequisite for the group kill below: without it the child sits in the MCP
+    server's OWN process group, so `os.getpgid(child)` would resolve to the
+    server and the timeout handler would SIGKILL itself.
+    """
+    calls = patched_run()
+
+    server._run_comfy("env", timeout=5.0)
+
+    assert calls[0]["start_new_session"] is True
+
+
+class _GroupKillProc:
+    """A `Popen` fake with a pid, for the process-group assertions below.
+
+    conftest's `_FakeRunProc` deliberately carries no `pid` so `_kill_proc_tree`
+    takes its single-child fallback rather than calling `os.killpg` on a made-up
+    one. This fake has a pid, and the test stubs `os.killpg`, so the group path
+    is the one under test.
+
+    `exited` models the case the group kill exists for: the direct `comfy` child
+    is already gone (a non-None `poll()`) while a forked grandchild is still
+    running and holding the pipes — which is why `communicate()` timed out.
+    """
+
+    def __init__(self, cmd, exc, *, exited=False):
+        self.args = cmd
+        self.pid = 424242
+        self.stdout = None
+        self.stderr = None
+        self.returncode = -1 if exited else None
+        self.killed = False
+        self._exc = exc
+        self._communicates = 0
+        # Every bound this fake was handed, in order: [0] is the caller's own
+        # timeout, [1] the post-kill drain's. Recorded so a test can pin that
+        # the drain stays BOUNDED — an unbounded second `communicate()` is the
+        # exact wedge `_DRAIN_TIMEOUT` exists to prevent, and a fake that merely
+        # ignores the argument would never notice it going missing.
+        self.timeouts: list = []
+
+    def communicate(self, timeout=None):
+        self._communicates += 1
+        self.timeouts.append(timeout)
+        if self._communicates == 1:
+            raise self._exc
+        return "drained stdout", "drained stderr"  # the post-kill drain
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):  # noqa: ARG002
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def test_sync_timeout_kills_the_whole_process_group(monkeypatch):
+    """A timed-out plain spawn reaps comfy-cli's DESCENDANTS, not just comfy-cli.
+
+    comfy-cli's long verbs fork real work — `comfy update` runs `git pull` and
+    then a multi-GB `pip install -r requirements.txt`, `comfy model download`
+    streams a large file — and both ride a 1800s ceiling. `subprocess.run` (what
+    this path used to be) kills only the direct child at the deadline, so those
+    grandchildren kept mutating the ComfyUI workspace and Python environment
+    long after the tool had reported failure, or died mid-write. Assert on the
+    signal that actually reaches the group.
+    """
+    proc = _GroupKillProc(
+        [server.COMFY_BIN, "update", "all"], _timeout(stderr=None, stdout=None)
+    )
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(
+        server.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
+    )
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    # `start_new_session=True` makes the child its own group leader, so its pid
+    # IS the pgid — signalled directly, without an `os.getpgid` lookup that
+    # would raise (and so skip the kill) on an already-reaped leader.
+    assert signalled == [(proc.pid, signal.SIGKILL)]  # the GROUP, not the child
+    assert proc.killed is False  # so the single-child fallback never had to fire
+    assert exc.value.timed_out is True
+    # The drain after the kill is what recovers the partial output that
+    # `subprocess.run` used to attach to the `TimeoutExpired` itself.
+    assert "drained stderr" in str(exc.value)
+
+
+def test_group_kill_is_not_gated_on_the_leader_still_running(monkeypatch):
+    """A dead `comfy` does not mean a dead tree — kill the group regardless.
+
+    The case this whole change exists for is a `comfy update` whose `git pull` /
+    `pip install` (or a `model download`) outlives its parent: `comfy` itself has
+    exited, the grandchild is still running and still holding the pipe open —
+    which is exactly WHY `communicate()` blew its deadline. Gating the group kill
+    on `proc.poll() is None` would read the exited leader and skip the kill in
+    precisely that case, leaving the descendant to keep mutating the workspace.
+    """
+    proc = _GroupKillProc(
+        [server.COMFY_BIN, "update", "all"],
+        _timeout(stderr=None, stdout=None),
+        exited=True,  # the leader is already gone; its group is not
+    )
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(
+        server.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    assert signalled == [(proc.pid, signal.SIGKILL)]  # the survivors still die
+
+
+def test_drain_second_timeout_keeps_the_longer_capture(monkeypatch):
+    """A drain that times out too still reports what it managed to read.
+
+    `communicate()` resumes the same accumulation buffers, so the capture on the
+    drain's own `TimeoutExpired` is a superset of the first one's. Falling back
+    to the first would silently under-report the diagnostics in the timeout
+    message and the failure log.
+    """
+
+    class _DoubleTimeoutProc(_GroupKillProc):
+        def communicate(self, timeout=None):
+            self._communicates += 1
+            self.timeouts.append(timeout)
+            if self._communicates == 1:
+                raise self._exc
+            raise subprocess.TimeoutExpired(
+                self.args, 5.0, output=b"first chunk + more", stderr=b"traceback tail"
+            )
+
+    proc = _DoubleTimeoutProc(
+        [server.COMFY_BIN, "update", "all"],
+        _timeout(stderr=b"trace", stdout=b"first"),
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)  # noqa: ARG005
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    msg = str(exc.value)
+    assert "first chunk + more" in msg  # the drain's longer read, not `first`
+    assert "traceback tail" in msg
+    # And the drain that produced it stayed bounded: a post-kill `communicate()`
+    # with no deadline is what `_DRAIN_TIMEOUT` exists to stop, since a
+    # descendant that survived SIGKILL can hold the pipes open indefinitely.
+    assert proc.timeouts == [1800.0, server._DRAIN_TIMEOUT]
+
+
+def test_drain_non_timeout_failure_falls_back_to_the_first_capture(monkeypatch):
+    """A drain that dies on a decode error has nothing better than the first read."""
+
+    class _DecodeFailProc(_GroupKillProc):
+        def communicate(self, timeout=None):
+            self._communicates += 1
+            self.timeouts.append(timeout)
+            if self._communicates == 1:
+                raise self._exc
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    proc = _DecodeFailProc(
+        [server.COMFY_BIN, "update", "all"],
+        _timeout(stderr="partial trace", stdout="partial out"),
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)  # noqa: ARG005
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    assert "partial trace" in str(exc.value)
+    assert proc.timeouts == [1800.0, server._DRAIN_TIMEOUT]  # still a bounded drain
+
+
+def test_sync_non_timeout_failure_still_reaps_the_child(patched_run):
+    """A decode error mid-drain must not leak the child either.
+
+    `subprocess.run` wrapped every call in `with Popen(...)` and had a bare
+    `except` that killed the process before re-raising; `_run_comfy_raw` owns
+    the process by hand now, so it has to do that itself — and it kills the
+    whole group rather than just the child.
+    """
+    calls = patched_run(
+        raises=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    )
+
+    with pytest.raises(UnicodeDecodeError):
+        server._run_comfy("env", timeout=5.0)
+
+    assert calls[0]["proc"].killed is True
+
+
 class _BlockingProcWithStderr:
     """A blocking Popen fake that also carries buffered stderr (a crashed child's traceback)."""
 
@@ -3600,14 +3805,14 @@ def test_update_comfyui_refuses_a_concurrent_update(monkeypatch, patched_plain_r
     calls = patched_plain_run(0, stderr="done")
     inside = threading.Event()
     release = threading.Event()
-    fixture_run = server.subprocess.run
+    fixture_popen = server.subprocess.Popen
 
-    def blocking_run(*args, **kwargs):
+    def blocking_popen(*args, **kwargs):
         inside.set()  # the first update now holds the lock...
         release.wait(5)  # ...and keeps holding it until this test lets go
-        return fixture_run(*args, **kwargs)
+        return fixture_popen(*args, **kwargs)
 
-    monkeypatch.setattr(server.subprocess, "run", blocking_run)
+    monkeypatch.setattr(server.subprocess, "Popen", blocking_popen)
     worker = threading.Thread(target=server.update_comfyui, args=("comfy",))
     worker.start()
     try:
