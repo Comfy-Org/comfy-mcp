@@ -211,6 +211,23 @@ def patched_run(monkeypatch):
 
 
 @pytest.fixture
+def no_spawn(monkeypatch):
+    """Assert no comfy-cli child is spawned — an input guard must refuse first.
+
+    The counterpart to :func:`patched_run` for the guard tests: they are not
+    about what the CLI returns but about never reaching it, and the point of a
+    pre-flight check is lost if the argv still goes out. Failing inside the fake
+    puts the assertion at the moment of the spawn, so a guard that stops
+    refusing surfaces as a spawn, not as a vague missing error.
+    """
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+
+@pytest.fixture
 def patched_plain_run(patched_run):
     """``setup(returncode=…, stdout=…, stderr=…) -> calls`` for the NO-envelope path.
 

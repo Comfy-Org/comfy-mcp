@@ -4935,6 +4935,145 @@ def set_workflow_slot(
     return _run_comfy(*args, timeout=60.0)
 
 
+# A slot entry's value portion is fed to `json.loads` by comfy-cli, so the two
+# examples that make the contract concrete: the mechanical shape, and the one
+# that trips callers up — a string value containing a comma, which is ONLY a
+# single value when it is JSON-quoted.
+_SLOT_VALUE_EXAMPLE = "3.seed=[1,2,3]"
+_SLOT_QUOTED_EXAMPLE = '6.text=["a lighthouse at dawn, oil painting", "a cabin"]'
+
+# Past this, a slot cannot reach comfy-cli at all: Linux caps a SINGLE argv
+# entry at `MAX_ARG_STRLEN` (32 pages = 128 KiB) regardless of the roomier total
+# `ARG_MAX`, so the spawn fails before comfy-cli parses anything. That makes this
+# a bound the pre-check can honor without inventing a policy — it is the engine's
+# own reachability limit, not a taste call about sweep size. The kernel counts
+# BYTES, so this must be measured after encoding: a value of multibyte
+# characters is several times its character count on the wire.
+_MAX_PRECHECKED_SLOT_BYTES = 128 * 1024
+
+
+def _clip_for_error(text: str) -> str:
+    """Render a caller-supplied fragment for an error message, bounded.
+
+    A slot's value list is caller-sized — a sweep over long prompts is KBs of
+    text — and the whole point of naming the offending entry is lost if the
+    message it rides in is unreadable. Same per-field cap the envelope errors use.
+
+    This quotes the fragment itself rather than leaving that to an ``!r`` at the
+    call site, because the cap has to apply to what is actually RENDERED. ``repr``
+    expands a control or non-printable character into a 4-to-10-character escape
+    (``\\x00``, ``\\uXXXX``, ``\\U000XXXXX``), so clipping the raw text first and
+    quoting after would let 500 such characters land as ~2000+ in the message —
+    the bound would read as if it held while the field blew past it. Clipping the
+    rendered form is what :func:`_render_error_details` does too.
+
+    The source text is sliced BEFORE ``repr`` so an MB-sized value never
+    materializes an expanded copy just to have it thrown away. That is safe for
+    the characters shown: every source character contributes at least one
+    character to the repr, so the escaping of the retained prefix cannot depend
+    on anything past the cap. The one thing it does change is ``repr``'s choice
+    of surrounding quote — it switches to double quotes for a string containing
+    an apostrophe and no double quote, and that decision is now made over the
+    slice, so an apostrophe past the cap flips it. Cosmetic, in a preview that
+    is already truncated. The ellipsis is counted inside the cap, so the
+    returned field never exceeds it.
+    """
+    rendered = repr(text[:_MAX_ERROR_FIELD_CHARS])
+    if len(rendered) <= _MAX_ERROR_FIELD_CHARS:
+        return rendered
+    return rendered[: _MAX_ERROR_FIELD_CHARS - 1] + "…"
+
+
+def _reject_non_json_array_slot(index: int, slot: str) -> None:
+    """Reject a ``vary_workflow`` slot whose value is not a JSON array.
+
+    comfy-cli splits each ``--slot`` entry on its first ``=`` and runs the value
+    portion through :func:`json.loads`, *falling back to the literal string* when
+    that fails — then rejects anything that did not parse to a list. So the
+    natural first attempt at a text sweep,
+    ``6.text=[a lighthouse at dawn, oil painting]``, is not a two-element list at
+    all: it is invalid JSON, comes back as one bare string, and dies as
+    ``value must be a JSON array (got str)`` with nothing pointing at the missing
+    quotes.
+
+    Checking here rather than passing the failure through buys two things. The
+    message can name WHICH entry was malformed and show the quoted form that
+    fixes it (comfy-cli sees only the value it already failed to parse), and the
+    check lands before the subprocess: ``comfy workflow vary`` loads the file and
+    fetches ``object_info`` from the live ComfyUI *before* it parses ``--slot``,
+    so with the server down a malformed slot surfaces as a connection failure
+    that hides the real mistake entirely.
+
+    This mirrors comfy-cli's own parse exactly — ``json.loads`` on the value
+    portion, accept only a ``list`` — so it can only refuse input comfy-cli would
+    also refuse — with one deliberate exception. A failure that is a property of
+    the PARSING PROCESS rather than of the input (recursion depth, an interpreter
+    limit like ``sys.get_int_max_str_digits``) says nothing about how comfy-cli's
+    own fresh subprocess will fare, so those are handed to the engine untouched
+    rather than guessed at. Only a genuine syntax error — a
+    :class:`json.JSONDecodeError` — is refused here.
+
+    A value too long to survive ``execve`` abstains the same way: see
+    :data:`_MAX_PRECHECKED_SLOT_BYTES`. That keeps the parse — the one piece of
+    real work this thin wrapper does in-process rather than in the disposable
+    subprocess — bounded by what the engine could actually have received.
+    """
+    fix = (
+        f"quote each value as JSON — e.g. '{_SLOT_VALUE_EXAMPLE}', or "
+        f"'{_SLOT_QUOTED_EXAMPLE}' when a value contains a comma or spaces "
+        "(an unquoted comma splits the value, and unquoted text is not JSON)"
+    )
+    if "=" not in slot:
+        raise ComfyCliError(
+            f"invalid slots[{index}] {_clip_for_error(slot)}: expected an "
+            f"'ADDR=[v1,v2,...]' string whose value is a JSON array — {fix}"
+        )
+    # Measured over the whole entry, encoded: `slot` IS the argv string, and the
+    # kernel's limit is in bytes. `surrogatepass` because a lone surrogate can
+    # arrive over the wire and this guard must not be the thing that raises.
+    if len(slot.encode("utf-8", "surrogatepass")) > _MAX_PRECHECKED_SLOT_BYTES:
+        # Too long to survive `execve` (see `_MAX_PRECHECKED_SLOT_BYTES`), so
+        # there is no verdict worth computing: the spawn fails before comfy-cli
+        # reads it either way. Parsing it anyway would do real work in the
+        # long-lived parent for a value that cannot land — allocating an object
+        # graph several times its size, and on an interpreter without
+        # `sys.get_int_max_str_digits` converting a multi-million-digit literal
+        # in quadratic time. Abstaining costs nothing: this is the same
+        # engine-decides path the other unparseable cases take, so it cannot
+        # over-reject.
+        return
+    addr, _, raw = slot.partition("=")
+    # Clipped like every other caller-supplied fragment here: the address is the
+    # portion BEFORE the first `=` and is just as caller-sized as the value, so
+    # echoing it raw would hand back a multi-KB message and defeat the bound.
+    addr = _clip_for_error(addr.strip())
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, but {_clip_for_error(raw)} is not valid JSON — {fix}"
+        ) from None
+    except (ValueError, RecursionError):
+        # NOT a syntax error — the input is well-formed JSON that THIS
+        # interpreter declined to build: nesting deeper than the stack left us
+        # (`RecursionError`), or an integer literal over
+        # `sys.get_int_max_str_digits` (a plain `ValueError`, not a
+        # `JSONDecodeError`, since 3.11). Both are limits of the process doing
+        # the parsing, and this one parses several frames down from the MCP
+        # handler with whatever limits this interpreter was started with, while
+        # comfy-cli parses in a fresh subprocess of its own. Refusing here would
+        # reject values the engine accepts and break the invariant above, so
+        # abstain and let the engine's parse be the verdict.
+        return
+    if not isinstance(value, list):
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, got {type(value).__name__} — wrap a single value in a "
+            f"one-element array ('3.seed=[42]'), and {fix}"
+        )
+
+
 @mcp.tool()
 def vary_workflow(
     workflow_path: str, slots: list[str], out_dir: str | None = None
@@ -4944,9 +5083,26 @@ def vary_workflow(
     Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``.
     ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
     ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
-    so every list MUST be the same length — e.g. ``["3.seed=[1,2,3]",
-    "6.text=[cat,dog,fish]"]`` yields three variants pairing seed 1/cat, 2/dog,
-    3/fish.
+    so every list MUST be the same length — e.g. ``['3.seed=[1,2,3]',
+    '6.text=["a cat", "a dog", "a fish"]']`` yields three variants pairing seed
+    1/cat, 2/dog, 3/fish.
+
+    **Each entry's value portion (everything after the first ``=``) must be
+    valid JSON, and must parse to a JSON ARRAY.** That is the whole gotcha, and
+    it bites hardest on prompts: a value containing a comma or spaces has to be
+    JSON-quoted, or it is not a list at all. Concretely::
+
+        # WRONG — not valid JSON; comfy-cli reads it as one bare string and
+        # fails with `value must be a JSON array (got str)`
+        ["1.prompt=[a lighthouse at dawn, oil painting, a cabin at dusk]"]
+
+        # RIGHT — each value is a JSON string, so the commas INSIDE a value
+        # stay part of that value
+        ['1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]']
+
+    Numbers and booleans need no quoting (``"3.seed=[1,2,3]"``), and a single
+    value still needs its array (``"3.seed=[42]"``, not ``"3.seed=42"``). This
+    tool pre-checks each entry and names the offending one before shelling out.
 
     With ``out_dir`` unset (default) comfy-cli emits the variants as NDJSON to
     stdout; set ``out_dir`` to instead write ``<stem>_<N>.json`` files there (and
@@ -4968,13 +5124,16 @@ def vary_workflow(
     )
     _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
-    for slot in slots:
+    for index, slot in enumerate(slots):
         _reject_option_like(
             "slot",
             slot,
             expected="an 'ADDR=[v1,v2,...]' string (e.g. '3.seed=[1,2,3]')",
         )
         _reject_nul("slot", slot)
+        # After the argv guards, not before: a dash-leading or NUL-bearing entry
+        # is an argv problem first, and its named error is the more useful one.
+        _reject_non_json_array_slot(index, slot)
         args += ["--slot", slot]
     if out_dir:
         _reject_option_like(
