@@ -4530,6 +4530,13 @@ def set_workflow_slot(
 _SLOT_VALUE_EXAMPLE = "3.seed=[1,2,3]"
 _SLOT_QUOTED_EXAMPLE = '6.text=["a lighthouse at dawn, oil painting", "a cabin"]'
 
+# Past this, a slot value cannot reach comfy-cli at all: Linux caps a SINGLE
+# argv entry at `MAX_ARG_STRLEN` (32 pages = 128 KiB) regardless of the roomier
+# total `ARG_MAX`, so the spawn fails before comfy-cli parses anything. That
+# makes this a bound the pre-check can honor without inventing a policy — it is
+# the engine's own reachability limit, not a taste call about sweep size.
+_MAX_PRECHECKED_SLOT_CHARS = 128 * 1024
+
 
 def _clip_for_error(text: str) -> str:
     """Render a caller-supplied fragment for an error message, bounded.
@@ -4545,11 +4552,18 @@ def _clip_for_error(text: str) -> str:
     quoting after would let 500 such characters land as ~2000+ in the message —
     the bound would read as if it held while the field blew past it. Clipping the
     rendered form is what :func:`_render_error_details` does too.
+
+    The source text is sliced BEFORE ``repr`` so an MB-sized value never
+    materializes an expanded copy just to have it thrown away: the first
+    ``_MAX_ERROR_FIELD_CHARS`` characters of ``repr(text)`` can only depend on
+    the first ``_MAX_ERROR_FIELD_CHARS`` characters of ``text``, since every
+    source character contributes at least one character to the repr. The
+    ellipsis is counted inside the cap, so the returned field never exceeds it.
     """
-    rendered = repr(text)
+    rendered = repr(text[:_MAX_ERROR_FIELD_CHARS])
     if len(rendered) <= _MAX_ERROR_FIELD_CHARS:
         return rendered
-    return rendered[:_MAX_ERROR_FIELD_CHARS] + "…"
+    return rendered[: _MAX_ERROR_FIELD_CHARS - 1] + "…"
 
 
 def _reject_non_json_array_slot(index: int, slot: str) -> None:
@@ -4580,8 +4594,12 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
     own fresh subprocess will fare, so those are handed to the engine untouched
     rather than guessed at. Only a genuine syntax error — a
     :class:`json.JSONDecodeError` — is refused here.
+
+    A value too long to survive ``execve`` abstains the same way: see
+    :data:`_MAX_PRECHECKED_SLOT_CHARS`. That keeps the parse — the one piece of
+    real work this thin wrapper does in-process rather than in the disposable
+    subprocess — bounded by what the engine could actually have received.
     """
-    preview = _clip_for_error(slot)
     fix = (
         f"quote each value as JSON — e.g. '{_SLOT_VALUE_EXAMPLE}', or "
         f"'{_SLOT_QUOTED_EXAMPLE}' when a value contains a comma or spaces "
@@ -4589,10 +4607,21 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
     )
     if "=" not in slot:
         raise ComfyCliError(
-            f"invalid slots[{index}] {preview}: expected an 'ADDR=[v1,v2,...]' "
-            f"string whose value is a JSON array — {fix}"
+            f"invalid slots[{index}] {_clip_for_error(slot)}: expected an "
+            f"'ADDR=[v1,v2,...]' string whose value is a JSON array — {fix}"
         )
     addr, _, raw = slot.partition("=")
+    if len(raw) > _MAX_PRECHECKED_SLOT_CHARS:
+        # Too long to survive `execve` (see `_MAX_PRECHECKED_SLOT_CHARS`), so
+        # there is no verdict worth computing: the spawn fails before comfy-cli
+        # reads it either way. Parsing it anyway would do real work in the
+        # long-lived parent for a value that cannot land — allocating an object
+        # graph several times its size, and on an interpreter without
+        # `sys.get_int_max_str_digits` converting a multi-million-digit literal
+        # in quadratic time. Abstaining costs nothing: this is the same
+        # engine-decides path the other unparseable cases take, so it cannot
+        # over-reject.
+        return
     # Clipped like every other caller-supplied fragment here: the address is the
     # portion BEFORE the first `=` and is just as caller-sized as the value, so
     # echoing it raw would hand back a multi-KB message and defeat the bound.

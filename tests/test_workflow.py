@@ -514,3 +514,67 @@ def test_vary_workflow_slot_error_bound_survives_repr_escaping(monkeypatch):
         server.vary_workflow("/tmp/flux.json", ["6.text=[" + "\x01" * 10_000 + "]"])
 
     assert len(str(excinfo.value)) < 2_000
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["\x01" * 10_000, "x" * 10_000, "\U0001f600" * 10_000],
+    ids=["control", "printable", "astral"],
+)
+def test_clip_for_error_never_exceeds_the_cap(text):
+    """The returned field is bounded whatever the escaping does to it.
+
+    Checked directly rather than through a message, because the cap is this
+    helper's whole contract and the call sites add their own fixed prose on top.
+    """
+    assert len(server._clip_for_error(text)) <= server._MAX_ERROR_FIELD_CHARS
+
+
+def test_clip_for_error_matches_an_unsliced_repr():
+    """Slicing the source before `repr` must not change the rendered prefix.
+
+    The pre-slice is an allocation guard, not a behavior change: every source
+    character contributes at least one character to the repr, so the first
+    `_MAX_ERROR_FIELD_CHARS` of `repr(text)` cannot depend on anything past the
+    first `_MAX_ERROR_FIELD_CHARS` of `text`.
+    """
+    for text in ("\x01" * 10_000, "y" * 10_000, "a, b" * 5_000):
+        clipped = server._clip_for_error(text)
+        assert clipped.endswith("…")
+        assert repr(text).startswith(clipped[:-1])
+
+
+def test_vary_workflow_defers_unspawnably_long_slot_to_the_engine(patched_run):
+    """A value past the single-argv limit is forwarded, not parsed and not refused.
+
+    Linux caps one argv entry at `MAX_ARG_STRLEN` (128 KiB), so a `--slot` value
+    beyond it can never reach comfy-cli — the spawn fails first. Parsing it here
+    would be real work in the long-lived parent for a value that cannot land, so
+    the guard abstains. Crucially it abstains rather than refuses: the pre-check
+    still never rejects anything the engine would have accepted.
+    """
+    calls = patched_run(envelope(data={"count": 1}))
+
+    oversized = "[" + "9" * (server._MAX_PRECHECKED_SLOT_CHARS + 1) + "]"
+    slot = f"3.seed={oversized}"
+    server.vary_workflow("/tmp/flux.json", [slot])
+
+    assert calls[0]["cmd"][4:] == ["workflow", "vary", "/tmp/flux.json", "--slot", slot]
+
+
+def test_vary_workflow_still_checks_a_slot_just_under_the_spawn_limit(monkeypatch):
+    """The abstain threshold is a ceiling, not a hole — just under it still checks.
+
+    Guards against the size gate silently swallowing the ordinary contract check
+    for any value large enough to matter.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    # Well-formed JSON, not an array, at a length the gate still inspects.
+    value = '"' + "p" * (server._MAX_PRECHECKED_SLOT_CHARS - 100) + '"'
+    with pytest.raises(server.ComfyCliError, match="got str"):
+        server.vary_workflow("/tmp/flux.json", [f"6.text={value}"])
