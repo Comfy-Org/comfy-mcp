@@ -364,3 +364,73 @@ def test_vary_workflow_slot_error_is_bounded(monkeypatch):
 
     assert "x" * 10_000 not in str(excinfo.value)
     assert len(str(excinfo.value)) < 2_000
+
+
+@pytest.mark.parametrize(
+    "value, marker",
+    [("42", "got int"), ("[bad", "not valid JSON")],
+    ids=["non-array", "invalid-json"],
+)
+def test_vary_workflow_slot_error_bounds_the_address_too(monkeypatch, value, marker):
+    """The ADDRESS half is caller-sized as well, and is clipped like the value.
+
+    Everything before the first `=` is whatever the caller sent — nothing
+    upstream caps it — so echoing it raw would blow the per-field bound from the
+    other side and, with the opt-in failure log on, write a multi-KB line per
+    attempt. Both error branches interpolate the address, so both are checked.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    address = "A" * 10_000
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.vary_workflow("/tmp/flux.json", [f"{address}={value}"])
+
+    message = str(excinfo.value)
+    assert marker in message  # still the branch we meant to exercise
+    assert address not in message
+    assert len(message) < 2_000
+
+
+def test_vary_workflow_defers_unparseably_nested_slot_to_the_engine(
+    patched_run, monkeypatch
+):
+    """Nesting too deep for THIS stack is not a verdict on comfy-cli's.
+
+    `json.loads` raises `RecursionError` once the nesting outruns the remaining
+    stack, and this pre-check runs several frames down (MCP handler -> tool ->
+    loop -> helper) from where comfy-cli parses — a fresh subprocess. So a depth
+    that fails here can still parse there, and refusing it would break the
+    invariant the pre-check rests on: it may only refuse what comfy-cli would
+    also refuse. Forward it and let the engine's own parse decide.
+
+    The error is injected rather than provoked with real nesting: the depth that
+    trips the C scanner moved between 3.10 and 3.14 (3.14 parses 20k-deep arrays
+    that 3.10 refuses), so a literal deep value would silently stop exercising
+    this branch on one of the two interpreters CI runs.
+    """
+    calls = patched_run(envelope(data={"count": 1}))
+
+    nested = "[" * 200 + "]" * 200
+    slot = f"6.text={nested}"
+    real_loads = server.json.loads
+
+    def loads(text, *args, **kwargs):
+        if text == nested:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(server.json, "loads", loads)
+
+    server.vary_workflow("/tmp/flux.json", [slot])
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        slot,  # untouched: the guard abstained, it did not rewrite or refuse
+    ]

@@ -4536,7 +4536,11 @@ def _clip_for_error(text: str) -> str:
 
     A slot's value list is caller-sized — a sweep over long prompts is KBs of
     text — and the whole point of naming the offending entry is lost if the
-    message it rides in is unreadable. Same per-field cap the envelope errors use.
+    message it rides in is unreadable. Same per-field cap the envelope errors use:
+    ``_MAX_ERROR_FIELD_CHARS`` bounds the caller-supplied CONTENT, exactly as the
+    bare ``[:_MAX_ERROR_FIELD_CHARS]`` slices in :func:`_render_error_details` do.
+    The one-character ellipsis rides on top as a truncation marker — it is ours,
+    not the caller's, so it is not counted against their budget.
     """
     if len(text) <= _MAX_ERROR_FIELD_CHARS:
         return text
@@ -4565,7 +4569,9 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
 
     This mirrors comfy-cli's own parse exactly — ``json.loads`` on the value
     portion, accept only a ``list`` — so it can only refuse input comfy-cli would
-    also refuse.
+    also refuse. The one place the mirror cannot hold is stack depth, which is a
+    property of the process doing the parsing rather than of the input; that case
+    is handed to the engine untouched rather than guessed at.
     """
     preview = _clip_for_error(slot)
     fix = (
@@ -4579,14 +4585,22 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
             f"string whose value is a JSON array — {fix}"
         )
     addr, _, raw = slot.partition("=")
-    addr = addr.strip()
+    # Clipped like every other caller-supplied fragment here: the address is the
+    # portion BEFORE the first `=` and is just as caller-sized as the value, so
+    # echoing it raw would hand back a multi-KB message and defeat the bound.
+    addr = _clip_for_error(addr.strip())
     try:
         value = json.loads(raw)
-    except (ValueError, RecursionError):
-        # `_parse_value` catches only `ValueError` (`JSONDecodeError` is one), so
-        # the nesting depth that makes `json.loads` blow the stack escapes it and
-        # crashes comfy-cli mid-command. Refusing it here is a strict improvement
-        # over that, and still refuses nothing the engine would have accepted.
+    except RecursionError:
+        # Nesting deep enough to exhaust THIS process's stack says nothing about
+        # comfy-cli's: it parses in a fresh subprocess that is not already
+        # carrying the MCP handler -> tool -> loop frames underneath, so a value
+        # that blows the limit here can still parse there. Refusing it would
+        # break the invariant this whole pre-check rests on — that it can only
+        # refuse what comfy-cli would also refuse — so defer to the engine and
+        # let its own parse be the verdict.
+        return
+    except ValueError:
         raise ComfyCliError(
             f"invalid slots[{index}] for address {addr!r}: value must be a JSON "
             f"array, but {_clip_for_error(raw)!r} is not valid JSON — {fix}"
