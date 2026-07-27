@@ -1252,13 +1252,19 @@ def _close_pipes(proc: subprocess.Popen) -> None:
     every call in; :func:`_run_comfy_raw` manages the process by hand (that
     block's ``__exit__`` waits on the child WITHOUT a deadline, which is the
     wedge :func:`_reap` exists to bound), so it closes them here instead.
+
+    Swallows ``ValueError`` alongside ``OSError``: closing a text wrapper whose
+    underlying buffer was already detached raises the former, and this runs from
+    the ``except BaseException`` cleanup whose whole job is that nothing escapes
+    it — matching the same tolerance in :func:`_kill_proc_tree` and
+    :func:`_drain_timed_out`.
     """
     for pipe in (proc.stdout, proc.stderr):
         if pipe is None:
             continue
         try:
             pipe.close()
-        except OSError:
+        except (OSError, ValueError):
             pass
 
 

@@ -2671,9 +2671,16 @@ class _GroupKillProc:
         self.killed = False
         self._exc = exc
         self._communicates = 0
+        # Every bound this fake was handed, in order: [0] is the caller's own
+        # timeout, [1] the post-kill drain's. Recorded so a test can pin that
+        # the drain stays BOUNDED — an unbounded second `communicate()` is the
+        # exact wedge `_DRAIN_TIMEOUT` exists to prevent, and a fake that merely
+        # ignores the argument would never notice it going missing.
+        self.timeouts: list = []
 
-    def communicate(self, timeout=None):  # noqa: ARG002
+    def communicate(self, timeout=None):
         self._communicates += 1
+        self.timeouts.append(timeout)
         if self._communicates == 1:
             raise self._exc
         return "drained stdout", "drained stderr"  # the post-kill drain
@@ -2762,8 +2769,9 @@ def test_drain_second_timeout_keeps_the_longer_capture(monkeypatch):
     """
 
     class _DoubleTimeoutProc(_GroupKillProc):
-        def communicate(self, timeout=None):  # noqa: ARG002
+        def communicate(self, timeout=None):
             self._communicates += 1
+            self.timeouts.append(timeout)
             if self._communicates == 1:
                 raise self._exc
             raise subprocess.TimeoutExpired(
@@ -2784,14 +2792,19 @@ def test_drain_second_timeout_keeps_the_longer_capture(monkeypatch):
     msg = str(exc.value)
     assert "first chunk + more" in msg  # the drain's longer read, not `first`
     assert "traceback tail" in msg
+    # And the drain that produced it stayed bounded: a post-kill `communicate()`
+    # with no deadline is what `_DRAIN_TIMEOUT` exists to stop, since a
+    # descendant that survived SIGKILL can hold the pipes open indefinitely.
+    assert proc.timeouts == [1800.0, server._DRAIN_TIMEOUT]
 
 
 def test_drain_non_timeout_failure_falls_back_to_the_first_capture(monkeypatch):
     """A drain that dies on a decode error has nothing better than the first read."""
 
     class _DecodeFailProc(_GroupKillProc):
-        def communicate(self, timeout=None):  # noqa: ARG002
+        def communicate(self, timeout=None):
             self._communicates += 1
+            self.timeouts.append(timeout)
             if self._communicates == 1:
                 raise self._exc
             raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
@@ -2808,6 +2821,7 @@ def test_drain_non_timeout_failure_falls_back_to_the_first_capture(monkeypatch):
         server._run_comfy("update", "all", timeout=1800.0)
 
     assert "partial trace" in str(exc.value)
+    assert proc.timeouts == [1800.0, server._DRAIN_TIMEOUT]  # still a bounded drain
 
 
 def test_sync_non_timeout_failure_still_reaps_the_child(patched_run):
