@@ -86,7 +86,10 @@ Cloud MCP** — comfy-cli is the engine.
   clients launch the server with their own environment, which often does **not** include your
   shell's `PATH` — so if `comfy` lives in a virtualenv or a non-standard location, set
   `COMFY_BIN` to its absolute path (e.g. `/path/to/venv/bin/comfy`). Every client example below
-  shows where it goes.
+  shows where it goes. Setting it is sufficient on its own — you do **not** also have to put
+  that directory on the client's `PATH`. The server prepends the resolved binary's directory to
+  the `PATH` it hands comfy-cli, because some comfy-cli commands (notably the background
+  `launch`) re-invoke `comfy` by name and have to be able to find themselves.
 - **`COMFY_API_KEY` (optional — needed only for partner-API nodes).** Workflows that use
   partner-API nodes (Seedream / Seedance / Nano Banana / Gemini / Veo / Kling / …) need a Comfy
   credential, and — exactly like `COMFY_BIN` — an MCP client launches the server with its own
