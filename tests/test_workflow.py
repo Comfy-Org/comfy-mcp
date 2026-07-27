@@ -16,10 +16,12 @@ they own on top of the passthrough:
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 from conftest import envelope
+from pydantic import ValidationError
 
 from comfy_local_mcp import server
 
@@ -569,3 +571,366 @@ def test_vary_workflow_still_checks_a_slot_just_under_the_spawn_limit(no_spawn):
     value = '"' + "p" * (server._MAX_PRECHECKED_SLOT_BYTES - 100) + '"'
     with pytest.raises(server.ComfyCliError, match="got str"):
         server.vary_workflow("/tmp/flux.json", [f"6.text={value}"])
+
+
+# --- structured {address, value} slot items -------------------------------
+#
+# The second accepted form for both tools' slot lists, added because the string
+# form's value portion is JSON-parsed by comfy-cli with a literal-string
+# fallback — so `"6.text=true"` sets a BOOLEAN and there is no way to spell the
+# literal string "true" through it. The structured form is lossless precisely
+# because `json.dumps` is the inverse of the `json.loads` comfy-cli runs, so
+# these tests assert on the exact argv the encode produces.
+
+
+def test_set_workflow_slot_structured_override_serializes_to_addr_json(patched_run):
+    """A structured override reaches argv as `ADDR=<json>`, positionally as before."""
+    calls = patched_run(envelope(data={"modified": True}))
+
+    result = server.set_workflow_slot(
+        "/tmp/flux.json", [{"address": "6.text", "value": "a cat"}]
+    )
+    assert result == {"modified": True}
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "set-slot",
+        "/tmp/flux.json",
+        '6.text="a cat"',  # JSON-encoded, so comfy-cli's json.loads returns a str
+        "--stdout",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value, encoded",
+    [
+        ("true", '"true"'),  # the footgun: a string that LOOKS like a boolean
+        ("42", '"42"'),  # ...and one that looks like a number
+        (True, "true"),  # a real boolean still arrives as one
+        (42, "42"),
+        (1.5, "1.5"),
+        (None, "null"),
+        ("a lighthouse at dawn, oil painting", '"a lighthouse at dawn, oil painting"'),
+        ({"k": [1, 2]}, '{"k": [1, 2]}'),
+    ],
+    ids=["str-true", "str-42", "bool", "int", "float", "null", "comma-str", "object"],
+)
+def test_set_workflow_slot_structured_override_preserves_value_type(
+    patched_run, value, encoded
+):
+    """Round-trip fidelity: `json.dumps` here, `json.loads` in comfy-cli.
+
+    The string form cannot express the first two rows at all — `"6.text=true"`
+    parses to the boolean and `"6.text=42"` to the int — which is the whole
+    reason this form exists.
+    """
+    calls = patched_run(envelope(data={"modified": True}))
+
+    server.set_workflow_slot("/tmp/flux.json", [{"address": "6.text", "value": value}])
+
+    override = calls[0]["cmd"][4:][3]
+    assert override == f"6.text={encoded}"
+    # ...and comfy-cli's own parse of that entry yields the value we were sent.
+    assert json.loads(override.partition("=")[2]) == value
+
+
+def test_set_workflow_slot_string_override_still_passes_through_verbatim(patched_run):
+    """Regression: the string form is untouched, coercion and all.
+
+    `"6.text=true"` still reaches argv byte-for-byte (and so still sets the
+    BOOLEAN downstream) — the structured form is additive, not a rewrite of the
+    existing one.
+    """
+    calls = patched_run(envelope(data={"modified": True}))
+
+    server.set_workflow_slot("/tmp/flux.json", ["6.text=true", "3.seed=42"])
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "set-slot",
+        "/tmp/flux.json",
+        "6.text=true",
+        "3.seed=42",
+        "--stdout",
+    ]
+
+
+def test_set_workflow_slot_mixes_string_and_structured_overrides(patched_run):
+    """Each entry is rendered on its own, so a mixed list is fine — and ordered."""
+    calls = patched_run(envelope(data={"modified": True}))
+
+    server.set_workflow_slot(
+        "/tmp/flux.json",
+        [
+            "3.seed=42",
+            {"address": "6.text", "value": "true"},
+            "4.ckpt=sd-xl",
+        ],
+        stdout=False,
+    )
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "set-slot",
+        "/tmp/flux.json",
+        "3.seed=42",
+        '6.text="true"',
+        "4.ckpt=sd-xl",
+    ]
+
+
+def test_vary_workflow_structured_slot_serializes_values_as_json_array(patched_run):
+    """`values` is encoded as the JSON array comfy-cli's `--slot` contract wants.
+
+    That also dissolves the string form's quoting gotcha: the comma inside the
+    first prompt stays inside it with nothing for the caller to escape.
+    """
+    calls = patched_run(envelope(data={"count": 2}))
+
+    result = server.vary_workflow(
+        "/tmp/flux.json",
+        [
+            {"address": "3.seed", "values": [1, 2]},
+            {
+                "address": "1.prompt",
+                "values": ["a lighthouse at dawn, oil painting", "a cabin"],
+            },
+        ],
+    )
+    assert result == {"count": 2}
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        "3.seed=[1, 2]",
+        "--slot",
+        '1.prompt=["a lighthouse at dawn, oil painting", "a cabin"]',
+    ]
+
+
+def test_vary_workflow_structured_slot_preserves_element_types(patched_run):
+    """Same fidelity guarantee per element: `["true"]` is not `[true]`."""
+    calls = patched_run(envelope(data={"count": 2}))
+
+    server.vary_workflow(
+        "/tmp/flux.json", [{"address": "6.text", "values": ["true", 1]}]
+    )
+
+    slot = calls[0]["cmd"][4:][-1]
+    assert slot == '6.text=["true", 1]'
+    assert json.loads(slot.partition("=")[2]) == ["true", 1]
+
+
+def test_vary_workflow_mixes_string_and_structured_slots(patched_run):
+    """A mixed list works, and each entry keeps its own `--slot` flag and order."""
+    calls = patched_run(envelope(data={"count": 2}))
+
+    server.vary_workflow(
+        "/tmp/flux.json",
+        ["3.seed=[1,2]", {"address": "6.text", "values": ["a cat", "a dog"]}],
+    )
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        "3.seed=[1,2]",  # verbatim, straight through the existing pre-check
+        "--slot",
+        '6.text=["a cat", "a dog"]',
+    ]
+
+
+def test_vary_workflow_rejects_empty_structured_values(no_spawn):
+    """An empty `values` produces zero variants, so name it instead of forwarding.
+
+    comfy-cli ZIPS the lists: an empty one silently makes the whole sweep empty
+    and the run "succeeds" having generated nothing.
+    """
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.vary_workflow(
+            "/tmp/flux.json",
+            [
+                {"address": "3.seed", "values": [1, 2]},
+                {"address": "6.text", "values": []},
+            ],
+        )
+
+    message = str(excinfo.value)
+    assert "slots[1]" in message  # names the offending entry...
+    assert "6.text" in message  # ...and its address
+    assert "empty" in message
+
+
+@pytest.mark.parametrize(
+    "address, marker",
+    [
+        ("--stdout", "leading '-'"),
+        ("-6.text", "leading '-'"),
+        ("6.text=x", "contains '='"),
+        ("6.te\0xt", "embedded NUL"),
+        ("", "empty"),
+        ("   ", "empty"),
+    ],
+    ids=["option-like", "dash-leading", "equals", "nul", "empty", "whitespace-only"],
+)
+def test_structured_slot_address_is_guarded(no_spawn, address, marker):
+    """The structured `address` carries every constraint the string entry did.
+
+    It BECOMES the portion before the first `=` of an argv entry, so it gets the
+    same `_reject_option_like` / `_reject_nul` pair the string path runs — named
+    against the `address` field the caller actually sent — plus the two checks
+    only this form can express: an empty address (a bare `=value` entry) and an
+    embedded `=` (which would re-split, silently shifting the value).
+    """
+    for call in (
+        lambda: server.set_workflow_slot(
+            "/tmp/flux.json", [{"address": address, "value": "x"}]
+        ),
+        lambda: server.vary_workflow(
+            "/tmp/flux.json", [{"address": address, "values": [1]}]
+        ),
+    ):
+        with pytest.raises(server.ComfyCliError) as excinfo:
+            call()
+        message = str(excinfo.value)
+        assert marker in message
+        assert "address" in message  # the named parameter, not a generic entry
+
+
+def test_structured_slot_address_is_stripped(patched_run):
+    """Surrounding whitespace is trimmed rather than smuggled into the argv entry."""
+    calls = patched_run(envelope(data={"modified": True}))
+
+    server.set_workflow_slot("/tmp/flux.json", [{"address": "  6.text\n", "value": 1}])
+
+    assert calls[0]["cmd"][4:][3] == "6.text=1"
+
+
+def test_structured_slot_value_must_be_json_data(no_spawn):
+    """A Python object with no JSON form is named, not raised as a bare TypeError.
+
+    Unreachable over MCP (everything there is JSON already); this covers the
+    in-process caller and keeps the tool's error type uniform.
+    """
+    with pytest.raises(server.ComfyCliError, match="not JSON data"):
+        server.set_workflow_slot(
+            "/tmp/flux.json", [{"address": "6.text", "value": {1}}]
+        )
+
+    with pytest.raises(server.ComfyCliError, match="not JSON data"):
+        server.vary_workflow("/tmp/flux.json", [{"address": "6.text", "values": [{1}]}])
+
+
+def test_structured_slot_item_requires_both_fields(no_spawn):
+    """A half-filled structured item is a validation error, not a silent default."""
+    for call in (
+        lambda: server.set_workflow_slot("/tmp/flux.json", [{"address": "6.text"}]),
+        lambda: server.set_workflow_slot("/tmp/flux.json", [{"value": "a cat"}]),
+        lambda: server.vary_workflow("/tmp/flux.json", [{"address": "6.text"}]),
+        lambda: server.vary_workflow("/tmp/flux.json", [{"values": [1]}]),
+    ):
+        with pytest.raises(ValidationError):
+            call()
+
+
+def test_slot_tools_advertise_the_union_item_type():
+    """The MCP schema offers BOTH forms per item, so a client can send either.
+
+    `anyOf: [string, $ref]` is what makes the structured form discoverable at
+    all — a client reads the schema, not the docstring, to decide what to send.
+    """
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+
+    for name, param, model, value_field in (
+        ("set_workflow_slot", "overrides", "SlotOverride", "value"),
+        ("vary_workflow", "slots", "SlotVariants", "values"),
+    ):
+        schema = tools[name].inputSchema
+        item = schema["properties"][param]["items"]
+        assert {"type": "string"} in item["anyOf"]
+        assert {"$ref": f"#/$defs/{model}"} in item["anyOf"]
+
+        model_schema = schema["$defs"][model]
+        assert model_schema["properties"]["address"]["type"] == "string"
+        assert sorted(model_schema["required"]) == sorted(["address", value_field])
+
+    # No existing parameter was renamed or dropped.
+    assert set(tools["set_workflow_slot"].inputSchema["properties"]) == {
+        "workflow_path",
+        "overrides",
+        "stdout",
+    }
+    assert set(tools["vary_workflow"].inputSchema["properties"]) == {
+        "workflow_path",
+        "slots",
+        "out_dir",
+    }
+
+
+def test_structured_slot_items_deserialize_through_the_mcp_boundary(patched_run):
+    """End-to-end through FastMCP: a JSON dict lands as the model, not a stray dict.
+
+    The direct-call tests above go through the same coercion helper but not
+    through FastMCP's own argument validation, which is what a real client
+    actually exercises — and it is the union that has to hold there.
+    """
+    calls = patched_run(envelope(data={"modified": True}))
+
+    asyncio.run(
+        server.mcp.call_tool(
+            "set_workflow_slot",
+            {
+                "workflow_path": "/tmp/flux.json",
+                "overrides": ["3.seed=42", {"address": "6.text", "value": "true"}],
+            },
+        )
+    )
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "set-slot",
+        "/tmp/flux.json",
+        "3.seed=42",
+        '6.text="true"',
+        "--stdout",
+    ]
+
+    asyncio.run(
+        server.mcp.call_tool(
+            "vary_workflow",
+            {
+                "workflow_path": "/tmp/flux.json",
+                "slots": [{"address": "6.text", "values": ["a cat", "a dog"]}],
+            },
+        )
+    )
+    assert calls[1]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        '6.text=["a cat", "a dog"]',
+    ]
+
+
+def test_vary_workflow_string_form_still_allows_an_empty_array(patched_run):
+    """The empty-`values` rejection is scoped to the STRUCTURED form only.
+
+    `'6.text=[]'` is a valid JSON array, so it rides through the existing
+    pre-check untouched and reaches comfy-cli exactly as it always did. Worth
+    locking in: the structured form's extra rejection is a nudge on a shape that
+    yields zero variants, NOT the removal of a way to send an empty list.
+    """
+    calls = patched_run(envelope(data={"count": 0}))
+
+    server.vary_workflow("/tmp/flux.json", ["6.text=[]"])
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "vary",
+        "/tmp/flux.json",
+        "--slot",
+        "6.text=[]",
+    ]

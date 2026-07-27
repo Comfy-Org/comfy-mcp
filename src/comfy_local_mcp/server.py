@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from mcp import types
@@ -272,9 +272,10 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
     - **A dash-leading slot ADDR** (``vary_workflow``'s ``slots``). An ``ADDR``
       begins with the node id, which comfy-cli surfaces non-negative via
       ``list_workflow_slots``, so no reachable address starts with ``-``. It also
-      costs no capability: ``set_workflow_slot``'s overrides and both param
-      marshalers (:func:`_validate_param_key`) already refuse one, so every other
-      way to name a slot in this module rejects it too.
+      costs no capability: ``set_workflow_slot``'s overrides, the structured
+      forms' ``address`` (:func:`_slot_address_arg`), and both param marshalers
+      (:func:`_validate_param_key`) already refuse one, so every other way to
+      name a slot in this module rejects it too.
 
     And one deliberate NON-rejection, which is what "nearly" above is doing:
 
@@ -4963,25 +4964,192 @@ def list_workflow_slots(workflow_path: str) -> Any:
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
 
 
+class SlotOverride(BaseModel):
+    """One ``set_workflow_slot`` override, as structured data instead of a string.
+
+    The reason this form exists: comfy-cli splits an override on its first ``=``
+    and runs the value portion through ``json.loads``, falling back to the
+    literal string when that fails. So the ``"ADDR=VALUE"`` string form
+    COERCES — ``"6.text=true"`` sets the boolean ``true``, ``"6.text=123"`` sets
+    the integer ``123``, and there is no way to spell the literal strings
+    ``"true"`` / ``"123"`` through it. Sending the value as DATA is lossless in
+    both directions: this server JSON-encodes it, and comfy-cli's ``json.loads``
+    decodes exactly what was sent.
+    """
+
+    address: str = Field(
+        description=(
+            "The slot address to set, exactly as `list_workflow_slots` reports "
+            "it in a slot's `address` field (e.g. '6.text')."
+        )
+    )
+    value: Any = Field(
+        description=(
+            "The value to set, as JSON data. Its type is preserved exactly: a "
+            "string stays a string (even 'true' or '42'), a number stays a "
+            "number, a boolean stays a boolean."
+        )
+    )
+
+
+class SlotVariants(BaseModel):
+    """One ``vary_workflow`` slot — an address and the values to sweep over it.
+
+    The structured counterpart to the ``"ADDR=[v1,v2,...]"`` string form, and
+    the same lossless-vs-coercing trade-off as :class:`SlotOverride`: comfy-cli
+    requires the value portion to parse to a JSON array, so ``values`` is sent
+    as one and every element keeps its type. It also removes the quoting
+    footgun the string form carries — a comma inside a prompt no longer has to
+    be hand-quoted to stay part of its value.
+    """
+
+    address: str = Field(
+        description=(
+            "The slot address to vary, exactly as `list_workflow_slots` reports "
+            "it in a slot's `address` field (e.g. '3.seed')."
+        )
+    )
+    values: list[Any] = Field(
+        description=(
+            "The values to sweep over this address, as JSON data. comfy-cli "
+            "ZIPS the lists across slots, so every slot's list must be the same "
+            "length. Must be non-empty."
+        )
+    )
+
+
+def _slot_address_arg(label: str, address: str) -> str:
+    """Validate a structured slot item's ``address`` and return it normalized.
+
+    A structured item's address becomes the portion before the first ``=`` of an
+    argv entry, so it inherits every constraint the string form's entry already
+    carries — hence the same ``_reject_option_like`` / ``_reject_nul`` pair the
+    string path runs, applied to the address specifically so the error names the
+    field the caller actually sent.
+
+    Two checks are new here because only the structured form can express them.
+    An empty (or all-whitespace) address would produce a bare ``"=value"`` entry
+    that comfy-cli splits into an address of ``""``; and an address containing
+    ``=`` would silently re-split, so ``{"address": "6.text=x", "value": "y"}``
+    would reach the engine as address ``6.text`` with value ``x="y"`` rather
+    than failing. Both are caller mistakes worth naming rather than forwarding.
+
+    The dash-leading rejection is defense in depth: a node id is non-negative
+    where ``list_workflow_slots`` surfaces it, so no reachable address starts
+    with ``-`` (see :func:`_reject_option_like`'s note on slot ADDRs). It is
+    guarded anyway for parity with the string path.
+    """
+    _reject_nul(f"{label} address", address)
+    stripped = address.strip()
+    expected = (
+        "a '<node_id>.<input>' address as `list_workflow_slots` reports it "
+        "(e.g. '6.text')"
+    )
+    if not stripped:
+        raise ComfyCliError(f"invalid {label} address: empty — expected {expected}")
+    if "=" in stripped:
+        raise ComfyCliError(
+            f"invalid {label} address: {_clip_for_error(stripped)} contains "
+            f"'=' — the address is only the part BEFORE the first '=', and the "
+            f"value belongs in its own field; expected {expected}"
+        )
+    return _reject_option_like(f"{label} address", stripped, expected=expected)
+
+
+def _slot_value_json(label: str, value: Any) -> str:
+    """JSON-encode a structured slot value, naming a non-encodable one.
+
+    Everything arriving over MCP is JSON already, so this can only fire for a
+    direct in-process caller that passed a Python object with no JSON form (a
+    ``set``, a ``datetime``). Naming it beats letting ``TypeError`` escape a
+    tool that reports every other input mistake as :class:`ComfyCliError`.
+
+    Note what encoding does to the NUL guard, since the asymmetry is deliberate:
+    the string form refuses a NUL because a raw one cannot ride in argv at all,
+    while ``json.dumps`` escapes it to ``\\u0000`` — so a structured value may
+    carry one, and comfy-cli's ``json.loads`` decodes it back on the far side.
+    That is the encoding doing its job (argv stays clean), not a hole in the
+    guard: the reason to refuse it never applies to an encoded value.
+    """
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        raise ComfyCliError(
+            f"invalid {label}: a {type(value).__name__} is not JSON data — send "
+            "a string, number, boolean, null, array, or object."
+        ) from exc
+
+
+_SlotModel = TypeVar("_SlotModel", bound=BaseModel)
+
+
+def _as_slot_model(item: Any, model: type[_SlotModel]) -> _SlotModel:
+    """Coerce one structured slot item to its model.
+
+    Over MCP, FastMCP has already validated the item into ``model``. A plain
+    mapping only reaches here from an in-process caller (this module's own
+    tests, a script importing the tool), so it is validated through the same
+    model rather than read key-by-key — one definition of the shape, one set of
+    error messages.
+    """
+    return item if isinstance(item, model) else model.model_validate(item)
+
+
+def _slot_override_arg(item: str | SlotOverride) -> str:
+    """Render one ``set_workflow_slot`` override as the ``ADDR=VALUE`` argv entry.
+
+    A string passes through byte-for-byte — that is the pre-existing form and
+    its coercing-but-established behavior is unchanged. A structured item is
+    serialized with ``json.dumps``, which is exactly what makes it lossless:
+    comfy-cli's ``json.loads`` is the inverse, so ``"true"`` arrives as the
+    string ``"true"`` (encoded ``"true"`` with its quotes) and ``42`` as the
+    integer.
+    """
+    if isinstance(item, str):
+        return item
+    override = _as_slot_model(item, SlotOverride)
+    address = _slot_address_arg("override", override.address)
+    return f"{address}={_slot_value_json('override value', override.value)}"
+
+
 @mcp.tool()
 def set_workflow_slot(
-    workflow_path: str, overrides: list[str], stdout: bool = True
+    workflow_path: str,
+    overrides: list[str | SlotOverride],
+    stdout: bool = True,
 ) -> Any:
     """Set one or more slot values on a frontend-format workflow.
 
-    Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]``, where
-    ``overrides`` is a list of ``"ADDR=VALUE"`` strings (the ``ADDR``s come from
-    ``list_workflow_slots``). This is the parameterize step of the template
-    on-ramp — change the prompt / seed / steps / model of a fetched template
-    without hand-editing its JSON.
+    Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]``. This
+    is the parameterize step of the template on-ramp — change the prompt / seed
+    / steps / model of a fetched template without hand-editing its JSON.
+
+    Each entry of ``overrides`` may be EITHER form, and the two can be mixed in
+    one list:
+
+    - **Structured (preferred)** — ``{"address": "6.text", "value": "a cat"}``.
+      The value's type is PRESERVED EXACTLY, because this server JSON-encodes it
+      and comfy-cli decodes it with ``json.loads``. Feed ``list_workflow_slots``'
+      ``address`` straight in.
+    - **String** — ``"6.text=a cat"``, the original form. comfy-cli parses the
+      part after the first ``=`` as JSON and falls back to the literal string,
+      so this form COERCES: ``"6.text=true"`` sets the boolean ``true`` and
+      ``"6.text=123"`` sets the integer ``123``. Use the structured form when
+      you mean the literal strings ``"true"`` / ``"123"``.
 
     ``stdout`` defaults to ``True`` (``--stdout``), so the tool is
     NON-DESTRUCTIVE: comfy-cli returns the modified workflow instead of mutating
     ``workflow_path`` in place. Set ``stdout=False`` to write the change back to
-    the file. Canonical loop::
+    the file. Canonical loop, driven off the slot list::
 
         path = fetch_template("flux_dev", "/tmp/flux.json")
-        modified = set_workflow_slot(path, ["6.text=a red bicycle", "3.seed=42"])
+        wanted = {"6.text": "a red bicycle", "3.seed": 42}
+        overrides = [
+            {"address": slot["address"], "value": wanted[slot["address"]]}
+            for slot in list_workflow_slots(path)["slots"]
+            if slot["address"] in wanted
+        ]
+        modified = set_workflow_slot(path, overrides)
         # write `modified` to disk (or call with stdout=False), then run_workflow
     """
     # `workflow_path` and each override are splatted in as bare positionals, so
@@ -4999,14 +5167,21 @@ def set_workflow_slot(
         ),
     )
     _reject_nul("workflow_path", workflow_path)
-    for o in overrides:
+    rendered = []
+    for item in overrides:
+        # Rendered per item, then guarded, so the argv guards read what actually
+        # reaches argv — a structured item is held to the same bar as a string
+        # one rather than to a laxer one on the strength of having been typed —
+        # and the first bad entry is still the one reported.
+        o = _slot_override_arg(item)
         _reject_option_like(
             "override",
             o,
             expected="an 'ADDR=VALUE' string (e.g. '6.text=a red bicycle')",
         )
         _reject_nul("override", o)
-    args = ["workflow", "set-slot", workflow_path, *overrides]
+        rendered.append(o)
+    args = ["workflow", "set-slot", workflow_path, *rendered]
     if stdout:
         args.append("--stdout")
     return _run_comfy(*args, timeout=60.0)
@@ -5151,23 +5326,75 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
         )
 
 
+def _slot_variants_arg(index: int, item: str | SlotVariants) -> str:
+    """Render one ``vary_workflow`` slot as the ``ADDR=[v1,v2,...]`` argv entry.
+
+    A string passes through byte-for-byte, into the existing
+    :func:`_reject_non_json_array_slot` pre-check. A structured item is
+    serialized with ``json.dumps(values)`` — which IS the wire form comfy-cli
+    wants, since it requires the value portion to parse to a JSON array — so the
+    quoting gotcha the string form carries cannot arise: a comma inside a prompt
+    stays inside its value with nothing for the caller to escape.
+
+    An empty ``values`` is refused here rather than forwarded. comfy-cli zips
+    the lists, so an empty one yields zero variants: the run "succeeds" having
+    done nothing, which reads as a broken sweep rather than as the input mistake
+    it is.
+    """
+    if isinstance(item, str):
+        return item
+    variants = _as_slot_model(item, SlotVariants)
+    address = _slot_address_arg("slot", variants.address)
+    if not variants.values:
+        raise ComfyCliError(
+            f"invalid slots[{index}] for address {_clip_for_error(address)}: "
+            "`values` is empty — comfy-cli zips the value lists, so an empty "
+            "one produces zero variants. Give at least one value (and the same "
+            "count as every other slot)."
+        )
+    return f"{address}={_slot_value_json(f'slots[{index}] values', variants.values)}"
+
+
 @mcp.tool()
 def vary_workflow(
-    workflow_path: str, slots: list[str], out_dir: str | None = None
+    workflow_path: str,
+    slots: list[str | SlotVariants],
+    out_dir: str | None = None,
 ) -> Any:
     """Fan a frontend-format workflow out into variants over slot value lists.
 
-    Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``.
-    ``slots`` is a list of ``"ADDR=[v1,v2,...]"`` strings, one per address (the
-    ``ADDR``s come from ``list_workflow_slots``); comfy-cli ZIPS the value lists,
-    so every list MUST be the same length — e.g. ``['3.seed=[1,2,3]',
-    '6.text=["a cat", "a dog", "a fish"]']`` yields three variants pairing seed
+    Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``,
+    one entry per address (the addresses come from ``list_workflow_slots``).
+    comfy-cli ZIPS the value lists, so every list MUST be the same length — a
+    seed list of 3 and a prompt list of 3 yield three variants pairing seed
     1/cat, 2/dog, 3/fish.
 
-    **Each entry's value portion (everything after the first ``=``) must be
-    valid JSON, and must parse to a JSON ARRAY.** That is the whole gotcha, and
-    it bites hardest on prompts: a value containing a comma or spaces has to be
-    JSON-quoted, or it is not a list at all. Concretely::
+    Each entry of ``slots`` may be EITHER form, and the two can be mixed in one
+    list:
+
+    - **Structured (preferred)** — ``{"address": "6.text", "values": ["a cat",
+      "a dog"]}``. Each value's type is PRESERVED EXACTLY (this server encodes
+      the list with ``json.dumps``, which is the wire form comfy-cli wants), and
+      the JSON-quoting gotcha below cannot arise at all: a comma or spaces
+      inside a prompt stay part of that value with nothing to escape. ``values``
+      must be non-empty. Feed ``list_workflow_slots``' ``address`` straight in::
+
+          slots = [
+              {"address": slot["address"], "values": ["a cat", "a dog"]}
+              for slot in list_workflow_slots(path)["slots"]
+              if slot["address"] == "6.text"
+          ]
+          vary_workflow(path, slots)
+
+    - **String** — ``'6.text=["a cat", "a dog"]'``, the original form. Its value
+      portion is parsed as JSON by comfy-cli, so it COERCES (``'6.text=[true]'``
+      is a boolean, not the string ``"true"``) and it has the quoting gotcha
+      spelled out next.
+
+    **In the STRING form, each entry's value portion (everything after the first
+    ``=``) must be valid JSON, and must parse to a JSON ARRAY.** That is the
+    whole gotcha, and it bites hardest on prompts: a value containing a comma or
+    spaces has to be JSON-quoted, or it is not a list at all. Concretely::
 
         # WRONG — not valid JSON; comfy-cli reads it as one bare string and
         # fails with `value must be a JSON array (got str)`
@@ -5201,7 +5428,10 @@ def vary_workflow(
     )
     _reject_nul("workflow_path", workflow_path)
     args = ["workflow", "vary", workflow_path]
-    for index, slot in enumerate(slots):
+    for index, item in enumerate(slots):
+        # Rendered first so every guard below reads what actually reaches argv,
+        # structured and string entries alike (same order as `set_workflow_slot`).
+        slot = _slot_variants_arg(index, item)
         _reject_option_like(
             "slot",
             slot,
