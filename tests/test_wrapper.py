@@ -1547,6 +1547,56 @@ def test_server_instructions_cover_canonical_flows():
         assert tool in instructions
 
 
+def test_server_instructions_document_the_argument_naming_convention():
+    """The handshake states the naming convention, so callers stop guessing.
+
+    The convention held across the tool surface long before it was written down
+    anywhere, so first-time agent callers guessed `path` / `workflow` and burned
+    a round trip. Stating it up front is the fix.
+    """
+    instructions = server.mcp.instructions
+
+    for argument in ("workflow_path", "out_path", "out_dir", "name", "prompt_id"):
+        assert argument in instructions
+
+
+def test_tool_arguments_follow_the_naming_convention():
+    """The live schemas obey the convention the instructions advertise.
+
+    Guards against drift in the direction that costs an agent a round trip: a
+    new tool that spells its workflow input `path` / `workflow`, or its output
+    file anything other than `out_path` (the `partner_generate` `download`
+    outlier this test was written alongside). Clients introspect these schemas
+    fresh each session, so the schema IS the contract.
+    """
+    schemas = {
+        tool.name: tool.parameters.get("properties", {})
+        for tool in server.mcp._tool_manager.list_tools()
+    }
+
+    # Every tool that consumes a workflow FILE names it `workflow_path`.
+    for name in (
+        "run_workflow",
+        "validate_workflow",
+        "list_workflow_slots",
+        "set_workflow_slot",
+        "vary_workflow",
+    ):
+        assert "workflow_path" in schemas[name]
+
+    # Output file -> `out_path`; output directory -> `out_dir`.
+    for name in ("fetch_template", "partner_generate"):
+        assert "out_path" in schemas[name]
+    for name in ("fetch_outputs", "vary_workflow"):
+        assert "out_dir" in schemas[name]
+
+    # And no tool offers a near-miss spelling of any of them — a second visible
+    # name for one concept is exactly the guess space the convention removes.
+    banned = {"path", "workflow", "download", "output_path", "directory"}
+    for name, properties in schemas.items():
+        assert not banned & set(properties), name
+
+
 def test_auth_status_maps_command_and_passes_payload_through(patched_run, monkeypatch):
     """auth_status wraps `comfy --json --where local cloud whoami`, payload unchanged."""
     whoami = {
