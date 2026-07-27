@@ -299,6 +299,48 @@ def test_comfy_env_sets_bare_path_when_none_inherited(tmp_path, monkeypatch):
 
 
 @_needs_posix_exec
+def test_comfy_env_falls_back_to_defpath_when_no_path_inherited(tmp_path, monkeypatch):
+    """No PATH inherited: keep the platform default behind the bin dir.
+
+    With no PATH in the environment CPython resolves a child's bare-name exec
+    against `os.defpath` (`os.get_exec_path`). Writing the bin dir ALONE would
+    replace that implicit default, leaving the child unable to find the `git` /
+    `python` / `uv` helpers comfy-cli shells out to — a strict regression on the
+    pre-prepend behavior. The prepend has to stay additive here too.
+    """
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.delenv("PATH", raising=False)
+
+    entries = server._comfy_env()["PATH"].split(os.pathsep)
+
+    assert entries[0] == str(exe.parent)
+    assert entries[1:] == os.defpath.split(os.pathsep)
+
+
+@_needs_posix_exec
+def test_comfy_env_skips_prepend_when_bin_dir_contains_pathsep(tmp_path, monkeypatch):
+    """A bin dir containing `os.pathsep` is unrepresentable — leave PATH alone.
+
+    There is no escape for the separator in PATH syntax, so writing such a
+    directory splits it into fragments: the intended entry is destroyed AND its
+    tail becomes a RELATIVE entry, which the child resolves against the
+    workspace comfy-cli chdir'd into. Skipping preserves the inherited PATH;
+    corrupting it would be strictly worse than not helping.
+    """
+    exe = _dummy_comfy(tmp_path, dirname="we" + os.pathsep + "ird")
+    inherited = os.pathsep.join(["/usr/bin", "/bin"])
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", inherited)
+
+    path = server._comfy_env()["PATH"]
+
+    assert path == inherited
+    # Nothing relative leaked in — that is the half with security weight.
+    assert all(os.path.isabs(entry) for entry in path.split(os.pathsep))
+
+
+@_needs_posix_exec
 def test_comfy_env_path_prepend_keeps_the_existing_pins(tmp_path, monkeypatch):
     """The PATH rewrite is additive — every previously-injected pin still holds."""
     exe = _dummy_comfy(tmp_path)

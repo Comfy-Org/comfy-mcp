@@ -504,6 +504,19 @@ def _comfy_env() -> dict[str, str]:
     (BE-3780). The entry is absolutized because comfy-cli ``os.chdir``s to the
     workspace in the child before that re-invocation resolves, so a relative
     entry would point somewhere else by then.
+
+    The rewrite is strictly additive and never *shrinks* the child's search
+    path: it is skipped outright when the directory cannot be expressed as a
+    PATH entry (it contains ``os.pathsep``), and an absent inherited ``PATH``
+    falls back to ``os.defpath`` — CPython's own fallback — rather than
+    resolving to the binary's directory alone.
+
+    What it cannot fix: comfy-cli re-invokes the literal name ``comfy``, so a
+    ``COMFY_BIN`` pointing at a RENAMED binary (``comfy-1.12``) still leaves the
+    child's bare-name lookup to find some other ``comfy`` — or none. Hoisting
+    the directory is still correct there (a sibling ``comfy`` symlink, the
+    common venv shape, then wins), but the residual case belongs upstream: only
+    comfy-cli can stop re-invoking by bare name.
     """
     env = {
         **os.environ,
@@ -523,10 +536,27 @@ def _comfy_env() -> dict[str, str]:
     resolved = shutil.which(COMFY_BIN)
     if resolved:
         bin_dir = os.path.dirname(os.path.abspath(resolved))
-        path = env.get("PATH", "")
-        entries = path.split(os.pathsep) if path else []
-        if not entries or entries[0] != bin_dir:
-            env["PATH"] = bin_dir + (os.pathsep + path if path else "")
+        # A directory whose own name contains `os.pathsep` cannot be expressed as
+        # a PATH entry — the separator has no escape in either POSIX or Windows
+        # PATH syntax, so writing it would split into fragments: the intended
+        # directory is lost AND the tail becomes a RELATIVE entry, which the
+        # child resolves against the workspace comfy-cli chdir'd into. Skip, the
+        # same silent no-op as an unresolvable binary: leaving the inherited
+        # PATH intact is strictly better than corrupting it.
+        if os.pathsep not in bin_dir:
+            # `None` (no PATH inherited at all) is NOT the same as `""`. With no
+            # PATH in the environment, CPython resolves a child's bare-name exec
+            # against `os.defpath` (see `os.get_exec_path`), so writing `bin_dir`
+            # alone would REPLACE that implicit default and strip the child of
+            # the `git` / `python` / `uv` helpers comfy-cli shells out to.
+            # Substituting `os.defpath` keeps the prepend strictly additive there
+            # too. An empty STRING is a deliberate "search nothing" and is left
+            # to mean exactly that.
+            inherited = env.get("PATH")
+            path = os.defpath if inherited is None else inherited
+            entries = path.split(os.pathsep) if path else []
+            if not entries or entries[0] != bin_dir:
+                env["PATH"] = bin_dir + (os.pathsep + path if path else "")
     return env
 
 
