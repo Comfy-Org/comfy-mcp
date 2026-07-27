@@ -2654,16 +2654,20 @@ class _GroupKillProc:
 
     conftest's `_FakeRunProc` deliberately carries no `pid` so `_kill_proc_tree`
     takes its single-child fallback rather than calling `os.killpg` on a made-up
-    one. This fake has a pid, and the test stubs `os.getpgid`/`os.killpg`, so the
-    group path is the one under test.
+    one. This fake has a pid, and the test stubs `os.killpg`, so the group path
+    is the one under test.
+
+    `exited` models the case the group kill exists for: the direct `comfy` child
+    is already gone (a non-None `poll()`) while a forked grandchild is still
+    running and holding the pipes — which is why `communicate()` timed out.
     """
 
-    def __init__(self, cmd, exc):
+    def __init__(self, cmd, exc, *, exited=False):
         self.args = cmd
         self.pid = 424242
         self.stdout = None
         self.stderr = None
-        self.returncode = None
+        self.returncode = -1 if exited else None
         self.killed = False
         self._exc = exc
         self._communicates = 0
@@ -2702,7 +2706,6 @@ def test_sync_timeout_kills_the_whole_process_group(monkeypatch):
     signalled: list[tuple[int, int]] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
-    monkeypatch.setattr(server.os, "getpgid", lambda pid: pid)  # it leads its group
     monkeypatch.setattr(
         server.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
     )
@@ -2710,12 +2713,101 @@ def test_sync_timeout_kills_the_whole_process_group(monkeypatch):
     with pytest.raises(server.ComfyCliError) as exc:
         server._run_comfy("update", "all", timeout=1800.0)
 
+    # `start_new_session=True` makes the child its own group leader, so its pid
+    # IS the pgid — signalled directly, without an `os.getpgid` lookup that
+    # would raise (and so skip the kill) on an already-reaped leader.
     assert signalled == [(proc.pid, signal.SIGKILL)]  # the GROUP, not the child
     assert proc.killed is False  # so the single-child fallback never had to fire
     assert exc.value.timed_out is True
     # The drain after the kill is what recovers the partial output that
     # `subprocess.run` used to attach to the `TimeoutExpired` itself.
     assert "drained stderr" in str(exc.value)
+
+
+def test_group_kill_is_not_gated_on_the_leader_still_running(monkeypatch):
+    """A dead `comfy` does not mean a dead tree — kill the group regardless.
+
+    The case this whole change exists for is a `comfy update` whose `git pull` /
+    `pip install` (or a `model download`) outlives its parent: `comfy` itself has
+    exited, the grandchild is still running and still holding the pipe open —
+    which is exactly WHY `communicate()` blew its deadline. Gating the group kill
+    on `proc.poll() is None` would read the exited leader and skip the kill in
+    precisely that case, leaving the descendant to keep mutating the workspace.
+    """
+    proc = _GroupKillProc(
+        [server.COMFY_BIN, "update", "all"],
+        _timeout(stderr=None, stdout=None),
+        exited=True,  # the leader is already gone; its group is not
+    )
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(
+        server.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    assert signalled == [(proc.pid, signal.SIGKILL)]  # the survivors still die
+
+
+def test_drain_second_timeout_keeps_the_longer_capture(monkeypatch):
+    """A drain that times out too still reports what it managed to read.
+
+    `communicate()` resumes the same accumulation buffers, so the capture on the
+    drain's own `TimeoutExpired` is a superset of the first one's. Falling back
+    to the first would silently under-report the diagnostics in the timeout
+    message and the failure log.
+    """
+
+    class _DoubleTimeoutProc(_GroupKillProc):
+        def communicate(self, timeout=None):  # noqa: ARG002
+            self._communicates += 1
+            if self._communicates == 1:
+                raise self._exc
+            raise subprocess.TimeoutExpired(
+                self.args, 5.0, output=b"first chunk + more", stderr=b"traceback tail"
+            )
+
+    proc = _DoubleTimeoutProc(
+        [server.COMFY_BIN, "update", "all"],
+        _timeout(stderr=b"trace", stdout=b"first"),
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)  # noqa: ARG005
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    msg = str(exc.value)
+    assert "first chunk + more" in msg  # the drain's longer read, not `first`
+    assert "traceback tail" in msg
+
+
+def test_drain_non_timeout_failure_falls_back_to_the_first_capture(monkeypatch):
+    """A drain that dies on a decode error has nothing better than the first read."""
+
+    class _DecodeFailProc(_GroupKillProc):
+        def communicate(self, timeout=None):  # noqa: ARG002
+            self._communicates += 1
+            if self._communicates == 1:
+                raise self._exc
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    proc = _DecodeFailProc(
+        [server.COMFY_BIN, "update", "all"],
+        _timeout(stderr="partial trace", stdout="partial out"),
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)  # noqa: ARG005
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("update", "all", timeout=1800.0)
+
+    assert "partial trace" in str(exc.value)
 
 
 def test_sync_non_timeout_failure_still_reaps_the_child(patched_run):

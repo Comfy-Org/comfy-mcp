@@ -1191,17 +1191,40 @@ def _kill_proc_tree(proc: subprocess.Popen) -> None:
     download``'s transfer keep mutating the workspace after the tool has already
     reported a timeout, so they have to die with their parent.
 
+    The group kill is UNCONDITIONAL — deliberately NOT gated on ``proc.poll()``.
+    A dead leader does not mean a dead tree: the case that matters most is
+    precisely the one where ``comfy`` itself has already exited but a forked
+    grandchild (``update``'s ``git pull`` / ``pip install``, a ``model
+    download``'s transfer) is still running and still holding the pipe open —
+    which is *why* ``communicate()`` blew its deadline. A ``poll()`` gate would
+    read that survivor's exited parent and skip the kill exactly when the
+    descendant most needs reaping, defeating the point of the group. The
+    zombie leader keeps the process group alive for its members, so the
+    ``killpg`` still lands.
+
+    Callers must therefore invoke this BEFORE anything reaps the child (a
+    ``wait``/``poll`` that returns a code). Once reaped, the pid is free for the
+    OS to reuse and ``killpg`` could signal an unrelated group; the streaming
+    path's two call sites gate on ``proc.poll() is None`` for that reason (they
+    can run after a completed ``proc.wait``), while :func:`_run_comfy_raw` calls
+    in straight off a ``communicate()`` that never reaped.
+
+    Signals ``proc.pid`` directly rather than ``os.getpgid(proc.pid)``: with
+    ``start_new_session=True`` the child IS its own group leader, so the two are
+    the same number, and ``getpgid`` on an already-reaped child raises — turning
+    the lookup itself into a way to skip the kill.
+
     Falls back to a plain ``kill`` on Windows / test fakes, where ``killpg`` is
-    unavailable. (BE-3343)
+    unavailable. That fallback reaches only the direct child; a Windows tree
+    kill needs ``taskkill /T`` or a Job Object and is tracked separately.
+    (BE-3343)
     """
-    if proc.poll() is not None:
-        return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)
     except (OSError, AttributeError, ValueError):
         try:
             proc.kill()
-        except (OSError, AttributeError):
+        except (OSError, AttributeError, ValueError):
             pass
 
 
@@ -1239,6 +1262,20 @@ def _close_pipes(proc: subprocess.Popen) -> None:
             pass
 
 
+def _longer_capture(first: Any, second: Any) -> Any:
+    """Whichever of two partial captures of the SAME stream carries more.
+
+    Both come from consecutive ``TimeoutExpired``s on one pipe, so they are the
+    same type (``bytes`` on POSIX, which is what CPython attaches even in text
+    mode) or ``None`` for "nothing written" — never a mix worth guarding.
+    """
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return second if len(second) > len(first) else first
+
+
 def _drain_timed_out(
     proc: subprocess.Popen, exc: subprocess.TimeoutExpired
 ) -> tuple[Any, Any]:
@@ -1256,8 +1293,22 @@ def _drain_timed_out(
     """
     try:
         stdout, stderr = proc.communicate(timeout=_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired as second:
+        # The drain blew its own deadline — a descendant survived `SIGKILL` and
+        # is still holding the pipes. `communicate()` resumes the SAME
+        # accumulation buffers, so what it attaches to this second exception is
+        # a superset of the first's: keep the longer capture rather than
+        # discarding everything that arrived after the original deadline.
+        _close_pipes(proc)
+        return (
+            _longer_capture(exc.stdout, second.stdout),
+            _longer_capture(exc.stderr, second.stderr),
+        )
     except (OSError, ValueError, subprocess.SubprocessError):
-        # The drain itself gave up, so nothing else will close these.
+        # The drain itself gave up, so nothing else will close these. Unlike the
+        # second-timeout case above, these carry no partial capture of their own
+        # (a `UnicodeDecodeError` holds only the chunk it choked on), so the
+        # first exception's is genuinely the best available.
         _close_pipes(proc)
         return exc.stdout, exc.stderr
     return (
