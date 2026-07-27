@@ -96,9 +96,12 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   Treat credentials as GOOD if `signed_in` is true OR
   `registration_env_key_present` is true — a registration-env key authenticates
   partner-API runs even though whoami can't see it, so do NOT nag the user to
-  re-auth in that case. Only when BOTH are false, tell the USER to
-  authenticate, in this order: (1) run `comfy cloud login` in a terminal
-  (canonical), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
+  re-auth in that case. Only when BOTH are false, get the USER
+  authenticated, in this order: (1) call `auth_login` — it starts the sign-in
+  and returns a `login_url` to hand to the user; ask them to open it, complete
+  sign-in, then confirm with `auth_status` (prefer this over asking them to run
+  `comfy cloud login` in a terminal themselves, though that stays a valid
+  fallback), or (2) set `COMFY_API_KEY` in the MCP client's registration env,
   or (3) persist a key with `comfy auth set comfy-cloud-api-key --key <KEY>`.
   Never put a key in a workflow file. If a run still hits a credential error
   despite good `auth_status`, it is retried briefly and surfaces a hint with
@@ -2203,6 +2206,480 @@ def auth_status() -> Any:
     if isinstance(data, dict):
         return {**data, "registration_env_key_present": present}
     return {"whoami": data, "registration_env_key_present": present}
+
+
+# --------------------------------------------------------------------------
+# `auth_login` — drive `comfy cloud login` and hand its OAuth URL to the agent
+# --------------------------------------------------------------------------
+#
+# No OAuth logic lives here (thin-wrapper rule): comfy-cli owns the PKCE flow
+# AND the loopback server the browser redirects back to, so all this does is
+# spawn the CLI, lift the authorize URL out of its machine stream, and leave the
+# child running while the user signs in. For a LOCAL MCP the child's loopback
+# listener is on the same host as the user's browser, which is what makes the
+# handoff work at all.
+
+# Forwarded as comfy-cli's `--timeout`: how long the child waits for the browser
+# callback before giving up with its own `oauth`-family error envelope. Ten
+# minutes is generous for a human who has to switch to a browser, read a consent
+# screen, and possibly sign in first — and because the child polices its own
+# deadline, nothing here has to.
+_LOGIN_TIMEOUT_S = 600
+
+# Bounded wait for the `login_url` event. comfy-cli builds the authorize URL and
+# FLUSHES the event before it blocks on the callback (see its docs/json-output.md),
+# so this budget only has to cover process start-up — an interpreter plus imports
+# — never the sign-in itself. Keeping it short is what makes `auth_login` a
+# normal, fast tool call instead of a ten-minute block.
+_LOGIN_URL_WAIT_S = 15.0
+
+# Grace for a login child that has already exited but whose reader task has not
+# stored the terminal result yet — both its streams have EOF'd by then, so this
+# is a scheduling hop, not a wait on the child.
+_LOGIN_REAP_GRACE = 5.0
+
+# How long past its OWN `--timeout` a child may still be running before we stop
+# believing it will ever finish and reap it (see `_login_is_overdue`). comfy-cli
+# polices the callback deadline itself, so a child alive well past it is wedged,
+# not waiting — and because only ONE login may be in flight, a wedged child would
+# otherwise make `auth_login` return `awaiting_browser` with a long-dead URL for
+# the rest of the process's life, with no way for the agent or the user to reset
+# it. The margin covers the child's own shutdown (write the error envelope, exit)
+# so this can never pre-empt a child that is merely finishing up.
+_LOGIN_OVERDUE_GRACE_S = 60.0
+
+# Cap on the retained stdout/stderr of a login child, mirroring
+# `_STDERR_MAX_CHARS` on the streaming path. The terminal envelope is the LAST
+# stdout line, so keeping the tail keeps the part that decides the outcome while
+# bounding memory for a child parked for ten minutes.
+_LOGIN_STREAM_MAX_CHARS = _STDERR_MAX_CHARS
+
+# asyncio's StreamReader raises `ValueError` once a single line exceeds its
+# buffer limit (64 KiB by default) — and the line we MUST NOT lose is the one
+# carrying the URL. An authorize URL (PKCE challenge + scopes + redirect URI) is
+# long by URL standards and nowhere near either bound; raising the limit just
+# means a future event line can never turn a login into a parse crash.
+_LOGIN_LINE_LIMIT = 1024 * 1024
+
+# What the agent should do next, per terminal state. Kept as constants so the
+# tool's contract reads in one place.
+_LOGIN_NEXT_PENDING = "open the URL, complete sign-in, then call auth_status"
+_LOGIN_NEXT_DONE = "call auth_status to confirm the session"
+_LOGIN_NEXT_RETRY = (
+    "call auth_login again to retry, or have the user run `comfy cloud login` "
+    "in a terminal"
+)
+
+
+class _LoginChild:
+    """The ONE in-flight ``comfy cloud login`` child and its stream reader.
+
+    Parked in module state (:data:`_login_child`) between tool calls: the whole
+    point of this tool is that the child OUTLIVES the call that started it —
+    it holds the loopback listener the browser redirects back to, so killing it
+    when ``auth_login`` returns would break the sign-in it just handed out.
+
+    ``result`` is written exactly once, by :func:`_tail_login_child`, as
+    ``(returncode, stdout_tail, stderr_tail)``; it stays ``None`` while the user
+    is still in the browser. Reading it is how a later ``auth_login`` call tells
+    "still waiting" from "finished" without touching the child.
+    """
+
+    __slots__ = (
+        "proc",
+        "args",
+        "login_url",
+        "expires_at",
+        "prefix",
+        "stderr_task",
+        "reader",
+        "result",
+    )
+
+    def __init__(
+        self,
+        proc: Any,
+        args: tuple[str, ...],
+        login_url: str,
+        timeout_s: float,
+        prefix: list[str],
+        stderr_task: Any,
+    ) -> None:
+        self.proc = proc
+        self.args = args
+        self.login_url = login_url
+        self.expires_at = time.monotonic() + timeout_s
+        self.prefix = prefix
+        self.stderr_task = stderr_task
+        self.reader: Any = None
+        self.result: tuple[int | None, str, str] | None = None
+
+    def expires_in_s(self) -> int:
+        """Seconds left on the child's own callback deadline (never negative).
+
+        Recomputed per call rather than echoing the constant: a second
+        ``auth_login`` five minutes into the flow must not tell the agent it
+        still has the full ten minutes.
+        """
+        return max(0, round(self.expires_at - time.monotonic()))
+
+    def pending_payload(self) -> dict:
+        return {
+            "status": "awaiting_browser",
+            "login_url": self.login_url,
+            "expires_in_s": self.expires_in_s(),
+            "next": _LOGIN_NEXT_PENDING,
+        }
+
+    def is_overdue(self) -> bool:
+        """True for a child still running well past its own callback deadline.
+
+        The wedge detector for the one-at-a-time guard: comfy-cli owns the
+        deadline we handed it, so a child that has neither exited nor written its
+        terminal envelope by ``deadline + _LOGIN_OVERDUE_GRACE_S`` is not going
+        to. Left alone it would hold the only login slot forever and keep
+        handing back a URL that expired long ago.
+        """
+        if self.proc.returncode is not None or self.result is not None:
+            return False
+        return time.monotonic() > self.expires_at + _LOGIN_OVERDUE_GRACE_S
+
+
+# The single in-flight login, or None. Module state on purpose: MCP tool calls
+# are independent, so this is the only place a child can survive between them.
+_login_child: _LoginChild | None = None
+
+# Serializes the check-then-spawn in `auth_login` so two concurrent calls cannot
+# both miss the state and start two OAuth flows (the second child's loopback
+# bind would collide, and the user would be handed a URL for a race loser).
+# Created lazily and re-created if the running loop ever changes: an
+# `asyncio.Lock` binds to the first loop that awaits it and raises on any other,
+# which would turn a loop swap into a hard failure of the tool rather than of
+# the (already broken) child it guards.
+_login_lock: asyncio.Lock | None = None
+_login_lock_loop: Any = None
+
+
+def _login_lock_for_loop() -> asyncio.Lock:
+    global _login_lock, _login_lock_loop
+    loop = asyncio.get_running_loop()
+    if _login_lock is None or _login_lock_loop is not loop:
+        _login_lock = asyncio.Lock()
+        _login_lock_loop = loop
+    return _login_lock
+
+
+def _kill_login_child(proc: Any) -> None:
+    """Kill a login child and any grandchildren, best-effort.
+
+    The async-subprocess twin of :func:`_kill_proc_tree` — same rationale (the
+    child leads its own process group via ``start_new_session=True``, so killing
+    the group closes every inherited copy of the stderr pipe and lets the drain
+    EOF), against :class:`asyncio.subprocess.Process`, which exposes
+    ``returncode`` rather than ``poll()``.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError, ValueError):
+        try:
+            proc.kill()
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
+async def _drain_capped_async(stream: Any, limit: int) -> str:
+    """Read an asyncio stream to EOF keeping only the trailing ``limit`` bytes.
+
+    The async counterpart of :func:`_drain_capped`, and there for the same
+    reason: draining keeps the child from wedging on a full pipe, and slicing
+    per chunk bounds memory however much it spams. Decoding once at the end (not
+    per chunk) keeps a multi-byte character split across a chunk boundary from
+    becoming a replacement character.
+    """
+    tail = b""
+    while True:
+        chunk = await stream.read(_STDERR_READ_CHUNK)
+        if not chunk:
+            break
+        tail = (tail + chunk)[-limit:]
+    return tail.decode("utf-8", "replace")
+
+
+async def _tail_login_child(child: _LoginChild) -> None:
+    """Consume the rest of a login child's output and park its terminal result.
+
+    Runs as a detached task for as long as the user is in the browser (up to
+    :data:`_LOGIN_TIMEOUT_S`). It exists to do two things a finished-and-returned
+    tool call cannot: keep reading stdout so the child never blocks on a full
+    pipe mid-flow, and capture the terminal envelope so the NEXT ``auth_login``
+    can report how the sign-in ended.
+
+    Every step is defensive — this task has no caller to raise into, and losing
+    the result would strand the stored child in a permanent "pending" state.
+    """
+    rest = ""
+    try:
+        rest = await _drain_capped_async(child.proc.stdout, _LOGIN_STREAM_MAX_CHARS)
+    except Exception:  # noqa: BLE001 - a lost tail must not lose the result
+        logging.getLogger(__name__).debug("login stdout drain failed", exc_info=True)
+    try:
+        returncode = await child.proc.wait()
+    except Exception:  # noqa: BLE001 - fall back to whatever the proc reports
+        returncode = child.proc.returncode
+    stderr_text = ""
+    try:
+        stderr_text = await child.stderr_task
+    except Exception:  # noqa: BLE001 - stderr is diagnostics, never the verdict
+        logging.getLogger(__name__).debug("login stderr drain failed", exc_info=True)
+    stdout_text = ("".join(child.prefix) + rest)[-_LOGIN_STREAM_MAX_CHARS:]
+    child.result = (returncode, stdout_text, stderr_text)
+
+
+async def _login_terminal_report(child: _LoginChild) -> dict | None:
+    """Terminal payload for a login child that has exited, else ``None``.
+
+    ``None`` means "still awaiting the browser" — the caller re-reports the
+    stored URL. Otherwise the child's own envelope decides the verdict, unwrapped
+    through :func:`_unwrap_envelope` so comfy-cli's ``error.code`` and hint reach
+    the agent verbatim. Nothing from ``data`` is echoed: a successful login
+    envelope carries the (already comfy-cli-redacted) session, and this tool's
+    contract is status fields only.
+    """
+    if child.result is None:
+        if child.proc.returncode is None:
+            return None
+        # Exited, but the reader task has not stored the result yet. Both
+        # streams have EOF'd, so this is a scheduling hop; `shield` keeps the
+        # timeout from cancelling the reader itself and losing the result.
+        try:
+            await asyncio.wait_for(asyncio.shield(child.reader), _LOGIN_REAP_GRACE)
+        except Exception:  # noqa: BLE001 - fall through to the report below
+            logging.getLogger(__name__).debug("login reader join failed", exc_info=True)
+    if child.result is None:
+        return {
+            "status": "failed",
+            "error_code": None,
+            "message": (
+                f"`comfy cloud login` exited (status {child.proc.returncode}) but its "
+                "output could not be collected, so the outcome is unknown."
+            ),
+            "next": _LOGIN_NEXT_RETRY,
+        }
+    returncode, stdout_text, stderr_text = child.result
+    try:
+        _unwrap_envelope(
+            _real_envelope(_last_json_object(stdout_text)),
+            child.args,
+            returncode,
+            stderr_text,
+            stdout=stdout_text,
+        )
+    except ComfyCliError as exc:
+        return {
+            "status": "failed",
+            "error_code": exc.code,
+            "message": str(exc),
+            "next": _LOGIN_NEXT_RETRY,
+        }
+    return {"status": "completed", "next": _LOGIN_NEXT_DONE}
+
+
+async def _start_login() -> tuple[_LoginChild | None, dict]:
+    """Spawn ``comfy cloud login`` and read up to its ``login_url`` event.
+
+    Returns ``(child, payload)``: a live child plus its ``awaiting_browser``
+    payload in the normal case, or ``(None, payload)`` for a child that finished
+    the whole flow before emitting a URL (nothing left to park). A child that
+    FAILS raises :class:`ComfyCliError` from its own envelope, so the CLI's error
+    code and hint are what the agent sees.
+    """
+    _require_comfy_bin()
+    # Same offload as the streaming path: the guard shells out to
+    # `comfy --version` (up to 30s on the first call per process) and must not
+    # block the event loop.
+    await asyncio.to_thread(_check_comfy_version)
+    args = ("cloud", "login", "--no-browser", "--timeout", str(_LOGIN_TIMEOUT_S))
+    proc = await asyncio.create_subprocess_exec(
+        COMFY_BIN,
+        # Global flags precede the subcommand, as everywhere else. `--json` is
+        # what makes comfy-cli emit the machine `login_url` event (it upgrades
+        # itself to the NDJSON stream to do so); `--where` is deliberately not
+        # forwarded — this verb targets the cloud by definition.
+        "--json",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        # Never let a child inherit the stdio transport's stdin and eat JSON-RPC
+        # request bytes. Same reason as both synchronous spawn sites.
+        stdin=asyncio.subprocess.DEVNULL,
+        env=_comfy_env(),
+        # Own process group so `_kill_login_child` can take the whole tree and
+        # close every copy of the stderr pipe. See `_kill_proc_tree`.
+        start_new_session=True,
+        limit=_LOGIN_LINE_LIMIT,
+    )
+    prefix: list[str] = []
+    stderr_task = asyncio.ensure_future(
+        _drain_capped_async(proc.stderr, _LOGIN_STREAM_MAX_CHARS)
+    )
+
+    async def _await_url() -> tuple[str, float] | None:
+        """The URL + the child's own deadline, or None on stdout EOF."""
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:  # EOF: the child died before emitting a URL
+                return None
+            line = raw.decode("utf-8", "replace")
+            prefix.append(line)
+            event = _parse_event(line)
+            if event is None or event.get("type") != "login_url":
+                continue
+            url = event.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            # Prefer the child's OWN reported deadline over the flag we passed,
+            # so `expires_in_s` can never over-promise if the CLI clamps it.
+            reported = event.get("timeout_s")
+            timeout_s = (
+                float(reported)
+                if isinstance(reported, (int, float))
+                and not isinstance(reported, bool)
+                and reported > 0
+                else float(_LOGIN_TIMEOUT_S)
+            )
+            return url, timeout_s
+
+    try:
+        found = await asyncio.wait_for(_await_url(), _LOGIN_URL_WAIT_S)
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        # No URL within the budget, and the child is still alive — it is blocked
+        # on something that is not the browser (most likely a comfy-cli without
+        # the `login_url` event). Reap it rather than leave an OAuth flow the
+        # agent has no URL for, and point at the path that still works.
+        _kill_login_child(proc)
+        await _reap_login_child(proc, stderr_task)
+        raise ComfyCliError(
+            f"`comfy cloud login` emitted no `login_url` within {_LOGIN_URL_WAIT_S:g}s. "
+            "This server needs a comfy-cli that emits the machine-readable "
+            "`login_url` event under `--json`; upgrade comfy-cli, or have the "
+            "user run `comfy cloud login` in a terminal and then call auth_status."
+        ) from exc
+    except BaseException:
+        # Cancellation (a disconnected client) must not leak a child holding a
+        # loopback port the user can never reach.
+        _kill_login_child(proc)
+        stderr_task.cancel()
+        raise
+    if found is None:
+        # stdout EOF with no URL: the child is done. Unwrap its envelope so a
+        # failure surfaces comfy-cli's own code/hint instead of a bare exit code.
+        returncode = await proc.wait()
+        try:
+            stderr_text = await stderr_task
+        except Exception:  # noqa: BLE001 - diagnostics only
+            stderr_text = ""
+        stdout_text = "".join(prefix)[-_LOGIN_STREAM_MAX_CHARS:]
+        _unwrap_envelope(
+            _real_envelope(_last_json_object(stdout_text)),
+            args,
+            returncode,
+            stderr_text,
+            stdout=stdout_text,
+        )
+        # A SUCCESS envelope with no URL means the flow completed without ever
+        # needing the browser. Nothing to park; report it terminally.
+        return None, {"status": "completed", "next": _LOGIN_NEXT_DONE}
+    url, timeout_s = found
+    child = _LoginChild(proc, args, url, timeout_s, prefix, stderr_task)
+    child.reader = asyncio.ensure_future(_tail_login_child(child))
+    return child, child.pending_payload()
+
+
+async def _reap_login_child(proc: Any, stderr_task: Any) -> None:
+    """Best-effort, bounded cleanup of a killed login child."""
+    try:
+        await asyncio.wait_for(proc.wait(), _LOGIN_REAP_GRACE)
+    except Exception:  # noqa: BLE001 - a stuck child is left to the OS
+        logging.getLogger(__name__).debug("login child reap failed", exc_info=True)
+    stderr_task.cancel()
+
+
+async def _abandon_login_child(child: _LoginChild) -> None:
+    """Tear down a PARKED child (kill, reap, stop its reader) — see `is_overdue`.
+
+    The parked case needs more than :func:`_reap_login_child`: a parked child has
+    a reader task holding its stdout, and that task would otherwise outlive the
+    child it is reading and keep the pipe (and its own frame) alive for the rest
+    of the process. Cancelling it is also what frees the loopback port before the
+    replacement login tries to bind one.
+    """
+    _kill_login_child(child.proc)
+    await _reap_login_child(child.proc, child.stderr_task)
+    if child.reader is not None:
+        child.reader.cancel()
+        await asyncio.gather(child.reader, return_exceptions=True)
+
+
+@mcp.tool()
+async def auth_login() -> Any:
+    """Start Comfy Cloud sign-in and return an OAuth URL for the USER to open.
+
+    Wraps ``comfy cloud login --no-browser`` and returns as soon as comfy-cli
+    hands over the authorize URL — the sign-in itself keeps running in the
+    background, so this is a fast call, not a ten-minute block. Use it instead
+    of telling the user to run ``comfy cloud login`` by hand: give them the
+    ``login_url``, let them complete the flow in their browser, then confirm
+    with ``auth_status``. ``--no-browser`` is deliberate — this server may be
+    headless relative to the person using the agent, so the URL is handed back
+    rather than opened here.
+
+    Returns while the flow is live::
+
+        {"status": "awaiting_browser", "login_url": "https://…",
+         "expires_in_s": 600, "next": "open the URL, …"}
+
+    ``expires_in_s`` counts down comfy-cli's own callback deadline. Calling this
+    again while a sign-in is pending returns the SAME URL and does not start a
+    second flow (only one at a time — a second child's loopback listener would
+    collide with the first). Calling it after the child has finished reports the
+    outcome once — ``{"status": "completed"}`` or ``{"status": "failed",
+    "error_code": …, "message": …}`` — and clears the state, so the call after
+    that starts a fresh sign-in. A pending child that is still running well past
+    its own deadline is treated as wedged: it is reaped and this call starts a
+    fresh sign-in, so the one-at-a-time guard can never strand the tool on a
+    long-dead URL.
+
+    Never returns secrets: only status fields cross this boundary, and the
+    session in comfy-cli's login envelope (already redacted upstream) is not
+    echoed at all. ``auth_status`` is the authority on whether credentials are
+    good — this tool only reports how the CLI's login process ended.
+
+    Raises :class:`ComfyCliError` if the login process fails before producing a
+    URL (comfy-cli's error code and hint are carried through), or if it produces
+    no URL at all — e.g. a comfy-cli too old to emit the machine-readable
+    ``login_url`` event, where the fallback is the manual
+    ``comfy cloud login`` in a terminal.
+    """
+    global _login_child
+    async with _login_lock_for_loop():
+        child = _login_child
+        if child is not None and child.is_overdue():
+            # Wedged past its own deadline: drop it and fall through to a fresh
+            # spawn rather than report a URL nobody can still use.
+            _login_child = None
+            await _abandon_login_child(child)
+            child = None
+        if child is not None:
+            report = await _login_terminal_report(child)
+            if report is None:
+                return child.pending_payload()
+            _login_child = None
+            return report
+        child, payload = await _start_login()
+        _login_child = child
+        return payload
 
 
 @mcp.tool()
