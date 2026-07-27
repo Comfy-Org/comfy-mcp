@@ -2645,6 +2645,14 @@ def test_is_no_recorded_server_matches_wording_drift(message):
         # that nothing was recorded: it does not open a message, line, or field.
         "comfy stop failed: cannot kill pid 7 (operation not permitted); "
         "check permissions and ensure no ComfyUI is running in the background",
+        # Opposite-meaning reports joined WITHOUT punctuation — a conjunction or
+        # a dash. The halves must be joined by the sentence's grammar, not just
+        # sit near each other.
+        "No ComfyUI process was stopped and remains running in the background",
+        "No ComfyUI process could be stopped — it is still running in the background",
+        "No ComfyUI was stopped so something else is running in the background",
+        # A longer, unrelated structured code that merely starts with the marker.
+        "comfy stop failed [no_recorded_server_pid]: none",
     ],
 )
 def test_is_no_recorded_server_rejects_other_failures(message):
@@ -2669,6 +2677,29 @@ def test_is_no_recorded_server_rejects_a_stop_we_timed_out():
         timed_out=True,
     )
 
+    assert not server._is_no_recorded_server(exc)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # The gate has to sit above BOTH text reads, not between them: a message
+        # quoting the literal marker must not slip past a timeout or a different
+        # structured code.
+        server.ComfyCliError(
+            "comfy stop timed out after 60s. stdout: comfy stop failed "
+            "[no_recorded_server]: none",
+            timed_out=True,
+        ),
+        server.ComfyCliError(
+            "comfy stop failed [permission_denied]: cannot kill pid 7 "
+            "(previous run reported no_recorded_server)",
+            code="permission_denied",
+        ),
+    ],
+)
+def test_is_no_recorded_server_gate_outranks_the_literal_marker_too(exc):
+    """A quoted marker does not make a timeout or a coded failure benign."""
     assert not server._is_no_recorded_server(exc)
 
 
@@ -2806,6 +2837,12 @@ def test_port_in_use_matches_the_real_phrasings(message):
         "Cannot load model: the file is already in use by another process",
         "CUDA device 0 is already in use",
         "The output directory is already in use",
+        # A `--port` echoed back from the command in one stream must not be
+        # stitched to an unrelated "already in use" in the other.
+        "comfy-cli returned no JSON (exit 1). stderr: launch --background -- "
+        "--port 8188 | stdout: CUDA device 0 is already in use",
+        "comfy-cli returned no JSON (exit 1). stderr: could not bind port | "
+        "stdout: the model file is already in use",
     ],
 )
 def test_port_in_use_ignores_non_port_conflicts(message):
@@ -2849,11 +2886,48 @@ def test_restart_comfyui_leaves_a_non_port_resource_clash_alone(monkeypatch):
         (["--port", "0"], None),  # out of range
         (["--port", "70000"], None),
         (["--portable"], None),  # a different flag that merely shares the prefix
+        # A trailing unparseable --port supersedes an earlier good one: it means
+        # we do not know the requested port, not that 8189 still stands.
+        (["--port", "8189", "--port", "bad"], None),
+        (["--port", "8189", "--port", "99999"], None),
     ],
 )
 def test_requested_port_reads_the_forwarded_port(extra_args, expected):
     """Best-effort read of the caller's `--port`; anything odd yields None."""
     assert server._requested_port(extra_args) == expected
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        (None, ["--port", "8189"]),
+        ([], ["--port", "8189"]),
+        (["--cpu"], ["--cpu", "--port", "8189"]),  # other flags survive
+        (["--cpu", "--port", "8188"], ["--cpu", "--port", "8189"]),
+        (["--port=8188", "--lowvram"], ["--lowvram", "--port", "8189"]),
+        (["--port"], ["--port", "8189"]),  # dangling flag dropped, not doubled
+    ],
+)
+def test_suggested_relaunch_args_swaps_the_port_and_keeps_the_rest(
+    extra_args, expected
+):
+    """The pasteable suggestion must not silently drop the caller's own flags."""
+    assert server._suggested_relaunch_args(extra_args, 8189) == expected
+
+
+def test_untracked_server_guidance_keeps_the_callers_other_flags():
+    """A user pasting the suggestion should not lose `--cpu` along the way."""
+    guidance = server._untracked_server_guidance(["--cpu", "--port", "8188"])
+
+    assert 'extra_args=["--cpu", "--port", "8189"]' in guidance
+
+
+def test_untracked_server_guidance_falls_back_when_the_args_are_long():
+    """Past the cap the suggestion degrades to the bare port rather than noise."""
+    guidance = server._untracked_server_guidance(["--some-very-long-flag"] * 12)
+
+    assert 'extra_args=["--port", "8189"]' in guidance
+    assert "--some-very-long-flag" not in guidance
 
 
 def test_untracked_server_guidance_avoids_suggesting_the_port_that_just_failed():

@@ -705,6 +705,14 @@ def _check_comfy_version() -> None:
 # stop failure ``restart_comfyui`` treats as benign (see its docstring).
 _NO_RECORDED_SERVER_CODE = "no_recorded_server"
 
+# The same marker as it appears rendered INSIDE a message (e.g. "comfy stop
+# failed [no_recorded_server]: none"), for the failures that carry it as text
+# without a structured ``code``. Word-bounded rather than a bare substring test
+# so a longer, unrelated code that merely starts with it — ``no_recorded_server_pid``
+# — is not read as this one. (``_`` is a word character, so ``\b`` does not fire
+# between "server" and "_pid".)
+_NO_RECORDED_SERVER_CODE_RE = re.compile(rf"\b{re.escape(_NO_RECORDED_SERVER_CODE)}\b")
+
 # The SAME condition as comfy-cli actually prints it in the common case: `comfy
 # stop` with no recorded background server prints "No ComfyUI is running in the
 # background." and exits 1 WITHOUT an envelope (comfy-cli 1.12.0 `cmdline.stop`),
@@ -737,17 +745,25 @@ _NO_RECORDED_SERVER_CODE = "no_recorded_server"
 #     this sentence on its own; a hint buried mid-sentence in some other failure
 #     ("…, and ensure no ComfyUI is running in the background") is advice, not a
 #     report that nothing was recorded, and must not be swallowed.
-#   * The gap between the halves stops at any clause break — ``. , ; :`` — or at
-#     the ``|`` stream delimiter, and spans at most 40 characters. That is what
-#     stops the two halves being stitched together out of DIFFERENT streams or
-#     different clauses ("No ComfyUI process could be stopped; it is still
-#     running in the background" is a failed stop, the exact opposite case).
-#     Newlines are deliberately still allowed inside the gap: comfy-cli renders
-#     through Rich, which may soft-wrap the sentence, and a wrap is not a clause
-#     break.
+#   * The two halves must be joined by the GRAMMAR of the sentence, not merely
+#     sit near each other: at most two inserted words and an optional copula
+#     ("No ComfyUI *server is* running…", "No ComfyUI running…"). Because that
+#     gap is built from ``\s`` and ``\w`` only, it cannot cross ANY punctuation —
+#     so the halves can never be stitched out of two different streams
+#     (``… | stdout: …``), two different clauses ("No ComfyUI process could be
+#     stopped; it is still running in the background"), or across a conjunction
+#     or dash ("No ComfyUI process was stopped and remains running in the
+#     background"). Every one of those reports a stop that FAILED — the exact
+#     opposite case — and none of them survives this shape.
+#
+#     A character-class gap was tried first and is what this replaces: excluding
+#     punctuation one mark at a time is whack-a-mole, whereas admitting only
+#     word characters is closed by construction. Newlines still pass (``\s``
+#     covers them), so a Rich soft-wrap inside the sentence still matches — a
+#     wrap is not a clause break.
 _NO_RECORDED_SERVER_TEXT_RE = re.compile(
     r"(?:\A|[\n|:]|\.\.\.)\s*no\s+comfyui\b"
-    r"[^.,;:|]{0,40}?\brunning\s+in\s+the\s+background\b",
+    r"(?:\s+\w+){0,2}(?:\s+(?:is|was))?\s+running\s+in\s+the\s+background\b",
     re.IGNORECASE,
 )
 
@@ -769,26 +785,31 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
     no-envelope message renders stdout and stderr side by side, and an envelope
     that carries the sentence but omits ``error.code`` is the same benign case.
 
-    It IS gated on the two signals that outrank the prose, because reading text
-    over them would let a real failure be swallowed:
+    BOTH text reads — the marker and the phrase — are gated on the two signals
+    that outrank anything in the message, because reading text over them would
+    let a real failure be swallowed:
 
     * ``exc.code`` set to something else. comfy-cli told us structurally what
-      went wrong; a stray sentence in the message does not overrule it (the
+      went wrong; text in the message does not overrule it (the
       ``code == _NO_RECORDED_SERVER_CODE`` branch above already took the benign
       case).
     * ``exc.timed_out``. We killed the stop at our own deadline, so whatever it
       printed before dying says nothing about whether a server is recorded — and
       a stop that never finished is precisely the case ``restart_comfyui`` must
       not relaunch over.
+
+    The gate therefore sits ABOVE both reads rather than between them: a
+    timed-out stop whose output happens to quote the marker is still a timeout.
     """
     if exc.code == _NO_RECORDED_SERVER_CODE:
         return True
-    message = str(exc)
-    if _NO_RECORDED_SERVER_CODE in message:
-        return True
     if exc.code is not None or exc.timed_out:
         return False
-    return _NO_RECORDED_SERVER_TEXT_RE.search(message) is not None
+    message = str(exc)
+    return (
+        _NO_RECORDED_SERVER_CODE_RE.search(message) is not None
+        or _NO_RECORDED_SERVER_TEXT_RE.search(message) is not None
+    )
 
 
 def _strip_brackets(host: str) -> str:
@@ -3805,8 +3826,15 @@ def stop_comfyui() -> Any:
 # ("Something is already serving this port") about a launch failure that has
 # nothing to do with the port. Failing to match only costs the explanation: the
 # original error is re-raised verbatim either way.
+#
+# The subject and the complaint must be joined grammatically, by the same
+# word-characters-only gap :data:`_NO_RECORDED_SERVER_TEXT_RE` uses and for the
+# same reason: it cannot cross punctuation, so a `port` mentioned in one rendered
+# stream (or in a `--port` echoed back from the command) can never be stitched to
+# an `already in use` belonging to some other failure in another — `stderr: ...
+# --port 8188 ... | stdout: CUDA device 0 is already in use` no longer matches.
 _PORT_IN_USE_TEXT_RE = re.compile(
-    r"\b(?:port|address)\b[^.\n]{0,60}?\balready\s+in\s+use\b",
+    r"\b(?:port|address)\b(?:\s+\w+){0,3}\s+already\s+in\s+use\b",
     re.IGNORECASE,
 )
 
@@ -3837,13 +3865,48 @@ def _requested_port(extra_args: list[str] | None) -> int | None:
             raw = arg[len("--port=") :]
         else:
             continue
+        # The LAST --port is the one an argument parser would act on, so it
+        # supersedes an earlier one whether or not it parses: a trailing
+        # `--port bad` means we do not know the requested port, not that the
+        # previous value is still in effect.
         try:
             value = int(raw)
         except (TypeError, ValueError):
+            port = None
             continue
-        if 1 <= value <= 65535:
-            port = value  # last --port wins, as an argument parser would read it
+        port = value if 1 <= value <= 65535 else None
     return port
+
+
+# Past this many characters the rendered relaunch stops being copy-pasteable
+# guidance and starts being noise inside an error message, so a long
+# ``extra_args`` falls back to the bare ``--port`` form.
+_MAX_SUGGESTED_ARGS_LEN = 120
+
+
+def _suggested_relaunch_args(extra_args: list[str] | None, port: int) -> list[str]:
+    """``extra_args`` with any ``--port`` replaced by ``port``.
+
+    Keeping the caller's OTHER flags matters because the guidance is meant to be
+    pasted: a user who failed with ``["--cpu", "--port", "8188"]`` and copies a
+    suggestion that dropped ``--cpu`` relaunches with different behavior than
+    they asked for.
+    """
+    kept: list[str] = []
+    skip_next = False
+    for arg in extra_args or []:
+        if skip_next:
+            skip_next = False
+            continue
+        if not isinstance(arg, str):
+            continue
+        if arg == "--port":
+            skip_next = True  # drop its value too
+            continue
+        if arg.startswith("--port="):
+            continue
+        kept.append(arg)
+    return [*kept, "--port", str(port)]
 
 
 def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
@@ -3858,6 +3921,9 @@ def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
     suggested = _ALT_PORT_SUGGESTION
     if _requested_port(extra_args) == suggested:
         suggested = _ALT_PORT_FALLBACK
+    rendered = json.dumps(_suggested_relaunch_args(extra_args, suggested))
+    if len(rendered) > _MAX_SUGGESTED_ARGS_LEN:
+        rendered = json.dumps(["--port", str(suggested)])
     return (
         "Something is already serving this port, but comfy-cli has no record of "
         "launching it — so there was nothing for the restart to stop, and the fresh "
@@ -3865,7 +3931,7 @@ def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
         "outside comfy-cli (a foreground `comfy launch`, the ComfyUI desktop app, or "
         "`python main.py`), and comfy-cli only ever stops a server it started itself. "
         "Either stop it the way you started it and retry, or bring one up alongside it "
-        f'on some free port, e.g. restart_comfyui(extra_args=["--port", "{suggested}"]). '
+        f"on some free port, e.g. restart_comfyui(extra_args={rendered}). "
         "`server_info` shows what is answering right now."
     )
 
