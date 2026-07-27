@@ -2067,6 +2067,17 @@ def server_info() -> Any:
     and, to see the dropped warning, run ``COMFY_LOCAL_URL=<value> comfy env``
     in a terminal.
 
+    ``workspace.manager_mode`` describes the cm-cli integration comfy-cli can
+    use, not whether ComfyUI-Manager exists: it reflects a per-user config
+    override first and otherwise whether the ``comfyui_manager`` pip package is
+    importable in the workspace venv. A Manager installed the legacy way —
+    cloned into ``custom_nodes/`` — is fully functional server-side yet still
+    reports ``"not-installed"`` here, and a stale config value can report a
+    mode for a Manager that was since removed. Treat ``"not-installed"`` as
+    "comfy-cli's Manager commands are unavailable", never as "Manager is
+    absent" — do not advise the user to install ComfyUI-Manager on the strength
+    of this field alone.
+
     Also the compatibility gate for the unpinned comfy-cli this server shells
     out to: it asserts comfy-cli's envelope schema major matches the
     ``envelope/N`` this wrapper parses, and — when a ``COMFY_CLI_MIN_VERSION``
