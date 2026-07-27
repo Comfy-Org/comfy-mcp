@@ -91,6 +91,50 @@ def test_run_comfy_utf8_env_overrides_inherited(patched_run, monkeypatch):
     assert calls[0]["env"]["PYTHONIOENCODING"] == "utf-8"
 
 
+def test_run_comfy_closes_child_stdin(patched_run):
+    """The child never inherits the stdio transport's stdin.
+
+    This is an MCP **stdio** server: the parent's stdin carries JSON-RPC
+    requests. A child that inherits it (the subprocess default) can read those
+    bytes out from under the client, silently corrupting the session, or block
+    on a prompt nobody can answer. No comfy-cli call here is interactive.
+    """
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["stdin"] == subprocess.DEVNULL
+
+
+def test_run_comfy_sets_non_interactive_child_env(patched_run):
+    """git/pip are told never to prompt, so a would-be prompt fails fast.
+
+    With stdin closed an interactive prompt could not be answered anyway; these
+    turn "block invisibly until the timeout" into an immediate, legible error —
+    which matters most for `update_comfyui`'s 30-minute ceiling.
+    """
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert calls[0]["env"]["PIP_NO_INPUT"] == "1"
+
+
+def test_run_comfy_leaves_askpass_alone(patched_run, monkeypatch):
+    """A GUI/keychain credential helper still works — it does not use stdin.
+
+    Overriding `GIT_ASKPASS` would break private-remote updates that succeed
+    today, so the non-interactive pins deliberately stop at the terminal prompt.
+    """
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/local/bin/my-helper")
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["GIT_ASKPASS"] == "/usr/local/bin/my-helper"
+
+
 def test_error_envelope_raises_with_code(patched_run):
     patched_run(
         {
@@ -1955,6 +1999,15 @@ def test_run_workflow_stream_forces_utf8_env(patched_stream):
     assert procs[0].encoding == "utf-8"
 
 
+def test_run_workflow_stream_closes_child_stdin(patched_stream):
+    """The streaming spawn also refuses to hand the child our JSON-RPC stdin."""
+    procs = patched_stream(_OK_STREAM)
+
+    asyncio.run(server.run_workflow("wf.json", wait=True))
+
+    assert procs[0].stdin_arg == subprocess.DEVNULL
+
+
 def test_run_workflow_stream_error_envelope_raises_with_code(patched_stream):
     """An error envelope on the final line raises ComfyCliError with its code."""
     stream = (
@@ -2565,6 +2618,193 @@ def test_restart_comfyui_returns_new_server_status(monkeypatch):
     )
 
     assert server.restart_comfyui() == {"pid": 42, "port": 8188}
+
+
+# --- update_comfyui (`comfy update [all|comfy|cli]`) ------------------------
+
+
+def test_update_comfyui_defaults_to_core_target(patched_plain_run):
+    """Bare call updates ComfyUI core: `comfy … update comfy`, plain-exit success.
+
+    `comfy update` never emits an envelope — it prints through comfy-cli's
+    rprint shim (which routes to stderr in `--json` mode) and exits 0 — so this
+    rides the same `plain_ok` synthesis as launch/stop.
+    """
+    calls = patched_plain_run(
+        0, stderr="Updating ComfyUI in /ws...\nAlready up to date."
+    )
+
+    result = server.update_comfyui()
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
+    assert cmd[4:] == ["update", "comfy"]
+    assert result["ok"] is True
+    assert result["action"] == "update comfy"
+    assert "Already up to date" in result["message"]
+
+
+@pytest.mark.parametrize("target", ["all", "comfy", "cli"])
+def test_update_comfyui_forwards_each_accepted_target(patched_plain_run, target):
+    """Every target comfy-cli accepts is forwarded verbatim."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui(target)
+
+    assert calls[0]["cmd"][4:] == ["update", target]
+
+
+def test_update_comfyui_nonzero_exit_raises(patched_plain_run):
+    """A failed update (non-zero exit, no envelope) must still raise, not synthesize."""
+    calls = patched_plain_run(
+        1, stderr="error: Your local changes would be overwritten"
+    )
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        server.update_comfyui()
+
+    assert len(calls) == 1  # it really did run, and the failure was not swallowed
+
+
+def test_update_comfyui_surfaces_error_envelope(patched_run):
+    """If comfy-cli does emit an error envelope, its code still propagates."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "workspace_not_found", "message": "no ComfyUI path"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.update_comfyui("comfy")
+    assert excinfo.value.code == "workspace_not_found"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["nodes", "", "  ", "comfy; rm -rf /", "--help", "core"],
+)
+def test_update_comfyui_rejects_unknown_target_before_spawning(patched_run, target):
+    """An unaccepted target is named and refused BEFORE any subprocess runs."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid update target"):
+        server.update_comfyui(target)
+
+    assert calls == []  # nothing was forwarded to comfy-cli
+
+
+def test_update_comfyui_error_names_the_allowed_targets(patched_run):
+    """The rejection is explicit about what IS accepted, not a bare refusal."""
+    patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.update_comfyui("everything")
+    message = str(excinfo.value)
+    assert "'everything'" in message  # the offending value, echoed back
+    for allowed in ("'all'", "'comfy'", "'cli'"):
+        assert allowed in message
+
+
+def test_update_comfyui_normalizes_case_and_whitespace(patched_plain_run):
+    """`" Comfy "` resolves to the canonical target; the raw string never hits argv."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui("  COMFY ")
+
+    assert calls[0]["cmd"][4:] == ["update", "comfy"]
+
+
+def test_update_comfyui_timeout_is_generous(patched_plain_run):
+    """The update timeout must comfortably exceed launch_comfyui's 180s boot."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui()
+
+    assert calls[0]["timeout"] >= 180.0
+    assert calls[0]["timeout"] == server._UPDATE_TIMEOUT
+
+
+def test_update_comfyui_is_non_interactive(patched_plain_run):
+    """An update must never stop to ask git/pip a question it cannot be answered.
+
+    The 30-minute ceiling makes a silent credential prompt the worst case: with
+    stdin inherited it would both eat JSON-RPC bytes and hang for half an hour.
+    """
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui()
+
+    assert calls[0]["stdin"] == subprocess.DEVNULL
+    assert calls[0]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert calls[0]["env"]["PIP_NO_INPUT"] == "1"
+
+
+def test_update_comfyui_refuses_a_concurrent_update(monkeypatch, patched_plain_run):
+    """A second update while one is in flight is refused, not run in parallel.
+
+    FastMCP dispatches sync tools onto a worker thread pool, so two calls really
+    can overlap — and both would then drive git/pip against the same checkout and
+    Python environment. A real second thread here, pinned inside the first
+    update's subprocess (i.e. while the lock is held).
+    """
+    calls = patched_plain_run(0, stderr="done")
+    inside = threading.Event()
+    release = threading.Event()
+    fixture_run = server.subprocess.run
+
+    def blocking_run(*args, **kwargs):
+        inside.set()  # the first update now holds the lock...
+        release.wait(5)  # ...and keeps holding it until this test lets go
+        return fixture_run(*args, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", blocking_run)
+    worker = threading.Thread(target=server.update_comfyui, args=("comfy",))
+    worker.start()
+    try:
+        assert inside.wait(5), "the first update never reached its subprocess"
+        with pytest.raises(server.ComfyCliError, match="already running"):
+            server.update_comfyui("all")
+    finally:
+        release.set()
+        worker.join(5)
+
+    # The refused call never reached comfy-cli; only the first update spawned.
+    assert [c["cmd"][4:] for c in calls] == [["update", "comfy"]]
+
+
+def test_update_comfyui_lock_is_released_after_failure(patched_plain_run):
+    """A failed update must not wedge every later update behind a held lock."""
+    patched_plain_run(1, stderr="error: local changes would be overwritten")
+
+    with pytest.raises(server.ComfyCliError):
+        server.update_comfyui()
+
+    # The lock is free again, so a retry proceeds instead of being refused.
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    server._UPDATE_LOCK.release()
+
+
+def test_update_comfyui_lock_is_released_after_success(patched_plain_run):
+    """The happy path releases too — two sequential updates are always allowed."""
+    calls = patched_plain_run(0, stderr="done")
+
+    server.update_comfyui("comfy")
+    server.update_comfyui("cli")
+
+    assert [c["cmd"][4:] for c in calls] == [["update", "comfy"], ["update", "cli"]]
+
+
+def test_update_comfyui_invalid_target_does_not_take_the_lock(patched_run):
+    """A rejected target leaves the lock untouched, so a good call still works."""
+    patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="invalid update target"):
+        server.update_comfyui("nope")
+
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    server._UPDATE_LOCK.release()
 
 
 # --- fetch_outputs inline image return -------------------------------------

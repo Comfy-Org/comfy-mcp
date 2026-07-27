@@ -225,9 +225,9 @@ reports the configured target under a `comfy_target` block.
 
 **Not remoted (this repo is a thin wrapper and never opens its own socket):**
 
-- **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `get_logs`) — these manage a
-  **local** ComfyUI process and stay local-only; they cannot start/stop or read logs from a remote
-  box. Start ComfyUI on the remote host yourself.
+- **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `update_comfyui`, `get_logs`)
+  — these manage a **local** ComfyUI process/install and stay local-only; they cannot start/stop,
+  update, or read logs from a remote box. Start and update ComfyUI on the remote host yourself.
 - **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
   / `generate_image` / `run_template` / `partner_generate` — this server forwards **no**
   `--host`/`--port` to these verbs (most of them accept none at all), so they run
@@ -499,6 +499,7 @@ the originals stay in the ComfyUI workspace.
 | `launch_comfyui(extra_args=None)` | `comfy launch --background [-- <extras>]` | Start the local ComfyUI detached; forwards `extra_args` to ComfyUI. |
 | `stop_comfyui()` | `comfy stop` | Stop the ComfyUI that comfy-cli launched (only its own recorded pid). |
 | `restart_comfyui(extra_args=None)` | `comfy stop` then `comfy launch --background [-- <extras>]` | Stop-then-launch the local ComfyUI (best-effort stop); forwards `extra_args` to the fresh server. Handy for relaunching with different flags. |
+| `update_comfyui(target="comfy")` | `comfy update <all\|comfy\|cli>` | Update the local install: `"comfy"` = ComfyUI core, `"all"` = the installed custom node packs, `"cli"` = comfy-cli itself. This is what `server_info`'s `freshness` block points at when it reports a stale install. Slow (a core update re-installs requirements; 30-minute timeout) and the updated code only takes effect after a `restart_comfyui`. Any other `target` is rejected before comfy-cli is invoked, and a second update requested while one is still running is refused rather than run in parallel (concurrent `git`/`pip` against one workspace can leave it half-installed). |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
 | `download_model(url, relative_path=None, filename=None)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>]` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. |
 
