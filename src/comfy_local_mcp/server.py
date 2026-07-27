@@ -4532,19 +4532,24 @@ _SLOT_QUOTED_EXAMPLE = '6.text=["a lighthouse at dawn, oil painting", "a cabin"]
 
 
 def _clip_for_error(text: str) -> str:
-    """Bound a caller-supplied fragment echoed back in an error message.
+    """Render a caller-supplied fragment for an error message, bounded.
 
     A slot's value list is caller-sized — a sweep over long prompts is KBs of
     text — and the whole point of naming the offending entry is lost if the
-    message it rides in is unreadable. Same per-field cap the envelope errors use:
-    ``_MAX_ERROR_FIELD_CHARS`` bounds the caller-supplied CONTENT, exactly as the
-    bare ``[:_MAX_ERROR_FIELD_CHARS]`` slices in :func:`_render_error_details` do.
-    The one-character ellipsis rides on top as a truncation marker — it is ours,
-    not the caller's, so it is not counted against their budget.
+    message it rides in is unreadable. Same per-field cap the envelope errors use.
+
+    This quotes the fragment itself rather than leaving that to an ``!r`` at the
+    call site, because the cap has to apply to what is actually RENDERED. ``repr``
+    expands a control or non-printable character into a 4-to-10-character escape
+    (``\\x00``, ``\\uXXXX``, ``\\U000XXXXX``), so clipping the raw text first and
+    quoting after would let 500 such characters land as ~2000+ in the message —
+    the bound would read as if it held while the field blew past it. Clipping the
+    rendered form is what :func:`_render_error_details` does too.
     """
-    if len(text) <= _MAX_ERROR_FIELD_CHARS:
-        return text
-    return text[:_MAX_ERROR_FIELD_CHARS] + "…"
+    rendered = repr(text)
+    if len(rendered) <= _MAX_ERROR_FIELD_CHARS:
+        return rendered
+    return rendered[:_MAX_ERROR_FIELD_CHARS] + "…"
 
 
 def _reject_non_json_array_slot(index: int, slot: str) -> None:
@@ -4569,9 +4574,12 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
 
     This mirrors comfy-cli's own parse exactly — ``json.loads`` on the value
     portion, accept only a ``list`` — so it can only refuse input comfy-cli would
-    also refuse. The one place the mirror cannot hold is stack depth, which is a
-    property of the process doing the parsing rather than of the input; that case
-    is handed to the engine untouched rather than guessed at.
+    also refuse — with one deliberate exception. A failure that is a property of
+    the PARSING PROCESS rather than of the input (recursion depth, an interpreter
+    limit like ``sys.get_int_max_str_digits``) says nothing about how comfy-cli's
+    own fresh subprocess will fare, so those are handed to the engine untouched
+    rather than guessed at. Only a genuine syntax error — a
+    :class:`json.JSONDecodeError` — is refused here.
     """
     preview = _clip_for_error(slot)
     fix = (
@@ -4581,7 +4589,7 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
     )
     if "=" not in slot:
         raise ComfyCliError(
-            f"invalid slots[{index}] {preview!r}: expected an 'ADDR=[v1,v2,...]' "
+            f"invalid slots[{index}] {preview}: expected an 'ADDR=[v1,v2,...]' "
             f"string whose value is a JSON array — {fix}"
         )
     addr, _, raw = slot.partition("=")
@@ -4591,23 +4599,26 @@ def _reject_non_json_array_slot(index: int, slot: str) -> None:
     addr = _clip_for_error(addr.strip())
     try:
         value = json.loads(raw)
-    except RecursionError:
-        # Nesting deep enough to exhaust THIS process's stack says nothing about
-        # comfy-cli's: it parses in a fresh subprocess that is not already
-        # carrying the MCP handler -> tool -> loop frames underneath, so a value
-        # that blows the limit here can still parse there. Refusing it would
-        # break the invariant this whole pre-check rests on — that it can only
-        # refuse what comfy-cli would also refuse — so defer to the engine and
-        # let its own parse be the verdict.
-        return
-    except ValueError:
+    except json.JSONDecodeError:
         raise ComfyCliError(
-            f"invalid slots[{index}] for address {addr!r}: value must be a JSON "
-            f"array, but {_clip_for_error(raw)!r} is not valid JSON — {fix}"
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
+            f"array, but {_clip_for_error(raw)} is not valid JSON — {fix}"
         ) from None
+    except (ValueError, RecursionError):
+        # NOT a syntax error — the input is well-formed JSON that THIS
+        # interpreter declined to build: nesting deeper than the stack left us
+        # (`RecursionError`), or an integer literal over
+        # `sys.get_int_max_str_digits` (a plain `ValueError`, not a
+        # `JSONDecodeError`, since 3.11). Both are limits of the process doing
+        # the parsing, and this one parses several frames down from the MCP
+        # handler with whatever limits this interpreter was started with, while
+        # comfy-cli parses in a fresh subprocess of its own. Refusing here would
+        # reject values the engine accepts and break the invariant above, so
+        # abstain and let the engine's parse be the verdict.
+        return
     if not isinstance(value, list):
         raise ComfyCliError(
-            f"invalid slots[{index}] for address {addr!r}: value must be a JSON "
+            f"invalid slots[{index}] for address {addr}: value must be a JSON "
             f"array, got {type(value).__name__} — wrap a single value in a "
             f"one-element array ('3.seed=[42]'), and {fix}"
         )

@@ -16,6 +16,8 @@ they own on top of the passthrough:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from conftest import envelope
 
@@ -434,3 +436,81 @@ def test_vary_workflow_defers_unparseably_nested_slot_to_the_engine(
         "--slot",
         slot,  # untouched: the guard abstained, it did not rewrite or refuse
     ]
+
+    # No sticky state: the injected failure is scoped to `nested`, so a normal
+    # entry right behind it still goes through the guard and out to the engine.
+    server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"])
+    assert calls[1]["cmd"][4:][-2:] == ["--slot", "3.seed=[1,2]"]
+
+
+def test_vary_workflow_survives_a_real_recursion_error(patched_run):
+    """A genuine stack exhaustion, not an injected one, leaves the server usable.
+
+    The companion test above injects `RecursionError` for deterministic branch
+    coverage, which by construction cannot say anything about the interpreter's
+    health afterwards. This one provokes the real thing: CPython's JSON C
+    scanner raises through `Py_EnterRecursiveCall`, which reserves stack
+    headroom rather than running the stack to the ground, so the frames unwind
+    cleanly and the next call parses normally. That matters here because this is
+    a long-lived single process — one hostile slot must not degrade every later
+    one.
+
+    Skipped rather than silently vacuous if the interpreter happens to swallow
+    the depth: the threshold moved between 3.10 and 3.14 and may move again.
+    """
+    depth = 200_000
+    nested = "[" * depth + "]" * depth
+    try:
+        json.loads(nested)
+    except RecursionError:
+        pass
+    else:  # pragma: no cover - depends on the interpreter's limit
+        pytest.skip(f"this interpreter parses {depth}-deep arrays without raising")
+
+    calls = patched_run(envelope(data={"count": 1}))
+
+    server.vary_workflow("/tmp/flux.json", [f"6.text={nested}"])
+    server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"])
+
+    assert len(calls) == 2
+    assert calls[1]["cmd"][4:][-2:] == ["--slot", "3.seed=[1,2]"]
+
+
+def test_vary_workflow_defers_oversized_int_literal_to_the_engine(patched_run):
+    """An interpreter limit is not a syntax error, and must not be reported as one.
+
+    Since 3.11 `json.loads` refuses an integer literal longer than
+    `sys.get_int_max_str_digits()` (4300 by default) with a PLAIN `ValueError`,
+    not a `JSONDecodeError` — `[<5000 digits>]` is perfectly well-formed JSON
+    that this interpreter simply declines to build. comfy-cli parses in its own
+    subprocess, under its own interpreter and limit, so it may well accept it.
+    Refusing here would both mislabel it 'not valid JSON' and reject a value the
+    engine takes, so the guard abstains.
+    """
+    calls = patched_run(envelope(data={"count": 1}))
+
+    slot = "3.seed=[" + "9" * 5_000 + "]"
+    server.vary_workflow("/tmp/flux.json", [slot])
+
+    assert calls[0]["cmd"][4:] == ["workflow", "vary", "/tmp/flux.json", "--slot", slot]
+
+
+def test_vary_workflow_slot_error_bound_survives_repr_escaping(monkeypatch):
+    """The cap has to hold on the RENDERED field, not the pre-quoted content.
+
+    `repr` turns one control character into a 4-character escape, so clipping
+    the raw text to the cap and quoting afterwards would put ~4x the cap into
+    the message — a bound that reads as if it holds while the field blows past
+    it. The other bounded tests use printable characters and would not catch it.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    # NUL is rejected earlier by `_reject_nul`; \x01 is not, and reprs as `\x01`.
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.vary_workflow("/tmp/flux.json", ["6.text=[" + "\x01" * 10_000 + "]"])
+
+    assert len(str(excinfo.value)) < 2_000
