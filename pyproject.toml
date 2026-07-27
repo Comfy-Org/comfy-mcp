@@ -26,7 +26,7 @@ dependencies = [
 # src/comfy_local_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.15,<0.16"]
+dev = ["pytest>=8", "ruff>=0.15,<0.17"]
 
 [project.scripts]
 comfy-local-mcp = "comfy_local_mcp.server:main"
