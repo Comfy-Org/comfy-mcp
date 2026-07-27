@@ -488,8 +488,24 @@ def _comfy_env() -> dict[str, str]:
       keychain credential helper does not use stdin, so it still works with
       stdin closed; overriding it would break private-remote updates that
       succeed today.
+
+    ``PATH`` is the one inherited variable this rewrites rather than injects
+    alongside: the directory of the RESOLVED ``COMFY_BIN`` is guaranteed to be
+    on the child's ``PATH``, first. This exists because ``comfy launch
+    --background`` re-invokes ``comfy`` by BARE NAME via ``PATH`` (comfy-cli
+    1.12's ``launch.py`` spawns ``Popen(["comfy", ...])`` for the detached
+    process). Without the prepend, an absolute ``COMFY_BIN`` pointing outside
+    the inherited ``PATH`` — the normal state for an MCP server launched by a
+    GUI client on macOS — crashes background launch with ``FileNotFoundError:
+    'comfy'`` before ComfyUI is ever spawned, surfacing here as the opaque
+    ``comfy-cli returned no JSON (exit 1)`` (BE-4735). Prepending rather than
+    appending is deliberate: it also stops a stale second comfy install earlier
+    on the user's ``PATH`` from shadowing the intended one inside the child
+    (BE-3780). The entry is absolutized because comfy-cli ``os.chdir``s to the
+    workspace in the child before that re-invocation resolves, so a relative
+    entry would point somewhere else by then.
     """
-    return {
+    env = {
         **os.environ,
         "COMFY_WHERE": "local",
         "COMFY_NO_WATCH": "1",
@@ -498,6 +514,20 @@ def _comfy_env() -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "PIP_NO_INPUT": "1",
     }
+    # `shutil.which` handles both shapes of COMFY_BIN: a value carrying a
+    # directory separator is checked as that exact file, a bare name is resolved
+    # against PATH. None means we could not locate the binary at all — skip
+    # silently rather than guess, since `_require_comfy_bin` already raises the
+    # curated missing-binary error ahead of any spawn and this must not add a
+    # second failure mode.
+    resolved = shutil.which(COMFY_BIN)
+    if resolved:
+        bin_dir = os.path.dirname(os.path.abspath(resolved))
+        path = env.get("PATH", "")
+        entries = path.split(os.pathsep) if path else []
+        if not entries or entries[0] != bin_dir:
+            env["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    return env
 
 
 class ComfyCliError(RuntimeError):
@@ -3727,6 +3757,23 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     in review upstream). On affected comfy-cli versions the crash surfaces here
     as a clean :class:`ComfyCliError` from the error envelope. Remove this note
     once the upstream fix ships.
+
+    NOTE (second upstream caveat, handled): ``comfy launch --background``
+    re-invokes ``comfy`` by BARE NAME via ``PATH`` to spawn the detached
+    process, so it needs to find itself on the child's ``PATH`` no matter how
+    this server was told to call it. This server therefore guarantees the
+    resolved ``COMFY_BIN``'s directory is first on the child ``PATH`` — see
+    :func:`_comfy_env`. Before that guarantee, an absolute ``COMFY_BIN``
+    pointing outside the inherited ``PATH`` (an MCP server started by a GUI
+    client plus a venv-installed comfy-cli) failed HERE, and only here, as
+    ``comfy-cli returned no JSON (exit 1)`` with a traceback whose first visible
+    frame is ``comfy_cli/tracking.py:334``. That frame is a red herring — it is
+    the ``track_command`` passthrough wrapper, not telemetry (typer's pretty
+    exceptions hide the frames above it, and the crash reproduces with
+    ``DO_NOT_TRACK=1``); the real exception is ``FileNotFoundError: 'comfy'``
+    from the inner re-invocation. See BE-4735. The upstream fix — re-invoking
+    via ``sys.executable -m comfy_cli`` instead of a bare name — is still
+    desirable, but this server no longer depends on it.
     """
     args = ["launch", "--background"]
     if extra_args:

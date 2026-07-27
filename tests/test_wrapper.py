@@ -17,7 +17,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -133,6 +136,200 @@ def test_run_comfy_leaves_askpass_alone(patched_run, monkeypatch):
     server._run_comfy("jobs", "status", "abc")
 
     assert calls[0]["env"]["GIT_ASKPASS"] == "/usr/local/bin/my-helper"
+
+
+# --- COMFY_BIN's directory is guaranteed first on the child PATH -------------
+#
+# `comfy launch --background` re-invokes `comfy` by BARE NAME via PATH to spawn
+# the detached process, so an absolute COMFY_BIN whose directory is not on the
+# inherited PATH (an MCP server started by a GUI client + a venv-installed
+# comfy-cli) crashed the child with FileNotFoundError before ComfyUI was ever
+# started. See `_comfy_env` (BE-4735 / BE-3780).
+
+_needs_posix_exec = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX exec bit; which() needs a PATHEXT suffix on Windows",
+)
+
+# The spawn-site fixtures stub `shutil.which` to a fixed "/fake/comfy" (they
+# patch the shared module attribute), which would mask the real resolution the
+# two end-to-end tests below are checking. Captured at import, before any test
+# has had a chance to patch it, so they can put the genuine one back.
+_real_which = shutil.which
+
+
+def _dummy_comfy(tmp_path, dirname="venv-bin", name="comfy"):
+    """A real, executable file on disk standing in for the comfy-cli binary.
+
+    `shutil.which` checks the exec bit, so a bare `tmp_path.touch()` would
+    resolve to None and quietly exercise the skip path instead of the prepend.
+    """
+    bin_dir = tmp_path / dirname
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / name
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    return exe
+
+
+@_needs_posix_exec
+def test_comfy_env_prepends_absolute_comfy_bin_dir(tmp_path, monkeypatch):
+    """The QA case: absolute COMFY_BIN in a venv, minimal PATH that excludes it."""
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    inherited = os.pathsep.join(["/usr/bin", "/bin"])
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", inherited)
+
+    path = server._comfy_env()["PATH"]
+
+    assert path.startswith(bin_dir + os.pathsep)
+    # The inherited PATH is preserved behind it, not replaced.
+    assert path == bin_dir + os.pathsep + inherited
+
+
+@_needs_posix_exec
+def test_comfy_env_absolutizes_a_relative_comfy_bin(tmp_path, monkeypatch):
+    """comfy-cli chdirs to the workspace before re-resolving, so a relative entry
+    would point somewhere else by then — the prepended entry must be absolute."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", os.path.join(".", "venv-bin", "comfy"))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    first = server._comfy_env()["PATH"].split(os.pathsep)[0]
+
+    assert os.path.isabs(first)
+    assert os.path.realpath(first) == os.path.realpath(str(exe.parent))
+
+
+@_needs_posix_exec
+def test_comfy_env_does_not_duplicate_bin_dir_already_first(tmp_path, monkeypatch):
+    """Already first: PATH is left exactly as inherited — no repeated prepend."""
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    inherited = os.pathsep.join([bin_dir, "/usr/bin"])
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", inherited)
+
+    path = server._comfy_env()["PATH"]
+
+    assert path == inherited
+    assert path.split(os.pathsep).count(bin_dir) == 1
+
+
+@_needs_posix_exec
+def test_comfy_env_prepends_even_when_bin_dir_is_later_on_path(tmp_path, monkeypatch):
+    """Present but shadowed: prepend anyway so an earlier stale comfy can't win.
+
+    Prepending (rather than appending, or skipping on "already present") is the
+    deliberate half of this: inside the child, `comfy` must resolve to the SAME
+    install this server was pointed at, not to whichever one happens to be
+    earlier on the user's PATH.
+    """
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    stale = tmp_path / "stale-bin"
+    stale.mkdir()
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stale), bin_dir]))
+
+    path = server._comfy_env()["PATH"]
+
+    assert path.split(os.pathsep)[0] == bin_dir
+
+
+@_needs_posix_exec
+def test_comfy_env_prepends_dir_of_bare_name_resolved_on_path(tmp_path, monkeypatch):
+    """A bare COMFY_BIN is resolved through PATH, and ITS directory is hoisted."""
+    exe = _dummy_comfy(tmp_path)
+    bin_dir = str(exe.parent)
+    other = tmp_path / "other-bin"
+    other.mkdir()
+    monkeypatch.setattr(server, "COMFY_BIN", "comfy")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(other), bin_dir]))
+
+    # Sanity: the bare name really does resolve into bin_dir under this PATH.
+    assert shutil.which("comfy") == str(exe)
+
+    assert server._comfy_env()["PATH"].split(os.pathsep)[0] == bin_dir
+
+
+def test_comfy_env_leaves_path_alone_when_comfy_bin_unresolvable(tmp_path, monkeypatch):
+    """Unresolvable COMFY_BIN: skip silently, never raise, never touch PATH.
+
+    `_require_comfy_bin` already raises the curated missing-binary error before
+    any spawn, so `_comfy_env` must not add a second failure mode here.
+    """
+    inherited = os.pathsep.join([str(tmp_path / "a"), str(tmp_path / "b")])
+    monkeypatch.setattr(server, "COMFY_BIN", str(tmp_path / "nope" / "comfy"))
+    monkeypatch.setenv("PATH", inherited)
+
+    assert server._comfy_env()["PATH"] == inherited
+
+
+def test_comfy_env_skips_a_non_executable_comfy_bin(tmp_path, monkeypatch):
+    """A file that exists but is not executable is not a resolution — skip it."""
+    exe = tmp_path / "not-exec" / "comfy"
+    exe.parent.mkdir()
+    exe.write_text("")
+    exe.chmod(0o644)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    assert server._comfy_env()["PATH"] == "/usr/bin"
+
+
+def test_comfy_env_unresolvable_with_no_inherited_path(tmp_path, monkeypatch):
+    """No PATH at all and nothing to resolve: PATH stays absent, no KeyError."""
+    monkeypatch.setattr(server, "COMFY_BIN", str(tmp_path / "nope" / "comfy"))
+    monkeypatch.delenv("PATH", raising=False)
+
+    assert "PATH" not in server._comfy_env()
+
+
+@_needs_posix_exec
+def test_comfy_env_sets_bare_path_when_none_inherited(tmp_path, monkeypatch):
+    """An empty/absent inherited PATH yields the bin dir alone — no stray separator."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "")
+
+    assert server._comfy_env()["PATH"] == str(exe.parent)
+
+
+@_needs_posix_exec
+def test_comfy_env_path_prepend_keeps_the_existing_pins(tmp_path, monkeypatch):
+    """The PATH rewrite is additive — every previously-injected pin still holds."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = server._comfy_env()
+
+    assert env["COMFY_WHERE"] == "local"
+    assert env["COMFY_NO_WATCH"] == "1"
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["PIP_NO_INPUT"] == "1"
+    assert env["PATH"].split(os.pathsep)[0] == str(exe.parent)
+
+
+@_needs_posix_exec
+def test_run_comfy_child_env_carries_the_bin_dir_on_path(
+    tmp_path, monkeypatch, patched_run
+):
+    """The plain `--json` spawn site really hands the child the rewritten PATH."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    calls = patched_run(envelope(data={"x": 1}))
+    monkeypatch.setattr(server.shutil, "which", _real_which)
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["PATH"].split(os.pathsep)[0] == str(exe.parent)
 
 
 def test_error_envelope_raises_with_code(patched_run):
@@ -1997,6 +2194,22 @@ def test_run_workflow_stream_forces_utf8_env(patched_stream):
     # And the parent-side stream read is pinned to UTF-8 to match (readline()/
     # stderr.read() would otherwise decode with the cp1252 parent locale).
     assert procs[0].encoding == "utf-8"
+
+
+@_needs_posix_exec
+def test_run_workflow_stream_carries_the_bin_dir_on_path(
+    tmp_path, monkeypatch, patched_stream
+):
+    """The streaming (Popen) spawn site hands the child the rewritten PATH too."""
+    exe = _dummy_comfy(tmp_path)
+    monkeypatch.setattr(server, "COMFY_BIN", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    procs = patched_stream(_OK_STREAM)
+    monkeypatch.setattr(server.shutil, "which", _real_which)
+
+    asyncio.run(server.run_workflow("wf.json", wait=True))
+
+    assert procs[0].env["PATH"].split(os.pathsep)[0] == str(exe.parent)
 
 
 def test_run_workflow_stream_closes_child_stdin(patched_stream):
