@@ -5327,10 +5327,16 @@ def _check_template_by_name(name: str) -> dict:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-_CHECK_NOT_REQUESTED = _unchecked(
-    "not checked against your ComfyUI install (check_local=False).",
-    "not_requested",
-)
+def _check_not_requested() -> dict:
+    """The ``local_check`` block for ``check_local=False``.
+
+    A function, not a module constant: every caller gets its own dict, so
+    nothing downstream can mutate a shared one out from under the next call.
+    """
+    return _unchecked(
+        "not checked against your ComfyUI install (check_local=False).",
+        "not_requested",
+    )
 
 
 @mcp.tool()
@@ -5367,7 +5373,7 @@ def get_template(name: str, check_local: bool = True) -> Any:
         **data,
         "local_check": _check_template_by_name(name)
         if check_local
-        else _CHECK_NOT_REQUESTED,
+        else _check_not_requested(),
     }
 
 
@@ -5417,7 +5423,7 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
         "path": path,
         "local_check": _local_template_check(path)
         if check_local
-        else _CHECK_NOT_REQUESTED,
+        else _check_not_requested(),
     }
 
 
