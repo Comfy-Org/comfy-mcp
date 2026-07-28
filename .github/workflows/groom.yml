@@ -84,9 +84,15 @@ jobs:
       # Manual dispatch may dry-run; the schedule always files live
       # (github.event.inputs is null on a schedule -> '' != 'true' -> false).
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
-      # Effective cadence, re-read every run, so retuning weekly -> every-3-days
-      # needs no edit to this file:
-      #   gh variable set GROOM_INTERVAL_DAYS --repo Comfy-Org/comfy-local-mcp --body 3
+      # Effective cadence, re-read every run, so retuning needs no edit to this
+      # file:
+      #   gh variable set GROOM_INTERVAL_DAYS --repo Comfy-Org/comfy-local-mcp --body 7
+      # `|| '7'` is ONLY the fallback for a MISSING variable — it is NOT the
+      # effective cadence and does not mean "weekly by default". This repo
+      # already defines GROOM_INTERVAL_DAYS, so the variable governs the spend,
+      # not this line. It is set to 1 (= a real audit every day the repo had a
+      # merge) as of this PR. Read it before assuming weekly:
+      #   gh variable get GROOM_INTERVAL_DAYS --repo Comfy-Org/comfy-local-mcp
       interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
       # Match the volume-gate window to the EFFECTIVE cadence above, not the
       # daily base cron, so "did anything merge since the last real run?" spans
