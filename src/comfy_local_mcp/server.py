@@ -108,6 +108,15 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   gated by the same `confirm_spend` flag as `partner_generate` (free templates ignore it).
   For the quickest path from text to an image, `generate_image(prompt)` runs the
   default local text-to-image template through that same verb — free, no API key.
+- Templates that use the frontend's "subgraph" feature (UUID-typed nodes plus a
+  `definitions.subgraphs` block in the workflow JSON) are FULLY supported:
+  `run_workflow` and `run_template` expand them client-side via comfy-cli, and
+  `list_workflow_slots` surfaces their interior inputs as slot addresses like
+  `115/75.strength` (subgraph instance node 115 -> interior node 75) alongside
+  proxy-widget slots on the instance node itself (`130.text`). Never refuse or
+  swap a template because it contains subgraphs, and never hand-edit
+  `definitions.subgraphs` — tweak it through `set_workflow_slot` /
+  `run_template(params=...)` like any other template.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
@@ -4108,7 +4117,11 @@ async def run_template(
     ``params`` fills the template's parameterized slots — ``{slot: value}`` where
     a slot is an address (``"6.text"``) or a unique name (``"prompt"``). List a
     template's slots by fetching it (``fetch_template``) and inspecting the graph.
-    Values are forwarded verbatim for comfy-cli to accept or reject.
+    Values are forwarded verbatim for comfy-cli to accept or reject. Subgraph
+    slot addresses work here too: a template built with the frontend's subgraph
+    feature exposes interior inputs as ``A/B.name`` addresses (e.g.
+    ``"115/75.strength"``) — pass them in ``params`` like any other slot; the
+    engine expands ``definitions.subgraphs`` for you.
 
     SPEND CONSENT — most gallery templates are free OSS graphs that run entirely
     on the user's own machine. SOME embed partner-API (paid) nodes, and running
@@ -5530,6 +5543,13 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     execution. ``{"checked": false, ...}`` means the comparison could not be made
     (usually: ComfyUI is not running) and is NOT a verdict. The file is written
     either way; pass ``check_local=False`` to skip the check.
+
+    The written JSON may contain a ``definitions.subgraphs`` block and nodes
+    whose ``type`` is a UUID (the frontend's "subgraph" feature). That is NORMAL
+    and fully supported — ``run_workflow`` / ``run_template`` expand it via
+    comfy-cli — so never refuse or swap a template over it. Do not hand-edit
+    ``definitions.subgraphs``; route edits through ``list_workflow_slots`` /
+    ``set_workflow_slot``, which address subgraph-interior inputs too.
     """
     # `name` is a bare positional, so a leading-dash value is read as an option
     # and every later token shifts up a slot. `out_path` rides behind `--out` as
@@ -6499,6 +6519,14 @@ def list_workflow_slots(workflow_path: str) -> Any:
     ``run_workflow`` accepts — ``list_workflow_slots(workflow_path=...)``. Pass
     a slot's ``ADDR`` back to ``set_workflow_slot`` (or ``vary_workflow``) to
     change it.
+
+    For a workflow that uses subgraphs (``definitions.subgraphs`` + UUID-typed
+    instance nodes), slots INSIDE a subgraph are addressed as ``A/B.name`` —
+    e.g. ``115/75.strength`` is input ``strength`` of interior node ``75`` inside
+    subgraph instance node ``115`` — alongside plain ``A.name`` slots for
+    proxy widgets promoted onto the instance node itself (e.g. ``130.text``).
+    Both forms come back in the slot's ``address`` field and are set the same
+    way; subgraphs never need hand-editing.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
