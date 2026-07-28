@@ -874,6 +874,174 @@ def test_partner_generate_synthesizes_success_without_an_envelope(patched_plain_
     assert "/tmp/out.png" in result["message"]
 
 
+# --- saved_paths (the resolved destinations, as data) -----------------------
+#
+# `comfy generate` prints where it put each asset as an indented `Saved:` block,
+# and comfy-cli renders it through rich, whose Console is a fixed 80 columns off
+# a TTY. A path longer than that is FOLDED mid-filename with no indent on the
+# continuation, so `message` alone is not parseable by a caller — which in
+# practice forced a shell-out to `ls` to confirm anything landed at all.
+
+
+def _fold(
+    path: str, *, width: int = server._RICH_DEFAULT_WIDTH, indent: str = "  "
+) -> str:
+    """Render one saved path the way rich would: indented, then folded at `width`.
+
+    Built here rather than hard-coding a wrapped blob so a test states the PATH
+    it means and the fold falls out, and so a three-line fold is as easy to
+    write as a two-line one.
+    """
+    text = indent + path
+    return "\n".join(text[i : i + width] for i in range(0, len(text), width))
+
+
+def test_partner_generate_reports_saved_paths(patched_plain_run):
+    """The destination comes back as data, alongside the raw text."""
+    patched_plain_run(0, stdout="Saved:\n  /tmp/a.png\n  /tmp/b.png\n", stderr="  \n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == ["/tmp/a.png", "/tmp/b.png"]
+    assert "Saved:" in result["message"]  # the raw text is RETAINED, not replaced
+
+
+def test_partner_generate_reassembles_a_path_rich_folded(patched_plain_run):
+    """A path longer than the console width is stitched back together.
+
+    This is the case that made `message` unusable: the fold lands mid-filename
+    (`…/partner-jellyfish.p` / `ng`), so a caller reading the first line alone
+    gets a path that does not exist.
+    """
+    path = "/Users/someone/Pictures/comfy-generations/2026-07/partner-jellyfish.png"
+    patched_plain_run(0, stdout=f"Saved:\n{_fold(path)}\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path]
+
+
+def test_partner_generate_reassembles_a_path_folded_more_than_once(
+    patched_plain_run,
+):
+    """Three physical lines still reassemble — the fold width is per-line."""
+    path = "/Users/someone/" + "deeply-nested-directory/" * 8 + "out.png"
+    assert len(path) > 160  # genuinely spans three 80-column lines
+    patched_plain_run(0, stdout=f"Saved:\n{_fold(path)}\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path]
+
+
+def test_saved_paths_stop_at_unrelated_output(patched_plain_run):
+    """A short path is complete; the next unindented line is not part of it.
+
+    Gluing trailing output onto a path would be worse than reporting none: the
+    caller would act on a destination that never existed.
+    """
+    patched_plain_run(
+        0,
+        stdout="Saved:\n  /tmp/a.png\nAll done in 12.4s\n",
+    )
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == ["/tmp/a.png"]
+
+
+def test_saved_paths_stop_at_unrelated_output_after_a_long_path(patched_plain_run):
+    """The same, for a path long enough to be a plausible fold candidate.
+
+    The short-path case above is the easy one. This path is long enough that a
+    naive "the widest line in the block is the fold width" rule would call the
+    line below it a continuation and hand back a destination that never existed.
+    """
+    path = "/Users/someone/Pictures/comfy-generations/partner-jellyfish.png"
+    assert 2 + len(path) < server._RICH_DEFAULT_WIDTH  # rendered, it did not fold
+    patched_plain_run(0, stdout=f"Saved:\n  {path}\nAll done in 12.4s\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path]
+
+
+def test_saved_paths_survive_the_message_cap(patched_plain_run):
+    """Parsed from the UNCAPPED text — `message` keeps only the last 1000 chars.
+
+    Without this the block could be sliced mid-path by the very cap that exists
+    to bound the response.
+    """
+    noise = "\n".join(f"progress line {i}" for i in range(200))
+    patched_plain_run(0, stdout=f"Saved:\n  /tmp/a.png\n\n{noise}\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == ["/tmp/a.png"]
+    assert "/tmp/a.png" not in result["message"]  # the cap really did drop it
+
+
+def test_saved_paths_follow_the_console_width_the_child_rendered_at(
+    patched_plain_run, monkeypatch
+):
+    """`COLUMNS` is forwarded to the child, so it is where the fold really lands.
+
+    Reading the width from the same place rich does — rather than assuming 80 —
+    is what keeps this correct for a host that exports `COLUMNS`.
+    """
+    monkeypatch.setenv("COLUMNS", "50")
+    path = "/Users/someone/Pictures/comfy-generations/partner-jellyfish.png"
+    patched_plain_run(0, stdout=f"Saved:\n{_fold(path, width=50)}\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path]
+
+
+@pytest.mark.parametrize("bad", ["", "wide", "0", "-5"])
+def test_an_unusable_columns_falls_back_to_richs_own_default(monkeypatch, bad):
+    """Junk in `COLUMNS` must not make the width nonsense — rich ignores it too."""
+    monkeypatch.setenv("COLUMNS", bad)
+
+    assert server._child_console_width() == server._RICH_DEFAULT_WIDTH
+
+
+def test_saved_paths_are_absent_when_nothing_was_saved(patched_plain_run):
+    """No `Saved:` block -> no key at all, rather than a misleading empty list."""
+    patched_plain_run(0, stdout="Generated 1 image -> https://example.invalid/x.png")
+
+    assert "saved_paths" not in _generate("flux-pro", confirm_spend=True)
+
+
+def test_saved_paths_are_bounded(patched_plain_run):
+    """A runaway block cannot turn a success payload into an unbounded response."""
+    block = "\n".join(f"  /tmp/out-{i}.png" for i in range(200))
+    patched_plain_run(0, stdout=f"Saved:\n{block}\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert len(result["saved_paths"]) == server._MAX_SAVED_PATHS
+
+
+def test_saved_paths_are_not_confused_by_a_long_stderr_line(patched_plain_run):
+    """stderr is not rich-rendered, so its lines must not set the fold width.
+
+    `_synthesize_plain_result` prepends stderr (the PostHog/telemetry noise a
+    real run carries), and measuring THAT would make every genuine fold look
+    unfoldable — leaving a truncated path in `saved_paths`.
+    """
+    path = "/Users/someone/Pictures/comfy-generations/2026-07/partner-jellyfish.png"
+    patched_plain_run(
+        0,
+        stdout=f"Saved:\n{_fold(path)}\n",
+        stderr="x" * 400,  # longer than any console width
+    )
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path]
+
+
 def test_partner_generate_prefers_a_real_envelope_when_comfy_cli_emits_one(
     patched_run,
 ):

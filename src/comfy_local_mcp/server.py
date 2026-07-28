@@ -26,7 +26,14 @@ models; it spends credits, so comfy-cli's own consent interlock gates it and
 this wrapper only passes that consent through (``--yes``) when the USER granted
 it for that call — asked per call over MCP elicitation, or pre-authorized in
 comfy-cli's own config. The durable "always proceed" stays engine-side, so this
-server holds no spend state of its own.
+server holds no spend state of its own. ``emit_partner_workflow``
+(``comfy generate <model> --emit-workflow <path>``) is its local counterpart:
+it writes a runnable graph containing the partner's API NODE instead of calling
+the proxy, so ``emit_partner_workflow`` -> ``run_workflow`` -> ``fetch_outputs``
+runs the partner model on the user's OWN ComfyUI (the other way to get there is
+an existing ``API``-tagged gallery template via ``search_templates`` /
+``run_template``; this is the path from a model ALIAS). It reaches no partner
+API and spends nothing, so it carries no consent gate.
 
 Requires comfy-cli >= 1.13.0 (the ``comfy logs`` verb, the ``envelope/1``
 contract, and the ``login_url`` event ``auth_login`` depends on):
@@ -147,12 +154,24 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   spend credits for that call, never just to clear the error, and never because
   the host granted blanket permission to call the tool. A user who prefers not
   to be asked persists it engine-side with `comfy generate consent always`.
+  `partner_generate` runs ENTIRELY on partner infrastructure — the local ComfyUI
+  is never in the execution path. When the user asks to run a partner model on
+  THEIR OWN ComfyUI, use `emit_partner_workflow(model, out_path)` instead: it
+  writes a runnable graph containing the partner's API node, which
+  `run_workflow` then executes locally and `fetch_outputs` collects. That emit
+  step calls no partner API and spends nothing (running the graph still bills
+  the partner node), but it covers only the few models comfy-cli can render as
+  a node — `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana`, `seedance`. For any
+  other model, the local route is an existing `API`-tagged gallery template
+  (`search_templates` → `run_template` / `run_workflow`), and the hosted route is
+  `partner_generate` — never report a partner model as impossible here.
 
 Argument naming is uniform across the whole tool surface, so do not guess it:
 an INPUT workflow file is always `workflow_path` (`run_workflow`,
 `validate_workflow`, `list_workflow_slots`, `set_workflow_slot`,
 `vary_workflow`); an OUTPUT file is `out_path` (`fetch_template`,
-`partner_generate`); an OUTPUT directory is `out_dir` (`fetch_outputs`,
+`partner_generate`, `emit_partner_workflow`); an OUTPUT directory is
+`out_dir` (`fetch_outputs`,
 `vary_workflow`); a registry lookup key is `name` (`get_template`, `get_node`,
 `nodes_upstream` / `nodes_downstream`, `run_template`); and a job handle is
 `prompt_id` (`job_status`, `wait_for_job`, `watch_job`, `fetch_outputs`,
@@ -1693,6 +1712,105 @@ def _unwrap_envelope(
     return envelope.get("data")
 
 
+# The header `comfy generate` prints above the files it wrote (comfy-cli's
+# `command/generate/output.py::print_saved`), followed by one INDENTED line per
+# saved path.
+_SAVED_MARKER = "Saved:"
+
+# rich's Console width when its output is not a terminal — which it never is
+# here, since every spawn pipes stdout (`_run_comfy_raw`).
+_RICH_DEFAULT_WIDTH = 80
+
+# Ceiling on how many saved paths a synthesized result reports. A partner model
+# returns a handful of assets; anything past this is a runaway, and the raw
+# `message` still carries the text.
+_MAX_SAVED_PATHS = 50
+
+
+def _child_console_width() -> int:
+    """Column count rich uses in a comfy-cli child, for un-folding its output.
+
+    rich resolves a non-terminal Console's width from ``COLUMNS`` and falls back
+    to 80. ``_comfy_env`` forwards ``os.environ`` wholesale, so the value read
+    here is the value the child actually rendered at — this is the same lookup,
+    not a guess about it. Read per call rather than latched: nothing stops the
+    host from re-exporting ``COLUMNS`` mid-session.
+
+    Anything unparseable or non-positive falls back to rich's own default, which
+    is what rich itself does with a junk ``COLUMNS``.
+    """
+    try:
+        width = int(os.environ.get("COLUMNS", ""))
+    except ValueError:
+        return _RICH_DEFAULT_WIDTH
+    return width if width > 0 else _RICH_DEFAULT_WIDTH
+
+
+def _extract_saved_paths(text: str) -> list[str]:
+    """Resolved output paths from a ``Saved:`` block in comfy-cli's printed text.
+
+    ``comfy generate`` prints where it put each asset as a ``Saved:`` header
+    followed by one indented path per line — the only place the resolved path
+    appears when the command emits no envelope. Callers had to scrape it out of
+    the human-readable blob (or shell out to ``ls`` to confirm anything landed),
+    which is not reliably possible: comfy-cli prints through rich, whose Console
+    is a fixed width off a TTY, so a path longer than that is FOLDED across
+    physical lines — mid-filename, with no indent on the continuation (observed:
+    ``…/partner-jellyfish.p`` / ``ng``).
+
+    Two signals reassemble it, both read off how that block is rendered rather
+    than guessed at:
+
+    - Every path line is INDENTED (``rprint(f"  {p}")``) and a fold continuation
+      never is, so an indented line starts a new path and an unindented one may
+      continue the previous.
+    - A fold fills the console width EXACTLY, and
+      :func:`_child_console_width` resolves that width the same way rich does, so
+      an unindented line continues a path only when the line above it was
+      full-width. Anything else ends the block — which is what keeps unrelated
+      trailing output from being glued onto a real path.
+
+    A blank line and the end of the text also end the block; a later ``Saved:``
+    header starts another. Paths are returned in printed order.
+
+    Two things the rendered text cannot express, and neither is fixable here:
+    rich word-wraps before it folds, so a path containing SPACES may break at the
+    space and lose it; and a path that happens to fill the console width EXACTLY
+    is indistinguishable from a folded one, so unrelated output printed
+    immediately after that path — with no blank line — would be read as a
+    continuation. comfy-cli prints nothing there today (``print_saved`` is the
+    last thing on the success path). Both are why the raw ``message`` is kept
+    alongside this field rather than replaced by it. The real fix is upstream —
+    an envelope for ``comfy generate`` — at which point ``_run_comfy`` takes the
+    envelope path and this synthesis is bypassed entirely.
+    """
+    width = _child_console_width()
+    lines = text.splitlines()
+    paths: list[str] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() != _SAVED_MARKER:
+            index += 1
+            continue
+        index += 1
+        previous_width = 0
+        while index < len(lines) and lines[index].strip():
+            line = lines[index]
+            if line[:1].isspace():
+                paths.append(line.strip())
+            elif paths and previous_width == width:
+                # `line` continues the path above only if that path's LAST
+                # physical line was full-width — which is what a fold produces
+                # and what a finished path does not. Tracked per physical line so
+                # a path folded over three or more lines keeps reassembling.
+                paths[-1] += line.strip()
+            else:
+                break
+            previous_width = len(line)
+            index += 1
+    return paths
+
+
 def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) -> dict:
     """Success payload for a ``plain_ok`` command that exited 0 without an envelope.
 
@@ -1706,10 +1824,19 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
     of an action that already succeeded (a non-idempotent lifecycle change, or a
     bandwidth-expensive multi-GB refetch).
 
-    The synthesized ``message`` is the only result data available without an
-    envelope, so it carries the printed text verbatim (capped). This path is a
-    stopgap: once comfy-cli emits an envelope for a verb, a real envelope always
-    wins in the ``_run_comfy`` fast-path and this synthesis is bypassed.
+    The synthesized ``message`` carries the printed text verbatim (capped) and
+    is always present. When that text contains a ``Saved:`` block — today only
+    ``comfy generate``, i.e. :func:`partner_generate` — the resolved output paths
+    are ALSO returned as ``saved_paths``, so a caller learns where the asset
+    landed without scraping prose that rich may have wrapped mid-filename (see
+    :func:`_extract_saved_paths`). The key is omitted when there is no such
+    block, so ``launch`` / ``stop`` / ``model download`` are unchanged, and it
+    never replaces ``message``: the text stays the fallback for anything the
+    parse cannot recover.
+
+    This path is a stopgap: once comfy-cli emits an envelope for a verb, a real
+    envelope always wins in the ``_run_comfy`` fast-path and this synthesis is
+    bypassed.
     """
     # `action` is the subcommand path: the leading non-flag tokens, so `launch
     # --background` -> "launch", `stop` -> "stop", `model download --url ...` ->
@@ -1724,7 +1851,7 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
     # `model download` URL can carry a signed token / userinfo in its query
     # string, and this message lands in the tool response and host-side logs.
     message = text or f"comfy {' '.join(action_parts)} completed (exit 0)."
-    return {
+    result = {
         "ok": True,
         "action": " ".join(action_parts),
         # Keep the TAIL, not the front: `model download` streams verbose progress
@@ -1736,6 +1863,18 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
             "a clean exit is treated as success."
         ),
     }
+    # Parsed from the UNCAPPED text — the cap above is a tail slice that would
+    # otherwise cut a long `Saved:` block mid-path. Joined on a NEWLINE rather
+    # than the space `message` uses, so a stderr tail can never share a physical
+    # line with the block and defeat its indent test.
+    saved_paths = _extract_saved_paths(
+        "\n".join(part for part in (stderr, stdout) if part.strip())
+    )
+    if saved_paths:
+        # Bounded like every other field here: a pathological run must not turn
+        # a success payload into an unbounded response.
+        result["saved_paths"] = [path[:1000] for path in saved_paths[:_MAX_SAVED_PATHS]]
+    return result
 
 
 # Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
@@ -3755,10 +3894,11 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
         if name.replace("_", "-") in _GENERATE_META_FLAGS:
             raise ComfyCliError(
                 f"`{name}` is a run-level `comfy generate` flag, not a model "
-                "parameter. Use this tool's own arguments where they cover it "
-                "(confirm_spend for --yes, out_path for --download, "
-                "timeout_seconds for --timeout); the "
-                "remaining run-level flags are not forwarded by this tool, so "
+                "parameter. Use the tool argument that covers it "
+                "(partner_generate: confirm_spend for --yes, out_path for "
+                "--download, timeout_seconds for --timeout; "
+                "emit_partner_workflow: out_path for --emit-workflow); the "
+                "remaining run-level flags are not forwarded by these tools, so "
                 "use comfy-cli directly for those."
             )
         if value is None:
@@ -3772,6 +3912,33 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
         _reject_nul(f"value for parameter {name!r}", rendered)
         argv.append(f"--{name}={rendered}")
     return argv
+
+
+def _validate_generate_model(model: str) -> None:
+    """Refuse a ``comfy generate`` target that is not usable as a partner model.
+
+    Shared by :func:`partner_generate` and :func:`emit_partner_workflow` so the
+    two cannot drift on what they accept — they hand the SAME first positional to
+    the SAME comfy-cli verb, and a guard that held on only one of them would be a
+    guard the other could be used to walk around (``consent`` most of all: it is
+    the spend gate's own configuration surface).
+    """
+    if not model:
+        raise ComfyCliError(
+            f"invalid model: {model!r} — expected a partner model alias "
+            "(e.g. 'flux-pro'), not an empty value."
+        )
+    # A leading-dash target is read by comfy-cli as an option rather than a
+    # model (the same guard watch_job applies to prompt_id).
+    _reject_option_like(
+        "model", model, expected="a partner model alias (e.g. 'flux-pro')"
+    )
+    if model in _GENERATE_RESERVED_TARGETS:
+        raise ComfyCliError(
+            f"invalid model: {model!r} is a `comfy generate` sub-action, not a "
+            "partner model. Use comfy-cli directly for those verbs."
+        )
+    _reject_nul("model", model)
 
 
 @mcp.tool()
@@ -3819,11 +3986,22 @@ async def partner_generate(
     fail-closed guarantee is the engine's, this refuses to run at all against a
     comfy-cli that predates the gate (see :func:`_require_spend_gate`).
 
+    This runs entirely on the PARTNER's infrastructure: comfy-cli posts to the
+    Comfy Cloud partner proxy, the asset comes back from the partner's own
+    delivery host, and the user's local ComfyUI never executes anything. For the
+    path where the LOCAL install does the work, use ``emit_partner_workflow`` →
+    ``run_workflow`` → ``fetch_outputs`` instead (it covers only the handful of
+    models comfy-cli can render as a node, so it is not a general substitute).
+
     ``params`` carries the model's OWN inputs (``prompt``, ``aspect_ratio``,
-    ``seed``, …). These are schema-driven per model and are forwarded verbatim;
-    discover a model's real parameters, and the available aliases, with
-    comfy-cli directly: ``comfy generate schema <model>`` / ``comfy generate
-    list``. ``out_path`` forwards ``--download <path>`` so comfy-cli saves the
+    ``seed``, …). These are schema-driven per model and are forwarded verbatim.
+    To discover what is available, stay in this server: ``search_nodes`` /
+    ``get_node`` read the live install's node catalog, including the partner API
+    node classes these aliases map onto, and ``search_templates`` finds ready-made
+    graphs that already wire them up. comfy-cli's ``generate list`` /
+    ``generate schema`` are not exposed as tools yet because they emit no
+    ``envelope/1`` for this wrapper to parse — that gap is tracked upstream.
+    ``out_path`` forwards ``--download <path>`` so comfy-cli saves the
     generated asset there. It is a save-path TEMPLATE, not just a filename: a
     plain path (``/tmp/out.png``) names the file; ``{request_id}`` / ``{index}``
     / ``{ext}`` placeholders are substituted per output; and a trailing slash
@@ -3840,24 +4018,14 @@ async def partner_generate(
     0 WITHOUT emitting an ``envelope/1``, so this runs through the same
     ``plain_ok`` stopgap as ``launch`` / ``stop`` / ``model download``: a clean
     exit is the success signal and the payload carries the printed text. A
-    non-zero exit — including the consent refusal — still raises.
+    non-zero exit — including the consent refusal — still raises. Where that text
+    names the files it wrote, they are also returned as ``saved_paths`` (a list
+    of resolved absolute paths) so the destination is readable without scraping
+    ``message`` — comfy-cli wraps its output to 80 columns and will break a long
+    path mid-filename. ``saved_paths`` is absent when comfy-cli printed no
+    ``Saved:`` block; ``message`` is always kept alongside it.
     """
-    if not model:
-        raise ComfyCliError(
-            f"invalid model: {model!r} — expected a partner model alias "
-            "(e.g. 'flux-pro'), not an empty value."
-        )
-    # A leading-dash target is read by comfy-cli as an option rather than a
-    # model (the same guard watch_job applies to prompt_id).
-    _reject_option_like(
-        "model", model, expected="a partner model alias (e.g. 'flux-pro')"
-    )
-    if model in _GENERATE_RESERVED_TARGETS:
-        raise ComfyCliError(
-            f"invalid model: {model!r} is a `comfy generate` sub-action, not a "
-            "partner model. Use comfy-cli directly for those verbs."
-        )
-    _reject_nul("model", model)
+    _validate_generate_model(model)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_GENERATE_TIMEOUT)
     args = ["generate", model, *_generate_param_args(params or {})]
     if out_path is not None:
@@ -3896,6 +4064,110 @@ async def partner_generate(
         timeout=timeout_seconds + _GENERATE_TIMEOUT_GRACE,
         plain_ok=True,
     )
+
+
+# `--emit-workflow` writes a JSON file from a mapping table comfy-cli already
+# holds; the only slow part is resolving the model spec, which it caches. Two
+# minutes is generous for that and still bounds a wedged child. No caller knob:
+# unlike `partner_generate`, nothing here waits on a partner API, so a tunable
+# deadline would be a dial with nothing behind it.
+_EMIT_WORKFLOW_TIMEOUT = 120.0
+
+
+@mcp.tool()
+async def emit_partner_workflow(
+    model: str,
+    out_path: str,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """Write a runnable workflow that drives a partner model's NODE on LOCAL ComfyUI.
+
+    Thin passthrough to ``comfy generate <model> --emit-workflow <out_path>``.
+    It writes an API-format graph with the partner's API NODE in it and returns,
+    calling no partner API and spending nothing — so the partner model then runs
+    on the USER'S OWN ComfyUI. ``partner_generate`` is the opposite: it posts to
+    the Comfy Cloud partner proxy, and the asset is produced and delivered by the
+    partner's own infrastructure with the local install never in the execution
+    path. This is the only tool that reaches a local partner-node run from a
+    partner MODEL ALIAS; the other route is a ready-made graph —
+    ``search_templates`` (its ``API``-tagged rows are exactly those) →
+    ``fetch_template`` → ``run_workflow``, or ``run_template`` in one call —
+    which also executes partner nodes locally, but only where such a template
+    already exists.
+
+    The intended chain, all in this server::
+
+        emit_partner_workflow("flux-pro", "/tmp/flux.json", {"prompt": "a red fox"})
+        run_workflow("/tmp/flux.json")     # local ComfyUI executes the node
+        fetch_outputs(prompt_id)           # collect the files it wrote
+
+    (``validate_workflow`` on the emitted file first is worth it if the install
+    may not carry the partner node classes yet.) The three steps stay separate so
+    the graph can be inspected, edited via ``list_workflow_slots`` /
+    ``set_workflow_slot``, re-run, or dropped into a larger pipeline.
+
+    COVERAGE IS NARROW — this is not a general substitute for
+    ``partner_generate``. comfy-cli maps only five aliases to a node class:
+    ``flux-2``, ``flux-pro``, ``kling-i2v``, ``nano-banana``, ``seedance``. That
+    is a small subset of what ``comfy generate list`` offers (only two of the
+    eleven text-to-image aliases, for instance); every other model reaches its
+    partner exclusively through the proxy, so route those to ``partner_generate``
+    rather than reporting them as impossible. An unsupported model raises with
+    comfy-cli's own ``emit_workflow_failed`` message, which names the supported
+    set as of the INSTALLED comfy-cli — trust that list over this docstring,
+    which can only describe the version it was written against.
+
+    ``params`` are the model's own inputs, exactly as ``partner_generate`` takes
+    them and validated by the same code, so the two cannot diverge on what they
+    accept. They are OPTIONAL here even when the proxy would require them: the
+    partner node carries its own defaults, so a bare
+    ``emit_partner_workflow("flux-pro", "/tmp/flux.json")`` still emits a runnable
+    graph whose prompt can be filled in afterwards with ``set_workflow_slot``.
+    ``out_path`` is the workflow JSON to write (required), and is the file
+    ``run_workflow(workflow_path=...)`` then takes.
+
+    Returns comfy-cli's own ``envelope/1`` data — ``{"out": …, "model": …,
+    "nodes": …}`` — so the written path and node count are structured rather than
+    scraped. Unlike ``partner_generate`` there is NO spend confirmation and no
+    ``confirm_spend`` argument, deliberately: ``--emit-workflow`` returns before
+    any proxy call, needs no API key, and spends no credits, so gating it behind
+    a consent prompt would be asking the user to approve a cost that does not
+    exist. RUNNING the emitted graph can still spend — a partner API node bills
+    the user's Comfy account when it executes — so the spend happens at
+    ``run_workflow`` time, under that tool's own posture, not here.
+    """
+    _validate_generate_model(model)
+    if not out_path:
+        # No default: unlike `partner_generate`'s `--download`, comfy-cli has no
+        # "somewhere sensible" fallback for `--emit-workflow` — the flag IS the
+        # destination, so an empty value is a caller mistake, not a preference.
+        raise ComfyCliError(
+            "invalid out_path: empty path — pass the workflow JSON file to write "
+            "(e.g. '/tmp/flux.json'), which run_workflow then takes."
+        )
+    # Rides behind `--emit-workflow=`, which Click takes verbatim, so this is
+    # input hygiene rather than an injection guard — the same posture as
+    # `fetch_template`'s `out_path`, the other file this server writes and then
+    # hands straight to `run_workflow`. See `_reject_option_like`.
+    _reject_option_like(
+        "out_path",
+        out_path,
+        expected="a file path (prefix a dash-leading name with './')",
+    )
+    _reject_nul("out_path", out_path)
+    args = [
+        "generate",
+        model,
+        *_generate_param_args(params or {}),
+        # `--flag=value` so a path beginning with `-` stays the value.
+        f"--emit-workflow={out_path}",
+    ]
+    # No `plain_ok`: `generate emit-workflow` DOES emit an `envelope/1` (unlike
+    # the proxy path this shares a verb with), so the normal contract applies —
+    # `data` on success, and a failure raises with comfy-cli's structured
+    # `error.code` / `message` / `hint` intact. That is what carries the
+    # supported-model list back to the caller verbatim on an unsupported model.
+    return await asyncio.to_thread(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
 
 
 # Hard ceiling for one template run (video templates are the slow end), so a
