@@ -1,0 +1,107 @@
+name: Groom
+
+# Thin caller for the shared reusable code-cleanup sweep. All the logic (the
+# two-phase finder -> independent verifier audit, the durable dedup ledger, the
+# GitHub-issue sink) lives in Comfy-Org/github-workflows — this repo carries
+# only the pin, exactly like agents-md-integrity.yml and ci-cursor-review.yml.
+# Keep `workflows_ref` equal to the `uses:` SHA so a run always loads the briefs
+# and ledger that match the workflow filing the issues; the upstream bump
+# dispatcher (GROOM_CALLERS) opens SHA-bump PRs automatically once registered.
+#
+# FINDS-ONLY. The opt-in auto-builder (`builder: true`, which turns findings
+# into review-gated PRs) is deliberately left OFF here. This repo's whole
+# contract is the thin-wrapper rule in AGENTS.md — "every tool is a
+# `comfy --json --where local` passthrough" — and that is a judgement a
+# refactor agent cannot make from the code alone: the most "duplicated" -looking
+# passthroughs are duplicated ON PURPOSE, because collapsing them would move
+# behavior out of comfy-cli and into this repo. Groom files issues a human
+# triages; it opens no PRs, writes no commits, and never merges.
+#
+# PREREQUISITE (operator): `secrets.ANTHROPIC_API_KEY` must reach this repo (org-
+# or repo-level) — the finder and verifier agents bill through it, and the
+# reusable declares it `required: true`. If it is absent the run fails LOUD at
+# the agent step by design, so the sweep is never silently inert. `vars.APP_ID` +
+# `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` are optional here: with them, issues are
+# filed as cloud-code-bot; without, the reusable degrades to github-actions[bot]
+# rather than failing.
+
+on:
+  schedule:
+    # DAILY base tick — deliberately NOT the effective cadence. GitHub Actions
+    # cron is static in the file, so "every N days" is implemented as a frequent
+    # base tick plus the reusable's runtime interval gate: a tick within
+    # GROOM_INTERVAL_DAYS of the last real run no-ops cheaply, before the finder
+    # ever spins up. Never fires on a PR. 10:41 UTC is off-peak and off the hour
+    # to dodge top-of-hour scheduler congestion, and staggered from the other
+    # groom callers so the org's runs do not all land in one minute.
+    - cron: '41 10 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Run the full audit + dedup but do NOT open issues — print what WOULD be
+          filed to the job summary. Use this for the first run to confirm the
+          agent credentials resolve and to eyeball finding quality before
+          trusting live filing.
+        type: boolean
+        default: false
+
+# NOTE: intentionally NO caller-level `concurrency:`. The reusable already
+# declares `concurrency: groom-${{ github.repository }}` (cancel-in-progress:
+# false), which is the real TOCTOU guard for the read-then-file dedup ledger.
+# Repeating that same group here would DEADLOCK the run — the caller would hold
+# the group while its `uses:` job waits on the identical group, and with
+# cancel-in-progress:false the nested job never gets the slot.
+
+jobs:
+  groom:
+    permissions:
+      # REQUIRED UNION, and it is not optional paperwork: a reusable's nested
+      # jobs cannot request more GITHUB_TOKEN scope than the caller grants, and
+      # GitHub validates that at STARTUP — before any job runs. A short grant
+      # fails the whole run with an opaque "workflow file issue" and zero jobs,
+      # not a clean error. At the pinned SHA: `file` needs issues: write;
+      # `build_select` needs issues: read + pull-requests: read; `gate` needs
+      # actions: read to find the last real run in this workflow's history.
+      # Omitting `actions: read` REJECTS the run outright ("requesting
+      # 'actions: read', but is only allowed 'actions: none'") — it does not
+      # quietly degrade to running every tick. The agent jobs need nothing
+      # beyond contents: read: they invoke the Claude CLI directly and mint no
+      # GitHub token, so `id-token: write` is not required at this SHA (verified
+      # against ece4c3e — grep finds no `id-token` outside a comment).
+      contents: read
+      issues: write
+      pull-requests: read
+      actions: read
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e # github-workflows main (ece4c3e)
+    with:
+      # Keep the assets ref (finder/verifier briefs, interval gate, dedup ledger)
+      # in lock-step with the `uses:` SHA above. Bump both together.
+      workflows_ref: ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e
+      # File as cloud-code-bot so groom's issues are a distinct, queryable actor
+      # rather than github-actions[bot]. Unset -> reusable falls back gracefully.
+      bot_app_id: ${{ vars.APP_ID }}
+      # Manual dispatch may dry-run; the schedule always files live
+      # (github.event.inputs is null on a schedule -> '' != 'true' -> false).
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+      # Effective cadence, re-read every run, so retuning weekly -> every-3-days
+      # needs no edit to this file:
+      #   gh variable set GROOM_INTERVAL_DAYS --repo Comfy-Org/comfy-local-mcp --body 3
+      interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
+      # Match the volume-gate window to the EFFECTIVE cadence above, not the
+      # daily base cron, so "did anything merge since the last real run?" spans
+      # the right window. Wired to the one variable so the two gates cannot drift.
+      cadence: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
+      # A dry-run is the pre-trust spot-check, so it must always reach the audit:
+      # bypass the volume gate when dispatched with dry_run:true, or a quiet week
+      # would gate it to nothing and print no summary — defeating the point. Live
+      # runs keep the gate on so a quiescent repo still skips the spend.
+      volume_gate: ${{ github.event.inputs.dry_run != 'true' }}
+      # Below the default of 12. This is a ~30-file repo whose entire source is
+      # one server module plus three leaves, so a cap sized for a large service
+      # would mostly buy restatements of the same few observations. Raise it if
+      # real findings start hitting the ceiling.
+      max_findings: 5
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
