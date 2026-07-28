@@ -17,9 +17,20 @@ dependencies = [
     #
     # < 3 for the same reason the `< 2` cap existed before this port: a major
     # release must arrive as a reviewable Dependabot PR, not as unrelated PRs'
-    # CI turning red hours after a release nobody here asked for. `mcp-types`
-    # is deliberately NOT declared — `mcp.types` still ships inside the `mcp`
-    # distribution on 2.x, and the split-out package comes in transitively.
+    # CI turning red hours after a release nobody here asked for.
+    #
+    # `mcp-types` is deliberately NOT declared, and the two facts behind that
+    # only look like a contradiction: 2.x split the wire types out into a
+    # standalone `mcp-types` distribution, AND kept `mcp.types` inside the `mcp`
+    # distribution as a module that mirrors it (every name is the same object),
+    # which is the spelling `server.py` imports. The version is bounded either
+    # way — `mcp` 2.0.0 requires `mcp-types==2.0.0`, an EXACT pin, so a breaking
+    # `mcp-types` major cannot arrive except via an `mcp` release, which this
+    # `< 3` ceiling already gates into a reviewable Dependabot PR.
+    #
+    # `requires-python = ">=3.10"` above still holds: `mcp` 2.0.0 and
+    # `mcp-types` 2.0.0 both declare `Requires-Python: >=3.10`, so the major
+    # bump did not raise the floor out from under the 3.10 CI leg.
     "mcp>=2,<3",
     # Already an mcp dependency; declared explicitly because this server now
     # imports it directly for the elicitation response schema.

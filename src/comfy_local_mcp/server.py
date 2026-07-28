@@ -7050,7 +7050,12 @@ def main() -> None:
     :func:`_require_comfy_bin` do for the child process we spawn.
     """
     try:
-        mcp.run()
+        # Name the transport rather than inheriting the SDK's default: the whole
+        # stdio design rests on it — `failure_log`'s rule that stdout is the
+        # JSON-RPC channel and must never be written to is only true under
+        # stdio. 2.x defaults to "stdio" today, but a default is a thing a
+        # future SDK is free to change, and this one is load-bearing.
+        mcp.run(transport="stdio")
     except PermissionError as exc:
         # Prefer the exception's structured `filename` over re-parsing its text:
         # it is the authoritative path, and it is present for errnos the text
