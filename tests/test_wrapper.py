@@ -410,6 +410,29 @@ def test_error_envelope_carries_structured_code(patched_run):
     assert excinfo.value.code == "server_not_running"
 
 
+def test_error_envelope_carries_its_data_payload(patched_run):
+    """A negative verdict that IS a structured report reaches the caller intact.
+
+    ``comfy validate`` emits its full report as the envelope's ``data`` and sets
+    ``ok`` to the verdict, so "this workflow does not fit the install" arrives as
+    an error whose payload is the actual answer. Dropping it would leave a caller
+    unable to tell a real verdict from a check that never ran — which is exactly
+    what the template ``local_check`` branches on.
+    """
+    report = {"valid": False, "errors": [{"node_id": "3", "message": "nope"}]}
+    patched_run({"type": "envelope", "ok": False, "data": report})
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("validate", "--workflow", "wf.json")
+
+    assert excinfo.value.data == report
+    # Failures with nothing structured to carry keep `data` at None.
+    patched_run({"type": "envelope", "ok": False, "error": {"code": "boom"}})
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+    assert excinfo.value.data is None
+
+
 # --- comfy-cli version guard -------------------------------------------------
 
 

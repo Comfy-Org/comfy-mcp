@@ -11,7 +11,9 @@ comfy-cli's real ``templates ls`` payload:
    the CLI's own ``--tag/--type/--model/--provider`` gallery filters, drops
    API-tagged rows on ``exclude_api``, and pages via ``limit``/``offset``.
 2. A payload with no ``rows`` list is a shape drift -> raise, never a raw dump.
-3. ``fetch_template`` returns the ABSOLUTE output path for ``run_workflow``.
+3. ``fetch_template`` returns ``{"path": <ABSOLUTE path>, "local_check": {...}}``
+   — the path for ``run_workflow``, and the cross-check of the template against
+   the live local ``object_info`` (``get_template`` reports the same block).
 """
 
 from __future__ import annotations
@@ -289,8 +291,26 @@ def test_get_template_argv(patched_run):
     """Passthrough: `comfy --json --where local templates show <name>`."""
     calls = patched_run(envelope(data={"name": "flux_dev", "nodes": 12}))
 
-    assert server.get_template("flux_dev") == {"name": "flux_dev", "nodes": 12}
+    result = server.get_template("flux_dev", check_local=False)
+
     assert calls[0]["cmd"][4:] == ["templates", "show", "flux_dev"]
+    # The metadata rides through untouched; only `local_check` is added.
+    assert {k: v for k, v in result.items() if k != "local_check"} == {
+        "name": "flux_dev",
+        "nodes": 12,
+    }
+    assert result["local_check"] == {
+        "checked": False,
+        "reason": "not_requested",
+        "summary": "not checked against your ComfyUI install (check_local=False).",
+    }
+    assert len(calls) == 1  # `check_local=False` costs exactly one call
+
+
+def test_get_template_returns_drifted_payload_untouched(monkeypatch):
+    """A non-dict `templates show` payload has nowhere to attach a check."""
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: ["not", "a", "dict"])
+    assert server.get_template("flux_dev") == ["not", "a", "dict"]
 
 
 # `get_template` / `fetch_template` leading-dash + NUL rejection is covered by
@@ -304,19 +324,21 @@ def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
     calls = patched_run(envelope(data=None))
 
     out = tmp_path / "flux.json"
-    result = server.fetch_template("flux_dev", str(out))
+    result = server.fetch_template("flux_dev", str(out), check_local=False)
 
     assert calls[0]["cmd"][4:] == ["templates", "fetch", "flux_dev", "--out", str(out)]
-    assert result == str(out)  # tmp_path is already absolute
-    assert os.path.isabs(result)
+    assert result["path"] == str(out)  # tmp_path is already absolute
+    assert os.path.isabs(result["path"])
+    assert result["local_check"]["reason"] == "not_requested"
+    assert len(calls) == 1  # no validate call when the check is skipped
 
 
 def test_fetch_template_resolves_relative_path(monkeypatch):
     """A relative out_path is returned as an absolute path (ready for run_workflow)."""
     monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: None)
-    result = server.fetch_template("flux_dev", "flux.json")
-    assert result == os.path.abspath("flux.json")
-    assert os.path.isabs(result)
+    result = server.fetch_template("flux_dev", "flux.json", check_local=False)
+    assert result["path"] == os.path.abspath("flux.json")
+    assert os.path.isabs(result["path"])
 
 
 def test_get_template_rejects_option_like_name(monkeypatch):
@@ -367,3 +389,210 @@ def test_template_tools_reject_embedded_nul(monkeypatch):
     ):
         with pytest.raises(server.ComfyCliError, match="embedded NUL"):
             call()
+
+
+# --- local_check: does the user's install actually support this template? ----
+#
+# The gallery is served fresh while the install is whatever the user has, so a
+# template can reference a node class — or a model option inside one — that this
+# ComfyUI does not expose yet. The tools cross-check via `comfy validate` against
+# the LIVE object_info and report it; the checks below pin the three outcomes
+# that matter, especially the two that must NOT read as "your install can't run
+# this": a check that could not run, and a vacuous pass.
+
+
+def _fake_comfy(monkeypatch, handler):
+    """Dispatch `_run_comfy` per subcommand; returns the recorded arg tuples."""
+    calls: list[tuple] = []
+
+    def fake(*args, **kwargs):
+        calls.append(args)
+        return handler(args)
+
+    monkeypatch.setattr(server, "_run_comfy", fake)
+    return calls
+
+
+def _report(*, valid: bool, errors=(), warnings=(), **extra) -> dict:
+    """A `comfy validate` payload, shaped like cmdline.py's `validate` emits."""
+    return {
+        "valid": valid,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "errors": list(errors),
+        "warnings": list(warnings),
+        **extra,
+    }
+
+
+def test_fetch_template_reports_a_clean_local_check(monkeypatch, tmp_path):
+    """A valid workflow: `validate` runs on the written file, verdict is runnable."""
+    out = tmp_path / "flux.json"
+    calls = _fake_comfy(
+        monkeypatch,
+        lambda args: (
+            _report(valid=True, converted_from_ui=True)
+            if args[0] == "validate"
+            else None
+        ),
+    )
+
+    result = server.fetch_template("flux_dev", str(out))
+
+    assert calls[0] == ("templates", "fetch", "flux_dev", "--out", str(out))
+    # Checked against the file just written, by absolute path.
+    assert calls[1] == ("validate", "--workflow", str(out))
+    assert result["path"] == str(out)
+    assert result["local_check"]["checked"] is True
+    assert result["local_check"]["runnable"] is True
+    assert result["local_check"]["error_count"] == 0
+
+
+def test_fetch_template_warns_when_the_install_lacks_a_model_option(
+    monkeypatch, tmp_path
+):
+    """The reported case: the template names a model key this install has never seen.
+
+    comfy-cli reports an invalid workflow as an envelope whose `ok` mirrors
+    `valid` and whose `data` is the full report, so it reaches us as a raised
+    `ComfyCliError` carrying that report — the verdict, not a failure to check.
+    """
+    out = tmp_path / "seedream.json"
+    error = {
+        "node_id": "12",
+        "code": "invalid_enum_value",
+        "message": "'seedream-5.0-pro' is not a valid value for input 'model'",
+        "suggestions": ["seedream-5.0-lite", "seedream-4.0"],
+    }
+
+    def handler(args):
+        if args[0] != "validate":
+            return None
+        raise server.ComfyCliError(
+            "comfy validate --workflow x failed [unknown]: ",
+            data=_report(valid=False, errors=[error], converted_from_ui=True),
+        )
+
+    _fake_comfy(monkeypatch, handler)
+    result = server.fetch_template("seedream_5_pro", str(out))
+
+    check = result["local_check"]
+    assert check["checked"] is True
+    assert check["runnable"] is False
+    assert check["error_count"] == 1
+    assert check["errors"] == [
+        "node 12: 'seedream-5.0-pro' is not a valid value for input 'model' "
+        "(this install has: seedream-5.0-lite, seedream-4.0)"
+    ]
+    assert "update comfyui" in check["summary"].lower()
+    # Advisory, never a refusal: the file is still written and still handed back.
+    assert result["path"] == str(out)
+
+
+def test_fetch_template_does_not_deny_when_the_check_cannot_run(monkeypatch, tmp_path):
+    """No live object_info (ComfyUI down) is `checked: false`, NOT `runnable: false`.
+
+    An unreachable node catalog says nothing about the template. Reporting it as
+    an incompatibility would send the user chasing an install problem that may
+    not exist.
+    """
+    out = tmp_path / "flux.json"
+
+    def handler(args):
+        if args[0] != "validate":
+            return None
+        raise server.ComfyCliError(
+            "comfy validate --workflow x failed [cql_no_graph]: no object_info",
+            code="cql_no_graph",
+        )
+
+    _fake_comfy(monkeypatch, handler)
+    check = server.fetch_template("flux_dev", str(out))["local_check"]
+
+    assert check == {
+        "checked": False,
+        "reason": "check_unavailable",
+        "summary": check["summary"],
+    }
+    assert "runnable" not in check
+    assert "launch_comfyui" in check["summary"]
+    assert "cql_no_graph" in check["summary"]  # the cause survives for the user
+
+
+def test_fetch_template_does_not_report_a_vacuous_pass(monkeypatch, tmp_path):
+    """An un-converted UI-format graph validates zero nodes — not a clean bill.
+
+    Gallery templates are UI exports; a comfy-cli too old to lower one to API
+    format emits `non_node_key` warnings, checks nothing, and calls it valid.
+    """
+    out = tmp_path / "flux.json"
+    _fake_comfy(
+        monkeypatch,
+        lambda args: (
+            _report(
+                valid=True,
+                warnings=[{"code": "non_node_key", "message": "ignored key 'links'"}],
+            )
+            if args[0] == "validate"
+            else None
+        ),
+    )
+
+    check = server.fetch_template("flux_dev", str(out))["local_check"]
+
+    assert check["checked"] is False
+    assert check["reason"] == "workflow_not_converted"
+
+
+def test_fetch_template_survives_a_drifted_validate_payload(monkeypatch, tmp_path):
+    """A payload that is not a validate report is `checked: false`, never a verdict."""
+    out = tmp_path / "flux.json"
+    _fake_comfy(
+        monkeypatch,
+        lambda args: {"something": "else"} if args[0] == "validate" else None,
+    )
+
+    check = server.fetch_template("flux_dev", str(out))["local_check"]
+
+    assert check["checked"] is False
+    assert check["reason"] == "unexpected_payload"
+
+
+def test_get_template_checks_via_a_scratch_copy_and_cleans_up(monkeypatch):
+    """`templates show` has no graph, so the check fetches one — to scratch space."""
+    fetched: list[str] = []
+
+    def handler(args):
+        if args[0] == "templates" and args[1] == "show":
+            return {"template": {"name": "flux_dev"}}
+        if args[0] == "templates" and args[1] == "fetch":
+            fetched.append(args[4])
+            return None
+        return _report(valid=True, converted_from_ui=True)
+
+    calls = _fake_comfy(monkeypatch, handler)
+    result = server.get_template("flux_dev")
+
+    assert result["template"] == {"name": "flux_dev"}
+    assert result["local_check"]["runnable"] is True
+    # Fetched to a scratch path (never the caller's cwd) and validated there...
+    assert calls[1][:4] == ("templates", "fetch", "flux_dev", "--out")
+    assert calls[2][:2] == ("validate", "--workflow")
+    assert calls[2][2] == fetched[0]
+    # ...and the scratch directory is gone afterwards.
+    assert not os.path.exists(os.path.dirname(fetched[0]))
+
+
+def test_get_template_reports_an_unfetchable_template_as_unchecked(monkeypatch):
+    """A failed scratch fetch is a check that did not happen, not a bad template."""
+
+    def handler(args):
+        if args[0] == "templates" and args[1] == "show":
+            return {"template": {"name": "flux_dev"}}
+        raise server.ComfyCliError("template fetch failed [template_fetch_failed]")
+
+    _fake_comfy(monkeypatch, handler)
+    check = server.get_template("flux_dev")["local_check"]
+
+    assert check["checked"] is False
+    assert check["reason"] == "template_fetch_failed"

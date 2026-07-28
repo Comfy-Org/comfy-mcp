@@ -35,6 +35,14 @@ Hard guardrails — a PR that breaks any of these should be rejected:
   — none of which apply here. This repo is local-only, single-process, and has no
   filesystem/multi-tenancy concerns to design around.
 
+A tool may COMPOSE more than one passthrough when the value is in the sequence
+rather than in new logic — `fetch_template` runs `templates fetch` and then
+`validate` to tell the caller whether the template it just wrote can actually
+run on this install. That stays inside the rule: every call still goes through
+`_run_comfy`, the verdict is comfy-cli's own, and this repo adds no product
+behavior of its own. What would breach it is deriving the answer here (parsing
+the graph, keeping a table of what is "supported") instead of asking the engine.
+
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
