@@ -383,7 +383,7 @@ class _FakeProc:
 
 
 class _RecordingCtx:
-    """A fake FastMCP Context that records each ``report_progress`` call."""
+    """A fake MCPServer Context that records each ``report_progress`` call."""
 
     def __init__(self):
         self.calls: list[dict] = []

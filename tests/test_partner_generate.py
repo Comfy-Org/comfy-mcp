@@ -55,7 +55,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
+    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
 
     Records every elicitation raised so a test can assert the prompt happened
     (and what it said), and can be told to have no elicitation capability at all
@@ -912,7 +912,7 @@ def test_instructions_warn_that_partner_generate_spends_credits():
 
 
 def test_partner_generate_takes_an_injected_context():
-    """FastMCP must recognise `ctx` — or the spend prompt silently never fires.
+    """MCPServer must recognise `ctx` — or the spend prompt silently never fires.
 
     The elicitation path is reachable only if the server injects the request
     context; a rename or a retype would quietly degrade every call to the

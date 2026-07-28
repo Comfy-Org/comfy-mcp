@@ -59,7 +59,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from mcp import types
-from mcp.server.fastmcp import Context, FastMCP, Image
+from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
 
 from . import failure_log, tcc, textutil
@@ -163,7 +163,7 @@ tool takes a bare `path` or `workflow` argument.
 Everything targets the LOCAL server only — there is no cloud access here.
 """
 
-mcp = FastMCP("comfy-local-mcp", instructions=INSTRUCTIONS)
+mcp = MCPServer("comfy-local-mcp", instructions=INSTRUCTIONS)
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
@@ -4599,7 +4599,7 @@ def get_queue() -> Any:
 
 
 # Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
-# ``mcp.server.fastmcp.Image`` maps to a real ``image/*`` MIME type (an unknown
+# ``mcp.server.mcpserver.Image`` maps to a real ``image/*`` MIME type (an unknown
 # suffix would fall back to ``application/octet-stream`` and not render).
 _INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
@@ -4984,7 +4984,7 @@ _UPDATE_TARGETS = ("all", "comfy", "cli")
 # network fetch that must not be killed halfway).
 _UPDATE_TIMEOUT = 1800.0
 
-# Only one `comfy update` may be in flight per server process. FastMCP dispatches
+# Only one `comfy update` may be in flight per server process. MCPServer dispatches
 # sync tools onto a worker thread pool, so a client is free to issue a second
 # `update_comfyui` while the first is still running — and both would drive `git`
 # and `pip` against the SAME workspace and Python environment at once (a fight
@@ -5054,7 +5054,7 @@ def update_comfyui(target: str = "comfy") -> Any:
             "('comfy' = ComfyUI core, 'all' = installed custom node packs, "
             "'cli' = comfy-cli itself)."
         )
-    # Refuse rather than queue: blocking would park a FastMCP worker thread for
+    # Refuse rather than queue: blocking would park an MCPServer worker thread for
     # up to 30 minutes behind an update the caller cannot see, and present as a
     # hang. Failing immediately names what is happening and leaves retrying to
     # the caller. Acquired AFTER target validation so a bad target is still
@@ -6664,7 +6664,7 @@ _SlotModel = TypeVar("_SlotModel", bound=BaseModel)
 def _as_slot_model(item: Any, model: type[_SlotModel]) -> _SlotModel:
     """Coerce one structured slot item to its model.
 
-    Over MCP, FastMCP has already validated the item into ``model``. A plain
+    Over MCP, MCPServer has already validated the item into ``model``. A plain
     mapping only reaches here from an in-process caller (this module's own
     tests, a script importing the tool), so it is validated through the same
     model rather than read key-by-key — one definition of the shape, one set of
