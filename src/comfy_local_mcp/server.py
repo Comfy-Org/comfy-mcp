@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 from urllib.parse import urlparse
@@ -1722,9 +1723,50 @@ _SAVED_MARKER = "Saved:"
 _RICH_DEFAULT_WIDTH = 80
 
 # Ceiling on how many saved paths a synthesized result reports. A partner model
-# returns a handful of assets; anything past this is a runaway, and the raw
-# `message` still carries the text.
+# returns a handful of assets; anything past this is a runaway. The overflow is
+# DROPPED outright, and `message` (a 1000-char tail) is not a reliable second
+# copy of it — which is why the ceiling is set far above any real run rather
+# than tight enough to need one.
 _MAX_SAVED_PATHS = 50
+
+# Longest path this will report. `PATH_MAX` is 4096 on Linux (1024 on macOS), so
+# anything past it cannot name a real file. Over-long entries are DROPPED rather
+# than sliced: a truncated path is a *different*, plausible-looking path, and a
+# caller that acts on it writes to — or reports — the wrong place. Absent is
+# legible; wrong is not.
+_MAX_SAVED_PATH_CHARS = 4096
+
+# How much text past the `Saved:` header is parsed. `_MAX_SAVED_PATHS` paths of
+# `_MAX_SAVED_PATH_CHARS` each, plus fold slack, fits inside this comfortably.
+# The bound exists because `model download` streams megabytes of rich progress
+# through this same `plain_ok` synthesis: `splitlines()` also splits on `\r`, so
+# a redrawing progress bar would otherwise materialize millions of tiny strings
+# and the reassembly's `+=` would run over them quadratically.
+_MAX_SAVED_BLOCK_CHARS = 256_000
+
+
+def _cell_len(text: str) -> int:
+    """Terminal CELLS ``text`` occupies — the unit rich measures its folds in.
+
+    rich folds on cell width (``rich.cells.cell_len`` / ``chop_cells``), not on
+    code points, so a path carrying CJK or emoji reaches the console edge after
+    FEWER characters than ``len`` reports. Measuring with ``len`` made every such
+    fold look unfoldable, and the continuation was then dropped — leaving a
+    silently truncated path in ``saved_paths``.
+
+    rich carries a generated width table; this approximates it with the two rules
+    that matter for a filename — East-Asian Wide/Fullwidth is two cells, a
+    combining mark is zero — and short-circuits the ASCII case, which is every
+    path on a normal install.
+    """
+    if text.isascii():
+        return len(text)
+    total = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return total
 
 
 def _child_console_width() -> int:
@@ -1736,12 +1778,21 @@ def _child_console_width() -> int:
     not a guess about it. Read per call rather than latched: nothing stops the
     host from re-exporting ``COLUMNS`` mid-session.
 
-    Anything unparseable or non-positive falls back to rich's own default, which
-    is what rich itself does with a junk ``COLUMNS``.
+    The ``isdigit()`` test is rich's own, and mirroring it is the whole point:
+    ``int()`` alone also accepts ``" 120 "``, ``"+120"``, ``"1_20"`` and
+    ``"120\\n"``, none of which rich honours — so for any of those the parent
+    would measure folds against a width the child never rendered at, and
+    mis-assemble or truncate the paths. Anything rich ignores falls back to
+    rich's own default, exactly as rich does.
     """
+    columns = os.environ.get("COLUMNS", "")
+    if not columns.isdigit():
+        return _RICH_DEFAULT_WIDTH
     try:
-        width = int(os.environ.get("COLUMNS", ""))
+        width = int(columns)
     except ValueError:
+        # `isdigit()` is true for characters `int()` rejects (superscripts such
+        # as "²"). rich has the same gap and crashes; fall back instead.
         return _RICH_DEFAULT_WIDTH
     return width if width > 0 else _RICH_DEFAULT_WIDTH
 
@@ -1758,34 +1809,62 @@ def _extract_saved_paths(text: str) -> list[str]:
     physical lines — mid-filename, with no indent on the continuation (observed:
     ``…/partner-jellyfish.p`` / ``ng``).
 
-    Two signals reassemble it, both read off how that block is rendered rather
+    Three signals reassemble it, all read off how that block is rendered rather
     than guessed at:
 
-    - Every path line is INDENTED (``rprint(f"  {p}")``) and a fold continuation
-      never is, so an indented line starts a new path and an unindented one may
+    - Every path line is INDENTED (``rprint(f"  {p}")``) and a continuation never
+      is, so an indented line starts a new path and an unindented one may
       continue the previous.
-    - A fold fills the console width EXACTLY, and
-      :func:`_child_console_width` resolves that width the same way rich does, so
-      an unindented line continues a path only when the line above it was
-      full-width. Anything else ends the block — which is what keeps unrelated
-      trailing output from being glued onto a real path.
+    - rich breaks a line only when the next thing does not FIT, so an unindented
+      line continues a path only when the line above it had no room for it —
+      measured in CELLS (:func:`_cell_len`), at the width
+      :func:`_child_console_width` resolves the same way rich does. Anything that
+      would have fit ends the block, which is what keeps unrelated trailing
+      output from being glued onto a real path.
+    - rich breaks in two different ways and they rejoin differently. A FOLD
+      chops mid-token and loses nothing, so the pieces concatenate directly; a
+      WORD WRAP breaks at whitespace and eats one space, so the pieces rejoin
+      with a space put back. They are told apart by whether the line above had
+      room for even the first character of the continuation: if it did not, the
+      break was a fold; if it had room for a character but not for the whole next
+      word, it was a wrap.
+
+    That third rule is what makes a path containing SPACES survive — the common
+    macOS ``/Users/me/My Pictures/…`` shape, which rich wraps at the space into a
+    first line SHORTER than the console width. Reading only exact-width lines as
+    continuations dropped the rest of the block and returned the leading
+    fragment (``/Users/me/My``) as if it were a resolved destination.
 
     A blank line and the end of the text also end the block; a later ``Saved:``
-    header starts another. Paths are returned in printed order.
+    header starts another. Paths are returned in printed order, and a path that
+    is left UNFINISHED — the block ended while the last line was still exactly
+    full-width, so more of it was coming — is dropped rather than reported as a
+    prefix, on the same reasoning as ``_MAX_SAVED_PATH_CHARS``.
 
-    Two things the rendered text cannot express, and neither is fixable here:
-    rich word-wraps before it folds, so a path containing SPACES may break at the
-    space and lose it; and a path that happens to fill the console width EXACTLY
-    is indistinguishable from a folded one, so unrelated output printed
-    immediately after that path — with no blank line — would be read as a
-    continuation. comfy-cli prints nothing there today (``print_saved`` is the
-    last thing on the success path). Both are why the raw ``message`` is kept
-    alongside this field rather than replaced by it. The real fix is upstream —
-    an envelope for ``comfy generate`` — at which point ``_run_comfy`` takes the
-    envelope path and this synthesis is bypassed entirely.
+    What the rendered text still cannot express: a path that happens to fill the
+    console width EXACTLY is indistinguishable from a folded one, so it is
+    dropped by the unfinished rule above, and unrelated output printed
+    immediately after a path — with no blank line, and long enough that it could
+    not have fit on that line — is read as a continuation. comfy-cli prints
+    nothing there today (``print_saved`` is the last thing on the success path).
+    Both are why the raw ``message`` is kept alongside this field rather than
+    replaced by it. The real fix is upstream — an envelope for ``comfy
+    generate`` — at which point ``_run_comfy`` takes the envelope path and this
+    synthesis is bypassed entirely.
     """
+    # Bound the parse to the block itself BEFORE splitting: this runs on the full
+    # uncapped stdout+stderr of every `plain_ok` verb, and `model download`'s is
+    # a multi-megabyte progress stream. Cheap `find` first so the overwhelmingly
+    # common "no block here" case never splits anything. See
+    # `_MAX_SAVED_BLOCK_CHARS`.
+    marker_at = text.find(_SAVED_MARKER)
+    if marker_at < 0:
+        return []
+    # Back up to the start of the marker's own physical line so the block's first
+    # line is intact; `\r` counts, because `splitlines` treats it as a break.
+    line_start = max(text.rfind("\n", 0, marker_at), text.rfind("\r", 0, marker_at)) + 1
     width = _child_console_width()
-    lines = text.splitlines()
+    lines = text[line_start : line_start + _MAX_SAVED_BLOCK_CHARS].splitlines()
     paths: list[str] = []
     index = 0
     while index < len(lines):
@@ -1794,21 +1873,38 @@ def _extract_saved_paths(text: str) -> list[str]:
             continue
         index += 1
         previous_width = 0
+        # Where THIS block's paths start, so a stray unindented first line can
+        # never be appended to a path the PREVIOUS block left behind.
+        block_start = len(paths)
         while index < len(lines) and lines[index].strip():
             line = lines[index]
             if line[:1].isspace():
                 paths.append(line.strip())
-            elif paths and previous_width == width:
-                # `line` continues the path above only if that path's LAST
-                # physical line was full-width — which is what a fold produces
-                # and what a finished path does not. Tracked per physical line so
-                # a path folded over three or more lines keeps reassembling.
-                paths[-1] += line.strip()
+            elif len(paths) > block_start:
+                # Continuation, and which KIND of break produced it. `max(…, 1)`
+                # because a zero-width leading character still occupies a slot
+                # rich had to have room for.
+                head = max(_cell_len(line[:1]), 1)
+                if previous_width + head > width:
+                    # No room for even one more character: rich chopped mid-token
+                    # and nothing was lost between the pieces.
+                    paths[-1] += line.strip()
+                elif previous_width + 1 + _cell_len(line.split(maxsplit=1)[0]) > width:
+                    # Room for a character but not for the next whole word: rich
+                    # wrapped at the space, and the space is not in either line.
+                    paths[-1] += " " + line.strip()
+                else:
+                    break
             else:
                 break
-            previous_width = len(line)
+            previous_width = _cell_len(line)
             index += 1
-    return paths
+        if previous_width == width and len(paths) > block_start:
+            # The block ended on a full-width line, so the path was still being
+            # folded when the text ran out: what we hold is a prefix, not a
+            # destination. Drop it rather than hand back a plausible wrong path.
+            paths.pop()
+    return [path for path in paths if len(path) <= _MAX_SAVED_PATH_CHARS]
 
 
 def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) -> dict:
@@ -1864,16 +1960,20 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
         ),
     }
     # Parsed from the UNCAPPED text — the cap above is a tail slice that would
-    # otherwise cut a long `Saved:` block mid-path. Joined on a NEWLINE rather
-    # than the space `message` uses, so a stderr tail can never share a physical
-    # line with the block and defeat its indent test.
-    saved_paths = _extract_saved_paths(
-        "\n".join(part for part in (stderr, stdout) if part.strip())
-    )
+    # otherwise cut a long `Saved:` block mid-path. Each stream is scanned on its
+    # OWN rather than concatenated: it keeps a stderr tail from ever sharing a
+    # physical line with the block and defeating its indent test (what the
+    # newline join used to buy), and it skips the join's full copy of a
+    # multi-megabyte `model download` progress stream.
+    saved_paths: list[str] = []
+    for part in (stderr, stdout):
+        if part.strip():
+            saved_paths.extend(_extract_saved_paths(part))
     if saved_paths:
         # Bounded like every other field here: a pathological run must not turn
-        # a success payload into an unbounded response.
-        result["saved_paths"] = [path[:1000] for path in saved_paths[:_MAX_SAVED_PATHS]]
+        # a success payload into an unbounded response. The per-path bound lives
+        # in `_extract_saved_paths` (over-long entries are dropped, not sliced).
+        result["saved_paths"] = saved_paths[:_MAX_SAVED_PATHS]
     return result
 
 
@@ -4019,11 +4119,15 @@ async def partner_generate(
     ``plain_ok`` stopgap as ``launch`` / ``stop`` / ``model download``: a clean
     exit is the success signal and the payload carries the printed text. A
     non-zero exit — including the consent refusal — still raises. Where that text
-    names the files it wrote, they are also returned as ``saved_paths`` (a list
-    of resolved absolute paths) so the destination is readable without scraping
-    ``message`` — comfy-cli wraps its output to 80 columns and will break a long
-    path mid-filename. ``saved_paths`` is absent when comfy-cli printed no
-    ``Saved:`` block; ``message`` is always kept alongside it.
+    names the files it wrote, they are also returned as ``saved_paths`` so the
+    destination is readable without scraping ``message`` — comfy-cli wraps its
+    output to 80 columns and will break a long path mid-filename. Those entries
+    are what comfy-cli PRINTED, verbatim, not paths this server resolved: they
+    are absolute whenever comfy-cli printed them absolute, which is the normal
+    case, but a relative one would be relative to comfy-cli's own cwd (it
+    ``os.chdir``s to the workspace) rather than to this process. ``saved_paths``
+    is absent when comfy-cli printed no ``Saved:`` block; ``message`` is always
+    kept alongside it.
     """
     _validate_generate_model(model)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_GENERATE_TIMEOUT)
@@ -4124,7 +4228,13 @@ async def emit_partner_workflow(
     ``emit_partner_workflow("flux-pro", "/tmp/flux.json")`` still emits a runnable
     graph whose prompt can be filled in afterwards with ``set_workflow_slot``.
     ``out_path`` is the workflow JSON to write (required), and is the file
-    ``run_workflow(workflow_path=...)`` then takes.
+    ``run_workflow(workflow_path=...)`` then takes. comfy-cli OVERWRITES it in
+    place with no existence check and no atomic rename, so name a fresh file
+    rather than an existing one worth keeping; and because a child killed at the
+    120s backstop can leave a half-written file behind, a run that ERRORS or
+    times out may still have replaced whatever was there. ``validate_workflow``
+    on the result is what turns such a partial file into an immediate, legible
+    failure instead of a confusing one at ``run_workflow`` time.
 
     Returns comfy-cli's own ``envelope/1`` data — ``{"out": …, "model": …,
     "nodes": …}`` — so the written path and node count are structured rather than
@@ -4167,7 +4277,14 @@ async def emit_partner_workflow(
     # `data` on success, and a failure raises with comfy-cli's structured
     # `error.code` / `message` / `hint` intact. That is what carries the
     # supported-model list back to the caller verbatim on an unsupported model.
-    return await asyncio.to_thread(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
+    #
+    # Its OWN pool, not the shared `asyncio.to_thread` one, for exactly the
+    # reason `partner_generate` uses it: cancelling this await does NOT interrupt
+    # the thread, so an abandoned emit stays parked until comfy-cli returns or
+    # the 120s backstop fires. On the default executor a run of cancelled calls
+    # would pin those workers and starve every other tool that off-loads through
+    # `to_thread`. See `_GENERATE_EXECUTOR`.
+    return await _in_generate_pool(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
 
 
 # Hard ceiling for one template run (video templates are the slow end), so a

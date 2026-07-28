@@ -22,6 +22,8 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 
 import pytest
 from conftest import envelope
@@ -883,17 +885,91 @@ def test_partner_generate_synthesizes_success_without_an_envelope(patched_plain_
 # practice forced a shell-out to `ls` to confirm anything landed at all.
 
 
+def _cells(text: str) -> int:
+    """Cell width of `text`, computed independently of the server's own helper.
+
+    rich measures its line breaks in terminal CELLS, so the renderer below must
+    too — and it must not borrow `server._cell_len`, or a bug in that helper
+    would cancel itself out and every fold test would pass on input the real
+    parser cannot handle.
+    """
+    return sum(
+        0
+        if unicodedata.combining(char)
+        else 2
+        if unicodedata.east_asian_width(char) in ("W", "F")
+        else 1
+        for char in text
+    )
+
+
+def _chop(text: str, width: int) -> tuple[str, str]:
+    """Split `text` at `width` CELLS — rich's `chop_cells`, minus the caching."""
+    used = 0
+    for position, char in enumerate(text):
+        size = _cells(char)
+        if used + size > width:
+            return text[:position], text[position:]
+        used += size
+    return text, ""
+
+
 def _fold(
     path: str, *, width: int = server._RICH_DEFAULT_WIDTH, indent: str = "  "
 ) -> str:
-    """Render one saved path the way rich would: indented, then folded at `width`.
+    """Render one saved path the way rich actually would, at `width` cells.
 
     Built here rather than hard-coding a wrapped blob so a test states the PATH
-    it means and the fold falls out, and so a three-line fold is as easy to
+    it means and the break falls out, and so a three-line break is as easy to
     write as a two-line one.
+
+    This models rich's `divide_line`, not a fixed-width slice, because the two
+    disagree on exactly the inputs that used to come back truncated: rich
+    WORD-WRAPS at whitespace before it folds (so a path with a space breaks
+    early, leaving a line SHORTER than `width`), and it measures in cells (so a
+    path with wide characters breaks after fewer code points than `width`).
+    Slicing at fixed character counts reproduced the parser's own model of rich
+    instead of rich, which is what let both silent-truncation modes ship green.
     """
     text = indent + path
-    return "\n".join(text[i : i + width] for i in range(0, len(text), width))
+    lines: list[str] = []
+    current = ""
+    # rich's `words()`: the whitespace before a word rides with it, so a break
+    # taken before the word is what swallows that whitespace.
+    for chunk in re.findall(r"\s*\S+", text):
+        word = chunk.lstrip()
+        lead = chunk[: len(chunk) - len(word)]
+        if current and _cells(current + lead + word) > width:
+            lines.append(current)
+            current = ""
+            lead = ""
+        piece = current + lead + word
+        # A single word too long for a whole line is FOLDED at the cell width.
+        while _cells(piece) > width:
+            head, piece = _chop(piece, width)
+            lines.append(head)
+        current = piece
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
+
+
+def test_the_fold_renderer_matches_rich_where_the_two_could_drift():
+    """Guard the renderer above: these are the shapes the parser is judged on."""
+    # A word too long for the line folds at exactly `width` cells, indent included.
+    assert _fold("a" * 100, width=20).splitlines() == [
+        "  " + "a" * 18,
+        *["a" * 20] * 4,
+        "a" * 2,
+    ]
+    # A space wraps EARLY, leaving a line SHORTER than `width` — the shape a
+    # fixed-width slice can never produce, and the one that used to truncate.
+    assert _fold("/tmp/my dir/" + "z" * 30, width=40).splitlines() == [
+        "  /tmp/my",
+        "dir/" + "z" * 30,
+    ]
+    # Wide characters reach the edge after fewer code points than `width`.
+    assert _fold("漢" * 20, width=20).splitlines()[0] == "  " + "漢" * 9
 
 
 def test_partner_generate_reports_saved_paths(patched_plain_run):
@@ -913,8 +989,13 @@ def test_partner_generate_reassembles_a_path_rich_folded(patched_plain_run):
     (`…/partner-jellyfish.p` / `ng`), so a caller reading the first line alone
     gets a path that does not exist.
     """
-    path = "/Users/someone/Pictures/comfy-generations/2026-07/partner-jellyfish.png"
-    patched_plain_run(0, stdout=f"Saved:\n{_fold(path)}\n")
+    path = (
+        "/Users/someone/Pictures/comfy-generations/2026-07/"
+        "partner-jellyfish-final-v2.png"
+    )
+    rendered = _fold(path)
+    assert len(rendered.splitlines()) == 2  # it genuinely folded, mid-filename
+    patched_plain_run(0, stdout=f"Saved:\n{rendered}\n")
 
     result = _generate("flux-pro", confirm_spend=True)
 
@@ -932,6 +1013,76 @@ def test_partner_generate_reassembles_a_path_folded_more_than_once(
     result = _generate("flux-pro", confirm_spend=True)
 
     assert result["saved_paths"] == [path]
+
+
+def test_a_path_containing_spaces_survives_richs_word_wrap(patched_plain_run):
+    """rich wraps at the SPACE before it folds, and the path still comes back whole.
+
+    The macOS shape (`~/My Pictures/…`). rich breaks at the space, so the first
+    physical line is SHORTER than the console width — and a parser that treats
+    only exact-width lines as foldable reads the block as finished, hands back
+    `/Users/someone/My` as a resolved destination, and silently drops every
+    remaining path. A truncated path is worse than no path: the caller acts on a
+    file that was never written.
+    """
+    path = (
+        "/Users/someone/My Pictures/comfy-generations/2026-07-28/"
+        "partner-jellyfish-final.png"
+    )
+    rendered = _fold(path)
+    assert len(rendered.splitlines()) == 2  # it really did wrap
+    assert rendered.splitlines()[0] == "  /Users/someone/My"  # ...at the space
+    patched_plain_run(0, stdout=f"Saved:\n{rendered}\n  /tmp/b.png\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path, "/tmp/b.png"]
+
+
+def test_a_path_of_wide_characters_is_measured_in_cells_not_code_points(
+    patched_plain_run,
+):
+    """A CJK path folds after fewer CHARACTERS than the console is wide.
+
+    Measuring the rendered line with `len` makes the fold look like a finished
+    path, so the continuation is dropped and a truncated path is reported.
+    """
+    path = "/Users/someone/" + "画像フォルダ/" * 6 + "out.png"
+    assert len(path) < server._RICH_DEFAULT_WIDTH  # `len` says it never folded...
+    rendered = _fold(path)
+    assert len(rendered.splitlines()) > 1  # ...but in CELLS it did
+    patched_plain_run(0, stdout=f"Saved:\n{rendered}\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == [path]
+
+
+def test_a_path_left_unfinished_is_dropped_rather_than_truncated(patched_plain_run):
+    """Text that ends mid-fold yields a PREFIX, so report nothing instead.
+
+    A full-width final line means rich had more to print. Returning what we hold
+    would name a file that does not exist; `message` still carries the text.
+    """
+    path = "/Users/someone/" + "deeply-nested-directory/" * 4 + "jellyfish.png"
+    first_line = _fold(path).splitlines()[0]
+    assert len(first_line) == server._RICH_DEFAULT_WIDTH  # the text stops here
+    patched_plain_run(0, stdout=f"Saved:\n  /tmp/a.png\n{first_line}")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == ["/tmp/a.png"]  # the prefix is NOT reported
+
+
+def test_an_over_long_path_is_dropped_rather_than_sliced(patched_plain_run):
+    """A path past PATH_MAX cannot name a real file, and a prefix of it names a
+    DIFFERENT plausible one — so drop it and keep the paths around it."""
+    huge = "/tmp/" + "d" * (server._MAX_SAVED_PATH_CHARS + 10) + ".png"
+    patched_plain_run(0, stdout=f"Saved:\n  /tmp/a.png\n  {huge}\n  /tmp/b.png\n")
+
+    result = _generate("flux-pro", confirm_spend=True)
+
+    assert result["saved_paths"] == ["/tmp/a.png", "/tmp/b.png"]
 
 
 def test_saved_paths_stop_at_unrelated_output(patched_plain_run):
@@ -998,7 +1149,23 @@ def test_saved_paths_follow_the_console_width_the_child_rendered_at(
     assert result["saved_paths"] == [path]
 
 
-@pytest.mark.parametrize("bad", ["", "wide", "0", "-5"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "wide",
+        "0",
+        "-5",
+        # Values `int()` accepts but rich's `isdigit()` gate does not, so rich
+        # rendered at 80 and measuring against them would mis-assemble the block.
+        " 120 ",
+        "+120",
+        "1_20",
+        "120\n",
+        # `isdigit()` accepts this one; `int()` is what rejects it.
+        "²",
+    ],
+)
 def test_an_unusable_columns_falls_back_to_richs_own_default(monkeypatch, bad):
     """Junk in `COLUMNS` must not make the width nonsense — rich ignores it too."""
     monkeypatch.setenv("COLUMNS", bad)
