@@ -12,7 +12,17 @@ dependencies = [
     # crash at import on this server's `ctx: Context | None` tool parameters
     # (`issubclass() arg 1 must be a class`). Verified by running the suite
     # against each release; the floor was previously understated at 1.2.0.
-    "mcp>=1.14.0",
+    #
+    # < 2 because the SDK's 2.0.0 (2026-07-28) DELETED `mcp.server.fastmcp`
+    # outright — no shim, no deprecation window. This server's single SDK import
+    # (`from mcp.server.fastmcp import Context, FastMCP, Image`, server.py) is
+    # therefore an ImportError on 2.x, which takes the whole suite down at
+    # conftest collection rather than at any one test. The ceiling is what makes
+    # that upgrade a reviewable Dependabot PR instead of an unrelated PR's CI
+    # turning red hours after a release nobody here asked for. Removing it is
+    # the LAST step of the 2.x migration (FastMCP -> `mcp.server.mcpserver`.
+    # MCPServer, elicitation types moved alongside it), never a prerequisite.
+    "mcp>=1.14.0,<2",
     # Already an mcp dependency; declared explicitly because this server now
     # imports it directly for the elicitation response schema.
     "pydantic>=2",
