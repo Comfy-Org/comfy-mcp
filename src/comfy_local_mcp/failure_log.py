@@ -252,11 +252,17 @@ def _failure_logger(path: str) -> logging.Logger:
                     logger.removeHandler(existing)
                     try:
                         existing.close()
-                    except Exception:
+                    except Exception:  # teardown must reach every handler
                         # A handler that fails to close is already detached; it
                         # must not abort the teardown of the ones after it (two
-                        # live handlers would duplicate every line).
-                        pass
+                        # live handlers would duplicate every line). Reported on
+                        # the MODULE logger rather than swallowed: that is a
+                        # different logger from the non-propagating
+                        # `comfy_local_mcp.failures` one being rebuilt here, so
+                        # this cannot recurse into the handler that just failed.
+                        logging.getLogger(__name__).debug(
+                            "failure-log handler close failed", exc_info=True
+                        )
                 parent = os.path.dirname(path)
                 if parent:
                     os.makedirs(parent, mode=_FAILURE_LOG_DIR_MODE, exist_ok=True)
@@ -326,5 +332,18 @@ def _log_failure(
             "streaming": streaming,
         }
         _failure_logger(path).info(json.dumps(entry, ensure_ascii=False))
-    except Exception:
-        pass  # diagnostics are best-effort; never mask the real error
+    except Exception:  # a diagnostic aid must never mask the real error
+        # Swallowed by design (see the contract in this function's docstring):
+        # this runs while a REAL error is being reported, so letting a logging
+        # fault replace it would lose the failure the user actually needs.
+        #
+        # But swallowing it SILENTLY is how a failure log ends up reading healthy
+        # while writing nothing — a disabled log and a broken one would look
+        # identical. So the drop is recorded on the module logger, which is a
+        # different, PROPAGATING logger from the non-propagating
+        # `comfy_local_mcp.failures` one that just failed: it can neither recurse
+        # nor re-enter the broken handler. `debug` because this file is an opt-in
+        # diagnostic, so its own faults belong at diagnostic level too.
+        logging.getLogger(__name__).debug(
+            "failure-log write failed; the entry was dropped", exc_info=True
+        )

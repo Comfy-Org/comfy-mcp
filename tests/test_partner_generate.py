@@ -318,7 +318,7 @@ def test_partner_generate_surfaces_a_broken_elicitation_without_spending(
     calls = patched_plain_run(0, stdout="done")
 
     class _BrokenCtx(_FakeCtx):
-        async def elicit(self, message, schema):  # noqa: ARG002
+        async def elicit(self, message, schema):
             raise RuntimeError("client closed the connection")
 
     with pytest.raises(
@@ -708,7 +708,7 @@ def test_client_elicitation_support_is_false_outside_a_live_request():
     """`Context.session` raises outside a request — that is "cannot ask", not a crash."""
 
     class _NoSessionCtx:
-        async def elicit(self, message, schema):  # noqa: ARG002
+        async def elicit(self, message, schema):
             raise AssertionError("must never be reached")
 
         @property
@@ -732,7 +732,7 @@ def test_client_elicitation_support_is_unknown_when_the_probe_raises():
             self.session = _BrokenSession()
 
     class _BrokenSession:
-        def check_client_capability(self, capability):  # noqa: ARG002
+        def check_client_capability(self, capability):
             raise RuntimeError("capability table is corrupt")
 
     assert server._client_elicitation_support(_BrokenProbeCtx()) is None
@@ -750,7 +750,7 @@ def test_an_errored_capability_probe_still_asks_before_spending(patched_plain_ru
     calls = patched_plain_run(0, stdout="done")
 
     class _BrokenSession:
-        def check_client_capability(self, capability):  # noqa: ARG002
+        def check_client_capability(self, capability):
             raise RuntimeError("capability table is corrupt")
 
     ctx = _FakeCtx(action="decline")
@@ -769,7 +769,7 @@ def test_an_unanswered_prompt_lapses_into_a_refusal(patched_plain_run, monkeypat
     monkeypatch.setattr(server, "_SPEND_ELICIT_TIMEOUT", 0.05)
 
     class _SilentCtx(_FakeCtx):
-        async def elicit(self, message, schema):  # noqa: ARG002
+        async def elicit(self, message, schema):
             self.elicitations.append(message)
             await asyncio.sleep(30)  # never answers
             raise AssertionError("must never be reached")
@@ -786,7 +786,7 @@ def test_a_malformed_elicitation_result_is_a_refusal(patched_plain_run):
     calls = patched_plain_run(0, stdout="done")
 
     class _NonsenseCtx(_FakeCtx):
-        async def elicit(self, message, schema):  # noqa: ARG002
+        async def elicit(self, message, schema):
             self.elicitations.append(message)
             return object()  # no `.action`, no `.data`
 

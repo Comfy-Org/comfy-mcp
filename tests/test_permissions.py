@@ -249,7 +249,7 @@ def _patch_version_probe(monkeypatch, returncode: int, stderr: str) -> None:
     monkeypatch.setattr(server, "_version_checked", False)
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    def fake_run(cmd, **kwargs):  # noqa: ARG001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr=stderr)
 
     monkeypatch.setattr(server.subprocess, "run", fake_run)
@@ -282,7 +282,7 @@ def test_version_guard_translates_a_denied_spawn(on_macos, monkeypatch):
     monkeypatch.setattr(
         server.subprocess,
         "run",
-        lambda cmd, **kw: (_ for _ in ()).throw(  # noqa: ARG005
+        lambda cmd, **kw: (_ for _ in ()).throw(
             PermissionError(1, "Operation not permitted", _DENIED_PATH)
         ),
     )
@@ -302,7 +302,7 @@ def test_version_guard_fails_open_on_an_unrelated_denied_spawn(on_macos, monkeyp
     monkeypatch.setattr(
         server.subprocess,
         "run",
-        lambda cmd, **kw: (_ for _ in ()).throw(  # noqa: ARG005
+        lambda cmd, **kw: (_ for _ in ()).throw(
             PermissionError(13, "Permission denied", "/opt/comfy/bin/comfy")
         ),
     )
@@ -325,7 +325,7 @@ def test_version_guard_ignores_a_healthy_comfy_cli(on_macos, monkeypatch):
     monkeypatch.setattr(
         server.subprocess,
         "run",
-        lambda cmd, **kwargs: subprocess.CompletedProcess(  # noqa: ARG005
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
             cmd, 0, stdout="comfy-cli, version 1.12.0\n", stderr=""
         ),
     )
@@ -340,7 +340,7 @@ def _patch_failing_run(monkeypatch, stderr: str) -> None:
     """A comfy-cli spawn that exits 1 with ``stderr`` and no envelope."""
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    def fake_popen(cmd, **kwargs):  # noqa: ARG001
+    def fake_popen(cmd, **kwargs):
         return _FakeRunProc(
             cmd, {}, stdout="", stderr=stderr, returncode=1, raises=None
         )
@@ -384,7 +384,7 @@ def test_a_real_error_envelope_is_untouched(on_macos, monkeypatch):
     monkeypatch.setattr(
         server.subprocess,
         "Popen",
-        lambda cmd, **kw: _FakeRunProc(  # noqa: ARG005
+        lambda cmd, **kw: _FakeRunProc(
             cmd, {}, stdout=envelope, stderr=_FATAL_STDERR, returncode=1, raises=None
         ),
     )

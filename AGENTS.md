@@ -119,7 +119,17 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for the verbs
   that print human text and emit no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
-  (`subprocess.Popen`).
+  (`asyncio.create_subprocess_exec`). Its fake pipes are real
+  `asyncio.StreamReader`s, built by conftest's `stream_reader(text, limit)`
+  helper; reuse that rather than hand-rolling an awaitable, so a fake still
+  exercises the reader's buffer-limit behavior.
+
+The two spawn paths differ deliberately: the plain `--json` path is synchronous
+(`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
+async callers), while every path that STREAMS or is otherwise long-lived
+(`_run_comfy_streaming`, `auth_login`) spawns with `asyncio.create_subprocess_exec`
+and reads the pipes as asyncio streams — nothing blocking may run on the event
+loop. `ASYNC` is enabled in ruff's `select` to enforce that.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.

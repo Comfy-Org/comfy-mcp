@@ -26,7 +26,14 @@ dependencies = [
 # src/comfy_local_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.15,<0.17"]
+# The ruff floor is 0.16, not 0.15, because `[tool.ruff.lint] select` below now
+# enables RUF100 (unused-`noqa`) — and 0.16 narrowed BLE001 to stop flagging a
+# blind `except` that logs its exception. Under 0.15 those handlers still need a
+# `# noqa: BLE001`; under 0.16 that same directive is an unused-directive error.
+# A range spanning that change cannot be green on both, so pin past it: a lint
+# toolchain whose verdicts differ by patch release is the exact problem the
+# pinned rule selection exists to prevent.
+dev = ["pytest>=8", "ruff>=0.16,<0.17"]
 
 [project.scripts]
 comfy-local-mcp = "comfy_local_mcp.server:main"
@@ -54,7 +61,32 @@ target-version = "py310"
 # bump turned a green tree red with 60 findings — 52 of them stale `# noqa: ARG0xx`
 # directives for a rule that was never enabled, plus 8 genuine ones.
 #
-# These four are ruff's historical defaults: the set this codebase was written
-# and reviewed against. Widening them is a deliberate decision, not something a
-# linter release should make on our behalf — so widen here, in a PR, on purpose.
-select = ["E4", "E7", "E9", "F"]
+# The first four are ruff's historical defaults: the set this codebase was
+# written and reviewed against. Widening them is a deliberate decision, not
+# something a linter release should make on our behalf — so widen here, in a PR,
+# on purpose. What follows is that deliberate widening, one rule set at a time:
+#
+# ASYNC  — blocking calls inside `async def`. This server's whole job is shelling
+#          out from async tools, so a blocking spawn or read on the event loop is
+#          the highest-value defect class ruff can find here.
+# BLE    — blind `except Exception`. Every remaining site now states its reason:
+#          the handlers that log the exception satisfy the rule outright (0.16
+#          exempts those), and the few that genuinely must swallow carry an
+#          explicit `# noqa: BLE001 - <reason>`. The rule now forces the NEXT
+#          blind catch to argue for itself the same way.
+# S110   — `try`/`except`/`pass`. Selected as a single rule rather than all of
+#          `S` (flake8-bandit): the broader set flags `subprocess` use itself,
+#          which is this repo's entire reason to exist.
+# I      — import sorting. Cosmetic and auto-fixable; on so it cannot drift.
+# RUF100 — unused/non-enabled `# noqa`. This is the rule that would have PREVENTED
+#          the mess this selection was written for: ~50 `# noqa: ARG0xx`
+#          directives had accumulated for `flake8-unused-arguments`, a rule this
+#          repo has never enabled, and nothing flagged them until a linter
+#          release changed its defaults. With RUF100 on, a directive that
+#          suppresses nothing is an error the day it is written.
+#
+# Deliberately NOT adopted: ARG (flake8-unused-arguments). The tests are largely
+# interface-mirroring fakes whose unused parameters exist precisely BECAUSE the
+# real signature has them, so the rule reports 306 sites here and finds no
+# defects. The ~50 stale directives were removed rather than completed.
+select = ["E4", "E7", "E9", "F", "ASYNC", "BLE", "S110", "I", "RUF100"]
