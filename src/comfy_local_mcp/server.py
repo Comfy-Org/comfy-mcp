@@ -5829,6 +5829,49 @@ def _submitted_download_id(submitted: Any) -> str:
     return _guard_download_id(value)
 
 
+def _download_verb_unsupported(exc: ComfyCliError, verb: str) -> dict[str, Any] | None:
+    """The capability-gap degrade for a ``model <verb>`` this comfy-cli lacks.
+
+    Returns the ``{"error": ..., "unsupported": True}`` shape
+    :func:`_freshness_report` established, or ``None`` when *exc* is any other
+    failure and must be re-raised untouched.
+
+    ``download_model`` already degrades for the OPTION-shaped half of this same
+    version gap (``--background``, see :func:`_is_missing_option_error`); this is
+    the VERB-shaped half, for the ``model download-status`` / ``download-cancel``
+    companions. The three ship as one group, in comfy-cli releases after 1.13.0
+    — so on every release through 1.13.0 these tools hit Click's raw usage dump,
+    which reads like a broken MCP rather than the version gap it is. That is the
+    common case today, not an edge one: this repo's floor is only 1.12.0.
+
+    This degrade REPORTS NO LOST CAPABILITY, which is why it is safe. The verb
+    group is all-or-nothing, so a CLI missing these two also rejects
+    ``--background`` — no ``download_id`` can ever have been minted on it (the
+    fallback's synthesized payload carries none), leaving nothing for these tools
+    to have acted on. Downloading still works on such a CLI, inline, via
+    ``download_model`` itself, and the message says so rather than dead-ending.
+
+    :func:`_is_missing_verb_error` decides the case and is deliberately strict
+    for the reason documented there: this shape asserts nothing is broken, so a
+    failure that merely RELAYS a "no such command" — or any real error from a
+    verb comfy-cli did dispatch, an unknown id included — must keep the raw
+    passthrough instead of being waved through as a capability gap.
+    """
+    if not _is_missing_verb_error(exc, verb):
+        return None
+    return {
+        "error": (
+            f"model {verb} unavailable: the installed comfy-cli does not support "
+            f"'comfy model {verb}' (the background-download verbs ship in "
+            "releases after 1.13.0). Downloads themselves still work — on this "
+            "comfy-cli `download_model` runs the transfer inline and returns "
+            "once the file has landed, so there is no background download to "
+            f"{'check on' if verb == 'download-status' else 'cancel'}."
+        ),
+        "unsupported": True,
+    }
+
+
 def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     """Poll ``comfy model download-status`` until terminal or ``timeout_seconds``.
 
@@ -6230,6 +6273,13 @@ async def download_model(
         # it. Re-raise carrying the id (and every structured attribute, so a
         # caller branching on `code` / `timed_out` still can). `wait_for_download`
         # needs no such wrapping: its caller passed the id in and still holds it.
+        #
+        # No `_download_verb_unsupported` degrade HERE, unlike the three standalone
+        # download tools: the submit above already parsed `--background`, so this
+        # CLI ships the whole verb group. A missing-verb read at this point would
+        # therefore be spurious — and claiming "nothing is broken" over a transfer
+        # that is genuinely running detached is the one thing that degrade must
+        # never do.
         raise ComfyCliError(
             f"{exc} (the background download is still running — check it with "
             f"`download_status({download_id!r})` or stop it with "
@@ -6268,9 +6318,19 @@ def download_status(download_id: str) -> Any:
     the file straight to ``dest`` as it transfers, so the path existing proves
     nothing until ``status`` reads ``completed``. ``failed`` and ``cancelled``
     are the other terminal states — anything else means bytes are still moving.
+
+    On a comfy-cli too old to know the verb this returns ``{"error": ...,
+    "unsupported": True}`` instead of Click's usage dump — see
+    :func:`_download_verb_unsupported`; no such CLI can have minted an id.
     """
     download_id = _guard_download_id(download_id)
-    return _run_comfy("model", "download-status", download_id, timeout=60.0)
+    try:
+        return _run_comfy("model", "download-status", download_id, timeout=60.0)
+    except ComfyCliError as exc:
+        degraded = _download_verb_unsupported(exc, "download-status")
+        if degraded is None:
+            raise
+        return degraded
 
 
 @mcp.tool()
@@ -6291,10 +6351,22 @@ def wait_for_download(download_id: str, timeout_seconds: float = 25.0) -> Any:
     on that bound, so the call returns at roughly the deadline even if a status
     poll wedges. Like ``wait_for_job``, a terminal FAILURE is returned rather
     than raised — read ``status`` / ``error`` off the payload.
+
+    Like its two companions, a comfy-cli too old to know the verb yields
+    ``{"error": ..., "unsupported": True}`` rather than Click's usage dump — see
+    :func:`_download_verb_unsupported`. Only reachable before the first poll
+    lands: a missing verb fails every poll identically, so ``_poll_download``
+    re-raises it immediately with no status yet to keep.
     """
     download_id = _guard_download_id(download_id)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_DOWNLOAD_WAIT_TIMEOUT)
-    return _poll_download(download_id, timeout_seconds)
+    try:
+        return _poll_download(download_id, timeout_seconds)
+    except ComfyCliError as exc:
+        degraded = _download_verb_unsupported(exc, "download-status")
+        if degraded is None:
+            raise
+        return degraded
 
 
 @mcp.tool()
@@ -6306,9 +6378,19 @@ def cancel_download(download_id: str) -> Any:
     checkpoint that turned out to be far larger than expected. Cancelling an
     unknown id, or one whose download already finished, surfaces comfy-cli's own
     answer (an error envelope, or the unchanged terminal status).
+
+    On a comfy-cli too old to know the verb this returns ``{"error": ...,
+    "unsupported": True}`` instead of Click's usage dump — see
+    :func:`_download_verb_unsupported`; no such CLI can have minted an id.
     """
     download_id = _guard_download_id(download_id)
-    return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
+    try:
+        return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
+    except ComfyCliError as exc:
+        degraded = _download_verb_unsupported(exc, "download-cancel")
+        if degraded is None:
+            raise
+        return degraded
 
 
 @mcp.tool()

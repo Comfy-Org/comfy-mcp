@@ -1516,6 +1516,35 @@ def test_download_model_returns_a_timed_out_envelope_rather_than_raising(monkeyp
     assert len(calls) == 2
 
 
+def test_download_model_tiny_bound_fails_without_starting_a_transfer(monkeypatch):
+    """A bound too small to resolve the download must not leave one running.
+
+    The docstring promises this outright, and the promise has real teeth: the
+    submit is capped to the caller's bound, so a tiny bound kills it — and that
+    timeout must NOT be mistaken for the missing-`--background` degrade, which
+    would retry the whole thing as an 1800s blocking transfer nobody asked for.
+    The existing end-to-end-budget test pins the cap; this pins what happens
+    when the cap actually bites.
+    """
+    calls: list[float] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise server.ComfyCliError(
+            "comfy-cli timed out after 0.001s", timed_out=True, returncode=None
+        )
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        _download_model("https://hf.co/x.safetensors", timeout_seconds=0.001)
+
+    # The submit took the caller's bound, not its own fixed budget...
+    assert calls == [0.001]
+    # ...and exactly one spawn happened: no legacy fallback, so nothing detached
+    # and no second copy of a multi-GB file was fetched.
+
+
 def test_download_model_raises_on_a_failed_download(monkeypatch):
     """A terminal `failed` carries comfy-cli's own error text into the raise."""
     _sequenced(
@@ -1801,6 +1830,74 @@ def test_cancel_download_unknown_id_raises_error_envelope(patched_run):
 
     with pytest.raises(server.ComfyCliError, match="download_not_found"):
         server.cancel_download("nope")
+
+
+# Click's usage error for a verb the installed comfy-cli does not have: exit 2,
+# no envelope. The background-download verb group ships only in releases after
+# 1.13.0, while this repo's floor is 1.12.0, so this is the COMMON path today.
+_NO_DOWNLOAD_STATUS = (
+    2,
+    "",
+    "Usage: comfy [OPTIONS] COMMAND\nNo such command 'download-status'.",
+)
+_NO_DOWNLOAD_CANCEL = (
+    2,
+    "",
+    "Usage: comfy [OPTIONS] COMMAND\nNo such command 'download-cancel'.",
+)
+
+
+@pytest.mark.parametrize(
+    "tool, reply, verb",
+    [
+        ("download_status", _NO_DOWNLOAD_STATUS, "download-status"),
+        ("wait_for_download", _NO_DOWNLOAD_STATUS, "download-status"),
+        ("cancel_download", _NO_DOWNLOAD_CANCEL, "download-cancel"),
+    ],
+)
+def test_download_companions_degrade_on_a_comfy_cli_without_the_verb(
+    patched_run, tool, reply, verb
+):
+    """A missing verb reads as a capability gap, not as a broken MCP.
+
+    `download_model` already degrades for the option-shaped half of this same
+    version gap (`--background`); these three are the verb-shaped half. The
+    group is all-or-nothing, so a CLI missing them also rejects `--background`
+    and can never have minted an id — nothing is actually lost, and the message
+    points at the inline `download_model` that DOES work there.
+    """
+    returncode, stdout, stderr = reply
+    patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    result = getattr(server, tool)("a1b2c3d4e5f6")
+
+    assert result["unsupported"] is True
+    assert f"model {verb} unavailable" in result["error"]
+    # Points at the path that still works rather than dead-ending.
+    assert "download_model" in result["error"]
+    # None of the raw wrapper/CLI text leaks through.
+    assert "No such command" not in result["error"]
+    assert "Usage: comfy" not in result["error"]
+    assert "returned no JSON" not in result["error"]
+
+
+@pytest.mark.parametrize("tool", ["download_status", "wait_for_download"])
+def test_download_companions_keep_a_real_error_raw(patched_run, tool):
+    """A verb comfy-cli DID dispatch must never be waved through as a gap.
+
+    An unknown id is a real answer from a working CLI. Degrading it would tell
+    the agent nothing is broken while its download silently isn't there.
+    """
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "download_not_found", "message": "no such download"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="download_not_found"):
+        getattr(server, tool)("a1b2c3d4e5f6")
 
 
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
