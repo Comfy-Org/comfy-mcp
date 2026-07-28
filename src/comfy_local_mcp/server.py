@@ -50,6 +50,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -79,7 +80,14 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   search, paged 25 at a time via `limit`/`offset`; narrow with `tag`/`type`/
   `model`/`provider`, or `exclude_api=True` for templates that run without a
   hosted-API key), `fetch_template` to save its workflow JSON, then `run_workflow`
-  on that file. To change the prompt / seed
+  on `result["path"]`. `fetch_template` and `get_template` also return a
+  `local_check` block comparing the template against the live node catalog of the
+  installed ComfyUI — the gallery is served fresh, so a template can need a node
+  or model option this install does not have yet. On
+  `{"checked": true, "runnable": false}` tell the USER what is missing (update
+  ComfyUI / custom nodes, or pick another template) instead of running it and
+  hitting the failure deep in execution; `{"checked": false}` is "could not
+  compare", not a verdict. To change the prompt / seed
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
@@ -584,6 +592,15 @@ class ComfyCliError(RuntimeError):
     can then tell its own deadline firing from a genuine comfy-cli error without
     matching on the message — :func:`wait_for_job`, which caps each poll to the
     time left on the caller's bound, is exactly that caller.
+
+    ``data`` is the failed envelope's own ``data`` payload, for the commands that
+    carry a STRUCTURED result alongside a negative verdict: ``comfy validate``
+    emits its full ``{valid, errors, warnings}`` report as ``data`` and sets the
+    envelope's ``ok`` to ``valid``, so "the workflow does not fit this install"
+    arrives here as an error whose payload is the actual answer. It is ``None``
+    for every failure that has no payload, which is what lets a caller tell a
+    real verdict from a check that could not run at all
+    (:func:`_local_template_check`).
     """
 
     def __init__(
@@ -593,12 +610,14 @@ class ComfyCliError(RuntimeError):
         no_envelope: bool = False,
         returncode: int | None = None,
         timed_out: bool = False,
+        data: Any = None,
     ) -> None:
         super().__init__(*args)
         self.code = code
         self.no_envelope = no_envelope
         self.returncode = returncode
         self.timed_out = timed_out
+        self.data = data
 
 
 def _comfy_bin_candidates() -> list[str]:
@@ -1570,7 +1589,13 @@ def _unwrap_envelope(
         # `_is_missing_verb_error`'s Click-usage-exit condition stays genuinely
         # independent of its `no_envelope` provenance condition rather than
         # being a proxy for it (an envelope-borne failure can also exit 2).
-        raise ComfyCliError(text, code=code, returncode=returncode)
+        # `data` rides along because a failed envelope is not always empty: the
+        # commands whose negative verdict IS a structured report (`comfy
+        # validate`) put that report in `data` and set `ok` to the verdict. See
+        # `ComfyCliError.data`.
+        raise ComfyCliError(
+            text, code=code, returncode=returncode, data=envelope.get("data")
+        )
     return envelope.get("data")
 
 
@@ -5125,37 +5150,253 @@ def search_templates(
     }
 
 
+# Cap on how many validator findings ride back in a template's `local_check` —
+# enough to act on, bounded so a wildly-mismatched template can't build a
+# response that trips the MCP client's tool-output cap (same reasoning as
+# `_TEMPLATE_LIST_MAX_LIMIT`).
+_TEMPLATE_CHECK_MAX_FINDINGS = 10
+
+
+def _validation_report(result: Any) -> dict | None:
+    """``result`` if it is a ``comfy validate`` report, else ``None``.
+
+    A report is only a report when comfy-cli actually compared the workflow
+    against the live ``object_info``: it carries a boolean ``valid`` and an
+    ``errors`` list. Anything else — the ``None`` a load failure raises with, a
+    drifted payload shape — means the comparison never happened, and the caller
+    must say so rather than invent a verdict. Wrongly telling a user their
+    template cannot run is worse than telling them it could not be checked.
+    """
+    if not isinstance(result, dict):
+        return None
+    if not isinstance(result.get("valid"), bool):
+        return None
+    if not isinstance(result.get("errors"), list):
+        return None
+    return result
+
+
+def _finding_line(finding: Any) -> str:
+    """Render one validator error/warning as a single readable clause."""
+    if not isinstance(finding, dict):
+        return str(finding)[:_MAX_ERROR_FIELD_CHARS]
+    message = str(finding.get("message") or finding.get("code") or "")[
+        :_MAX_ERROR_FIELD_CHARS
+    ]
+    node_id = finding.get("node_id")
+    line = f"node {node_id}: {message}" if node_id else message
+    suggestions = finding.get("suggestions")
+    if isinstance(suggestions, list) and suggestions:
+        line += f" (this install has: {', '.join(str(s) for s in suggestions[:3])})"
+    return line
+
+
+def _unchecked(summary: str, reason: str) -> dict:
+    """A ``local_check`` block for "the comparison did not happen"."""
+    return {"checked": False, "reason": reason, "summary": summary}
+
+
+def _local_template_check(workflow_path: str) -> dict:
+    """Cross-check a fetched template against the LOCAL install's ``object_info``.
+
+    The gallery is served fresh from ``Comfy-Org/workflow_templates`` while the
+    user's ComfyUI is whatever they installed, so a template can legitimately
+    reference a node class — or an input option inside one, e.g. a partner
+    model key added in a later release — that this install does not expose yet.
+    Discovery then succeeds and the RUN fails, which is a bad place to find out.
+    This runs ``comfy validate --workflow <path>`` (the same engine
+    ``validate_workflow`` exposes: class_types, input shapes, enum values, edge
+    wiring, all read from the running server's live ``object_info``) and turns
+    its report into a block the agent can relay.
+
+    Advisory only, and deliberately fail-OPEN: the template is already written
+    and every caller still gets its path, a negative verdict is comfy-cli's own
+    (never a hardcoded list of "unsupported" things here), and anything that
+    stops the comparison from happening — no ComfyUI running, so no
+    ``object_info`` — comes back ``checked: False`` rather than a denial.
+    """
+    try:
+        result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+    except ComfyCliError as exc:
+        # `comfy validate` reports an invalid workflow as an envelope whose `ok`
+        # mirrors `valid` and whose `data` is the full report, so this except
+        # branch covers BOTH "the template does not fit this install" and "the
+        # check could not run at all". The payload is what tells them apart.
+        result = exc.data
+        if _validation_report(result) is None:
+            return _unchecked(
+                "could not check this template against your ComfyUI install "
+                "(the live node catalog was unreachable — the server may not be "
+                "running). The template was still written. Start ComfyUI with "
+                "`launch_comfyui`, then re-check with "
+                "`validate_workflow(workflow_path=...)`. "
+                f"Details: {str(exc)[:_MAX_ERROR_FIELD_CHARS]}",
+                "check_unavailable",
+            )
+
+    report = _validation_report(result)
+    if report is None:
+        return _unchecked(
+            "could not check this template against your ComfyUI install: "
+            "`comfy validate` returned an unexpected payload, so its output "
+            "shape may have drifted. The template was still written.",
+            "unexpected_payload",
+        )
+
+    errors = report["errors"]
+    warnings = report.get("warnings")
+    warnings = warnings if isinstance(warnings, list) else []
+    # A comfy-cli too old to lower a UI-export workflow to API format checks ZERO
+    # nodes on one and calls it valid (`validate_workflow`'s blind spot 3), and
+    # gallery templates are UI exports — so that vacuous pass must not be
+    # reported as a clean bill of health.
+    converted = bool(report.get("converted_from_ui"))
+    vacuous = (
+        report["valid"]
+        and not converted
+        and any(
+            isinstance(w, dict) and w.get("code") == "non_node_key" for w in warnings
+        )
+    )
+    if vacuous:
+        return _unchecked(
+            "could not check this template against your ComfyUI install: this "
+            "comfy-cli did not convert the template's UI-format graph, so no "
+            "node was actually compared against the live catalog. Upgrade "
+            "comfy-cli for a real check. The template was still written.",
+            "workflow_not_converted",
+        )
+
+    if report["valid"]:
+        summary = (
+            "every node class and input option this template uses is present in "
+            "your ComfyUI install. A clean check is necessary, not sufficient — "
+            "see `validate_workflow` for what it cannot see."
+        )
+    else:
+        summary = (
+            f"{len(errors)} problem(s): this template needs a node class or an "
+            "input option your ComfyUI install does not have — a template served "
+            "from the gallery can be newer than your install. Update ComfyUI and "
+            "its custom nodes (`update_comfyui`), or pick another template. "
+            f"First: {_finding_line(errors[0])}"
+            if errors
+            else (
+                "this template did not validate against your ComfyUI install, "
+                "though comfy-cli listed no specific problem."
+            )
+        )
+
+    check = {
+        "checked": True,
+        "runnable": report["valid"],
+        "summary": summary,
+        "error_count": len(errors),
+        "errors": [_finding_line(e) for e in errors[:_TEMPLATE_CHECK_MAX_FINDINGS]],
+    }
+    if warnings:
+        check["warnings"] = [
+            _finding_line(w) for w in warnings[:_TEMPLATE_CHECK_MAX_FINDINGS]
+        ]
+    return check
+
+
+def _check_template_by_name(name: str) -> dict:
+    """``_local_template_check`` for a template that is not on disk yet.
+
+    ``comfy templates show`` returns gallery metadata only — no graph — so the
+    workflow has to be materialized before it can be compared against the local
+    catalog. It goes to a scratch directory that is removed either way, leaving
+    the caller's filesystem untouched (``fetch_template`` is the tool that
+    writes a file the user keeps).
+    """
+    scratch = tempfile.mkdtemp(prefix="comfy-local-mcp-template-")
+    try:
+        path = os.path.join(scratch, "template.json")
+        try:
+            _run_comfy("templates", "fetch", name, "--out", path, timeout=60.0)
+        except ComfyCliError as exc:
+            return _unchecked(
+                "could not check this template against your ComfyUI install: "
+                "fetching its workflow failed. "
+                f"Details: {str(exc)[:_MAX_ERROR_FIELD_CHARS]}",
+                "template_fetch_failed",
+            )
+        return _local_template_check(path)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+_CHECK_NOT_REQUESTED = _unchecked(
+    "not checked against your ComfyUI install (check_local=False).",
+    "not_requested",
+)
+
+
 @mcp.tool()
-def get_template(name: str) -> Any:
-    """Show one template's details/schema (inputs, description, node graph).
+def get_template(name: str, check_local: bool = True) -> Any:
+    """Show one template's details/schema, and whether your install can run it.
 
     Wraps ``comfy templates show <name>``, using a ``name`` from
     ``search_templates``. Step 2 of the on-ramp: inspect a template before
     fetching it, then ``fetch_template(name, out_path)`` writes the runnable JSON
     for ``run_workflow``.
+
+    With ``check_local=True`` (the default) the response also carries a
+    ``local_check`` block: the template's graph is compared against the LIVE
+    ``object_info`` of the running local ComfyUI, because the gallery is served
+    fresh while the user's install is whatever they installed — a template can
+    reference a node class, or a model option inside one, that only a newer
+    ComfyUI exposes. ``{"checked": true, "runnable": false, ...}`` means running
+    it will fail until the install is updated; ``{"checked": false, ...}`` means
+    the comparison could not be made (usually: ComfyUI is not running) and says
+    nothing either way. The check costs an extra gallery fetch plus a validate —
+    pass ``check_local=False`` to skip it when you only want the metadata.
     """
     # Bare positional: a leading-dash name is read by comfy-cli as an option
     # rather than the template to show (argument injection).
     _reject_option_like("name", name, expected="a template name (e.g. 'image_flux2')")
     _reject_nul("name", name)
-    return _run_comfy("templates", "show", name, timeout=60.0)
+    data = _run_comfy("templates", "show", name, timeout=60.0)
+    if not isinstance(data, dict):
+        # comfy-cli emits `{"template": {...}}`; on a drifted shape there is no
+        # object to attach to, so hand the payload back untouched rather than
+        # re-wrap it into something the caller does not expect.
+        return data
+    return {
+        **data,
+        "local_check": _check_template_by_name(name)
+        if check_local
+        else _CHECK_NOT_REQUESTED,
+    }
 
 
 @mcp.tool()
-def fetch_template(name: str, out_path: str) -> str:
-    """Write a template's runnable workflow JSON to ``out_path``; return its absolute path.
+def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
+    """Write a template's runnable workflow JSON to ``out_path``; report if it can run here.
 
     Wraps ``comfy templates fetch <name> --out <path>``, which materializes the
-    template as a workflow JSON file on disk. Returns the ABSOLUTE path so it can
-    be passed straight to ``run_workflow(workflow_path=...)``, completing the
-    template on-ramp::
+    template as a workflow JSON file on disk. Returns
+    ``{"path": <absolute path>, "local_check": {...}}`` — ``path`` is what
+    ``run_workflow(workflow_path=...)`` takes, completing the template
+    on-ramp::
 
         search_templates("flux")               # find a template
         get_template("flux_dev")               # inspect it
-        path = fetch_template("flux_dev", "/tmp/flux.json")
-        run_workflow(path)                      # generate — no hand-authored JSON
+        result = fetch_template("flux_dev", "/tmp/flux.json")
+        run_workflow(result["path"])           # generate — no hand-authored JSON
 
     so an agent reaches a working generation without hand-authoring workflow JSON.
+
+    ``local_check`` is the same cross-check ``get_template`` reports, run against
+    the file just written: the gallery serves templates that can be newer than
+    the user's ComfyUI, so one may reference a node class or an input option
+    this install does not expose. ``{"checked": true, "runnable": false, ...}``
+    means the run will fail until the install is updated — RELAY that to the
+    user instead of running it and letting the failure surface deep in
+    execution. ``{"checked": false, ...}`` means the comparison could not be made
+    (usually: ComfyUI is not running) and is NOT a verdict. The file is written
+    either way; pass ``check_local=False`` to skip the check.
     """
     # `name` is a bare positional, so a leading-dash value is read as an option
     # and every later token shifts up a slot. `out_path` rides behind `--out` as
@@ -5171,7 +5412,13 @@ def fetch_template(name: str, out_path: str) -> str:
     _reject_nul("name", name)
     _reject_nul("out_path", out_path)
     _run_comfy("templates", "fetch", name, "--out", out_path, timeout=60.0)
-    return os.path.abspath(out_path)
+    path = os.path.abspath(out_path)
+    return {
+        "path": path,
+        "local_check": _local_template_check(path)
+        if check_local
+        else _CHECK_NOT_REQUESTED,
+    }
 
 
 @mcp.tool()

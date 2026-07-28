@@ -49,6 +49,7 @@ Cloud MCP** — comfy-cli is the engine.
 - [Prerequisites](#prerequisites)
 - [Partner-API nodes](#partner-api-nodes)
 - [Spending credits on partner models](#spending-credits-on-partner-models)
+- [Templates your install can't run](#templates-your-install-cant-run)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
 - [Install](#install)
@@ -206,6 +207,28 @@ some embed partner-API nodes and bill through them.
 
 Unlike `partner_generate`, there is no up-front gate probe: `run-template` carries its spend gate
 inside the verb itself, so a comfy-cli that has the verb has the gate.
+
+## Templates your install can't run
+
+The template gallery is served fresh from `Comfy-Org/workflow_templates`, while your ComfyUI is
+whatever version you installed. So the catalog can legitimately offer a template your install
+cannot run yet — it references a node class you don't have, or a *model option inside* a node you
+do have (a partner model key added in a later release is the common one). Discovery succeeds, the
+run fails, and you get to work out why.
+
+`get_template` and `fetch_template` cross-check the template against your install and report it
+as a `local_check` block. Under the hood it is `comfy validate` — the same engine
+[`validate_workflow`](#workflow-building) uses, reading the **live `object_info`** of your running
+ComfyUI, so it sees your custom nodes and your model options, not a bundled catalog.
+
+| `local_check` | Means |
+|---|---|
+| `{"checked": true, "runnable": true, …}` | Every node class and input option the template uses exists in your install. Necessary, not sufficient — `validate_workflow`'s documented blind spots still apply. |
+| `{"checked": true, "runnable": false, "errors": [...], …}` | Running it will fail as-is: the `errors` name what is missing (and, where comfy-cli can, what your install offers instead). Update ComfyUI and its custom nodes, or pick another template. |
+| `{"checked": false, "reason": …, …}` | The comparison could **not** be made — almost always because ComfyUI isn't running, so there is no live catalog to compare against. This is not a verdict about the template. |
+
+The check is advisory and fails open: the workflow file is written either way, `path` always comes
+back, and nothing is ever refused on its account. Pass `check_local=False` to skip it.
 
 ## Driving a remote ComfyUI
 
@@ -432,7 +455,9 @@ Zero to a generated image:
    Under the hood the agent calls `server_info` to confirm ComfyUI is up, `run_workflow` to
    execute your workflow JSON (API-format or a UI export), and `fetch_outputs` to collect the
    result. No hand-authored workflow? Ask it to start from a template instead — it can
-   `search_templates`, `fetch_template` to write a runnable JSON, and run that.
+   `search_templates`, `fetch_template` to write a runnable JSON, and run that — and
+   `fetch_template` tells it up front if [your install can't run that
+   template](#templates-your-install-cant-run) yet.
 
 **Where the images land.** ComfyUI writes generated files into your ComfyUI **workspace's
 `output/` directory** (part of the workspace `comfy install` created). On top of that,
@@ -491,8 +516,8 @@ handle is `prompt_id`.
 | Tool | Wraps | What it does |
 |---|---|---|
 | `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type}]}`. |
-| `get_template(name)` | `comfy templates show <name>` | Show one template's details/schema before fetching it. |
-| `fetch_template(name, out_path)` | `comfy templates fetch <name> --out <path>` | Write a template's runnable workflow JSON to `out_path`; returns the absolute path for `run_workflow`. |
+| `get_template(name, check_local=True)` | `comfy templates show <name>` (+ `comfy validate`) | Show one template's details/schema before fetching it, plus a `local_check` block cross-checking its graph against the live `object_info` of your install — see [Templates your install can't run](#templates-your-install-cant-run). `check_local=False` skips the check (metadata only, one call). |
+| `fetch_template(name, out_path, check_local=True)` | `comfy templates fetch <name> --out <path>` (+ `comfy validate`) | Write a template's runnable workflow JSON to `out_path`; returns `{path, local_check}` — `path` is the absolute path for `run_workflow`, `local_check` is the same cross-check run on the file just written. The file is written either way. |
 | `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
 | `get_node(name)` | `comfy nodes show <ClassName>` | Full input/output schema for one node class — what you need to author/repair a graph. |
 | `list_nodes(produces="", accepts="", category="", pack="", label="")` | `comfy nodes ls [--produces/--accepts/--category/--pack/--label …]` | List node classes, filtered by output/input type, category, pack, or label; bare call lists all. Reads the **live install**. |
