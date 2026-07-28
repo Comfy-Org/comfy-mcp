@@ -5917,9 +5917,15 @@ async def download_model(
     ``timeout_seconds`` defaults to 110s — deliberately BELOW a typical MCP
     client's ~120s tool budget, so a slow transfer surfaces this wrapper's own
     ``timed_out`` payload (with the id to resume from) instead of an opaque
-    client-side deadline. It is clamped to a sane maximum on the waiting path,
-    and a non-positive / NaN value is rejected outright; ``wait=False`` ignores
-    it entirely (that submit runs on its own fixed budget).
+    client-side deadline. On the waiting path it is the END-TO-END budget for
+    the whole call, submit included: the submit's own elapsed time is deducted
+    from the poll's, so the two cannot add up past the deadline the default was
+    chosen to sit under. It is clamped to a sane maximum, and a non-positive /
+    NaN value is rejected outright. A bound too small to resolve the download at
+    all therefore fails without starting one, rather than starting a transfer
+    nobody can wait for; ``wait=False`` ignores ``timeout_seconds`` entirely —
+    that submit keeps its own fixed budget — and is the way to START a download
+    regardless of how long you mean to wait on it.
 
     THE FILE IS WRITTEN DIRECTLY TO ITS FINAL PATH while it transfers — comfy-cli
     streams into ``dest`` rather than into a temp file it renames at the end. So
@@ -5956,9 +5962,12 @@ async def download_model(
     text (the "Done in …" tail and saved-path line) — rather than envelope
     ``data`` (BE-3345). ``wait`` and ``timeout_seconds`` cannot be honored there
     (there is no id to poll and nothing to detach), so ``wait=False`` still
-    blocks. That caveat is now scoped to this path alone: a ``--background``
-    submit returns a REAL envelope. A non-zero exit still raises
-    :class:`ComfyCliError`.
+    blocks; when it does, the returned payload carries
+    ``"background_unsupported": True`` so a caller that asked not to block can
+    SEE that it blocked and that no ``download_id`` exists, rather than
+    inferring both from an absent key. That caveat is now scoped to this path
+    alone: a ``--background`` submit returns a REAL envelope. A non-zero exit
+    still raises :class:`ComfyCliError`.
     """
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
@@ -6126,6 +6135,8 @@ async def download_model(
         args += ["--relative-path", relative_path]
     if filename:
         args += ["--filename", filename]
+    submit_timeout = _DOWNLOAD_SUBMIT_TIMEOUT
+    deadline: float | None = None
     if wait:
         # Harden the caller's bound BEFORE anything is submitted, so an `inf` /
         # NaN / non-positive value fails without leaving a detached worker
@@ -6133,6 +6144,23 @@ async def download_model(
         # this path: `wait=False` never reads the parameter, so validating it
         # there would newly reject a submit that works fine today.
         timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_DOWNLOAD_WAIT_TIMEOUT)
+        # `timeout_seconds` is the END-TO-END budget for a waited call, not the
+        # poll loop's alone. Left as two independent budgets, a submit that used
+        # its full `_DOWNLOAD_SUBMIT_TIMEOUT` and then a poll that used the whole
+        # 110s default would run ~230s — and the 110s default exists precisely to
+        # come in under a typical client's ~120s request budget. Overshooting it
+        # means the client aborts the call and never receives the `download_id`
+        # the submit already obtained, which is the exact opaque client-side
+        # timeout this async shape was built to prevent.
+        #
+        # So take one deadline here and spend against it twice: the submit is
+        # capped to what is left (never more than its own budget), and the poll
+        # gets the remainder. `wait=False` is deliberately exempt — it keeps the
+        # full fixed submit budget, and is the escape hatch for a caller who
+        # wants the download STARTED whatever their own patience for waiting on
+        # it, since a submit cut short may leave no transfer running at all.
+        deadline = time.monotonic() + timeout_seconds
+        submit_timeout = min(_DOWNLOAD_SUBMIT_TIMEOUT, timeout_seconds)
     try:
         # The submit is metadata-only — CivitAI/HuggingFace resolution, the token
         # lookup, the destination check — but those are real network round-trips,
@@ -6143,7 +6171,7 @@ async def download_model(
         # the reason the `run_workflow` submit is: a blocking subprocess on the
         # event loop stalls every other concurrent MCP request.
         submitted = await asyncio.to_thread(
-            _run_comfy, *args, "--background", timeout=_DOWNLOAD_SUBMIT_TIMEOUT
+            _run_comfy, *args, "--background", timeout=submit_timeout
         )
     except ComfyCliError as exc:
         # An installed comfy-cli that predates the background download rejects
@@ -6159,17 +6187,59 @@ async def download_model(
         # and no envelope, so treat a clean exit as success instead of raising
         # the "returned no JSON" false negative on a download that actually
         # landed (BE-3345). A real error envelope or a non-zero exit still raises.
-        return await asyncio.to_thread(
+        legacy = await asyncio.to_thread(
             _run_comfy, *args, timeout=_DOWNLOAD_SYNC_TIMEOUT, plain_ok=True
         )
+        # `wait=False` could not be honored here: with no `--background` there
+        # was nothing to detach and no `download_id` to hand back, so the whole
+        # transfer ran inside this call. Mark that in the payload rather than
+        # only in the docstring — a caller that asked not to block can then SEE
+        # that it blocked and that the download family has no id to poll,
+        # instead of inferring both from a missing key.
+        #
+        # Deliberately NOT an error. Refusing here would remove the only way to
+        # download a model on a comfy-cli that predates `--background`, which is
+        # the entire reason this fallback exists; the file did land.
+        if not wait and isinstance(legacy, dict):
+            return {**legacy, "background_unsupported": True}
+        return legacy
+    # Validate the handle on BOTH paths. `wait=False` hands the envelope straight
+    # to the caller, so a malformed or version-skewed one would otherwise leave a
+    # transfer running detached behind a payload with nothing to poll or cancel
+    # it by — the same broken contract the waiting path already refuses.
+    download_id = _submitted_download_id(submitted)
     if not wait:
         return submitted
-    download_id = _submitted_download_id(submitted)
     # One `to_thread` for the whole poll loop rather than one per poll: the loop
     # is `time.sleep` + blocking spawns throughout, and it is already bounded by
     # `timeout_seconds`, so handing the entire thing to a worker thread keeps the
     # event loop free for the duration.
-    result = await asyncio.to_thread(_poll_download, download_id, timeout_seconds)
+    #
+    # Spend what the submit left, not the full bound — see the deadline above.
+    # A remainder at or below zero is passed through rather than clamped:
+    # `_poll_download` keeps a one-poll minimum, so the caller still gets a real
+    # status payload (and the id) back instead of a contentless envelope.
+    try:
+        result = await asyncio.to_thread(
+            _poll_download, download_id, deadline - time.monotonic()
+        )
+    except ComfyCliError as exc:
+        # The transfer is ALREADY RUNNING DETACHED and this id is the only handle
+        # to it — it was minted inside this call, so letting the exception through
+        # untouched orphans a multi-GB download with no way to enumerate or stop
+        # it. Re-raise carrying the id (and every structured attribute, so a
+        # caller branching on `code` / `timed_out` still can). `wait_for_download`
+        # needs no such wrapping: its caller passed the id in and still holds it.
+        raise ComfyCliError(
+            f"{exc} (the background download is still running — check it with "
+            f"`download_status({download_id!r})` or stop it with "
+            f"`cancel_download({download_id!r})`)",
+            code=exc.code,
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+            timed_out=exc.timed_out,
+            data=exc.data,
+        ) from exc
     if result.get("timed_out"):
         # A download still running at the bound is PROGRESS, not a failure —
         # returning it (with the id to resume from) instead of raising is the

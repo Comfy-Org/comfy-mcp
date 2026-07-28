@@ -953,7 +953,7 @@ def test_download_model_url_only(patched_run):
 
 def test_download_model_threads_relative_path(patched_run):
     """--relative-path is appended only when provided."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model(
         "https://hf.co/l.safetensors", relative_path="models/loras", wait=False
@@ -972,7 +972,7 @@ def test_download_model_threads_relative_path(patched_run):
 
 def test_download_model_threads_filename(patched_run):
     """--filename is appended only when provided."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model(
         "https://hf.co/c.safetensors", filename="renamed.safetensors", wait=False
@@ -991,7 +991,7 @@ def test_download_model_threads_filename(patched_run):
 
 def test_download_model_threads_all_optionals(patched_run):
     """Both optional args thread through together, in order, only when set."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model(
         "https://civitai.com/api/download/models/42",
@@ -1015,7 +1015,7 @@ def test_download_model_threads_all_optionals(patched_run):
 
 def test_download_model_omits_absent_optionals(patched_run):
     """Neither optional flag is emitted when the argument is left unset."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model("https://hf.co/x.safetensors", wait=False)
 
@@ -1086,7 +1086,7 @@ def test_download_model_rejects_traversal_relative_path(bad_path):
 def test_download_model_rejects_windows_drive_relative_path(bad_path, patched_run):
     """A Windows drive/UNC/root-relative ``relative_path`` is refused before any
     child spawns — on Linux CI as much as on Windows."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
@@ -1118,7 +1118,7 @@ def test_download_model_rejects_windows_drive_relative_path(bad_path, patched_ru
 def test_download_model_rejects_dot_run_relative_path(bad_path, patched_run):
     """A `..` disguised by trailing spaces/periods is refused before any child
     spawns — on Linux CI as much as on Windows."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
@@ -1140,7 +1140,7 @@ def test_download_model_accepts_dotted_but_ordinary_relative_path(
 ):
     """The dot-run check must not widen into ordinary names or empty segments —
     only a component that is *nothing but* dots and spaces is a disguised `..`."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model("https://hf.co/x.safetensors", relative_path=good_path, wait=False)
 
@@ -1178,7 +1178,7 @@ def test_download_model_accepts_dotted_but_ordinary_relative_path(
 def test_download_model_rejects_non_models_relative_path(bad_path, patched_run):
     """A traversal-clean ``relative_path`` that does not start at ``models`` is
     refused before any child spawns."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
@@ -1195,7 +1195,7 @@ def test_download_model_rejects_custom_nodes_init_py_rce(patched_run):
     (`custom_nodes/pwn` is traversal-clean; `__init__.py` is a bare filename);
     it is the models-tree confinement that refuses the combination.
     """
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model(
@@ -1215,7 +1215,7 @@ def test_download_model_traversal_still_reports_as_traversal(bad_path, patched_r
     """Ordering pin: the models-tree check runs AFTER the traversal checks, so a
     traversal string keeps its own (more specific) diagnosis rather than being
     relabelled as a wrong-folder error."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*traversal"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
@@ -1236,7 +1236,7 @@ def test_download_model_traversal_still_reports_as_traversal(bad_path, patched_r
 def test_download_model_forwards_models_relative_path_unchanged(good_path, patched_run):
     """Accepted values are forwarded to comfy-cli VERBATIM — the guard rejects,
     it never rewrites the argument."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model("https://hf.co/x.safetensors", relative_path=good_path, wait=False)
 
@@ -1261,7 +1261,7 @@ def test_download_model_rejects_backslash_relative_path(bad_path, patched_run):
     (see the named pin below). `/` reaches the same directory on Windows, so this
     costs a spelling, not a destination.
     """
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*separator"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
@@ -1278,7 +1278,7 @@ def test_download_model_rejects_backslash_escaping_models_tree(patched_run):
     SIBLING of the models dir rather than a folder inside it. The write would land
     outside the tree the guard claims to confine it to.
     """
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     # Pin the mechanism, so this test fails loudly if pathlib ever changes: the
     # backslash is one literal path component, not a separator, off POSIX.
@@ -1312,7 +1312,7 @@ def test_download_model_backslash_check_is_ordered_last(
 ):
     """A `\\` value that is ALSO a traversal or a wrong-tree value reports as that,
     not as a separator-spelling complaint."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match=expected):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
@@ -1323,7 +1323,7 @@ def test_download_model_backslash_check_is_ordered_last(
 @pytest.mark.parametrize("bad_name", [".. ", "...", ". ", "... ", " "])
 def test_download_model_rejects_dot_run_filename(bad_name, patched_run):
     """Same disguise on the bare-name side: `".. "` is a `..`, not a filename."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         _download_model("https://hf.co/x.safetensors", filename=bad_name)
@@ -1335,7 +1335,7 @@ def test_download_model_rejects_dot_run_filename(bad_name, patched_run):
 def test_download_model_accepts_dotted_but_ordinary_filename(good_name, patched_run):
     """Regression pin for the dot-run filename check: a name that merely
     *contains* dots still has something left after `strip(" .")`."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model("https://hf.co/x.safetensors", filename=good_name, wait=False)
 
@@ -1366,7 +1366,7 @@ def test_download_model_rejects_pathy_filename(bad_name):
 def test_download_model_rejects_windows_drive_relative_filename(bad_name, patched_run):
     """A Windows drive/UNC/root-relative ``filename`` is refused before any child
     spawns — on Linux CI as much as on Windows."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         _download_model("https://hf.co/x.safetensors", filename=bad_name)
@@ -1377,7 +1377,7 @@ def test_download_model_rejects_windows_drive_relative_filename(bad_name, patche
 def test_download_model_still_accepts_ordinary_path_and_name(patched_run):
     """Regression pin: the Windows-shaped rejections above must not catch the
     ordinary values these tools are actually called with."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model(
         "https://hf.co/x.safetensors",
@@ -1411,7 +1411,7 @@ def test_download_model_rejects_embedded_nul_filename():
 
 def test_download_model_omits_empty_string_optionals(patched_run):
     """Explicit empty-string optionals are treated as unset, not forwarded as ``""``."""
-    calls = patched_run(envelope(data={}))
+    calls = patched_run(envelope(data=_submit()))
 
     _download_model(
         "https://hf.co/x.safetensors", relative_path="", filename="", wait=False
@@ -1555,6 +1555,102 @@ def test_download_model_rejects_a_submit_envelope_with_no_download_id(monkeypatc
         _download_model("https://hf.co/x.safetensors")
 
 
+def test_download_model_wait_false_also_rejects_an_envelope_with_no_id(monkeypatch):
+    """The id is validated on the wait=False path too, not just the waiting one.
+
+    Handing back a malformed envelope unchecked would leave a transfer running
+    detached behind a payload carrying nothing to poll or cancel it by — the
+    same broken contract, just without a poll loop to notice it.
+    """
+    _sequenced(monkeypatch, [{"dest": "/models/x.safetensors", "status": "starting"}])
+
+    with pytest.raises(server.ComfyCliError, match="no usable `download_id`"):
+        _download_model("https://hf.co/x.safetensors", wait=False)
+
+
+def test_download_model_spends_one_end_to_end_budget(monkeypatch):
+    """`timeout_seconds` covers submit AND poll, not each of them separately.
+
+    Two independent budgets add up: a submit that used its full
+    `_DOWNLOAD_SUBMIT_TIMEOUT` plus a full-length poll ran ~230s, while the 110s
+    default exists precisely to come in under a typical client's ~120s request
+    budget. Overshooting it means the client aborts and never receives the
+    `download_id` the submit already obtained — the exact failure this tool's
+    async shape was built to prevent.
+    """
+    seen: dict[str, float] = {}
+    elapsed = 4.0
+
+    def fake_run(*args, **kwargs):
+        seen["submit_timeout"] = kwargs["timeout"]
+        # Simulate a submit that spent `elapsed` seconds resolving metadata.
+        base = time.monotonic()
+        monkeypatch.setattr(server.time, "monotonic", lambda: base + elapsed)
+        return _submit()
+
+    def fake_poll(download_id, timeout_seconds):
+        seen["poll_bound"] = timeout_seconds
+        return _status("completed")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server, "_poll_download", fake_poll)
+
+    _download_model("https://hf.co/x.safetensors", timeout_seconds=30.0)
+
+    # The submit is capped to the caller's bound as well as its own...
+    assert seen["submit_timeout"] == 30.0
+    # ...and the poll gets only what the submit left of it.
+    assert seen["poll_bound"] == pytest.approx(30.0 - elapsed, abs=0.5)
+
+
+def test_download_model_wait_false_keeps_the_full_submit_budget(monkeypatch):
+    """wait=False is exempt from the end-to-end cap — it never waits.
+
+    A submit cut short may leave no transfer running at all, so the fire-and-
+    return path keeps the fixed submit budget however impatient the caller is.
+    """
+    seen: dict[str, float] = {}
+
+    def fake_run(*args, **kwargs):
+        seen["submit_timeout"] = kwargs["timeout"]
+        return _submit()
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    _download_model("https://hf.co/x.safetensors", wait=False, timeout_seconds=1.0)
+
+    assert seen["submit_timeout"] == server._DOWNLOAD_SUBMIT_TIMEOUT
+
+
+def test_download_model_attaches_the_id_when_the_poll_raises(monkeypatch):
+    """A poll that errors must not orphan the transfer it was polling.
+
+    The id was minted INSIDE this call, so letting the exception through
+    untouched leaves a multi-GB download running detached with no handle to
+    enumerate or cancel it. `wait_for_download` needs no such wrapping — its
+    caller passed the id in and still holds it.
+    """
+
+    def fake_poll(download_id, timeout_seconds):
+        raise server.ComfyCliError(
+            "comfy-cli timed out after 1.0s", timed_out=True, returncode=None
+        )
+
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: _submit())
+    monkeypatch.setattr(server, "_poll_download", fake_poll)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model("https://hf.co/x.safetensors")
+
+    message = str(excinfo.value)
+    assert "a1b2c3d4e5f6" in message  # the handle survives the failure
+    assert "cancel_download" in message
+    assert "comfy-cli timed out after 1.0s" in message  # original diagnosis kept
+    # Structured attributes survive too, so a caller branching on them still can.
+    assert excinfo.value.timed_out is True
+    assert isinstance(excinfo.value.__cause__, server.ComfyCliError)
+
+
 def test_download_model_falls_back_to_the_synchronous_call_on_an_old_cli(
     patched_plain_run, legacy_comfy_cli
 ):
@@ -1570,6 +1666,31 @@ def test_download_model_falls_back_to_the_synchronous_call_on_an_old_cli(
     assert len(calls) == 1
     assert "--background" not in calls[0]["cmd"]
     assert calls[0]["timeout"] == server._DOWNLOAD_SYNC_TIMEOUT
+    # wait=True was honored as well as it can be here — the transfer really did
+    # finish inside the call — so nothing is flagged.
+    assert "background_unsupported" not in result
+
+
+def test_download_model_fallback_flags_a_wait_false_it_could_not_honor(
+    patched_plain_run, legacy_comfy_cli
+):
+    """The legacy path blocks even on wait=False, and says so in the payload.
+
+    There is no `--background` to detach and no `download_id` to hand back, so
+    the whole transfer runs inside the call. Marking that lets a caller who
+    asked NOT to block see that it blocked — and that the download family has no
+    id to poll — instead of inferring both from a missing key.
+
+    Deliberately still a success: refusing would remove the only way to download
+    a model on a comfy-cli that predates `--background`, and the file did land.
+    """
+    patched_plain_run(0, stderr="Done in 55.8s. Saved to /models/x.safetensors")
+
+    result = _download_model("https://hf.co/x.safetensors", wait=False)
+
+    assert result["ok"] is True
+    assert result["background_unsupported"] is True
+    assert "download_id" not in result
 
 
 def test_download_model_does_not_fall_back_on_a_real_submit_failure(monkeypatch):
@@ -1609,7 +1730,12 @@ def test_download_model_clamps_an_oversized_timeout(monkeypatch):
 
     _download_model("https://hf.co/x.safetensors", timeout_seconds=float("inf"))
 
-    assert seen["bound"] == server._MAX_DOWNLOAD_WAIT_TIMEOUT
+    # The poll gets the ceiling MINUS whatever the submit just spent, so this is
+    # bounded-just-under rather than equal — the deduction is the point (see
+    # `test_download_model_spends_one_end_to_end_budget`), and the submit here is
+    # a stubbed call that returns in microseconds.
+    assert 0 < seen["bound"] <= server._MAX_DOWNLOAD_WAIT_TIMEOUT
+    assert seen["bound"] == pytest.approx(server._MAX_DOWNLOAD_WAIT_TIMEOUT, abs=1.0)
 
 
 @pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
