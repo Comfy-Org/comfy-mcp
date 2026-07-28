@@ -3240,11 +3240,16 @@ def test_download_model_fallback_omits_url_when_no_output(
 
 
 def test_discover_maps_command_and_returns_data(patched_run):
-    """discover wraps `comfy discover` and returns the envelope data verbatim."""
+    """discover wraps `comfy discover` and returns the envelope data verbatim.
+
+    The default carries `--schemas-only` (see `test_discover_defaults_to_
+    schemas_only` in test_discovery.py for why); `schemas_only=False` is the
+    bare subcommand.
+    """
     surface = {"commands": ["run", "env"], "error_codes": ["server_not_running"]}
     calls = patched_run(envelope(data=surface))
 
-    assert server.discover() == surface
+    assert server.discover(schemas_only=False) == surface
     cmd = calls[0]["cmd"]
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
     assert cmd[4:] == ["discover"]  # bare subcommand, no positional args

@@ -271,6 +271,33 @@ def test_search_models_empty_values_still_select_the_mode(patched_run):
     assert calls[1]["cmd"][4:] == ["models", "list-folders"]
 
 
+def test_discover_defaults_to_schemas_only(patched_run):
+    """The default MUST forward `--schemas-only`.
+
+    The full command surface is ~5x the schemas bundle and ~1.8x the 25,000-token
+    `MAX_MCP_OUTPUT_TOKENS` an MCP client defaults to — and that cap truncates
+    rather than rejects, so the full mode hands back JSON cut mid-structure.
+    Defaulting to the slim mode is what keeps this tool's response parseable.
+    """
+    calls = patched_run(envelope(data={"schemas": {}}))
+    assert server.discover() == {"schemas": {}}
+    assert calls[0]["cmd"] == [
+        server.COMFY_BIN,
+        "--json",
+        "--where",
+        "local",
+        "discover",
+        "--schemas-only",
+    ]
+
+
+def test_discover_schemas_only_false_omits_the_flag(patched_run):
+    """`schemas_only=False` still reaches the full surface — flag simply absent."""
+    calls = patched_run(envelope(data={"commands": {}}))
+    assert server.discover(schemas_only=False) == {"commands": {}}
+    assert calls[0]["cmd"][4:] == ["discover"]
+
+
 def test_discovery_surfaces_error_envelope(patched_run):
     """A local server-not-running envelope must raise, not return silently."""
     patched_run(
