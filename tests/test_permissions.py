@@ -399,10 +399,29 @@ def test_a_real_error_envelope_is_untouched(on_macos, monkeypatch):
 # --- process startup ---------------------------------------------------------
 
 
+def test_main_serves_stdio_explicitly(monkeypatch):
+    """The transport is NAMED, never inherited from whatever the SDK defaults to.
+
+    Everything downstream assumes stdio: `failure_log`'s rule that stdout is the
+    JSON-RPC channel and must never be written to, and every child spawn that
+    withholds the parent's stdin so a subprocess cannot eat protocol traffic. A
+    default is a thing an SDK major is free to change; this contract is not.
+    """
+    seen = {}
+
+    def record(transport):
+        seen["transport"] = transport
+
+    monkeypatch.setattr(server.mcp, "run", record)
+    server.main()
+
+    assert seen["transport"] == "stdio"
+
+
 def test_main_reports_a_startup_denial_instead_of_a_traceback(
     on_macos, monkeypatch, capsys
 ):
-    def boom():
+    def boom(transport):
         raise PermissionError(1, "Operation not permitted", _DENIED_PATH)
 
     monkeypatch.setattr(server.mcp, "run", boom)
@@ -419,7 +438,7 @@ def test_main_reports_a_startup_denial_instead_of_a_traceback(
 def test_main_handles_a_bytes_filename(on_macos, monkeypatch, capsys):
     """A denial on a bytes path carries a bytes `filename` — decode, don't crash."""
 
-    def boom():
+    def boom(transport):
         raise PermissionError(1, "Operation not permitted", os.fsencode(_DENIED_PATH))
 
     monkeypatch.setattr(server.mcp, "run", boom)
@@ -433,7 +452,7 @@ def test_main_handles_a_bytes_filename(on_macos, monkeypatch, capsys):
 
 
 def test_main_propagates_an_unrelated_permission_error(on_macos, monkeypatch):
-    def boom():
+    def boom(transport):
         raise PermissionError(13, "Permission denied", "/etc/shadow")
 
     monkeypatch.setattr(server.mcp, "run", boom)
@@ -443,7 +462,7 @@ def test_main_propagates_an_unrelated_permission_error(on_macos, monkeypatch):
 
 
 def test_main_propagates_on_non_macos(on_linux, monkeypatch):
-    def boom():
+    def boom(transport):
         raise PermissionError(1, "Operation not permitted", _DENIED_PATH)
 
     monkeypatch.setattr(server.mcp, "run", boom)

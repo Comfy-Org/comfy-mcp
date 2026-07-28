@@ -848,7 +848,7 @@ def test_slot_tools_advertise_the_union_item_type():
         ("set_workflow_slot", "overrides", "SlotOverride", "value"),
         ("vary_workflow", "slots", "SlotVariants", "values"),
     ):
-        schema = tools[name].inputSchema
+        schema = tools[name].input_schema
         item = schema["properties"][param]["items"]
         assert {"type": "string"} in item["anyOf"]
         assert {"$ref": f"#/$defs/{model}"} in item["anyOf"]
@@ -858,12 +858,12 @@ def test_slot_tools_advertise_the_union_item_type():
         assert sorted(model_schema["required"]) == sorted(["address", value_field])
 
     # No existing parameter was renamed or dropped.
-    assert set(tools["set_workflow_slot"].inputSchema["properties"]) == {
+    assert set(tools["set_workflow_slot"].input_schema["properties"]) == {
         "workflow_path",
         "overrides",
         "stdout",
     }
-    assert set(tools["vary_workflow"].inputSchema["properties"]) == {
+    assert set(tools["vary_workflow"].input_schema["properties"]) == {
         "workflow_path",
         "slots",
         "out_dir",
@@ -871,10 +871,10 @@ def test_slot_tools_advertise_the_union_item_type():
 
 
 def test_structured_slot_items_deserialize_through_the_mcp_boundary(patched_run):
-    """End-to-end through FastMCP: a JSON dict lands as the model, not a stray dict.
+    """End-to-end through MCPServer: a JSON dict lands as the model, not a stray dict.
 
     The direct-call tests above go through the same coercion helper but not
-    through FastMCP's own argument validation, which is what a real client
+    through MCPServer's own argument validation, which is what a real client
     actually exercises — and it is the union that has to hold there.
     """
     calls = patched_run(envelope(data={"modified": True}))

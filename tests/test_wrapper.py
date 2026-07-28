@@ -2533,7 +2533,7 @@ def test_fetch_outputs_omits_url_only_by_default(patched_run):
 def test_server_instructions_cover_canonical_flows():
     """Instructions ride the handshake and teach submit->poll->fetch + templates."""
     instructions = server.mcp.instructions
-    assert instructions  # present on the FastMCP instance
+    assert instructions  # present on the MCPServer instance
 
     # Call-server-info-first + the async submit -> poll -> fetch generation loop.
     for tool in ("server_info", "run_workflow", "wait_for_job", "fetch_outputs"):
@@ -4740,7 +4740,7 @@ def test_update_comfyui_is_non_interactive(patched_plain_run):
 def test_update_comfyui_refuses_a_concurrent_update(monkeypatch, patched_plain_run):
     """A second update while one is in flight is refused, not run in parallel.
 
-    FastMCP dispatches sync tools onto a worker thread pool, so two calls really
+    MCPServer dispatches sync tools onto a worker thread pool, so two calls really
     can overlap — and both would then drive git/pip against the same checkout and
     Python environment. A real second thread here, pinned inside the first
     update's subprocess (i.e. while the lock is held).
@@ -4824,7 +4824,7 @@ def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path
 
     content = images[0].to_image_content()
     assert content.type == "image"
-    assert content.mimeType == "image/png"
+    assert content.mime_type == "image/png"
     import base64
 
     assert base64.b64decode(content.data) == _FAKE_PNG  # the real file bytes
@@ -4850,7 +4850,7 @@ def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
 
     images = [r for r in result if isinstance(r, server.Image)]
     assert len(images) == 1
-    assert images[0].to_image_content().mimeType == "image/jpeg"
+    assert images[0].to_image_content().mime_type == "image/jpeg"
 
 
 def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(

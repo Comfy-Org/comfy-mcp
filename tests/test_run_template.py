@@ -61,7 +61,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
+    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
 
     Deliberately a local copy of ``test_partner_generate``'s fake rather than a
     shared one: the two tools' consent paths are asserted independently, so a

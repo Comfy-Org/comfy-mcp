@@ -7,22 +7,31 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "Comfy Org" }]
 dependencies = [
-    # >= 1.10 for elicitation (`Context.elicit`, used by `partner_generate` to
-    # confirm a credit spend per call); >= 1.14 because earlier FastMCP builds
-    # crash at import on this server's `ctx: Context | None` tool parameters
-    # (`issubclass() arg 1 must be a class`). Verified by running the suite
-    # against each release; the floor was previously understated at 1.2.0.
+    # >= 2 because that is where `mcp.server.mcpserver` exists: the SDK's 2.0.0
+    # DELETED `mcp.server.fastmcp` outright — no shim, no deprecation window —
+    # and this server's single SDK import (`from mcp.server.mcpserver import
+    # Context, Image, MCPServer`, server.py) resolves on 2.x only. On 1.x it is
+    # an ImportError that takes the whole suite down at conftest collection
+    # rather than at any one test. (Historical floors this supersedes: >= 1.10
+    # for elicitation, >= 1.14 to survive `ctx: Context | None` tool parameters.)
     #
-    # < 2 because the SDK's 2.0.0 (2026-07-28) DELETED `mcp.server.fastmcp`
-    # outright — no shim, no deprecation window. This server's single SDK import
-    # (`from mcp.server.fastmcp import Context, FastMCP, Image`, server.py) is
-    # therefore an ImportError on 2.x, which takes the whole suite down at
-    # conftest collection rather than at any one test. The ceiling is what makes
-    # that upgrade a reviewable Dependabot PR instead of an unrelated PR's CI
-    # turning red hours after a release nobody here asked for. Removing it is
-    # the LAST step of the 2.x migration (FastMCP -> `mcp.server.mcpserver`.
-    # MCPServer, elicitation types moved alongside it), never a prerequisite.
-    "mcp>=1.14.0,<2",
+    # < 3 for the same reason the `< 2` cap existed before this port: a major
+    # release must arrive as a reviewable Dependabot PR, not as unrelated PRs'
+    # CI turning red hours after a release nobody here asked for.
+    #
+    # `mcp-types` is deliberately NOT declared, and the two facts behind that
+    # only look like a contradiction: 2.x split the wire types out into a
+    # standalone `mcp-types` distribution, AND kept `mcp.types` inside the `mcp`
+    # distribution as a module that mirrors it (every name is the same object),
+    # which is the spelling `server.py` imports. The version is bounded either
+    # way — `mcp` 2.0.0 requires `mcp-types==2.0.0`, an EXACT pin, so a breaking
+    # `mcp-types` major cannot arrive except via an `mcp` release, which this
+    # `< 3` ceiling already gates into a reviewable Dependabot PR.
+    #
+    # `requires-python = ">=3.10"` above still holds: `mcp` 2.0.0 and
+    # `mcp-types` 2.0.0 both declare `Requires-Python: >=3.10`, so the major
+    # bump did not raise the floor out from under the 3.10 CI leg.
+    "mcp>=2,<3",
     # Already an mcp dependency; declared explicitly because this server now
     # imports it directly for the elicitation response schema.
     "pydantic>=2",
