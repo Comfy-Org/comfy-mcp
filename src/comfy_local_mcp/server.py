@@ -5131,15 +5131,49 @@ def get_logs(tail: int = 200) -> Any:
 
 
 @mcp.tool()
-def discover() -> Any:
+def discover(schemas_only: bool = True) -> Any:
     """Return comfy-cli's self-describing command surface (its own contract).
 
     Wraps ``comfy discover``. comfy-cli emits a machine-readable description of
     itself — the available commands, their argument schemas, and the error codes
     they can return — so an agent can learn the CLI's contract at runtime instead
-    of hard-coding it. Returns that description verbatim.
+    of hard-coding it. Returns that description verbatim; ``schemas_only`` picks
+    how much of it comes back.
+
+    ``schemas_only`` (default ``True``) forwards comfy-cli's ``--schemas-only``,
+    returning just the schema bundle — ``schemas`` / ``command_schemas`` /
+    ``capabilities`` / ``stream_event_schemas`` — and dropping ``commands``,
+    ``error_codes``, ``root`` and ``output_contract``. That is **~34 KB (~9k
+    tokens)** against the full surface's **~177 KB (~45k tokens)**; sizes were
+    measured against comfy-cli 1.13.0, so treat the ~5x ratio as the durable
+    number rather than the byte counts. The command tree is the bulk of the
+    difference (~123 KB of the ~177 KB), but note ``error_codes`` (~20 KB) goes
+    with it — reach for ``schemas_only=False`` if you need those.
+
+    Why the default flipped to the slim mode: tool-output caps are set by the
+    CLIENT, not by MCP, so the concrete number here is the one we can name — in
+    Claude Code the cap is `MAX_MCP_OUTPUT_TOKENS`, which is unset in normal use
+    and defaults to 25,000 tokens. The full surface is ~1.8x that, and that cap
+    TRUNCATES rather than rejects — a JSON document cut mid-structure is text
+    that will not parse, so the full mode does not fail loudly, it hands back a
+    broken envelope that looks like a response. Same hazard `search_templates`
+    guards with its field projection and page cap below. Treat 25,000 as the
+    representative cap rather than a universal one: another client sets its own
+    limit, but the schemas bundle is the mode that fits either way. Since the
+    full tree cannot be returned intact under Claude Code's default anyway,
+    defaulting to the schemas bundle costs no working behavior.
+
+    Pass ``schemas_only=False`` for the full command tree — only worth it on a
+    client whose cap is raised (`MAX_MCP_OUTPUT_TOKENS` in Claude Code) or that
+    has a larger native one.
     """
-    return _run_comfy("discover", timeout=60.0)
+    args = ["discover"]
+    if schemas_only:
+        # Safe to pass unconditionally with no version gate: `--schemas-only`
+        # shipped in the same comfy-cli commit that introduced `discover`, so
+        # any build carrying the command carries the flag.
+        args.append("--schemas-only")
+    return _run_comfy(*args, timeout=60.0)
 
 
 @mcp.tool()
