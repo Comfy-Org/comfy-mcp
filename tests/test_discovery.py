@@ -274,9 +274,10 @@ def test_search_models_empty_values_still_select_the_mode(patched_run):
 def test_discover_defaults_to_schemas_only(patched_run):
     """The default MUST forward `--schemas-only`.
 
-    The full command surface is ~5x the schemas bundle and ~1.8x the 25,000-token
-    `MAX_MCP_OUTPUT_TOKENS` an MCP client defaults to — and that cap truncates
-    rather than rejects, so the full mode hands back JSON cut mid-structure.
+    The full command surface is ~5x the schemas bundle and ~1.8x the 25,000
+    tokens Claude Code's `MAX_MCP_OUTPUT_TOKENS` defaults to (caps are set by the
+    client, not by MCP) — and that cap truncates rather than rejects, so the full
+    mode hands back JSON cut mid-structure.
     Defaulting to the slim mode is what keeps this tool's response parseable.
     """
     calls = patched_run(envelope(data={"schemas": {}}))

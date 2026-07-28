@@ -5150,17 +5150,22 @@ def discover(schemas_only: bool = True) -> Any:
     difference (~123 KB of the ~177 KB), but note ``error_codes`` (~20 KB) goes
     with it — reach for ``schemas_only=False`` if you need those.
 
-    Why the default flipped to the slim mode: the full surface is ~1.8x the
-    25,000-token `MAX_MCP_OUTPUT_TOKENS` an MCP client defaults to, and that cap
+    Why the default flipped to the slim mode: tool-output caps are set by the
+    CLIENT, not by MCP, so the concrete number here is the one we can name — in
+    Claude Code the cap is `MAX_MCP_OUTPUT_TOKENS`, which is unset in normal use
+    and defaults to 25,000 tokens. The full surface is ~1.8x that, and that cap
     TRUNCATES rather than rejects — a JSON document cut mid-structure is text
     that will not parse, so the full mode does not fail loudly, it hands back a
     broken envelope that looks like a response. Same hazard `search_templates`
-    guards with its field projection and page cap below. Since the full tree
-    cannot be returned intact at the default cap anyway, defaulting to the
-    schemas bundle costs no working behavior.
+    guards with its field projection and page cap below. Treat 25,000 as the
+    representative cap rather than a universal one: another client sets its own
+    limit, but the schemas bundle is the mode that fits either way. Since the
+    full tree cannot be returned intact under Claude Code's default anyway,
+    defaulting to the schemas bundle costs no working behavior.
 
     Pass ``schemas_only=False`` for the full command tree — only worth it on a
-    client with a raised `MAX_MCP_OUTPUT_TOKENS` or a larger native cap.
+    client whose cap is raised (`MAX_MCP_OUTPUT_TOKENS` in Claude Code) or that
+    has a larger native one.
     """
     args = ["discover"]
     if schemas_only:
