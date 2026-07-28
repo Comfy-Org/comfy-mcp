@@ -87,6 +87,20 @@ def _clear_comfyui_target_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _clear_columns_env(monkeypatch):
+    """Default every test to rich's own off-a-TTY console width (80 columns).
+
+    ``server._child_console_width`` reads ``COLUMNS`` because ``_comfy_env``
+    forwards it to the child, so a developer running under a terminal that
+    exports it would shift where ``_extract_saved_paths`` believes comfy-cli
+    folded its output — the same class of ambient-environment perturbation the
+    target/T2I fixtures guard against. The width-override test sets it
+    explicitly.
+    """
+    monkeypatch.delenv("COLUMNS", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_failure_log(monkeypatch):
     """Default every test to the opt-in failure log being OFF, and never leak it.
 
