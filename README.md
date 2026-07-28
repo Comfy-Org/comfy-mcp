@@ -65,10 +65,13 @@ Cloud MCP** — comfy-cli is the engine.
 ## Prerequisites
 
 - **Python ≥ 3.10.**
-- **comfy-cli ≥ 1.12.0** on your `PATH`: `pip install 'comfy-cli>=1.12.0'`. This is the engine
+- **comfy-cli ≥ 1.13.0** on your `PATH`: `pip install 'comfy-cli>=1.13.0'`. This is the engine
   every tool wraps; the server refuses to run against an older comfy-cli with an upgrade message.
-  The `server_info` `freshness` block additionally needs the first comfy-cli release **after**
-  1.12.0 that ships the `comfy outdated` verb; on a comfy-cli without it the block degrades to
+  1.13.0 is the first release carrying everything this server needs — the `comfy logs` verb, the
+  `envelope/1` contract, the `comfy outdated` verb behind `server_info`'s `freshness` block, and
+  the machine-readable `login_url` event `auth_login` waits for. On a comfy-cli that slips past
+  the version guard (it fails open on a `--version` it can't parse — a source build, a fork) and
+  lacks `outdated`, the `freshness` block degrades to
   `freshness: {"error": "freshness unavailable: …", "unsupported": true}` — update checks are
   skipped, nothing is broken, and everything else works unchanged.
 - **A ComfyUI workspace.** If you don't have one, `comfy-cli` can create it: `comfy install`
@@ -303,9 +306,10 @@ breaking the call.
 resolves the local address by the same rules, so the server URL it reports *is* the resolved
 address. Seeing `:8189` there (and the server reported running) confirms the override is live.
 
-**Requires a comfy-cli newer than 1.12.0.** `COMFY_LOCAL_URL` landed after the 1.12.0 release and
-is not in a published version yet — install comfy-cli from `main` to use it. On 1.12.0 or older the
-variable is simply ignored (no error) and every tool keeps targeting `127.0.0.1:8188`.
+**Requires comfy-cli ≥ 1.13.0.** `COMFY_LOCAL_URL` landed after the 1.12.0 release and first
+shipped in 1.13.0 — which is also this server's enforced floor, so any comfy-cli it accepts
+honors the variable. On 1.12.0 or older the variable is simply ignored (no error) and every tool
+keeps targeting `127.0.0.1:8188`.
 
 **Still reporting `:8188`?** Three causes, all silent, in the order worth checking:
 
@@ -433,7 +437,7 @@ Zero to a generated image:
 1. **Install the pieces.**
 
    ```bash
-   pip install 'comfy-cli>=1.12.0'  # the engine (>= 1.12.0 required)
+   pip install 'comfy-cli>=1.13.0'  # the engine (>= 1.13.0 required)
    comfy install                  # create a ComfyUI workspace (skip if you have one)
    pip install .                  # this MCP server → the `comfy-local-mcp` command
    ```

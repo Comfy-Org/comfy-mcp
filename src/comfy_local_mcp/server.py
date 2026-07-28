@@ -28,9 +28,10 @@ it for that call — asked per call over MCP elicitation, or pre-authorized in
 comfy-cli's own config. The durable "always proceed" stays engine-side, so this
 server holds no spend state of its own.
 
-Requires comfy-cli >= 1.12.0 (the ``comfy logs`` verb + the ``envelope/1``
-contract): :func:`_run_comfy` guards this once, up front, with an actionable
-upgrade error so a stale install fails clearly rather than cryptically.
+Requires comfy-cli >= 1.13.0 (the ``comfy logs`` verb, the ``envelope/1``
+contract, and the ``login_url`` event ``auth_login`` depends on):
+:func:`_run_comfy` guards this once, up front, with an actionable upgrade error
+so a stale install fails clearly rather than cryptically.
 
 NOTE: the exact ``comfy`` invocation + envelope shape still need a smoke test
 against a real comfy-cli install and a running local ComfyUI.
@@ -442,12 +443,17 @@ _STDERR_READ_CHUNK = 64 * 1024
 _STREAM_LINE_LIMIT = 1024 * 1024
 
 
-# comfy-cli floor. `comfy logs` (get_logs) and the structured `envelope/1`
-# contract this server relies on require comfy-cli >= 1.12.0; against an older
-# install `comfy logs` doesn't exist and would surface as a cryptic "No such
-# command", so `_run_comfy` guards this once, up front, with an upgrade message.
-_MIN_COMFY_CLI = (1, 12, 0)
-_MIN_COMFY_CLI_STR = "1.12.0"
+# comfy-cli floor. Three things this server relies on require comfy-cli
+# >= 1.13.0: `comfy logs` (get_logs), the structured `envelope/1` contract, and
+# the machine-readable `login_url` event `comfy cloud login --json` emits, which
+# `auth_login` blocks on. Against an older install the first two surface as a
+# cryptic "No such command", and `auth_login` burns its whole
+# `_LOGIN_URL_WAIT_S` budget before it can say why — so `_run_comfy` guards this
+# once, up front, with an upgrade message. `auth_login` keeps its own timeout
+# branch as the backstop for an install that slips past the guard (which fails
+# OPEN on a `--version` it cannot read).
+_MIN_COMFY_CLI = (1, 13, 0)
+_MIN_COMFY_CLI_STR = "1.13.0"
 
 # The version guard shells out to `comfy --version`; memoize so it runs at most
 # once per process (it sits on the hot path of every _run_comfy call).
@@ -708,7 +714,7 @@ def _spawn_comfy_version() -> subprocess.CompletedProcess:
     """Run ``comfy --version`` and return the completed process.
 
     The single spawn site shared by the two ``--version`` probes —
-    :func:`_check_comfy_version` (the hard ``>= 1.12.0`` floor) and
+    :func:`_check_comfy_version` (the hard ``>= 1.13.0`` floor) and
     :func:`_detect_comfy_cli_version` (the opt-in ``COMFY_CLI_MIN_VERSION``
     report). It deliberately does NOT catch anything: the two callers have
     different, load-bearing failure policies (fail-open with a latched timeout
@@ -731,7 +737,7 @@ def _check_comfy_version() -> None:
     Runs ``comfy --version`` once per process (memoized via ``_version_checked``).
     If the reported version is below the floor, raises a clear, actionable
     :class:`ComfyCliError` telling the user to upgrade — so a stale install fails
-    with "upgrade comfy-cli to >= 1.12.0" instead of a cryptic "No such command:
+    with "upgrade comfy-cli to >= 1.13.0" instead of a cryptic "No such command:
     logs" deep inside a tool call. Fails OPEN on anything it can't positively read
     as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
     future comfy-cli output-format change can never wedge a working install.
@@ -2247,11 +2253,14 @@ def _freshness_report() -> Any:
     the probe can never take ``server_info`` down with it; it degrades to one of
     two shapes instead.
 
-    The MISSING-VERB degrade is its own shape: ``comfy outdated`` does not exist
-    on any released comfy-cli (through 1.12.0), so on those installs this probe
-    fails every time — and Click/Typer's raw ``No such command 'outdated'.``
-    usage dump, relayed verbatim, reads like a broken MCP rather than the benign
-    capability gap it is. That case returns
+    The MISSING-VERB degrade is its own shape: ``comfy outdated`` ships in
+    comfy-cli 1.13.0 (:data:`_MIN_COMFY_CLI`, the floor this server enforces), so
+    a compliant install answers this probe. It stays as a degrade because the
+    version guard fails OPEN — an install whose ``comfy --version`` can't be
+    parsed (a source build, a fork) reaches here below the floor, and
+    Click/Typer's raw ``No such command 'outdated'.`` usage dump, relayed
+    verbatim, reads like a broken MCP rather than the benign capability gap it
+    is. That case returns
     ``{"error": "freshness unavailable: ...", "unsupported": True}``, with
     ``unsupported`` machine-readable so a client can branch on it without
     matching strings. :func:`_is_missing_verb_error` decides that case, and is
@@ -2282,7 +2291,7 @@ def _freshness_report() -> Any:
             return {
                 "error": (
                     "freshness unavailable: the installed comfy-cli does not support "
-                    "'comfy outdated' (the verb ships in releases after 1.12.0). "
+                    f"'comfy outdated' (the verb ships in comfy-cli >= {_MIN_COMFY_CLI_STR}). "
                     "Workflows are unaffected; update checks were skipped."
                 ),
                 "unsupported": True,
@@ -2343,8 +2352,10 @@ def server_info() -> Any:
     (``target="comfy"`` for core, ``target="all"`` for the node packs; the
     per-pack form is terminal-only), and ``restart_comfyui`` afterwards is what
     makes the updated code take effect. The probe is best-effort and degrades
-    two ways — ``server_info`` itself still succeeds either way. On a comfy-cli
-    that lacks the ``outdated`` verb (no release through 1.12.0 has it), ``freshness`` is
+    two ways — ``server_info`` itself still succeeds either way. The verb ships
+    in comfy-cli 1.13.0, this server's enforced floor, so a compliant install
+    answers it; on a comfy-cli that lacks it anyway (the version guard fails
+    OPEN, so a source build or fork can slip past the floor), ``freshness`` is
     ``{"error": "freshness unavailable: ...", "unsupported": true}``:
     ``unsupported: true`` means SKIP staleness advice entirely and do NOT tell
     the user anything is broken — nothing failed, this comfy-cli just cannot
@@ -3263,11 +3274,12 @@ def _require_spend_gate() -> None:
     """Refuse to run a spending call unless comfy-cli's spend gate is installed.
 
     This tool's core safety claim is that ``confirm_spend=False`` spends nothing
-    because comfy-cli fails CLOSED. That interlock landed in comfy-cli AFTER the
-    ``>= 1.12.0`` floor :data:`_MIN_COMFY_CLI` enforces (which was chosen for
-    ``comfy logs`` / ``envelope/1``), so the version check cannot prove it is
-    present — and against a comfy-cli without it the default call would silently
-    charge the user's card.
+    because comfy-cli fails CLOSED. That interlock ships in comfy-cli 1.13.0, so
+    the ``>= 1.13.0`` floor :data:`_MIN_COMFY_CLI` enforces now covers it — but
+    the floor check fails OPEN (an unparseable ``--version``, a source build, a
+    fork), so it still cannot PROVE the gate is present, and against a comfy-cli
+    without it the default call would silently charge the user's card. This
+    probe stays as the load-bearing check; the floor is not a substitute for it.
 
     ``comfy generate consent`` is the gate's OWN configuration surface and ships
     with it, so a clean exit is the capability signal; on an older CLI
