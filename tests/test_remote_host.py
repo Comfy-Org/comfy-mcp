@@ -297,7 +297,7 @@ def _patch_env_for_server_info(monkeypatch, patched_run):
     """Stub `comfy env` + the version detection so `server_info()` runs offline."""
     patched_run(envelope(data={"running": False}))
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
-    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
 
 
 def test_server_info_reports_remote_target(monkeypatch, patched_run):

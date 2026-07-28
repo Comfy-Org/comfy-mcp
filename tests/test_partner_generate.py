@@ -656,10 +656,11 @@ def test_partner_generate_refuses_when_comfy_cli_has_no_spend_gate(
 ):
     """No `comfy generate consent` -> no interlock -> refuse BEFORE spending.
 
-    The fail-closed guarantee is comfy-cli's, and it landed after the >= 1.12.0
-    floor this server enforces, so the version check cannot prove it is there.
-    Against an older CLI a default `confirm_spend=False` call would charge the
-    user with nothing to stop it.
+    The fail-closed guarantee is comfy-cli's. It ships in 1.13.0, the floor this
+    server enforces, but the floor check fails OPEN (an unparseable `--version`,
+    a source build, a fork), so the version check still cannot PROVE the gate is
+    there. Against a CLI without it a default `confirm_spend=False` call would
+    charge the user with nothing to stop it.
     """
     monkeypatch.setattr(server, "_spend_gate_probed", False)
     # An older comfy-cli reads `consent` as a model name and exits non-zero.

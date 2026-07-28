@@ -83,7 +83,7 @@ def test_incompatible_envelope_propagates_through_run_comfy(patched_run):
 @pytest.mark.parametrize(
     "text,expected",
     [
-        ("comfy-cli 1.12.0", (1, 12, 0)),
+        ("comfy-cli 1.13.0", (1, 13, 0)),
         ("comfy version 1.5", (1, 5, 0)),
         ("v2.0.3\n", (2, 0, 3)),
         ("no version here", None),
@@ -104,11 +104,11 @@ def test_detect_version_parses_cli_output(monkeypatch):
     def fake(cmd, capture_output, text, errors, timeout, check):
         assert cmd == [server.COMFY_BIN, "--version"]
         return subprocess.CompletedProcess(
-            cmd, 0, stdout="comfy-cli, 1.12.0\n", stderr=""
+            cmd, 0, stdout="comfy-cli, 1.13.0\n", stderr=""
         )
 
     monkeypatch.setattr(server.subprocess, "run", fake)
-    assert server._detect_comfy_cli_version() == "1.12.0"
+    assert server._detect_comfy_cli_version() == "1.13.0"
 
 
 def test_detect_version_ignores_stderr_and_nonzero_exit(monkeypatch):
@@ -141,11 +141,11 @@ def test_detect_version_none_on_subprocess_error(monkeypatch):
 def test_check_reports_version_without_floor(monkeypatch):
     """No floor configured: report the version, no warning, never raise."""
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
-    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
 
     report = server._check_comfy_cli_version()
 
-    assert report["comfy_cli_version"] == "1.12.0"
+    assert report["comfy_cli_version"] == "1.13.0"
     assert report["min_comfy_cli_version"] is None
     assert report["envelope_schema_major"] == server.ENVELOPE_SCHEMA_MAJOR
     assert report["warnings"] == []
@@ -163,7 +163,7 @@ def test_check_warns_when_version_unknown_and_no_floor(monkeypatch):
 
 def test_check_passes_when_version_meets_floor(monkeypatch):
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", "1.5.0")
-    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
 
     report = server._check_comfy_cli_version()
 
@@ -183,7 +183,7 @@ def test_check_raises_when_version_below_floor(monkeypatch):
 def test_check_warns_when_floor_is_unparseable(monkeypatch, bad_floor):
     """A misconfigured floor must not silently no-op: warn instead of failing open."""
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", bad_floor)
-    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
 
     report = server._check_comfy_cli_version()
 
@@ -209,7 +209,7 @@ def test_check_warns_but_does_not_raise_when_floor_set_and_version_unknown(monke
 def patched_env(monkeypatch, patched_run):
     """Patch comfy-cli so ``server_info`` sees a given ``comfy env`` envelope."""
 
-    def setup(payload: dict, version: str | None = "1.12.0") -> list[dict]:
+    def setup(payload: dict, version: str | None = "1.13.0") -> list[dict]:
         calls = patched_run(payload)
         monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: version)
         return calls
@@ -232,7 +232,7 @@ def test_server_info_attaches_compatibility_block(patched_env, monkeypatch):
 
     assert result["running"] is True  # original comfy env data preserved
     compat = result["compatibility"]
-    assert compat["comfy_cli_version"] == "1.12.0"
+    assert compat["comfy_cli_version"] == "1.13.0"
     assert compat["envelope_schema"] == "envelope/1"
     assert compat["envelope_schema_major"] == server.ENVELOPE_SCHEMA_MAJOR
     assert calls[0]["cmd"][4:] == ["env"]  # still `comfy env`
@@ -255,7 +255,7 @@ def test_server_info_raises_on_version_below_floor(patched_env, monkeypatch):
             "ok": True,
             "data": {"running": False},
         },
-        version="1.12.0",
+        version="1.13.0",
     )
 
     with pytest.raises(server.ComfyCliError, match="older than the required minimum"):
@@ -360,7 +360,7 @@ def patched_env_then_outdated(monkeypatch):
 
         monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
         monkeypatch.setattr(server.subprocess, "Popen", fake)
-        monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.12.0")
+        monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
         monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
         return calls
 
@@ -394,11 +394,14 @@ def test_server_info_attaches_freshness_block(patched_env_then_outdated):
 def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdated):
     """A comfy-cli without `outdated` -> the purpose-built `unsupported` degrade.
 
-    Every released comfy-cli (through 1.12.0) lacks the verb, so this is the
-    COMMON path, not an edge case. It must read as a capability gap rather than
-    a failure of this server: no raw Click/Typer usage dump, no "returned no
-    JSON" wrapper text, and a machine-readable `unsupported` flag so a client
-    can branch without string-matching.
+    `comfy outdated` ships in comfy-cli 1.13.0, this server's enforced floor, so
+    a compliant install answers the probe and this is now the RARE path — it
+    survives because the version guard fails OPEN, letting an install with an
+    unparseable `--version` (a source build, a fork) reach here below the floor.
+    It must still read as a capability gap rather than a failure of this server:
+    no raw Click/Typer usage dump, no "returned no JSON" wrapper text, and a
+    machine-readable `unsupported` flag so a client can branch without
+    string-matching.
     """
     import json
 
