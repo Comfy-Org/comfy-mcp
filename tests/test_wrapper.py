@@ -15,7 +15,6 @@ MCP progress notifications, and still returns the final envelope's data.
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import os
 import shutil
@@ -27,7 +26,7 @@ import time
 from pathlib import PurePosixPath
 
 import pytest
-from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope
+from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope, stream_reader
 
 from comfy_local_mcp import server, textutil
 
@@ -418,7 +417,7 @@ def _fake_version(stdout: str, *, stderr: str = "", raises: Exception | None = N
     """A `subprocess.run` stand-in for `comfy --version`; records each call."""
     calls: list[list[str]] = []
 
-    def fake(cmd, capture_output, text, timeout, check, errors=None):  # noqa: ARG001
+    def fake(cmd, capture_output, text, timeout, check, errors=None):
         calls.append(cmd)
         if raises is not None:
             raise raises
@@ -2141,20 +2140,19 @@ def test_streaming_no_envelope_error_includes_both_stream_tails(monkeypatch):
     """The streaming EOF path produces the same enriched message as `_run_comfy`."""
     procs: list[_FakeProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _FakeProc(
-            cmd,
+            list(cmd),
             "starting run...\ncomfy-cli crashed before emitting a result\n",
             stderr_text="Traceback (most recent call last):\nRuntimeError: nope",
             env=env,
-            encoding=encoding,
         )
         proc.returncode = 1
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         asyncio.run(
@@ -2177,21 +2175,20 @@ def test_streaming_eof_ignores_a_trailing_progress_event(monkeypatch):
     tool), so it is filtered to None and the no-envelope branch fires instead.
     """
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _FakeProc(
-            cmd,
+            list(cmd),
             # An event that both parses AND claims success — the worst case.
             '{"type": "progress", "ok": true, "data": {"value": 3}}\n'
             "comfy-cli crashed mid-run\n",
             stderr_text="RuntimeError: nope",
             env=env,
-            encoding=encoding,
         )
         proc.returncode = 1
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         asyncio.run(
@@ -2212,17 +2209,16 @@ def test_streaming_eof_still_refuses_an_incompatible_envelope(monkeypatch):
     with the incompatible-version message — not demoted to "returned no JSON".
     """
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _FakeProc(
-            cmd,
+            list(cmd),
             '{"schema": "envelope/2", "type": "envelope", "ok": true, "data": {}}\n',
             env=env,
-            encoding=encoding,
         )
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError, match="incompatible comfy-cli envelope"):
         asyncio.run(
@@ -2447,16 +2443,82 @@ def test_run_workflow_stream_sets_no_watch_env(patched_stream):
 
 
 def test_run_workflow_stream_forces_utf8_env(patched_stream):
-    """The streaming (Popen) spawn path also forces UTF-8 for the Windows fix."""
+    """The streaming spawn path also forces UTF-8 for the Windows fix."""
     procs = patched_stream(_OK_STREAM)
 
     asyncio.run(server.run_workflow("wf.json", wait=True))
 
     assert procs[0].env["PYTHONUTF8"] == "1"
     assert procs[0].env["PYTHONIOENCODING"] == "utf-8"
-    # And the parent-side stream read is pinned to UTF-8 to match (readline()/
-    # stderr.read() would otherwise decode with the cp1252 parent locale).
-    assert procs[0].encoding == "utf-8"
+
+
+def test_run_workflow_stream_decodes_utf8_and_survives_bad_bytes(monkeypatch):
+    """Stream lines decode as UTF-8, and an undecodable byte degrades one line.
+
+    The async pipes are binary, so the parent decodes each line itself rather
+    than relying on the parent locale (cp1252 on Windows would mojibake or raise
+    on the non-ASCII title below). ``errors="replace"`` is the deliberate half:
+    a truncated multi-byte sequence must not raise ``UnicodeDecodeError`` out of
+    the middle of a live run whose envelope is still to come.
+    """
+    ctx = _RecordingCtx()
+    good = json.dumps({"type": "executing", "node": "1", "title": "Café ☕"}).encode()
+    envelope_line = json.dumps(
+        {"schema": "envelope/1", "type": "envelope", "ok": True, "data": {"n": 1}}
+    ).encode()
+    raw = good + b"\n" + b'{"type": "executing", "node": "\xff\xfe"}\n' + envelope_line
+
+    procs: list[object] = []
+
+    async def fake_exec(*cmd, stdout, stderr, env, limit=None, **kwargs):
+        proc = _FakeProc(list(cmd), "", env=env, limit=limit)
+        proc.stdout = stream_reader(raw, limit)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+
+    result = asyncio.run(server._run_comfy_streaming("run", "wf.json", ctx=ctx))
+
+    assert result == {"n": 1}  # the undecodable line did not abort the run
+    assert any("Café ☕" in (c["message"] or "") for c in ctx.calls)
+
+
+def test_streaming_reads_a_line_longer_than_the_reader_limit(monkeypatch):
+    """An NDJSON event bigger than the StreamReader's buffer is still read whole.
+
+    ``asyncio.StreamReader.readline`` raises ``ValueError`` as soon as one line
+    exceeds ``limit``; the blocking ``Popen`` + text ``readline`` this path used
+    to run had no such ceiling. A ``queued`` event carrying a large node manifest
+    is exactly the shape that would hit it, so ``_readline_unbounded`` stitches
+    the overrun chunks back together instead. Spawning with a deliberately tiny
+    ``limit`` makes the overrun happen at test speed.
+    """
+    nodes = [{"node_id": str(i)} for i in range(400)]
+    stream = (
+        json.dumps({"schema": "event/1", "type": "queued", "nodes": nodes})
+        + "\n"
+        + json.dumps(
+            {"schema": "envelope/1", "type": "envelope", "ok": True, "data": {"ok": 1}}
+        )
+        + "\n"
+    )
+    assert len(stream) > 4096  # the manifest line really does overrun the limit
+
+    ctx = _RecordingCtx()
+
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        return _FakeProc(list(cmd), stream, env=env, limit=1024)
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+
+    result = asyncio.run(server._run_comfy_streaming("run", "wf.json", ctx=ctx))
+
+    assert result == {"ok": 1}
+    # The oversized line parsed, so the node manifest set the progress total.
+    assert ctx.calls[0]["total"] == float(len(nodes))
 
 
 @_needs_posix_exec
@@ -2564,33 +2626,34 @@ def test_watch_job_stream_error_envelope_raises_with_code(patched_stream):
 
 
 class _BlockingProc:
-    """A fake Popen whose stdout yields ``first_lines`` then blocks (forces a timeout)."""
+    """A fake child whose stdout yields ``first_lines`` then blocks (forces a timeout).
+
+    ``returncode`` starts None (the child is running) so the timeout handler's
+    kill actually fires; carries no ``pid`` so the kill takes the ``proc.kill()``
+    fallback rather than signalling a made-up group. See conftest's ``_FakeProc``.
+    """
 
     def __init__(self, cmd, first_lines):
         self.cmd = cmd
-        self._lines = list(first_lines)
-        self.stdout = self  # readline lives on the proc itself
-        self.stderr = io.StringIO("")
-        self.returncode = 0
+        self._lines = [line.encode("utf-8") for line in first_lines]
+        self.stdout = self  # the reader protocol lives on the proc itself
+        self.stderr = stream_reader("")
+        self.returncode = None
         self.killed = False
-        self._alive = True
 
-    def readline(self):
+    async def readuntil(self, separator=b"\n"):
         if self._lines:
             return self._lines.pop(0)
-        time.sleep(1.0)  # outlives the test's tiny timeout, never yields the envelope
-        return ""
+        # Outlives the test's tiny timeout, so the envelope never arrives.
+        await asyncio.sleep(1.0)
+        raise asyncio.IncompleteReadError(b"", None)
 
-    def poll(self):
-        return None if self._alive else self.returncode
-
-    def wait(self, timeout=None):  # noqa: ARG002
-        self._alive = False
+    async def wait(self):
+        self.returncode = 0
         return self.returncode
 
     def kill(self):
         self.killed = True
-        self._alive = False
 
 
 def test_watch_job_times_out_returns_payload(monkeypatch):
@@ -2600,13 +2663,13 @@ def test_watch_job_times_out_returns_payload(monkeypatch):
     )
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _BlockingProc(cmd, [queued + "\n"])
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     # MCP always injects a ctx, so the tracker has advanced by the time we expire.
     result = asyncio.run(
@@ -2628,13 +2691,13 @@ def test_watch_job_times_out_reports_progress_without_ctx(monkeypatch):
     executed = json.dumps({"type": "executed", "node": "1"})
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _BlockingProc(cmd, [queued + "\n", executed + "\n"])
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     # No ctx: the notification is a no-op, but tracker state must still advance
     # so the snapshot reports the node that actually finished (not all zeros).
@@ -2911,7 +2974,7 @@ class _GroupKillProc:
     def poll(self):
         return self.returncode
 
-    def wait(self, timeout=None):  # noqa: ARG002
+    def wait(self, timeout=None):
         return self.returncode
 
     def kill(self):
@@ -2935,7 +2998,7 @@ def test_sync_timeout_kills_the_whole_process_group(monkeypatch):
     )
     signalled: list[tuple[int, int]] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)
     monkeypatch.setattr(
         server.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
     )
@@ -2971,7 +3034,7 @@ def test_group_kill_is_not_gated_on_the_leader_still_running(monkeypatch):
     )
     signalled: list[tuple[int, int]] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)
     monkeypatch.setattr(
         server.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
     )
@@ -3006,8 +3069,8 @@ def test_drain_second_timeout_keeps_the_longer_capture(monkeypatch):
         _timeout(stderr=b"trace", stdout=b"first"),
     )
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
-    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)  # noqa: ARG005
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)
 
     with pytest.raises(server.ComfyCliError) as exc:
         server._run_comfy("update", "all", timeout=1800.0)
@@ -3037,8 +3100,8 @@ def test_drain_non_timeout_failure_falls_back_to_the_first_capture(monkeypatch):
         _timeout(stderr="partial trace", stdout="partial out"),
     )
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)  # noqa: ARG005
-    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)  # noqa: ARG005
+    monkeypatch.setattr(server.subprocess, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(server.os, "killpg", lambda pgid, sig: None)
 
     with pytest.raises(server.ComfyCliError) as exc:
         server._run_comfy("update", "all", timeout=1800.0)
@@ -3065,34 +3128,12 @@ def test_sync_non_timeout_failure_still_reaps_the_child(patched_run):
     assert calls[0]["proc"].killed is True
 
 
-class _BlockingProcWithStderr:
-    """A blocking Popen fake that also carries buffered stderr (a crashed child's traceback)."""
+class _BlockingProcWithStderr(_BlockingProc):
+    """A blocking child fake that also carries buffered stderr (a crashed traceback)."""
 
     def __init__(self, cmd, first_lines, stderr_text):
-        self.cmd = cmd
-        self._lines = list(first_lines)
-        self.stdout = self  # readline lives on the proc itself
-        self.stderr = io.StringIO(stderr_text)
-        self.returncode = 0
-        self.killed = False
-        self._alive = True
-
-    def readline(self):
-        if self._lines:
-            return self._lines.pop(0)
-        time.sleep(1.0)  # outlives the test's tiny timeout, never yields the envelope
-        return ""
-
-    def poll(self):
-        return None if self._alive else self.returncode
-
-    def wait(self, timeout=None):  # noqa: ARG002
-        self._alive = False
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-        self._alive = False
+        super().__init__(cmd, first_lines)
+        self.stderr = stream_reader(stderr_text)
 
 
 def test_streaming_timeout_surfaces_stdout_and_stderr_tails(monkeypatch):
@@ -3100,7 +3141,7 @@ def test_streaming_timeout_surfaces_stdout_and_stderr_tails(monkeypatch):
     queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
     procs: list[_BlockingProcWithStderr] = []
 
-    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _BlockingProcWithStderr(
             cmd, [queued + "\n"], "Traceback ...\nUnicodeEncodeError: boom"
         )
@@ -3108,7 +3149,7 @@ def test_streaming_timeout_surfaces_stdout_and_stderr_tails(monkeypatch):
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -3128,13 +3169,13 @@ def test_streaming_timeout_stdout_tail_is_bounded(monkeypatch):
     noisy = [("x" * 100 + "\n") for _ in range(50)]  # 5000+ chars of NDJSON
     procs: list[_BlockingProcWithStderr] = []
 
-    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _BlockingProcWithStderr(cmd, noisy, "")
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -3162,25 +3203,24 @@ class _StderrBlockingProc:
 
     def __init__(self, cmd, stdout_lines):
         self.cmd = cmd
-        self._lines = list(stdout_lines)
-        self.stdout = self  # readline lives on the proc
+        self._lines = [line.encode("utf-8") for line in stdout_lines]
+        self.stdout = self  # the reader protocol lives on the proc
         self.stderr = self  # read lives on the proc
-        self.returncode = 0
+        self.returncode = None
         self.killed = False
-        self._alive = True
 
-    def readline(self):
-        return self._lines.pop(0) if self._lines else ""  # EOF -> _pump breaks
+    async def readuntil(self, separator=b"\n"):
+        if self._lines:
+            return self._lines.pop(0)
+        raise asyncio.IncompleteReadError(b"", None)  # EOF -> _pump breaks
 
-    def read(self, size=-1):  # noqa: ARG002 — size ignored; models a blocking pipe
-        time.sleep(1.0)  # outlives the tiny timeout; suspends _drain at stderr_future
-        return ""
+    async def read(self, size=-1):
+        # Outlives the tiny timeout; suspends `_read` at `await stderr_future`.
+        await asyncio.sleep(1.0)
+        return b""
 
-    def poll(self):
-        return None if self._alive else self.returncode
-
-    def wait(self, timeout=None):  # noqa: ARG002
-        self._alive = False
+    async def wait(self):
+        self.returncode = 0
         return self.returncode
 
     def kill(self):
@@ -3192,11 +3232,11 @@ def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
     """A timeout that cancels the stderr read must still raise ComfyCliError, not CancelledError."""
     queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
 
-    def fake_popen(cmd, stdout, stderr, text, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         return _StderrBlockingProc(cmd, [queued + "\n"])
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -3491,7 +3531,7 @@ def test_restart_comfyui_explains_port_clash_after_nothing_to_stop(monkeypatch):
     def fake_stop():
         raise server.ComfyCliError("No ComfyUI is running in the background.")
 
-    def fake_launch(extra_args=None):  # noqa: ARG001
+    def fake_launch(extra_args=None):
         raise server.ComfyCliError(
             "comfy-cli returned no JSON (exit 1). stderr: The 8188 port is "
             "already in use. | stdout: <empty>",
@@ -3518,7 +3558,7 @@ def test_restart_comfyui_leaves_port_clash_alone_after_a_real_stop(monkeypatch):
     """A port clash after a stop that DID kill comfy-cli's server is a different bug."""
     monkeypatch.setattr(server, "stop_comfyui", lambda: {"ok": True})
 
-    def fake_launch(extra_args=None):  # noqa: ARG001
+    def fake_launch(extra_args=None):
         raise server.ComfyCliError("The 8188 port is already in use.")
 
     monkeypatch.setattr(server, "launch_comfyui", fake_launch)
@@ -3539,7 +3579,7 @@ def test_restart_comfyui_leaves_non_port_launch_failure_alone(monkeypatch):
         ),
     )
 
-    def fake_launch(extra_args=None):  # noqa: ARG001
+    def fake_launch(extra_args=None):
         raise server.ComfyCliError("ComfyUI exited during startup: missing torch")
 
     monkeypatch.setattr(server, "launch_comfyui", fake_launch)
@@ -3596,7 +3636,7 @@ def test_restart_comfyui_leaves_a_non_port_resource_clash_alone(monkeypatch):
         ),
     )
 
-    def fake_launch(extra_args=None):  # noqa: ARG001
+    def fake_launch(extra_args=None):
         raise server.ComfyCliError("Cannot load model: the file is already in use")
 
     monkeypatch.setattr(server, "launch_comfyui", fake_launch)
@@ -3684,7 +3724,7 @@ def test_restart_comfyui_port_guidance_reflects_the_requested_port(monkeypatch):
     def fake_stop():
         raise server.ComfyCliError("No ComfyUI is running in the background.")
 
-    def fake_launch(extra_args=None):  # noqa: ARG001
+    def fake_launch(extra_args=None):
         raise server.ComfyCliError("The 8189 port is already in use.")
 
     monkeypatch.setattr(server, "stop_comfyui", fake_stop)
@@ -4111,43 +4151,50 @@ def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
 
 
 class _LingeringProc:
-    """Fake Popen that emits ``lines`` (incl. the terminal envelope) then lingers.
+    """Fake async child emitting ``lines`` (incl. the envelope) then lingering.
 
-    Once the canned lines are exhausted ``stdout.readline`` blocks until the
-    child is killed, and ``wait()`` blocks the same way — modeling comfy-cli
-    outliving its own ``--json-stream`` envelope under a pipe. ``stderr.read``
-    blocks too, so a test also proves the envelope path never awaits stderr. The
-    block is bounded (10s) only so a buggy test can't hang the suite; the real
-    exit is ``kill()``.
+    Once the canned lines are exhausted ``stdout`` never EOFs and ``wait()``
+    never returns — modeling comfy-cli outliving its own ``--json-stream``
+    envelope under a pipe. ``stderr.read`` blocks the same way, so a test also
+    proves the envelope path never awaits stderr. The block is bounded (10s) only
+    so a buggy test can't hang the suite; the real exit is ``kill()``.
+
+    Carries no ``pid``, so ``server._kill_proc_tree_async`` takes its
+    ``AttributeError`` fallback to ``proc.kill()`` instead of signalling a
+    made-up process group — same reasoning as conftest's ``_FakeProc``.
     """
 
     def __init__(self, cmd, lines):
         self.cmd = cmd
-        self._lines = list(lines)
-        self.stdout = self  # readline lives on the proc itself
+        self._lines = [line.encode("utf-8") for line in lines]
+        self.stdout = self  # the reader protocol lives on the proc itself
         self.stderr = self  # read() blocks the same way -> proves we don't await it
-        # None until reaped, mirroring real Popen: while the child lingers past
-        # its envelope its returncode is unknown, and _unwrap_envelope must
-        # tolerate that (it ignores returncode whenever an envelope is present).
+        # None until reaped, mirroring a real child: while it lingers past its
+        # envelope its returncode is unknown, and _unwrap_envelope must tolerate
+        # that (it ignores returncode whenever an envelope is present).
         self.returncode = None
         self.killed = False
-        self._dead = threading.Event()
+        self._dead = asyncio.Event()
 
-    def readline(self):
+    async def _park(self):
+        """Block until killed — bounded only so a buggy test can't hang the suite."""
+        try:
+            await asyncio.wait_for(self._dead.wait(), 10.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+
+    async def readuntil(self, separator=b"\n"):
         if self._lines:
             return self._lines.pop(0)
-        self._dead.wait(timeout=10.0)  # stdout never EOFs on its own
-        return ""
+        await self._park()  # stdout never EOFs on its own
+        raise asyncio.IncompleteReadError(b"", None)
 
-    def read(self, size=-1):  # noqa: ARG002 — size ignored; models a blocking pipe
-        self._dead.wait(timeout=10.0)  # stderr never EOFs while the child lives
-        return ""
+    async def read(self, size=-1):
+        await self._park()  # stderr never EOFs while the child lives
+        return b""
 
-    def poll(self):
-        return self.returncode if self._dead.is_set() else None
-
-    def wait(self, timeout=None):  # noqa: ARG002
-        self._dead.wait(timeout=10.0)  # a child that lingers past its envelope
+    async def wait(self):
+        await self._park()  # a child that lingers past its envelope
         return self.returncode
 
     def kill(self):
@@ -4156,15 +4203,15 @@ class _LingeringProc:
         self._dead.set()
 
 
-def _lingering_popen(procs, stream_lines):
-    """A ``subprocess.Popen`` stand-in minting a fresh ``_LingeringProc`` per call."""
+def _lingering_exec(procs, stream_lines):
+    """An ``create_subprocess_exec`` stand-in minting a ``_LingeringProc`` per call."""
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
-        proc = _LingeringProc(cmd, list(stream_lines))
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        proc = _LingeringProc(list(cmd), list(stream_lines))
         procs.append(proc)
         return proc
 
-    return fake_popen
+    return fake_exec
 
 
 # Run events (2-node manifest + one completion) then the terminal envelope; the
@@ -4208,7 +4255,9 @@ def test_run_workflow_returns_on_envelope_despite_lingering_child(monkeypatch):
     procs: list[_LingeringProc] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(
-        server.subprocess, "Popen", _lingering_popen(procs, _ENVELOPE_THEN_LINGER)
+        server.asyncio,
+        "create_subprocess_exec",
+        _lingering_exec(procs, _ENVELOPE_THEN_LINGER),
     )
     # Tiny post-envelope grace so the lingering child is reaped fast in-test.
     monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
@@ -4231,7 +4280,9 @@ def test_run_workflow_error_envelope_with_open_pipe_raises(monkeypatch):
     procs: list[_LingeringProc] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(
-        server.subprocess, "Popen", _lingering_popen(procs, _ERROR_ENVELOPE_THEN_LINGER)
+        server.asyncio,
+        "create_subprocess_exec",
+        _lingering_exec(procs, _ERROR_ENVELOPE_THEN_LINGER),
     )
     monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
 
@@ -4251,7 +4302,9 @@ def test_two_overlapping_run_workflow_calls_complete_independently(monkeypatch):
     procs: list[_LingeringProc] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(
-        server.subprocess, "Popen", _lingering_popen(procs, _ENVELOPE_THEN_LINGER)
+        server.asyncio,
+        "create_subprocess_exec",
+        _lingering_exec(procs, _ENVELOPE_THEN_LINGER),
     )
     monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
 
@@ -4275,13 +4328,13 @@ def test_run_workflow_timeout_error_includes_snapshot_and_hint(monkeypatch):
     )
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _BlockingProc(cmd, [queued + "\n"])
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         asyncio.run(
@@ -4336,7 +4389,9 @@ def test_run_workflow_returns_envelope_after_deadline_during_reap(monkeypatch):
     procs: list[_LingeringProc] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(
-        server.subprocess, "Popen", _lingering_popen(procs, _ENVELOPE_THEN_LINGER)
+        server.asyncio,
+        "create_subprocess_exec",
+        _lingering_exec(procs, _ENVELOPE_THEN_LINGER),
     )
     # Grace (0.5s) deliberately exceeds the client timeout (0.2s): the OLD code
     # ran the reap inside the client budget and raised; the fix returns the data.
@@ -4361,9 +4416,9 @@ def test_run_workflow_ignores_non_terminal_envelope_typed_line(monkeypatch):
     procs: list[_LingeringProc] = []
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(
-        server.subprocess,
-        "Popen",
-        _lingering_popen(procs, _SPURIOUS_ENVELOPE_THEN_REAL),
+        server.asyncio,
+        "create_subprocess_exec",
+        _lingering_exec(procs, _SPURIOUS_ENVELOPE_THEN_REAL),
     )
     monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
 
@@ -4388,19 +4443,18 @@ class _ExitedErrorProc:
 
     def __init__(self, cmd, lines, stderr_text):
         self.cmd = cmd
-        self._lines = list(lines)
+        self._lines = [line.encode("utf-8") for line in lines]
         self.stdout = self
-        self.stderr = io.StringIO(stderr_text)
+        self.stderr = stream_reader(stderr_text)
         self.returncode = 1  # already exited by the time we reap
         self.killed = False
 
-    def readline(self):
-        return self._lines.pop(0) if self._lines else ""
+    async def readuntil(self, separator=b"\n"):
+        if self._lines:
+            return self._lines.pop(0)
+        raise asyncio.IncompleteReadError(b"", None)
 
-    def poll(self):
-        return self.returncode
-
-    def wait(self, timeout=None):  # noqa: ARG002
+    async def wait(self):
         return self.returncode
 
     def kill(self):
@@ -4423,11 +4477,11 @@ def test_run_workflow_error_envelope_empty_message_falls_back_to_stderr(monkeypa
     ]
     stderr_text = "Traceback (most recent call last):\nRuntimeError: kaboom"
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         return _ExitedErrorProc(cmd, lines, stderr_text)
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.1)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
@@ -4442,11 +4496,11 @@ def test_run_workflow_error_envelope_empty_message_falls_back_to_stderr(monkeypa
 
 
 class _ChunkedStream:
-    """Fake pipe that hands back ``data`` in fixed ``chunk`` slices, then EOF.
+    """Fake async pipe handing back ``data`` in fixed ``chunk`` slices, then EOF.
 
     Models a real pipe delivering stderr in many small reads (ignoring the
-    requested size), so a test can prove `_drain_capped` keeps reading to EOF
-    and retains the tail across chunk boundaries — not just within one read.
+    requested size), so a test can prove `_drain_capped_async` keeps reading to
+    EOF and retains the tail across chunk boundaries — not just within one read.
     """
 
     def __init__(self, data, chunk):
@@ -4454,62 +4508,81 @@ class _ChunkedStream:
         self._chunk = chunk
         self._pos = 0
 
-    def read(self, size=-1):  # noqa: ARG002 — models a pipe: own chunk, not size
+    async def read(self, size=-1):  # chunked regardless of the requested size
         piece = self._data[self._pos : self._pos + self._chunk]
         self._pos += len(piece)
         return piece
 
 
-def test_drain_capped_retains_only_the_tail_across_chunks():
-    """`_drain_capped` drains to EOF but keeps at most ``limit`` trailing chars.
+def test_drain_capped_async_retains_only_the_tail_across_chunks():
+    """`_drain_capped_async` drains to EOF but keeps at most ``limit`` trailing bytes.
 
     A verbose child must be fully drained (so it can't wedge on a full stderr
     pipe) without letting its output drive unbounded allocation here — only the
     tail, where the actual error/traceback lands, is retained.
     """
-    data = "".join(f"line{i}\n" for i in range(1000))  # ~7 KB across many chunks
-    out = server._drain_capped(_ChunkedStream(data, chunk=64), limit=100)
-    assert out == data[-100:]
+    data = b"".join(f"line{i}\n".encode() for i in range(1000))  # ~7 KB, many chunks
+    out = asyncio.run(server._drain_capped_async(_ChunkedStream(data, chunk=64), 100))
+    assert out == data[-100:].decode()
     assert len(out) == 100
     # Under the cap: returned whole. Empty: drains to "".
-    assert server._drain_capped(_ChunkedStream("short", chunk=64), 100) == "short"
-    assert server._drain_capped(_ChunkedStream("", chunk=64), 100) == ""
+    drain = server._drain_capped_async
+    assert asyncio.run(drain(_ChunkedStream(b"short", chunk=64), 100)) == "short"
+    assert asyncio.run(drain(_ChunkedStream(b"", chunk=64), 100)) == ""
+
+
+def test_drain_capped_async_decodes_once_at_the_end():
+    """A multi-byte character split across a chunk boundary survives the drain.
+
+    The cap slices BYTES, so decoding per chunk would turn a UTF-8 sequence
+    straddling a read into replacement characters — which is why the decode
+    happens once, after the tail is assembled.
+    """
+    data = "ünïcödé ☕ traceback\n".encode()
+    # A chunk size that lands mid-sequence on the multi-byte characters.
+    out = asyncio.run(server._drain_capped_async(_ChunkedStream(data, chunk=3), 4096))
+    assert out == data.decode()
+    assert "�" not in out
 
 
 class _StderrNeverEOFProc:
     """Envelope-then-linger child whose stderr pipe never EOFs, even after kill.
 
     Models comfy-cli leaving a descendant that inherited the stderr write fd:
-    ``kill()`` reaps the direct child (unblocking ``readline`` / ``wait``) but
-    the stderr ``read()`` never returns. The bounded ``finally`` join must
-    detach the parked reader instead of hanging the tool call forever.
+    ``kill()`` reaps the direct child (unblocking the stdout read / ``wait``) but
+    the stderr ``read()`` never returns. Cleanup must detach the parked reader
+    instead of hanging the tool call forever.
     """
 
     def __init__(self, cmd, lines):
         self.cmd = cmd
-        self._lines = list(lines)
+        self._lines = [line.encode("utf-8") for line in lines]
         self.stdout = self
         self.stderr = self
         self.returncode = None
         self.killed = False
-        self._child_dead = threading.Event()  # set by kill(): the direct child
-        self._stderr_eof = threading.Event()  # NEVER set: descendant holds the fd
+        self._child_dead = asyncio.Event()  # set by kill(): the direct child
+        self._stderr_eof = asyncio.Event()  # NEVER set: descendant holds the fd
 
-    def readline(self):
+    async def _park(self, event):
+        """Block on ``event`` — bounded only so a buggy test can't hang the suite."""
+        try:
+            await asyncio.wait_for(event.wait(), 10.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+
+    async def readuntil(self, separator=b"\n"):
         if self._lines:
             return self._lines.pop(0)
-        self._child_dead.wait(timeout=10.0)
-        return ""
+        await self._park(self._child_dead)
+        raise asyncio.IncompleteReadError(b"", None)
 
-    def read(self, size=-1):  # noqa: ARG002 — parks past kill(); never EOFs
-        self._stderr_eof.wait(timeout=10.0)
-        return ""
+    async def read(self, size=-1):
+        await self._park(self._stderr_eof)
+        return b""
 
-    def poll(self):
-        return self.returncode if self._child_dead.is_set() else None
-
-    def wait(self, timeout=None):  # noqa: ARG002
-        self._child_dead.wait(timeout=10.0)
+    async def wait(self):
+        await self._park(self._child_dead)
         return self.returncode
 
     def kill(self):
@@ -4539,11 +4612,11 @@ def test_envelope_path_does_not_hang_when_stderr_pipe_never_eofs(monkeypatch):
     ]
     proc = _StderrNeverEOFProc(cmd=["comfy"], lines=lines)
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.05)
     monkeypatch.setattr(server, "_STDERR_JOIN_GRACE", 0.05)
 
@@ -4559,154 +4632,83 @@ def test_envelope_path_does_not_hang_when_stderr_pipe_never_eofs(monkeypatch):
     assert proc.killed  # the direct child was reaped even though stderr never EOF'd
 
 
-# --- bounded pipe-read pool: threads don't accumulate on the default executor -
+# --- the streaming path never blocks the event loop ---------------------------
 
 
-def test_pipe_executor_is_dedicated_and_bounded():
-    """The subprocess pipe reads run on their own bounded pool, not the default.
+def test_streaming_run_keeps_the_event_loop_responsive(monkeypatch):
+    """A live stream must not stall other coroutines on the same loop.
 
-    A dedicated `ThreadPoolExecutor` with a finite `max_workers` is what keeps
-    parked pipe-reader/waiter threads off asyncio's shared default executor, so
-    they can never starve unrelated `to_thread` work.
+    This is the property `_run_comfy_streaming` exists to hold and the one a
+    result-only test cannot see: an implementation that spawned with
+    `subprocess.Popen` and read the pipes with blocking `readline` would return
+    the exact same envelope while the loop sat frozen for the life of the child.
+
+    So the assertion is on the HEARTBEAT, not the payload. A companion coroutine
+    ticks every millisecond for the whole run; if the stream ever monopolizes the
+    loop the tick count collapses and the largest gap between ticks approaches
+    the run's duration. Both are checked, because either alone is foolable — a
+    high tick count could come from one long stall plus a fast burst.
     """
-    from concurrent.futures import ThreadPoolExecutor
+    ticks: list[float] = []
+    step = 0.02  # per-line delay: the run lasts long enough to sample the loop
 
-    assert isinstance(server._PIPE_EXECUTOR, ThreadPoolExecutor)
-    assert server._PIPE_EXECUTOR._max_workers == server._PIPE_POOL_MAX_WORKERS
-    assert server._PIPE_POOL_MAX_WORKERS >= 1  # bounded, non-zero
+    class _PacedProc:
+        """Emits its canned lines one `step` apart, yielding to the loop between."""
 
-
-def test_overlapping_streaming_runs_confine_and_release_pipe_threads(monkeypatch):
-    """N overlapping streaming runs keep their blocking pipe reads on the
-    dedicated pool and drain back to baseline once each run returns.
-
-    Each fake child emits its envelope then lingers with a blocked stderr pipe
-    (``read()`` never EOFs until the child is killed) — the exact shape that
-    parks a reader thread. This asserts the two halves of the fix together:
-
-    1. Isolation — every blocking ``readline`` / ``read`` / ``wait`` runs on a
-       ``_PIPE_EXECUTOR`` worker (``comfy-pipe`` prefix), NOT the loop's shared
-       default executor (whose threads are named ``asyncio_*``). On the old
-       ``asyncio.to_thread`` code these would land on the default pool and the
-       name assertion fails.
-    2. Baseline — after every run returns, no reader/waiter thread is still
-       parked: the ``finally`` joins the stderr reader once the child is dead
-       instead of leaving it parked on a cancelled future.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    n_runs = 6
-    parked = 0  # threads currently blocked in a fake pipe read / wait
-    peak_parked = 0
-    seen_thread_names: set[str] = set()
-    lock = threading.Lock()
-
-    # A generously sized dedicated pool so the test never deadlocks on a
-    # low-core host (a persistent stderr reader holds a slot for the whole run);
-    # the `comfy-pipe` prefix mirrors the real `_PIPE_EXECUTOR`.
-    test_pool = ThreadPoolExecutor(
-        max_workers=4 * n_runs, thread_name_prefix="comfy-pipe"
-    )
-    monkeypatch.setattr(server, "_PIPE_EXECUTOR", test_pool)
-
-    class _InstrumentedProc:
         def __init__(self, cmd, lines):
             self.cmd = cmd
-            self._lines = list(lines)
+            self._lines = [line.encode("utf-8") for line in lines]
             self.stdout = self
-            self.stderr = self
+            self.stderr = stream_reader("")
             self.returncode = None
             self.killed = False
-            self._dead = threading.Event()
 
-        def _record_thread(self):
-            with lock:
-                seen_thread_names.add(threading.current_thread().name)
-
-        def _block_until_dead(self):
-            nonlocal parked, peak_parked
-            self._record_thread()
-            with lock:
-                parked += 1
-                peak_parked = max(peak_parked, parked)
-            try:
-                self._dead.wait(timeout=10.0)  # real exit is kill(); bound as a guard
-            finally:
-                with lock:
-                    parked -= 1
-
-        def readline(self):
-            self._record_thread()
+        async def readuntil(self, separator=b"\n"):
+            await asyncio.sleep(step)  # the child is "thinking" between events
             if self._lines:
                 return self._lines.pop(0)
-            self._block_until_dead()
-            return ""
+            raise asyncio.IncompleteReadError(b"", None)
 
-        def read(self, size=-1):  # noqa: ARG002 — size ignored; parks until killed
-            self._block_until_dead()
-            return ""
-
-        def poll(self):
-            return self.returncode if self._dead.is_set() else None
-
-        def wait(self, timeout=None):  # noqa: ARG002
-            self._block_until_dead()
+        async def wait(self):
+            self.returncode = 0
             return self.returncode
 
         def kill(self):
             self.killed = True
-            self.returncode = -9
-            self._dead.set()
 
-    procs: list[_InstrumentedProc] = []
-
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
-        proc = _InstrumentedProc(cmd, list(_ENVELOPE_THEN_LINGER))
-        procs.append(proc)
-        return proc
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        return _PacedProc(list(cmd), _OK_STREAM.splitlines(keepends=True))
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(server, "_POST_ENVELOPE_REAP_GRACE", 0.2)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
-    async def _run_many():
-        return await asyncio.gather(
-            *[
-                server.run_workflow(f"wf{i}.json", wait=True, timeout_seconds=30.0)
-                for i in range(n_runs)
-            ]
-        )
+    async def _heartbeat(stop: asyncio.Event):
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.001)
 
-    try:
-        results = asyncio.run(_run_many())
+    async def _drive():
+        stop = asyncio.Event()
+        beat = asyncio.ensure_future(_heartbeat(stop))
+        started = time.monotonic()
+        try:
+            result = await server.run_workflow("wf.json", wait=True, timeout_seconds=30)
+        finally:
+            stop.set()
+            await beat
+        return result, time.monotonic() - started
 
-        assert results == [{"outputs": ["/x.png"]}] * n_runs
-        assert len(procs) == n_runs
-        assert all(p.killed for p in procs)  # every child reaped
+    result, elapsed = asyncio.run(_drive())
 
-        # The runs genuinely overlapped: at least the N stderr readers were
-        # parked at once (proves this isn't trivially serialized).
-        assert peak_parked >= n_runs
-
-        # (1) Isolation: everything ran on the dedicated pool, never the default.
-        assert seen_thread_names, "expected pipe reads to run on worker threads"
-        assert all(name.startswith("comfy-pipe") for name in seen_thread_names), (
-            seen_thread_names
-        )
-
-        # (2) Baseline: no pipe thread stays parked after the runs return. The
-        # only laggard is each timed-out reap `wait`, released by kill(); poll
-        # briefly so a sub-millisecond unwind race isn't read as a leak.
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            with lock:
-                if parked == 0:
-                    break
-            time.sleep(0.01)
-        with lock:
-            assert parked == 0, f"{parked} pipe thread(s) still parked at baseline"
-    finally:
-        test_pool.shutdown(wait=True)
+    assert result == {"outputs": ["/x.png"]}
+    # The run really did span several event lines rather than resolving instantly.
+    assert elapsed >= 3 * step
+    # The other coroutine made progress THROUGHOUT: many ticks, and no single gap
+    # anywhere near the run's length. A blocking implementation parks the loop for
+    # the whole run, which shows up as a gap of roughly `elapsed`.
+    assert len(ticks) > 10, f"only {len(ticks)} ticks in {elapsed:.3f}s"
+    largest_gap = max(b - a for a, b in zip(ticks, ticks[1:]))
+    assert largest_gap < elapsed / 2, f"loop stalled for {largest_gap:.3f}s"
 
 
 def test_get_logs_caps_oversized_line(patched_run):

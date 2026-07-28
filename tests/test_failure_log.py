@@ -322,13 +322,13 @@ def test_streaming_failure_is_flagged(log_path, monkeypatch):
     """The ``streaming`` flag distinguishes the ``--json-stream`` spawn path."""
     procs: list[_FakeProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
-        proc = _FakeProc(cmd, _ERROR_ENVELOPE + "\n", env=env, encoding=encoding)
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        proc = _FakeProc(list(cmd), _ERROR_ENVELOPE + "\n", env=env)
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
     with pytest.raises(server.ComfyCliError):
         server.asyncio.run(server._run_comfy_streaming("run", "wf.json"))

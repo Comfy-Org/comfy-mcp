@@ -15,17 +15,24 @@ copy per test file:
 
 * the plain ``--json`` path (``subprocess.Popen`` + a bounded
   ``communicate``) — ``envelope`` + ``patched_run`` / ``patched_plain_run``;
-* the streaming ``--json-stream`` path (``subprocess.Popen`` + incremental
-  reads) — ``patched_stream``. ``run_workflow``, ``watch_job`` and
-  ``generate_image`` all drive the same NDJSON stream.
+* the streaming ``--json-stream`` path
+  (``asyncio.create_subprocess_exec`` + incremental stream reads) —
+  ``patched_stream``. ``run_workflow``, ``watch_job`` and ``generate_image``
+  all drive the same NDJSON stream.
 
 Both paths spawn with ``start_new_session=True`` so a timeout can kill the whole
 process group; the fakes model that too (see ``_FakeRunProc``).
+
+The streaming fakes back their pipes with REAL :class:`asyncio.StreamReader`
+objects (``stream_reader``) rather than a hand-rolled awaitable. The reader's
+buffer-limit behavior is load-bearing for ``server._readline_unbounded``, so a
+stub that merely returned canned lines would test nothing about the one thing
+that path exists to handle.
 """
 
 from __future__ import annotations
 
-import io
+import asyncio
 import json
 import logging
 
@@ -208,7 +215,7 @@ class _FakeRunProc:
     def poll(self):
         return self.returncode  # None until it exits or is killed
 
-    def wait(self, timeout=None):  # noqa: ARG002
+    def wait(self, timeout=None):
         return self.returncode
 
     def kill(self):
@@ -234,7 +241,7 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
     """
     canned_stdout, canned_stderr = stdout, stderr
 
-    def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):  # noqa: ARG001
+    def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):
         record = {
             "cmd": cmd,
             "env": env,
@@ -332,25 +339,43 @@ def patched_plain_run(patched_run):
     return setup
 
 
+def stream_reader(text: str | bytes, limit: int | None = None) -> asyncio.StreamReader:
+    """A closed :class:`asyncio.StreamReader` pre-loaded with ``text``.
+
+    The real reader, not a stub: ``server._readline_unbounded`` exists precisely
+    to survive a line longer than the reader's ``limit``, and only a genuine
+    ``StreamReader`` raises the ``LimitOverrunError`` that exercises it. Must be
+    called with a running event loop (the reader binds to it at construction).
+    """
+    reader = asyncio.StreamReader(limit=limit or server._STREAM_LINE_LIMIT)
+    reader.feed_data(text.encode("utf-8") if isinstance(text, str) else text)
+    reader.feed_eof()
+    return reader
+
+
 class _FakeProc:
-    """A minimal stand-in for ``subprocess.Popen`` over a canned NDJSON stream."""
+    """A stand-in for ``asyncio.subprocess.Process`` over a canned NDJSON stream.
+
+    Deliberately carries NO ``pid``: ``server._kill_proc_tree_async`` looks one
+    up for its ``killpg`` and falls back to ``proc.kill()`` on the resulting
+    ``AttributeError``, so the fake records the kill instead of signalling a
+    made-up pid — which on a busy machine could land on a real, unrelated
+    process group. See ``_FakeRunProc`` for the same reasoning on the plain path.
+    """
 
     def __init__(
-        self, cmd, stdout_text, stderr_text="", env=None, encoding=None, stdin=None
+        self, cmd, stdout_text, stderr_text="", env=None, stdin=None, limit=None
     ):
         self.cmd = cmd
         self.env = env
-        self.encoding = encoding
+        self.limit = limit  # what `server` asked for, for the argv assertions
         self.stdin_arg = stdin  # what `server` asked for, not a writable pipe
-        self.stdout = io.StringIO(stdout_text)
-        self.stderr = io.StringIO(stderr_text)
+        self.stdout = stream_reader(stdout_text, limit)
+        self.stderr = stream_reader(stderr_text, limit)
         self.returncode = 0
         self.killed = False
 
-    def poll(self):
-        return self.returncode  # already "finished" once the stream is drained
-
-    def wait(self, timeout=None):  # noqa: ARG002
+    async def wait(self):
         return self.returncode
 
     def kill(self):
@@ -369,7 +394,7 @@ class _RecordingCtx:
 
 @pytest.fixture
 def patched_stream(monkeypatch):
-    """Patch ``shutil.which`` + ``subprocess.Popen`` for the streaming path.
+    """Patch ``shutil.which`` + ``asyncio.create_subprocess_exec`` for streaming.
 
     Returns ``setup(stdout_text) -> procs`` — the list capturing each spawned
     ``_FakeProc`` (so the test can assert the command line that was run).
@@ -378,13 +403,15 @@ def patched_stream(monkeypatch):
     def setup(stdout_text: str) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
-        def fake_popen(cmd, stdout, stderr, text, encoding, env, stdin=None, **kwargs):  # noqa: ARG001
-            proc = _FakeProc(cmd, stdout_text, env=env, encoding=encoding, stdin=stdin)
+        async def fake_exec(
+            *cmd, stdout, stderr, env, stdin=None, limit=None, **kwargs
+        ):
+            proc = _FakeProc(list(cmd), stdout_text, env=env, stdin=stdin, limit=limit)
             procs.append(proc)
             return proc
 
         monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
         return procs
 
     return setup

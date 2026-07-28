@@ -363,34 +363,15 @@ _POST_ENVELOPE_REAP_GRACE = 5.0
 # (uninterruptible sleep) cannot hold the tool call open past its deadline.
 _DRAIN_TIMEOUT = 5.0
 
-# Dedicated, bounded thread pool for the blocking pipe reads / process waits in
-# `_run_comfy_streaming` (`stdout.readline`, `stderr.read`, `proc.wait`).
-#
-# Cancelling an `asyncio.to_thread` NEVER interrupts the underlying OS thread —
-# it stays parked on the pipe until the child is killed and its stdio closes.
-# On the success-envelope path the stderr reader is never awaited, only
-# cancelled, so it lingers until the `finally` kills the child (up to
-# `_POST_ENVELOPE_REAP_GRACE`). Running these on asyncio's shared *default*
-# executor means many concurrent `run_workflow(wait=True)` / `watch_job` calls
-# could pile parked readers/waiters onto that pool and starve unrelated
-# `to_thread` work for the grace window. Confining them to their own bounded
-# pool caps the blast radius to this pool; the `finally` block additionally
-# joins the stderr reader once the child is dead so it does not outlive the run.
-_PIPE_POOL_MAX_WORKERS = min(32, (os.cpu_count() or 1) + 4)
-_PIPE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_PIPE_POOL_MAX_WORKERS,
-    thread_name_prefix="comfy-pipe",
-)
-
-
-def _in_pipe_pool(func, *args):
-    """Off-load a blocking pipe read / process wait to the dedicated pool.
-
-    Mirrors :func:`asyncio.to_thread` but targets :data:`_PIPE_EXECUTOR`
-    instead of the loop's shared default executor, so subprocess pipe threads
-    can never saturate the pool other `to_thread` callers rely on.
-    """
-    return asyncio.get_running_loop().run_in_executor(_PIPE_EXECUTOR, func, *args)
+# `_run_comfy_streaming` used to off-load its blocking pipe reads / process
+# waits (`stdout.readline`, `stderr.read`, `proc.wait`) to a dedicated bounded
+# thread pool, because cancelling an `asyncio.to_thread` NEVER interrupts the
+# underlying OS thread — it stays parked on the pipe until the child is killed
+# and its stdio closes, so a timed-out or cancelled run left a thread behind.
+# That path now spawns with `asyncio.create_subprocess_exec` and reads the pipes
+# as asyncio streams, so there is no blocking read to off-load and no thread to
+# strand: cancelling the read cancels it. Only `partner_generate`'s genuinely
+# synchronous `comfy generate` run still needs a pool (below).
 
 
 # Dedicated, bounded thread pool for `partner_generate`'s blocking `comfy
@@ -446,21 +427,11 @@ _STDERR_JOIN_GRACE = 5.0
 _STDERR_MAX_CHARS = 64 * 1024
 _STDERR_READ_CHUNK = 64 * 1024
 
-
-def _drain_capped(stream: Any, limit: int) -> str:
-    """Read ``stream`` to EOF but keep only the trailing ``limit`` chars.
-
-    Draining to EOF keeps the child from blocking on a full stderr pipe; slicing
-    to the tail on every chunk bounds memory to ``limit`` + one chunk regardless
-    of how much the child spams.
-    """
-    tail = ""
-    while True:
-        chunk = stream.read(_STDERR_READ_CHUNK)
-        if not chunk:
-            break
-        tail = (tail + chunk)[-limit:]
-    return tail
+# Buffer size for the streaming path's stdout `StreamReader`. NOT a maximum line
+# length — `_readline_unbounded` stitches an over-long line back together — so
+# this only trades memory for the number of read hops a big NDJSON event costs.
+# Sized to comfortably hold a `queued` event's node manifest in one pass.
+_STREAM_LINE_LIMIT = 1024 * 1024
 
 
 # comfy-cli floor. `comfy logs` (get_logs) and the structured `envelope/1`
@@ -1192,19 +1163,19 @@ def _envelope_major(envelope: dict) -> int | None:
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
     """Kill the child *and* any grandchildren it spawned.
 
-    Shared by both spawn sites — :func:`_run_comfy_raw` and
-    :func:`_run_comfy_streaming` both pass ``start_new_session=True``, so the
-    child leads its own process group and one ``killpg`` reaps the whole tree.
+    Serves the synchronous spawn site, :func:`_run_comfy_raw`, which passes
+    ``start_new_session=True`` so the child leads its own process group and one
+    ``killpg`` reaps the whole tree. The async spawn sites
+    (:func:`_run_comfy_streaming`, :func:`_start_login`) use the identical
+    twin :func:`_kill_proc_tree_async`.
 
-    On the streaming path that closes every copy of the stderr pipe: comfy-cli
-    can fork a ComfyUI/helper grandchild that inherits the pipe's write-end, and
-    killing only the direct child leaves that fd open, so the blocking
-    ``proc.stderr.read()`` we run in a ``to_thread`` worker never sees EOF and
-    the thread leaks — repeated timeouts then exhaust the default ``to_thread``
-    pool and wedge the server. On the plain path the stake is the work itself:
-    ``comfy update``'s ``git pull`` + ``pip install`` and ``comfy model
-    download``'s transfer keep mutating the workspace after the tool has already
-    reported a timeout, so they have to die with their parent.
+    What is at stake is the work itself: ``comfy update``'s ``git pull`` + ``pip
+    install`` and ``comfy model download``'s transfer keep mutating the
+    workspace after the tool has already reported a timeout, so they have to die
+    with their parent. Killing the group also closes every copy of the stderr
+    pipe — comfy-cli can fork a ComfyUI/helper grandchild that inherits the
+    write-end, and killing only the direct child leaves that fd open so the
+    drain never sees EOF.
 
     The group kill is UNCONDITIONAL — deliberately NOT gated on ``proc.poll()``.
     A dead leader does not mean a dead tree: the case that matters most is
@@ -1255,6 +1226,98 @@ def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _kill_proc_tree_async(proc: Any) -> None:
+    """Kill an async-spawned child and any grandchildren, best-effort.
+
+    The :class:`asyncio.subprocess.Process` twin of :func:`_kill_proc_tree` —
+    same rationale (the child leads its own process group via
+    ``start_new_session=True``, so killing the group closes every inherited copy
+    of the stderr pipe and lets the drain EOF), against a process object that
+    exposes ``returncode`` rather than ``poll()``. Shared by
+    :func:`_run_comfy_streaming` and :func:`_start_login`.
+
+    Unlike the synchronous twin this DOES gate on ``returncode``, because
+    ``asyncio``'s child watcher reaps the process as soon as it exits: signalling
+    a reaped pid could reach an unrelated group the OS has since handed the
+    number to.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError, ValueError):
+        try:
+            proc.kill()
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
+async def _reap_async(proc: Any, timeout: float = 5.0) -> None:
+    """Reap a (killed) async-spawned child without blocking forever.
+
+    The :func:`_reap` twin for :class:`asyncio.subprocess.Process`. Same reason
+    for the bound: a child stuck in uninterruptible sleep (D state) can ignore
+    ``SIGKILL`` indefinitely, and cleanup must never hang the tool call on one.
+    Best-effort — a still-unreaped child is left to the OS.
+    """
+    try:
+        await asyncio.wait_for(proc.wait(), timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        logging.getLogger(__name__).debug(
+            "comfy-cli child survived SIGKILL for %.1fs; leaving it to the OS", timeout
+        )
+
+
+async def _drain_capped_async(stream: Any, limit: int) -> str:
+    """Read an asyncio stream to EOF keeping only the trailing ``limit`` bytes.
+
+    Draining to EOF keeps the child from wedging on a full pipe; slicing to the
+    tail on every chunk bounds memory to ``limit`` + one chunk however much it
+    spams. Decoding once at the end (not per chunk) keeps a multi-byte character
+    split across a chunk boundary from becoming a replacement character.
+
+    Shared by both async spawn sites, :func:`_run_comfy_streaming` and
+    :func:`_start_login`. The synchronous plain path does not need an equivalent:
+    :func:`_run_comfy_raw` bounds its child with ``communicate()``, which drains
+    both pipes itself.
+    """
+    tail = b""
+    while True:
+        chunk = await stream.read(_STDERR_READ_CHUNK)
+        if not chunk:
+            break
+        tail = (tail + chunk)[-limit:]
+    return tail.decode("utf-8", "replace")
+
+
+async def _readline_unbounded(stream: Any) -> bytes:
+    """Read one newline-terminated line however long it is (``b""`` at EOF).
+
+    :meth:`asyncio.StreamReader.readline` raises ``ValueError`` the moment a
+    single line exceeds the reader's buffer limit, which would turn one oversized
+    comfy-cli event into a crashed run — the blocking ``Popen`` + text-mode
+    ``readline`` this replaced had no such ceiling, and a ``queued`` event
+    carrying a large node manifest is exactly the shape that would hit it.
+    Stitching the overrun chunks back together preserves that parity: ``limit``
+    becomes a read-granularity knob rather than a hard maximum line length.
+    """
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunks.append(await stream.readuntil(b"\n"))
+            return b"".join(chunks)
+        except asyncio.LimitOverrunError as exc:
+            # `consumed` bytes are buffered with no newline among them: take
+            # them and keep looking for the terminator past that point.
+            chunks.append(await stream.readexactly(exc.consumed))
+        except asyncio.IncompleteReadError as exc:
+            # EOF before a newline. `partial` is b"" at a clean EOF, which is
+            # the pump's stop signal; a trailing unterminated line is returned
+            # as-is rather than dropped.
+            chunks.append(exc.partial)
+            return b"".join(chunks)
 
 
 def _close_pipes(proc: subprocess.Popen) -> None:
@@ -1699,7 +1762,7 @@ class _StreamProgress:
                 await ctx.report_progress(
                     progress=progress, total=self.total, message=message
                 )
-            except Exception:  # noqa: BLE001 - telemetry must not abort the run
+            except Exception:  # telemetry must not abort the run
                 # A notification is best-effort; the run's RESULT is the
                 # deliverable. Any exception out of the pump reaches
                 # `_run_comfy_streaming`'s `finally`, which kills the comfy-cli
@@ -1726,9 +1789,9 @@ async def _run_comfy_streaming(
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
-    Spawns comfy-cli with :class:`subprocess.Popen`, reads its NDJSON stdout
-    line-by-line (each ``readline`` off-loaded to a thread so the event loop
-    stays free), and forwards run events as MCP progress notifications via
+    Spawns comfy-cli with :func:`asyncio.create_subprocess_exec`, reads its
+    NDJSON stdout line-by-line off the child's asyncio stream, and forwards run
+    events as MCP progress notifications via
     ``ctx.report_progress``. The final ``envelope/1`` line is unwrapped exactly
     as :func:`_run_comfy` does, so an error envelope raises
     :class:`ComfyCliError` with the same code — terminal behavior is unchanged.
@@ -1752,25 +1815,22 @@ async def _run_comfy_streaming(
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
     env = _comfy_env()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         # Same reason as the plain path: never let a child inherit the stdio
         # transport's stdin and eat JSON-RPC request bytes. See _run_comfy_raw.
-        stdin=subprocess.DEVNULL,
-        text=True,
-        # Match the child's forced UTF-8 output (see _comfy_env); otherwise
-        # readline()/stderr.read() decode with the parent locale (cp1252 on
-        # Windows) and non-ASCII stream lines raise UnicodeDecodeError or
-        # corrupt to mojibake before _parse_event/_last_json_object.
-        encoding="utf-8",
+        stdin=asyncio.subprocess.DEVNULL,
         env=env,
         # Own process group so a timeout can kill the whole tree (child +
         # grandchildren) and close every copy of the stderr pipe — otherwise a
-        # grandchild that inherited the fd keeps the blocking stderr read (and
-        # its to_thread worker) alive forever. See _kill_proc_tree. (BE-3343)
+        # grandchild that inherited the fd keeps the stderr drain from ever
+        # seeing EOF. See _kill_proc_tree_async. (BE-3343)
         start_new_session=True,
+        # Read granularity, not a maximum line length: `_readline_unbounded`
+        # stitches an over-long line back together rather than raising.
+        limit=_STREAM_LINE_LIMIT,
     )
     lines: list[str] = []
     tracker = _StreamProgress()
@@ -1789,9 +1849,14 @@ async def _run_comfy_streaming(
         """
         assert proc.stdout is not None
         while True:
-            line = await _in_pipe_pool(proc.stdout.readline)
-            if not line:  # EOF: comfy-cli closed stdout
+            raw = await _readline_unbounded(proc.stdout)
+            if not raw:  # EOF: comfy-cli closed stdout
                 return False
+            # comfy-cli's output is forced to UTF-8 (see `_comfy_env`); decode
+            # with `replace` rather than strict so a truncated or mis-encoded
+            # byte degrades one line instead of raising UnicodeDecodeError out
+            # of the middle of a live run.
+            line = raw.decode("utf-8", "replace")
             lines.append(line)
             # Advance the tracker even without a ctx so a timed-out ctx-less
             # watch still returns real progress; report() no-ops the notify.
@@ -1810,9 +1875,7 @@ async def _run_comfy_streaming(
     # Drain stderr concurrently so a chatty child can't deadlock on a full pipe;
     # retain only the tail so it can't drive unbounded allocation here.
     stderr_future = (
-        asyncio.ensure_future(
-            _in_pipe_pool(_drain_capped, proc.stderr, _STDERR_MAX_CHARS)
-        )
+        asyncio.ensure_future(_drain_capped_async(proc.stderr, _STDERR_MAX_CHARS))
         if proc.stderr is not None
         else None
     )
@@ -1828,7 +1891,7 @@ async def _run_comfy_streaming(
             return True, None
         # EOF: the child has closed stdout, so a plain wait is safe and its
         # stderr is collectible for the error message.
-        returncode = await _in_pipe_pool(proc.wait)
+        returncode = await proc.wait()
         stderr = (await stderr_future) if stderr_future is not None else ""
         # Keep the joined stdout around rather than only its parsed JSON: this is
         # the EOF path, so comfy-cli died without an envelope and whatever plain
@@ -1874,9 +1937,9 @@ async def _run_comfy_streaming(
             # the whole tree FIRST so every copy of the stderr pipe closes and
             # the drain returns the buffered output (a wedged child — or a
             # grandchild holding the fd — would otherwise block the read).
-            if proc.poll() is None:
-                _kill_proc_tree(proc)
-                await _in_pipe_pool(_reap, proc)
+            if proc.returncode is None:
+                _kill_proc_tree_async(proc)
+                await _reap_async(proc)
             # Keep the drained text itself, not only its 500-char message tail:
             # the failure log records a much longer slice
             # (`textutil._stream_tail` at `failure_log._FAILURE_LOG_TAIL_CHARS`),
@@ -1886,7 +1949,7 @@ async def _run_comfy_streaming(
             if stderr_future is not None:
                 try:
                     stderr_text = await asyncio.wait_for(stderr_future, 2.0) or ""
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001 - see body
                     # Diagnostics are best-effort: never let gathering the tail
                     # mask the timeout itself. CancelledError is a BaseException
                     # (not caught by `except Exception`) and DOES fire here: the
@@ -1922,9 +1985,7 @@ async def _run_comfy_streaming(
         envelope = _last_json_object(stdout_text)
         child_reaped = True
         try:
-            await asyncio.wait_for(
-                _in_pipe_pool(proc.wait), timeout=_POST_ENVELOPE_REAP_GRACE
-            )
+            await asyncio.wait_for(proc.wait(), timeout=_POST_ENVELOPE_REAP_GRACE)
         except (asyncio.TimeoutError, TimeoutError):
             child_reaped = False  # lingering child; `finally` reaps it
         # stderr only matters for an error envelope whose `error.message` is
@@ -1939,8 +2000,9 @@ async def _run_comfy_streaming(
         ):
             # The direct child exited during the grace, so its stderr pipe has
             # normally EOF'd — but a descendant holding the write fd could still
-            # block this read. Bound it; `shield` keeps a timeout from cancelling
-            # the reader here so the `finally` join can still detach it.
+            # block this read. Bound it; `shield` keeps a timeout here from
+            # cancelling the reader task itself, leaving that to the `finally`
+            # once the whole tree is dead.
             try:
                 stderr = await asyncio.wait_for(
                     asyncio.shield(stderr_future), _STDERR_JOIN_GRACE
@@ -1961,13 +2023,13 @@ async def _run_comfy_streaming(
         # notification is swallowed in `_StreamProgress.report` and reaches
         # neither this block nor the caller). Kill the whole process tree (not
         # just the direct child) so a descendant holding the stderr write fd
-        # can't keep the pipe from EOFing — see
-        # _kill_proc_tree. (BE-3343) Reap on the dedicated pipe pool, not the
-        # default `to_thread` pool, so this wait can never contend with (or be
-        # confused for) unrelated `to_thread` callers.
-        if proc.poll() is None:
-            _kill_proc_tree(proc)
-            await _in_pipe_pool(_reap, proc)
+        # can't keep the pipe from EOFing — see _kill_proc_tree_async. (BE-3343)
+        if proc.returncode is None:
+            _kill_proc_tree_async(proc)
+            await _reap_async(proc)
+        # Cancelling an asyncio stream read takes effect immediately, so unlike
+        # the thread-pool reader this replaced there is nothing left parked on
+        # the pipe once the task is cancelled — no join is needed.
         if stderr_future is not None and not stderr_future.done():
             stderr_future.cancel()
 
@@ -2535,44 +2597,6 @@ def _login_lock_for_loop() -> asyncio.Lock:
     return _login_lock
 
 
-def _kill_login_child(proc: Any) -> None:
-    """Kill a login child and any grandchildren, best-effort.
-
-    The async-subprocess twin of :func:`_kill_proc_tree` — same rationale (the
-    child leads its own process group via ``start_new_session=True``, so killing
-    the group closes every inherited copy of the stderr pipe and lets the drain
-    EOF), against :class:`asyncio.subprocess.Process`, which exposes
-    ``returncode`` rather than ``poll()``.
-    """
-    if proc.returncode is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (OSError, AttributeError, ValueError):
-        try:
-            proc.kill()
-        except (OSError, AttributeError, ValueError):
-            pass
-
-
-async def _drain_capped_async(stream: Any, limit: int) -> str:
-    """Read an asyncio stream to EOF keeping only the trailing ``limit`` bytes.
-
-    The async counterpart of :func:`_drain_capped`, and there for the same
-    reason: draining keeps the child from wedging on a full pipe, and slicing
-    per chunk bounds memory however much it spams. Decoding once at the end (not
-    per chunk) keeps a multi-byte character split across a chunk boundary from
-    becoming a replacement character.
-    """
-    tail = b""
-    while True:
-        chunk = await stream.read(_STDERR_READ_CHUNK)
-        if not chunk:
-            break
-        tail = (tail + chunk)[-limit:]
-    return tail.decode("utf-8", "replace")
-
-
 async def _tail_login_child(child: _LoginChild) -> None:
     """Consume the rest of a login child's output and park its terminal result.
 
@@ -2588,7 +2612,7 @@ async def _tail_login_child(child: _LoginChild) -> None:
     rest = ""
     try:
         rest = await _drain_capped_async(child.proc.stdout, _LOGIN_STREAM_MAX_CHARS)
-    except Exception:  # noqa: BLE001 - a lost tail must not lose the result
+    except Exception:  # a lost tail must not lose the result
         logging.getLogger(__name__).debug("login stdout drain failed", exc_info=True)
     try:
         returncode = await child.proc.wait()
@@ -2597,7 +2621,7 @@ async def _tail_login_child(child: _LoginChild) -> None:
     stderr_text = ""
     try:
         stderr_text = await child.stderr_task
-    except Exception:  # noqa: BLE001 - stderr is diagnostics, never the verdict
+    except Exception:  # stderr is diagnostics, never the verdict
         logging.getLogger(__name__).debug("login stderr drain failed", exc_info=True)
     stdout_text = ("".join(child.prefix) + rest)[-_LOGIN_STREAM_MAX_CHARS:]
     child.result = (returncode, stdout_text, stderr_text)
@@ -2621,7 +2645,7 @@ async def _login_terminal_report(child: _LoginChild) -> dict | None:
         # timeout from cancelling the reader itself and losing the result.
         try:
             await asyncio.wait_for(asyncio.shield(child.reader), _LOGIN_REAP_GRACE)
-        except Exception:  # noqa: BLE001 - fall through to the report below
+        except Exception:  # fall through to the report below
             logging.getLogger(__name__).debug("login reader join failed", exc_info=True)
     if child.result is None:
         return {
@@ -2681,8 +2705,8 @@ async def _start_login() -> tuple[_LoginChild | None, dict]:
         # request bytes. Same reason as both synchronous spawn sites.
         stdin=asyncio.subprocess.DEVNULL,
         env=_comfy_env(),
-        # Own process group so `_kill_login_child` can take the whole tree and
-        # close every copy of the stderr pipe. See `_kill_proc_tree`.
+        # Own process group so `_kill_proc_tree_async` can take the whole tree
+        # and close every copy of the stderr pipe.
         start_new_session=True,
         limit=_LOGIN_LINE_LIMIT,
     )
@@ -2724,7 +2748,7 @@ async def _start_login() -> tuple[_LoginChild | None, dict]:
         # on something that is not the browser (most likely a comfy-cli without
         # the `login_url` event). Reap it rather than leave an OAuth flow the
         # agent has no URL for, and point at the path that still works.
-        _kill_login_child(proc)
+        _kill_proc_tree_async(proc)
         await _reap_login_child(proc, stderr_task)
         raise ComfyCliError(
             f"`comfy cloud login` emitted no `login_url` within {_LOGIN_URL_WAIT_S:g}s. "
@@ -2735,7 +2759,7 @@ async def _start_login() -> tuple[_LoginChild | None, dict]:
     except BaseException:
         # Cancellation (a disconnected client) must not leak a child holding a
         # loopback port the user can never reach.
-        _kill_login_child(proc)
+        _kill_proc_tree_async(proc)
         stderr_task.cancel()
         raise
     if found is None:
@@ -2767,7 +2791,7 @@ async def _reap_login_child(proc: Any, stderr_task: Any) -> None:
     """Best-effort, bounded cleanup of a killed login child."""
     try:
         await asyncio.wait_for(proc.wait(), _LOGIN_REAP_GRACE)
-    except Exception:  # noqa: BLE001 - a stuck child is left to the OS
+    except Exception:  # a stuck child is left to the OS
         logging.getLogger(__name__).debug("login child reap failed", exc_info=True)
     stderr_task.cancel()
 
@@ -2781,7 +2805,7 @@ async def _abandon_login_child(child: _LoginChild) -> None:
     of the process. Cancelling it is also what frees the loopback port before the
     replacement login tries to bind one.
     """
-    _kill_login_child(child.proc)
+    _kill_proc_tree_async(child.proc)
     await _reap_login_child(child.proc, child.stderr_task)
     if child.reader is not None:
         child.reader.cancel()
@@ -3285,7 +3309,7 @@ def _engine_auto_confirms() -> bool:
     # (`UnicodeDecodeError`) escapes `_run_comfy_raw` uncaught, and crashing
     # `partner_generate` is strictly worse than falling back to asking.
     # `False` is the safe direction — it can only ever cause a prompt.
-    except Exception:
+    except Exception:  # noqa: BLE001 - deliberate: every failure answers False
         return False
     if returncode != 0:
         return False
@@ -3353,7 +3377,11 @@ def _client_elicitation_support(ctx: Context | None) -> bool | None:
         return bool(
             check(types.ClientCapabilities(elicitation=types.ElicitationCapability()))
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unreadable capability must ask, not assume
+        # Any failure here is UNKNOWN, not "no elicitation": a third-party
+        # client's probe can raise anything, and narrowing this catch would let
+        # an unlisted exception type escape and be read as a hard False by the
+        # caller — which is what would spend credits without a human prompt.
         return None
 
 

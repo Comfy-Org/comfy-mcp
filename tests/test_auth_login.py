@@ -122,7 +122,7 @@ def _isolated_login_state(monkeypatch):
     child = server._login_child
     server._login_child = None
     if child is not None:
-        server._kill_login_child(child.proc)
+        server._kill_proc_tree_async(child.proc)
 
 
 async def _shutdown_login() -> None:

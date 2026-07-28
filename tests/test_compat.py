@@ -20,7 +20,6 @@ from conftest import _FakeRunProc, _raises_at_spawn
 
 from comfy_local_mcp import server
 
-
 # --- envelope-version assertion (_unwrap_envelope) --------------------------
 
 
@@ -102,7 +101,7 @@ def test_detect_version_none_when_binary_missing(monkeypatch):
 def test_detect_version_parses_cli_output(monkeypatch):
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    def fake(cmd, capture_output, text, errors, timeout, check):  # noqa: ARG001
+    def fake(cmd, capture_output, text, errors, timeout, check):
         assert cmd == [server.COMFY_BIN, "--version"]
         return subprocess.CompletedProcess(
             cmd, 0, stdout="comfy-cli, 1.12.0\n", stderr=""
@@ -116,7 +115,7 @@ def test_detect_version_ignores_stderr_and_nonzero_exit(monkeypatch):
     """Only stdout on a clean exit is trusted; a stderr number / bad exit -> None."""
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    def fake(cmd, capture_output, text, errors, timeout, check):  # noqa: ARG001
+    def fake(cmd, capture_output, text, errors, timeout, check):
         # Non-zero exit, and a misleading dotted number only on stderr.
         return subprocess.CompletedProcess(
             cmd, 1, stdout="", stderr="Python 3.11.7 error\n"
@@ -342,7 +341,7 @@ def patched_env_then_outdated(monkeypatch):
     def setup(replies: list) -> list[dict]:
         calls: list[dict] = []
 
-        def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):  # noqa: ARG001
+        def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):
             record = {"cmd": cmd, "timeout": None}
             calls.append(record)
             reply = replies[len(calls) - 1]

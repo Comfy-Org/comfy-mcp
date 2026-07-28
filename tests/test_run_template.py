@@ -27,12 +27,10 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
-import io
 import json
-import time
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx, envelope
+from conftest import _OK_STREAM, _RecordingCtx, envelope, stream_reader
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -208,7 +206,7 @@ def test_run_template_survives_a_failing_progress_notification(patched_streamed_
         def __init__(self):
             self.attempts = 0
 
-        async def report_progress(self, progress, total=None, message=None):  # noqa: ARG002
+        async def report_progress(self, progress, total=None, message=None):
             self.attempts += 1
             raise RuntimeError("client disconnected")
 
@@ -482,40 +480,40 @@ def test_run_template_wait_false_submits_async(patched_run, monkeypatch):
 
 
 class _BlockingProc:
-    """A Popen fake that emits ``first_lines`` and then never yields an envelope.
+    """A child fake that emits ``first_lines`` and then never yields an envelope.
 
     Local rather than in ``conftest`` because this is the one case where the call
     genuinely differs (see AGENTS.md): the shared ``patched_stream`` fake drains a
     canned stream to EOF instantly and reports itself already exited, so it can
     never hold the read past a deadline — which is precisely the state this test
     is about.
+
+    ``returncode`` starts None so the timeout handler's kill fires; no ``pid``, so
+    that kill takes ``server._kill_proc_tree_async``'s ``proc.kill()`` fallback
+    instead of signalling a made-up process group.
     """
 
     def __init__(self, cmd, first_lines):
         self.cmd = cmd
-        self._lines = list(first_lines)
-        self.stdout = self  # readline lives on the proc itself
-        self.stderr = io.StringIO("")
-        self.returncode = 0
+        self._lines = [line.encode("utf-8") for line in first_lines]
+        self.stdout = self  # the reader protocol lives on the proc itself
+        self.stderr = stream_reader("")
+        self.returncode = None
         self.killed = False
-        self._alive = True
 
-    def readline(self):
+    async def readuntil(self, separator=b"\n"):
         if self._lines:
             return self._lines.pop(0)
-        time.sleep(1.0)  # outlives the test's tiny deadline; no envelope ever comes
-        return ""
+        # Outlives the test's tiny deadline; no envelope ever comes.
+        await asyncio.sleep(1.0)
+        raise asyncio.IncompleteReadError(b"", None)
 
-    def poll(self):
-        return None if self._alive else self.returncode
-
-    def wait(self, timeout=None):  # noqa: ARG002
-        self._alive = False
+    async def wait(self):
+        self.returncode = 0
         return self.returncode
 
     def kill(self):
         self.killed = True
-        self._alive = False
 
 
 def test_run_template_timeout_raises_the_streaming_shape(monkeypatch):
@@ -532,13 +530,13 @@ def test_run_template_timeout_raises_the_streaming_shape(monkeypatch):
     queued = json.dumps({"schema": "event/1", "type": "queued", "nodes": [{"id": "1"}]})
     procs: list[_BlockingProc] = []
 
-    def fake_popen(cmd, stdout, stderr, text, encoding, env, **kwargs):  # noqa: ARG001
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
         proc = _BlockingProc(cmd, [queued + "\n"])
         procs.append(proc)
         return proc
 
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(server, "_RUN_TEMPLATE_TIMEOUT_GRACE", 0.0)
 
     with pytest.raises(server.ComfyCliError) as exc:

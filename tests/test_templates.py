@@ -23,7 +23,6 @@ from conftest import envelope
 
 from comfy_local_mcp import server
 
-
 # A representative slice of the real comfy-cli `templates ls` payload shape.
 ROWS = [
     {
