@@ -139,11 +139,16 @@ def test_partner_generate_param_value_with_leading_dash_stays_a_value(
     ]
 
 
-def test_partner_generate_forwards_download_path(patched_plain_run):
-    """`download` forwards comfy-cli's `--download`, in the `=value` form."""
+def test_partner_generate_forwards_out_path(patched_plain_run):
+    """`out_path` forwards comfy-cli's `--download`, in the `=value` form.
+
+    The ARGUMENT was renamed `download` -> `out_path` to match the server-wide
+    naming convention (an output file is `out_path` everywhere); the comfy-cli
+    FLAG it forwards is unchanged, so the argv assertion pins `--download=`.
+    """
     calls = patched_plain_run(0, stdout="done")
 
-    _generate("flux-pro", download="/tmp/out.png")
+    _generate("flux-pro", out_path="/tmp/out.png")
 
     assert calls[0]["cmd"][4:] == [
         "generate",
@@ -151,6 +156,39 @@ def test_partner_generate_forwards_download_path(patched_plain_run):
         "--download=/tmp/out.png",
         "--timeout=600.0",
     ]
+
+
+def test_partner_generate_forwards_out_path_template_verbatim(patched_plain_run):
+    """A save-path TEMPLATE (`{index}` / trailing slash) is forwarded unchanged.
+
+    comfy-cli resolves the template itself (`generate/output.py` `save_urls`),
+    so this wrapper must not normalize, expand, or split it.
+    """
+    calls = patched_plain_run(0, stdout="done")
+
+    _generate("flux-pro", out_path="/tmp/gen/{index}.{ext}")
+
+    assert calls[0]["cmd"][4:] == [
+        "generate",
+        "flux-pro",
+        "--download=/tmp/gen/{index}.{ext}",
+        "--timeout=600.0",
+    ]
+
+
+def test_partner_generate_schema_names_the_save_path_out_path():
+    """The rename is a real rename: no `download` alias survives in the schema.
+
+    Clients introspect this schema fresh each session, so `out_path` is what an
+    agent sees. Two visible names for one save path would enlarge exactly the
+    guess space the naming convention exists to shrink — hence no alias.
+    """
+    properties = server.mcp._tool_manager.get_tool("partner_generate").parameters[
+        "properties"
+    ]
+
+    assert "out_path" in properties
+    assert "download" not in properties
 
 
 def test_partner_generate_omits_params_when_none(patched_plain_run):
@@ -537,7 +575,7 @@ def test_partner_generate_rejects_param_names_that_smuggle_a_value(
         ({"model": "flux\0pro"}, "invalid model"),
         ({"model": "flux-pro", "params": {"pro\0mpt": "a cat"}}, "parameter name"),
         ({"model": "flux-pro", "params": {"prompt": "a\0cat"}}, "value for parameter"),
-        ({"model": "flux-pro", "download": "/tmp/\0.png"}, "invalid download"),
+        ({"model": "flux-pro", "out_path": "/tmp/\0.png"}, "invalid out_path"),
     ],
 )
 def test_partner_generate_rejects_embedded_nul(patched_plain_run, kwargs, match):
@@ -554,12 +592,12 @@ def test_partner_generate_rejects_embedded_nul(patched_plain_run, kwargs, match)
     assert calls == []
 
 
-def test_partner_generate_rejects_an_empty_download_path(patched_plain_run):
-    """`download=""` is a caller mistake, not "use the default location"."""
+def test_partner_generate_rejects_an_empty_out_path(patched_plain_run):
+    """`out_path=""` is a caller mistake, not "use the default location"."""
     calls = patched_plain_run(0, stdout="done")
 
-    with pytest.raises(server.ComfyCliError, match="invalid download"):
-        _generate("flux-pro", download="")
+    with pytest.raises(server.ComfyCliError, match="invalid out_path"):
+        _generate("flux-pro", out_path="")
 
     assert calls == []
 

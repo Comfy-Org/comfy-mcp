@@ -119,6 +119,17 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   the host granted blanket permission to call the tool. A user who prefers not
   to be asked persists it engine-side with `comfy generate consent always`.
 
+Argument naming is uniform across the whole tool surface, so do not guess it:
+an INPUT workflow file is always `workflow_path` (`run_workflow`,
+`validate_workflow`, `list_workflow_slots`, `set_workflow_slot`,
+`vary_workflow`); an OUTPUT file is `out_path` (`fetch_template`,
+`partner_generate`); an OUTPUT directory is `out_dir` (`fetch_outputs`,
+`vary_workflow`); a registry lookup key is `name` (`get_template`, `get_node`,
+`nodes_upstream` / `nodes_downstream`, `run_template`); and a job handle is
+`prompt_id` (`job_status`, `wait_for_job`, `watch_job`, `fetch_outputs`,
+`cancel_job`, `get_execution_error`). No tool takes a bare `path` or
+`workflow` argument.
+
 Everything targets the LOCAL server only — there is no cloud access here.
 """
 
@@ -2846,8 +2857,9 @@ async def run_workflow(
 ) -> Any:
     """Run a ComfyUI workflow JSON on the LOCAL ComfyUI.
 
-    Accepts an API-format or UI-export workflow file. Wraps
-    ``comfy run --workflow <path>``. With ``wait=True`` (default) this waits
+    Accepts an API-format or UI-export workflow file — call it as
+    ``run_workflow(workflow_path=...)``. Wraps ``comfy run --workflow <path>``.
+    With ``wait=True`` (default) this waits
     until the run finishes and returns the full result, streaming live progress
     as MCP progress notifications (per-node execution + sampler step counts) so
     a long generation is not a silent block; with ``wait=False`` it submits and
@@ -3555,7 +3567,8 @@ def _generate_param_args(params: dict[str, Any]) -> list[str]:
             raise ComfyCliError(
                 f"`{name}` is a run-level `comfy generate` flag, not a model "
                 "parameter. Use this tool's own arguments where they cover it "
-                "(confirm_spend for --yes, download, timeout_seconds); the "
+                "(confirm_spend for --yes, out_path for --download, "
+                "timeout_seconds for --timeout); the "
                 "remaining run-level flags are not forwarded by this tool, so "
                 "use comfy-cli directly for those."
             )
@@ -3577,7 +3590,7 @@ async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
     confirm_spend: bool = False,
-    download: str | None = None,
+    out_path: str | None = None,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
 ) -> Any:
@@ -3621,12 +3634,18 @@ async def partner_generate(
     ``seed``, …). These are schema-driven per model and are forwarded verbatim;
     discover a model's real parameters, and the available aliases, with
     comfy-cli directly: ``comfy generate schema <model>`` / ``comfy generate
-    list``. ``download`` forwards ``--download <path>`` so comfy-cli saves the
-    generated asset there. ``timeout_seconds`` is forwarded as comfy-cli's own
-    ``--timeout`` (clamped to an hour; partner video models are the slow end),
-    so the ENGINE owns the deadline and can report a resumable job rather than
-    being killed mid-flight; this process only enforces a slightly later
-    backstop.
+    list``. ``out_path`` forwards ``--download <path>`` so comfy-cli saves the
+    generated asset there. It is a save-path TEMPLATE, not just a filename: a
+    plain path (``/tmp/out.png``) names the file; ``{request_id}`` / ``{index}``
+    / ``{ext}`` placeholders are substituted per output; and a trailing slash
+    (``/tmp/gen/``) means "a default filename in this directory". A model that
+    returns several assets (a video plus its thumbnail, say) auto-inserts
+    ``_<i>`` when the template carries neither ``{index}`` nor a trailing slash,
+    so nothing is silently overwritten. ``timeout_seconds`` is forwarded as
+    comfy-cli's own ``--timeout`` (clamped to an hour; partner video models are
+    the slow end), so the ENGINE owns the deadline and can report a resumable
+    job rather than being killed mid-flight; this process only enforces a
+    slightly later backstop.
 
     NOTE: ``comfy generate`` prints its result as human-readable text and exits
     0 WITHOUT emitting an ``envelope/1``, so this runs through the same
@@ -3652,18 +3671,18 @@ async def partner_generate(
     _reject_nul("model", model)
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_GENERATE_TIMEOUT)
     args = ["generate", model, *_generate_param_args(params or {})]
-    if download is not None:
-        if not download:
+    if out_path is not None:
+        if not out_path:
             # Distinguish "no path given" (None -> comfy-cli's default location)
             # from an empty string, which is a caller mistake: silently dropping
             # it saves the asset somewhere the caller did not ask for.
             raise ComfyCliError(
-                "invalid download: empty path — omit `download` to let comfy-cli "
+                "invalid out_path: empty path — omit `out_path` to let comfy-cli "
                 "choose the default location, or pass a real path."
             )
-        _reject_nul("download", download)
+        _reject_nul("out_path", out_path)
         # `--flag=value` so a path beginning with `-` stays the value.
-        args.append(f"--download={download}")
+        args.append(f"--download={out_path}")
     # Hand the deadline to the engine so IT owns giving up (see
     # `_GENERATE_TIMEOUT_GRACE`); the parent timeout below is only the backstop.
     # This is also what makes `timeout_seconds` real: comfy-cli's own default is
@@ -5607,7 +5626,8 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
 def validate_workflow(workflow_path: str) -> Any:
     """Pre-flight a workflow against the live local ComfyUI before running it.
 
-    Wraps ``comfy validate --workflow <path>``. Checks the workflow's
+    Wraps ``comfy validate --workflow <path>``; call it as
+    ``validate_workflow(workflow_path=...)``. Checks the workflow's
     class_types, input shapes, enum values and wiring against the running
     ComfyUI's ``object_info`` and returns the validation result — cheap
     insurance before a slow ``run_workflow``. On an invalid workflow this
@@ -5664,8 +5684,9 @@ def list_workflow_slots(workflow_path: str) -> Any:
     count, or model name) together with its current value, so an agent can see
     what a template exposes without hand-reading the raw workflow JSON. Operates
     on the frontend-format (UI export) workflow that ``fetch_template`` writes and
-    ``run_workflow`` accepts. Pass a slot's ``ADDR`` back to ``set_workflow_slot``
-    (or ``vary_workflow``) to change it.
+    ``run_workflow`` accepts — ``list_workflow_slots(workflow_path=...)``. Pass
+    a slot's ``ADDR`` back to ``set_workflow_slot`` (or ``vary_workflow``) to
+    change it.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
@@ -5837,9 +5858,10 @@ def set_workflow_slot(
 ) -> Any:
     """Set one or more slot values on a frontend-format workflow.
 
-    Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]``. This
-    is the parameterize step of the template on-ramp — change the prompt / seed
-    / steps / model of a fetched template without hand-editing its JSON.
+    Wraps ``comfy workflow set-slot <path> ADDR=VALUE [ADDR=VALUE ...]`` — call
+    it as ``set_workflow_slot(workflow_path=..., overrides=[...])``. This is the
+    parameterize step of the template on-ramp — change the prompt / seed /
+    steps / model of a fetched template without hand-editing its JSON.
 
     Each entry of ``overrides`` may be EITHER form, and the two can be mixed in
     one list:
@@ -6080,11 +6102,12 @@ def vary_workflow(
 ) -> Any:
     """Fan a frontend-format workflow out into variants over slot value lists.
 
-    Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]``,
-    one entry per address (the addresses come from ``list_workflow_slots``).
-    comfy-cli ZIPS the value lists, so every list MUST be the same length — a
-    seed list of 3 and a prompt list of 3 yield three variants pairing seed
-    1/cat, 2/dog, 3/fish.
+    Wraps ``comfy workflow vary <path> --slot "ADDR=[v1,v2,...]" [--slot ...]`` —
+    call it as ``vary_workflow(workflow_path=..., slots=[...])``, one entry per
+    address (the addresses come from ``list_workflow_slots``). comfy-cli ZIPS
+    the value lists, so every list MUST be the same length — a seed list of 3
+    and a prompt list of 3 yield three variants pairing seed 1/cat, 2/dog,
+    3/fish.
 
     Each entry of ``slots`` may be EITHER form, and the two can be mixed in one
     list:
