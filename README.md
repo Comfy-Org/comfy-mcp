@@ -40,7 +40,7 @@ Each tool shells out to the `comfy` command with `--where local --json`, parses 
 `envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
 Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** beta. 37 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 42 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -71,6 +71,10 @@ Cloud MCP** — comfy-cli is the engine.
   1.12.0 that ships the `comfy outdated` verb; on a comfy-cli without it the block degrades to
   `freshness: {"error": "freshness unavailable: …", "unsupported": true}` — update checks are
   skipped, nothing is broken, and everything else works unchanged.
+  The background model download (`download_model`'s `--background` submit and the
+  `download_status` / `wait_for_download` / `cancel_download` verbs) likewise ships in a release
+  **after** 1.13.0; against an older comfy-cli `download_model` falls back to the previous
+  blocking synchronous download and the three polling tools are unavailable.
 - **A ComfyUI workspace.** If you don't have one, `comfy-cli` can create it: `comfy install`
   sets up a ComfyUI workspace it will point at. (An existing ComfyUI checkout works too — see
   `comfy set-default <path>`.)
@@ -467,7 +471,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-37 tools, grouped below by what they do. Every tool runs `comfy` with the global
+42 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
@@ -537,7 +541,10 @@ handle is `prompt_id`.
 | `restart_comfyui(extra_args=None)` | `comfy stop` then `comfy launch --background [-- <extras>]` | Stop-then-launch the local ComfyUI (best-effort stop); forwards `extra_args` to the fresh server. Handy for relaunching with different flags. |
 | `update_comfyui(target="comfy")` | `comfy update <all\|comfy\|cli>` | Update the local install: `"comfy"` = ComfyUI core, `"all"` = the installed custom node packs, `"cli"` = comfy-cli itself. This is what `server_info`'s `freshness` block points at when it reports a stale install. Slow (a core update re-installs requirements; 30-minute timeout) and the updated code only takes effect after a `restart_comfyui`. Any other `target` is rejected before comfy-cli is invoked, and a second update requested while one is still running is refused rather than run in parallel (concurrent `git`/`pip` against one workspace can leave it half-installed). |
 | `upload_file(paths, overwrite=False)` | `comfy upload <files...> [--overwrite]` | Stage source images/masks into the local `input` dir (unlocks img2img / inpaint). |
-| `download_model(url, relative_path=None, filename=None)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>]` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. `relative_path` resolves from the workspace root and must be the models dir or a subfolder of it — `models`, `models/loras` (a bare `loras` is rejected, not assumed); sibling dirs like `custom_nodes/…`, `input`, `output` are refused. Use `/` as the separator on every host, Windows included. |
+| `download_model(url, relative_path=None, filename=None, wait=True, timeout_seconds=110.0)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>] --background` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. The transfer is **submitted** to comfy-cli's background worker and returns a `download_id`, so a multi-GB checkpoint no longer holds the MCP request open past the client's deadline: `wait=True` (default) polls that id for you within a bounded budget and returns `{"timed_out": True, "download_id": …}` — not an error — if the transfer is still running, while a `failed` / `cancelled` download raises with comfy-cli's own error. `wait=False` returns the submit payload immediately. The file is written straight to its final path as it transfers, so a filesystem / `search_models` check mid-flight sees a present-but-incomplete file — `download_status` is the source of truth. `relative_path` resolves from the workspace root and must be the models dir or a subfolder of it — `models`, `models/loras` (a bare `loras` is rejected, not assumed); sibling dirs like `custom_nodes/…`, `input`, `output` are refused. Use `/` as the separator on every host, Windows included. Against a comfy-cli too old to know `--background` (releases up to 1.13.0) it falls back to the previous blocking synchronous download. |
+| `download_status(download_id)` | `comfy model download-status <download_id>` | Progress of one background download: `status`, `completed_bytes` / `total_bytes` / `percent`, `elapsed_seconds`, `dest`, and `error`. The only proof a model is complete and loadable. |
+| `wait_for_download(download_id, timeout_seconds=25.0)` | `comfy model download-status <download_id>` (polled) | Bounded wait until a download reaches a terminal state (completed / failed / cancelled); returns a `{"timed_out": True, …}` payload on expiry. Chain several — the `wait_for_job` shape, for transfers. |
+| `cancel_download(download_id)` | `comfy model download-cancel <download_id>` | Stop a running background download and remove its partial file. |
 
 Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream` /
 `nodes_downstream` / `nodes_path` / `nodes_types` / `nodes_categories`) and `search_models`
