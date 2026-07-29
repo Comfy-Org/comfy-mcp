@@ -383,13 +383,18 @@ _DOWNLOAD_SUBMIT_TIMEOUT = 120.0
 # old to know `--background`.
 _DOWNLOAD_SYNC_TIMEOUT = 1800.0
 
-# Floor for that legacy bound. The submit attempt that discovered the CLI is too
-# old already spent part of the caller's deadline, and a caller whose remainder
-# has effectively run out is better served by the actionable timeout message
-# (which names the possible partial file and how to retry) than by a
-# sub-millisecond bound that fails before comfy-cli prints anything. Same spirit
-# as `_MIN_JOB_STATUS_POLL_TIMEOUT`, kept separate because it floors a whole
-# transfer rather than one status poll.
+# Smallest legacy bound worth SPAWNING under. The submit attempt that discovered
+# the CLI is too old already spent part of the caller's deadline, and below this
+# much remainder the transfer is guaranteed to be killed before comfy-cli has
+# printed anything — so `download_model` refuses instead, and never starts it.
+# Refusing is not merely tidier: `comfy model download` writes straight to the
+# FINAL path, so a transfer started only to be killed a moment later truncates
+# whatever is already at the destination, and a caller who is out of budget would
+# have paid for that with a corrupted model file. The `--background` path takes
+# the same position on a bound too small to resolve the download at all (see
+# `download_model`'s `timeout_seconds`). Same spirit as
+# `_MIN_JOB_STATUS_POLL_TIMEOUT`, kept separate because it gates a whole transfer
+# rather than one status poll.
 _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 
 # Sleep between `model download-status` polls. Matches `wait_for_job`'s cadence:
@@ -1260,6 +1265,24 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     return (*args, "--host", host, "--port", str(port))
 
 
+def _cmd_for_message(cmd: list[str]) -> str:
+    """The spawned argv rendered for an error message, credentials masked.
+
+    A timeout message names the command so a reader can tell WHICH comfy-cli call
+    wedged — but argv is not innocuous. ``model download --url <url>`` and
+    ``generate --image_url=<url>`` carry HuggingFace / CivitAI URLs whose
+    credential lives in a ``?token=…`` query or in ``user:pass@`` userinfo, and
+    this text goes straight into the tool response the MCP client renders and the
+    host logs it. :func:`failure_log._scrub_text` already masks exactly that shape
+    (userinfo masked, query and fragment dropped) for every URL anywhere in a
+    string, so reuse it rather than growing a second redactor —
+    :func:`_synthesize_plain_result` omits raw args altogether for the same
+    reason. Everything that is not URL-shaped survives byte-for-byte, so the flags
+    and the subcommand stay legible.
+    """
+    return failure_log._scrub_text(" ".join(cmd))
+
+
 def _run_comfy_raw(
     *args: str, timeout: float | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
@@ -1327,7 +1350,7 @@ def _run_comfy_raw(
         # indistinguishable from a genuinely slow one. See BE-3343.
         stdout, stderr = _drain_timed_out(proc, exc)
         message = (
-            f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+            f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
             f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
             f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
         )
@@ -1532,26 +1555,50 @@ async def _reap_async(proc: Any, timeout: float = 5.0) -> None:
         )
 
 
-async def _drain_capped_async(stream: Any, limit: int) -> str:
-    """Read an asyncio stream to EOF keeping only the trailing ``limit`` bytes.
+async def _drain_capped_into(stream: Any, limit: int, sink: list[bytes]) -> None:
+    """Read an asyncio stream to EOF, keeping the trailing ``limit`` bytes in a sink.
 
     Draining to EOF keeps the child from wedging on a full pipe; slicing to the
     tail on every chunk bounds memory to ``limit`` + one chunk however much it
-    spams. Decoding once at the end (not per chunk) keeps a multi-byte character
-    split across a chunk boundary from becoming a replacement character.
+    spams. Bytes, not text, so a multi-byte character split across a chunk
+    boundary can be decoded intact once at the end.
 
-    Shared by both async spawn sites, :func:`_run_comfy_streaming` and
-    :func:`_start_login`. The synchronous plain path does not need an equivalent:
-    :func:`_run_comfy_raw` bounds its child with ``communicate()``, which drains
-    both pipes itself.
+    The tail lives in the CALLER's ``sink[0]`` rather than in a local returned at
+    the end, and that is the point: a reader cancelled mid-flight (a ``wait_for``
+    bound firing, an MCP cancel) never reaches a return statement, so a local tail
+    dies with it. :func:`_run_comfy_async` reads through this so a child killed at
+    its deadline still reports the output it had already produced — the same
+    partial capture :func:`_drain_timed_out` replays on the synchronous path.
+    :func:`_drain_capped_async` is the plain "give me the text" wrapper for callers
+    that do not need to survive their own cancellation.
+
+    A ``None`` stream (no pipe was requested) is a no-op, so callers do not each
+    re-check.
     """
-    tail = b""
+    if stream is None:
+        return
     while True:
         chunk = await stream.read(_STDERR_READ_CHUNK)
         if not chunk:
-            break
-        tail = (tail + chunk)[-limit:]
-    return tail.decode("utf-8", "replace")
+            return
+        sink[0] = (sink[0] + chunk)[-limit:]
+
+
+async def _drain_capped_async(stream: Any, limit: int) -> str:
+    """:func:`_drain_capped_into`'s bounded tail, decoded, for a caller with no sink.
+
+    Decoding once at the end (not per chunk) keeps a multi-byte character split
+    across a chunk boundary from becoming a replacement character.
+
+    Shared by both streaming async spawn sites, :func:`_run_comfy_streaming` and
+    :func:`_start_login`, neither of which needs the capture to survive its own
+    cancellation. The synchronous plain path needs no equivalent at all:
+    :func:`_run_comfy_raw` bounds its child with ``communicate()``, which drains
+    both pipes itself.
+    """
+    sink = [b""]
+    await _drain_capped_into(stream, limit, sink)
+    return sink[0].decode("utf-8", "replace")
 
 
 async def _readline_unbounded(stream: Any) -> bytes:
@@ -2268,39 +2315,57 @@ class _StreamProgress:
                 )
 
 
-async def _drain_timed_out_async(proc: Any, timeout: float = 2.0) -> tuple[str, str]:
-    """Best-effort ``(stdout, stderr)`` an async child wrote before it was killed.
+async def _drain_timed_out_async(
+    proc: Any,
+    stdout_sink: list[bytes],
+    stderr_sink: list[bytes],
+    timeout: float = 2.0,
+) -> None:
+    """Top up a killed async child's captured output with whatever is left in its pipes.
 
-    The :func:`_drain_timed_out` twin for :class:`asyncio.subprocess.Process`.
-    The synchronous version can replay what ``communicate`` had already buffered
-    when the deadline fired; here that buffer belonged to the ``communicate()``
-    coroutine ``wait_for`` just cancelled, so it is gone and this reads whatever
-    is LEFT in the pipes instead. Partial by construction, which is fine — this
-    output is a diagnostic, and the alternative is reporting a timeout with no
-    hint at all as to why the child was stuck (BE-3343).
+    The :func:`_drain_timed_out` twin for :class:`asyncio.subprocess.Process`, and
+    it inherits that function's central property: the capture is a SUPERSET of
+    what the cancelled reader had, never a replacement for it. The synchronous
+    version gets that by resuming ``communicate``'s own accumulation buffers;
+    here :func:`_run_comfy_async` reads through sinks it owns, so everything read
+    before the deadline is already in ``stdout_sink`` / ``stderr_sink`` and this
+    only appends the bytes still sitting unread in the pipes. Reporting a timeout
+    with no hint at all as to why the child was stuck is the failure mode both
+    exist to prevent (BE-3343).
 
     Call it only AFTER the process tree is dead: a live child (or a grandchild
     holding an inherited write fd) never EOFs the pipe, so the read would hang.
-    The bound is the backstop for exactly that, and every failure degrades to
-    empty strings — gathering diagnostics must never mask the timeout itself.
+    The bound is the backstop for exactly that, and any failure leaves the sinks
+    as they were — gathering diagnostics must never mask the timeout itself.
     """
-
-    async def _read(stream: Any) -> str:
-        if stream is None:
-            return ""
-        return await _drain_capped_async(stream, _STDERR_MAX_CHARS)
-
     try:
-        stdout, stderr = await asyncio.wait_for(
-            asyncio.gather(_read(proc.stdout), _read(proc.stderr)), timeout
+        await asyncio.wait_for(
+            # `return_exceptions=True`: a bare `gather` propagates the FIRST
+            # failure and leaves the sibling reader neither cancelled nor awaited
+            # — a stray task against a pipe a surviving grandchild may still hold
+            # open, plus a "Task exception was never retrieved" warning on a path
+            # that is already reporting a timeout. Both readers write to their
+            # sink as they go, so there is no result to collect here.
+            asyncio.gather(
+                _drain_capped_into(proc.stdout, _STDERR_MAX_CHARS, stdout_sink),
+                _drain_capped_into(proc.stderr, _STDERR_MAX_CHARS, stderr_sink),
+                return_exceptions=True,
+            ),
+            timeout,
         )
-    except (Exception, asyncio.CancelledError):  # noqa: BLE001 - see docstring
-        # Same reasoning as `_run_comfy_streaming`'s stderr-tail collection:
-        # `CancelledError` is a `BaseException` and DOES reach here when the
-        # enclosing task is being torn down, so catch it explicitly rather than
-        # letting it replace the ComfyCliError the caller is about to raise.
-        return "", ""
-    return stdout, stderr
+    except asyncio.CancelledError:
+        # An EXTERNAL cancellation (an MCP cancel notification, stdio-shutdown
+        # task-group teardown) arriving while these diagnostics drain: it is not
+        # ours to swallow. `wait_for` reports its OWN expiry as `TimeoutError`,
+        # so a `CancelledError` here always came from outside, and converting it
+        # into the caller's synthesized timeout would lose the cancellation the
+        # enclosing scope is waiting to observe. Whatever the readers had already
+        # collected stays in the sinks, so re-raising costs no diagnostics.
+        raise
+    except Exception:  # noqa: BLE001 - see docstring
+        # Anything else (a closed transport, a decode fault) is best-effort by
+        # contract: keep the sinks and let the caller raise its ComfyCliError.
+        return
 
 
 async def _run_comfy_async(
@@ -2308,12 +2373,25 @@ async def _run_comfy_async(
 ) -> Any:
     """Async twin of :func:`_run_comfy`: same result contract, cancellable child.
 
-    Identical inputs and outputs to :func:`_run_comfy` — the ``envelope/1``
+    The same inputs and result shapes as :func:`_run_comfy` — the ``envelope/1``
     unwrap, the ``plain_ok`` synthesis for the verbs that print human text and
     emit no envelope, the :class:`ComfyCliError` shapes — but spawned like
     :func:`_run_comfy_streaming` with :func:`asyncio.create_subprocess_exec`
     instead of a ``Popen`` handed to a worker thread. Nothing here streams; it
-    collects the whole output with one ``communicate()``.
+    collects the whole output up front and parses it once at the end.
+
+    It collects that output through :func:`_drain_capped_into` rather than with
+    ``communicate()``, which is the one place the contract is deliberately
+    narrower than :func:`_run_comfy`'s: each stream is bounded to its trailing
+    :data:`_STDERR_MAX_CHARS` instead of retained whole. ``communicate()`` is safe
+    on the thread-pool path's short metadata calls, but this runner is reserved
+    for the LONGEST-LIVED child in the server — up to
+    :data:`_DOWNLOAD_SYNC_TIMEOUT` of a multi-GB download's verbose progress text
+    — and retaining every byte of that is the unbounded allocation
+    :data:`_STDERR_MAX_CHARS` was introduced to prevent for the streaming path.
+    Keeping the TAIL loses nothing either consumer needs: comfy-cli's envelope is
+    the LAST JSON object it prints and :func:`_synthesize_plain_result` already
+    reports only the tail of the printed text.
 
     That difference is the entire point, and it is about CANCELLATION rather
     than about the event loop. ``asyncio.to_thread(_run_comfy, …)`` is perfectly
@@ -2354,26 +2432,47 @@ async def _run_comfy_async(
         # _kill_proc_tree_async. (BE-3343)
         start_new_session=True,
     )
+    # Owned by THIS frame, not by the reader coroutines, so a bound that fires
+    # mid-transfer still leaves the tail each stream had reached — see
+    # `_drain_capped_into`.
+    stdout_sink: list[bytes] = [b""]
+    stderr_sink: list[bytes] = [b""]
+
+    async def _collect() -> None:
+        # BOTH pipes concurrently, then the exit status — exactly what
+        # `communicate()` did, minus the unbounded retention. Reading them one
+        # after the other would wedge the child on whichever full pipe it is
+        # writing to while we block on the other.
+        await asyncio.gather(
+            _drain_capped_into(proc.stdout, _STDERR_MAX_CHARS, stdout_sink),
+            _drain_capped_into(proc.stderr, _STDERR_MAX_CHARS, stderr_sink),
+        )
+        await proc.wait()
+
     try:
         try:
             if timeout is not None:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
+                await asyncio.wait_for(_collect(), timeout=timeout)
             else:
-                stdout_b, stderr_b = await proc.communicate()
+                await _collect()
         except (asyncio.TimeoutError, TimeoutError) as exc:
             # Kill the whole tree FIRST so every copy of both pipes closes and
             # the drain below can reach EOF, exactly as the streaming path does.
-            if proc.returncode is None:
-                _kill_proc_tree_async(proc)
-                await _reap_async(proc)
-            stdout, stderr = await _drain_timed_out_async(proc)
+            # `_kill_proc_tree_async` owns the "already reaped?" check (signalling
+            # a pid asyncio's child watcher has reaped could reach an unrelated
+            # group), so do not second-guess it with a duplicate guard here.
+            _kill_proc_tree_async(proc)
+            await _reap_async(proc)
+            # `wait_for` cancelled the readers, but their capture lives in the
+            # sinks; this only appends whatever was still unread in the pipes.
+            await _drain_timed_out_async(proc, stdout_sink, stderr_sink)
+            stdout = stdout_sink[0].decode("utf-8", "replace")
+            stderr = stderr_sink[0].decode("utf-8", "replace")
             # Same message shape as `_run_comfy_raw`'s timeout, so a caller (or a
             # QA log reader) sees one timeout report regardless of which runner
             # produced it.
             message = (
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+                f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
                 f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
                 f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
             )
@@ -2391,9 +2490,11 @@ async def _run_comfy_async(
         # comfy-cli's output is forced to UTF-8 (see `_comfy_env`); decode with
         # `replace` rather than strict for the same reason the streaming reader
         # does — a truncated or mis-encoded byte must degrade the text, not raise
-        # a `UnicodeDecodeError` out of a transfer that actually completed.
-        stdout = stdout_b.decode("utf-8", "replace")
-        stderr = stderr_b.decode("utf-8", "replace")
+        # a `UnicodeDecodeError` out of a transfer that actually completed. Decode
+        # ONCE here, not per chunk, so a multi-byte character split across a read
+        # boundary survives (`_drain_capped_into` accumulates bytes for this).
+        stdout = stdout_sink[0].decode("utf-8", "replace")
+        stderr = stderr_sink[0].decode("utf-8", "replace")
         # Unwrapping is `_run_comfy`'s, verbatim — see its body for why the
         # plain_ok fast-path keys off `_real_envelope` being None rather than off
         # the absence of any JSON (BE-2953 launch/stop, BE-3345 model download).
@@ -2409,9 +2510,13 @@ async def _run_comfy_async(
         # `CancelledError`, from an MCP cancel notification or from stdio-shutdown
         # task-group teardown. Kill the whole tree, not just the direct child, for
         # the `start_new_session` reason above. (BE-3343)
-        if proc.returncode is None:
-            _kill_proc_tree_async(proc)
-            await _reap_async(proc)
+        #
+        # Unconditional: both helpers are no-ops for a child that already exited
+        # (`_kill_proc_tree_async` refuses to signal a reaped pid, and `proc.wait()`
+        # returns its stored status immediately), so the single "is it still
+        # running?" decision stays in one place instead of being restated here.
+        _kill_proc_tree_async(proc)
+        await _reap_async(proc)
 
 
 async def _run_comfy_streaming(
@@ -2594,7 +2699,7 @@ async def _run_comfy_streaming(
             # stdout history isn't copied just to keep the 500-char tail.
             timeout_stdout = "".join(lines[-500:])
             message = (
-                f"comfy-cli timed out after {timeout}s: {' '.join(cmd)}. "
+                f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
                 f"Progress so far: {tracker.snapshot()}. The run may still be "
                 "going — check `job_status`, or for long generations submit "
                 "with `wait=False` and poll `wait_for_job` / `watch_job`. "
@@ -7706,6 +7811,39 @@ def _legacy_download_partial(relative_path: str | None, filename: str | None) ->
     )
 
 
+def _legacy_download_way_out(at_cap: bool) -> str:
+    """The routes that actually complete a LEGACY foreground ``model download``.
+
+    Both ways this path can fail on the caller's own budget — the refusal that
+    never spawns a transfer, and the timeout that killed one — end with the same
+    two ways forward, so they share one sentence rather than drifting apart.
+
+    ``at_cap`` is whether the bound that failed WAS already
+    :data:`_DOWNLOAD_SYNC_TIMEOUT`, and it is deliberately keyed off the effective
+    bound rather than off ``wait``: telling a caller to raise ``timeout_seconds``
+    is dead advice both for ``wait=False`` (which does not read the parameter on
+    this path) and for a waiting caller who already passed a value at or above the
+    cap. Either way the only remaining route is a comfy-cli new enough to
+    background the transfer.
+    """
+    if at_cap:
+        route = (
+            f"note the bound was already this path's {int(_DOWNLOAD_SYNC_TIMEOUT)}s "
+            "cap, so raising `timeout_seconds` cannot widen it, and "
+        )
+    else:
+        route = (
+            "retry with a larger `timeout_seconds` (up to "
+            f"{int(_DOWNLOAD_SYNC_TIMEOUT)}, this path's cap) for a longer "
+            "foreground transfer, or "
+        )
+    return (
+        f"To finish the download, {route}upgrade comfy-cli once a release ships "
+        "`--background`, which makes downloads non-blocking with a real "
+        "`download_id`."
+    )
+
+
 def _download_verb_unsupported(exc: ComfyCliError, verb: str) -> dict[str, Any] | None:
     """The capability-gap degrade for a ``model <verb>`` this comfy-cli lacks.
 
@@ -7880,10 +8018,14 @@ async def download_model(
     synthesized payload — ``{"ok": True, "action": ..., "message": ...,
     "note": ...}`` whose ``message`` carries the CLI's printed text (the "Done
     in …" tail and saved-path line) — rather than envelope ``data`` (BE-3345).
-    Every payload it returns carries ``"background_unsupported": True``,
-    whichever ``wait`` you passed, so a caller can always SEE that it ran on the
-    old path and that no ``download_id`` exists rather than inferring that from
-    an absent key. A non-zero exit still raises :class:`ComfyCliError`.
+    Whenever the payload is an object it carries ``"background_unsupported":
+    True`` — whichever ``wait`` you passed, and both for the synthesized shape
+    above and for a real envelope's ``data`` — so a caller can SEE that it ran on
+    the old path and that no ``download_id`` exists rather than inferring that
+    from an absent key. (A comfy-cli that answered with a non-object ``data`` is
+    returned as-is: there is nowhere to hang the marker, and rewrapping it would
+    change the result shape on the one path whose contract is "whatever the old
+    CLI said".) A non-zero exit still raises :class:`ComfyCliError`.
 
     ``wait`` itself cannot be honored there — there is nothing to detach and no
     id to poll, so ``wait=False`` still blocks — but ``timeout_seconds`` now IS:
@@ -7891,8 +8033,17 @@ async def download_model(
     capped at 1800s, instead of the flat half hour it used to run for silently.
     When that bound expires the transfer is KILLED (it was running inside this
     call, so nothing survives it) and the error names where an incomplete file
-    may remain, since no ``download_id`` exists to check it with. Cancelling the
-    tool call kills the transfer the same way, rather than orphaning it.
+    may remain, since no ``download_id`` exists to check it with. If the submit
+    left under a second of that budget, the transfer is REFUSED instead of
+    started — comfy-cli writes straight to the final path, so a transfer killed
+    moments after starting would truncate the destination for no chance of
+    finishing — and the error says how to retry. Cancelling the tool call kills a
+    running transfer the same way, rather than orphaning it.
+
+    So on an old CLI a large model needs a ``timeout_seconds`` big enough to
+    actually transfer it (up to 1800), or a ``wait=False`` call, which runs at
+    that full cap; the default 110s budget exists for the modern path, where the
+    transfer outlives the request.
     """
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
@@ -8112,9 +8263,7 @@ async def download_model(
         # submit attempt above already spent part of it, so spend the remainder —
         # the same two-phase spend the `--background` path does with its poll —
         # capped by `_DOWNLOAD_SYNC_TIMEOUT`, which is this path's ceiling and no
-        # longer its flat bound. A near-zero remainder is floored rather than
-        # passed through: a sub-millisecond bound would fail with a contentless
-        # instant error instead of the actionable timeout message below.
+        # longer its flat bound.
         #
         # `wait=False` keeps the full cap: that caller explicitly decoupled from
         # waiting (the docstring documents that `wait` cannot be honored here at
@@ -8124,10 +8273,32 @@ async def download_model(
         if deadline is None:
             legacy_timeout = _DOWNLOAD_SYNC_TIMEOUT
         else:
-            legacy_timeout = min(
-                _DOWNLOAD_SYNC_TIMEOUT,
-                max(deadline - time.monotonic(), _MIN_LEGACY_DOWNLOAD_TIMEOUT),
-            )
+            remaining = deadline - time.monotonic()
+            if remaining < _MIN_LEGACY_DOWNLOAD_TIMEOUT:
+                # Out of budget: REFUSE without spawning, the same position the
+                # `--background` path takes on a bound too small to resolve the
+                # download at all. Starting a transfer here would be worse than
+                # useless — `comfy model download` writes straight to the final
+                # path, so a child killed a moment after it opened the destination
+                # leaves a truncated file where a complete model may have been,
+                # and the caller would have bought that with a bound that could
+                # never have finished anyway. `timed_out=True` because this IS the
+                # caller's deadline expiring, just detected before the spend
+                # rather than after it.
+                raise ComfyCliError(
+                    "the installed comfy-cli predates `model download "
+                    "--background`, so the transfer has to run in the FOREGROUND "
+                    "inside this call — and the rejected submit left only "
+                    f"{max(remaining, 0.0):.1f}s of `timeout_seconds`, under the "
+                    f"{_MIN_LEGACY_DOWNLOAD_TIMEOUT:.0f}s minimum a foreground "
+                    "transfer is started for. NOTHING was downloaded and nothing "
+                    "on disk was touched: comfy-cli writes straight to the final "
+                    "path, so starting a transfer only to kill it moments later "
+                    f"would truncate {_legacy_download_partial(relative_path, filename)}"
+                    f". {_legacy_download_way_out(at_cap=False)}",
+                    timed_out=True,
+                ) from exc
+            legacy_timeout = min(_DOWNLOAD_SYNC_TIMEOUT, remaining)
         # plain_ok=True: `comfy model download` exits 0 with human progress text
         # and no envelope, so treat a clean exit as success instead of raising
         # the "returned no JSON" false negative on a download that actually
@@ -8162,21 +8333,11 @@ async def download_model(
             # `filename` was passed, so removing a file guessed from the URL could
             # delete the wrong one. Reporting it is v1 (see BE-3428 for the
             # adjacent trust-the-engine's-own-answer theme).
-            # Only a waiting caller can widen the bound: `wait=False` already ran
-            # at the cap (it ignores `timeout_seconds` by design), so telling them
-            # to raise it would be advice that changes nothing.
-            if wait:
-                retry_hint = (
-                    "retry with a larger `timeout_seconds` (up to "
-                    f"{int(_DOWNLOAD_SYNC_TIMEOUT)}, this path's cap) for a "
-                    "longer foreground transfer, or "
-                )
-            else:
-                retry_hint = (
-                    f"note this path already ran at its "
-                    f"{int(_DOWNLOAD_SYNC_TIMEOUT)}s cap (`wait=False` does not "
-                    "read `timeout_seconds` here), so "
-                )
+            #
+            # The way out is keyed on whether the bound that just expired WAS the
+            # cap, not on `wait`: "raise `timeout_seconds`" is dead advice for
+            # `wait=False` (which never reads it here) AND for a waiting caller who
+            # already passed a value at or above the cap.
             raise ComfyCliError(
                 f"{legacy_exc} (the installed comfy-cli predates `model download "
                 "--background`, so the transfer ran in the FOREGROUND and was "
@@ -8184,9 +8345,8 @@ async def download_model(
                 "An INCOMPLETE file may remain under "
                 f"{_legacy_download_partial(relative_path, filename)} — no "
                 "`download_id` exists to check it with, so verify or remove it "
-                f"yourself. To finish the download, {retry_hint}upgrade "
-                "comfy-cli once a release ships `--background`, which makes "
-                "downloads non-blocking with a real `download_id`.)",
+                "yourself. "
+                f"{_legacy_download_way_out(at_cap=legacy_timeout >= _DOWNLOAD_SYNC_TIMEOUT)})",
                 code=legacy_exc.code,
                 no_envelope=legacy_exc.no_envelope,
                 returncode=legacy_exc.returncode,

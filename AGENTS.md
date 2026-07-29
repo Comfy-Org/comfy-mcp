@@ -145,10 +145,12 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   exercises the reader's buffer-limit behavior.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…) -> procs` — the
   plain-JSON *async* path (`_run_comfy_async`): same
-  `asyncio.create_subprocess_exec` spawn, but collected with one `communicate()`
-  instead of read line-by-line. `hang=True` makes the fake child never finish, for
-  the timeout/cancellation cases; each `_FakeAsyncRunProc` records `killed`, so a
-  test can assert the process-tree kill actually fired.
+  `asyncio.create_subprocess_exec` spawn and the same real `StreamReader` pipes,
+  but the capture is parsed once at the end instead of read line-by-line.
+  `hang=True` leaves those pipes OPEN so the fake child never finishes, for the
+  timeout/cancellation cases; its `kill()` closes them, mirroring the process-group
+  kill that is what lets a post-kill drain reach EOF. Each `_FakeAsyncRunProc`
+  records `killed`, so a test can assert the process-tree kill actually fired.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
@@ -157,12 +159,15 @@ with `asyncio.create_subprocess_exec` — nothing blocking may run on the event
 loop. `ASYNC` is enabled in ruff's `select` to enforce that. There are two async
 runners on that side, not one: `_run_comfy_streaming` (NDJSON + progress
 notifications) and `_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the
-identical result contract. `_run_comfy_async` exists for CANCELLATION, not for the
+same result contract. `_run_comfy_async` exists for CANCELLATION, not for the
 event loop — `asyncio.to_thread(_run_comfy, …)` is already non-blocking but its
 cancellation never reaches the thread, so a long-lived call left the `comfy` child
 running when a client gave up. Today it carries the legacy foreground `model
 download` (the `--background`-less fallback); short metadata calls stay on the
-thread-pool path. `auth_login` is a third async spawn site (`_start_login`) for the
+thread-pool path. Because it is reserved for the longest-lived children, it bounds
+each captured stream to its trailing `_STDERR_MAX_CHARS` (via `_drain_capped_into`)
+rather than retaining everything the way `communicate()` does — the one place its
+contract is narrower than `_run_comfy`'s. `auth_login` is a third async spawn site (`_start_login`) for the
 same long-lived reason, but it drives its own browser flow rather than either
 runner.
 

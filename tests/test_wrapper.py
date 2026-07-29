@@ -2222,29 +2222,65 @@ def test_download_model_legacy_wait_true_is_capped_by_the_sync_ceiling(monkeypat
     assert seen["bound"] == server._DOWNLOAD_SYNC_TIMEOUT
 
 
-def test_download_model_legacy_floors_an_exhausted_remainder(monkeypatch):
-    """An all-but-spent deadline is floored, not passed through as ~0.
+def test_download_model_legacy_refuses_an_exhausted_remainder(monkeypatch):
+    """An all-but-spent deadline REFUSES the transfer instead of starting one.
 
-    A sub-millisecond bound would fail before comfy-cli printed anything; the
-    floor buys the actionable timeout message (which names the possible partial
-    file) instead of a contentless instant error.
+    Starting one anyway would be worse than useless: `comfy model download` writes
+    straight to the FINAL path, so a child killed moments after it opened the
+    destination truncates whatever complete model was already there — bought with a
+    bound that could never have finished the transfer. The `--background` path
+    takes the same position on a bound too small to resolve the download at all.
     """
-    seen: dict[str, float] = {}
+    spawned: list[float | None] = []
 
     def fake_run(*args, **kwargs):
         time.sleep(1.2)  # overspends the caller's whole 1s budget
         raise _missing_background_error()
 
     async def fake_async(*args, timeout=None, **kwargs):
-        seen["bound"] = timeout
+        spawned.append(timeout)
         return {"ok": True}
 
     monkeypatch.setattr(server, "_run_comfy", fake_run)
     monkeypatch.setattr(server, "_run_comfy_async", fake_async)
 
-    _download_model("https://hf.co/x.safetensors", timeout_seconds=1.0)
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model("https://hf.co/x.safetensors", timeout_seconds=1.0)
 
-    assert seen["bound"] == server._MIN_LEGACY_DOWNLOAD_TIMEOUT
+    assert spawned == []  # nothing spawned, so nothing on disk was touched
+    message = str(excinfo.value)
+    # The caller's deadline expiring, just detected before the spend instead of
+    # after it — so it reads as a timeout to anyone keying on that.
+    assert excinfo.value.timed_out is True
+    assert "NOTHING was downloaded" in message
+    assert "predates `model download --background`" in message
+    # And the same way out the timeout path offers, so the refusal is actionable.
+    assert "timeout_seconds" in message and "1800" in message
+    assert "upgrade comfy-cli" in message
+
+
+def test_download_model_legacy_spends_a_remainder_above_the_minimum(monkeypatch):
+    """A remainder that COULD carry a transfer is spent, not refused.
+
+    The refusal above is scoped to a budget too small to start under; anything
+    above `_MIN_LEGACY_DOWNLOAD_TIMEOUT` still gets its foreground transfer, which
+    is the only way to download a model on a CLI this old.
+    """
+    seen: dict[str, float] = {}
+
+    async def fake_async(*args, timeout=None, **kwargs):
+        seen["bound"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_comfy", _reject_background)
+    monkeypatch.setattr(server, "_run_comfy_async", fake_async)
+
+    _download_model(
+        "https://hf.co/x.safetensors",
+        timeout_seconds=server._MIN_LEGACY_DOWNLOAD_TIMEOUT + 5.0,
+    )
+
+    assert seen["bound"] >= server._MIN_LEGACY_DOWNLOAD_TIMEOUT
 
 
 def test_download_model_legacy_wait_false_keeps_the_full_cap(monkeypatch):
@@ -3727,8 +3763,9 @@ def test_download_model_legacy_timeout_kills_the_transfer_and_guides_the_caller(
     transfer is dead and a partial file may be on disk with no `download_id` to
     check it with. The error has to carry all of that, plus the way out.
     """
-    # Shrink the FLOOR, not the cap: `_DOWNLOAD_SYNC_TIMEOUT` has to stay real so
-    # the retry guidance quotes the number a caller would actually pass.
+    # Shrink the MINIMUM, not the cap, so a fraction-of-a-second budget is still
+    # big enough to spawn under: `_DOWNLOAD_SYNC_TIMEOUT` has to stay real so the
+    # retry guidance quotes the number a caller would actually pass.
     monkeypatch.setattr(server, "_MIN_LEGACY_DOWNLOAD_TIMEOUT", 0.05)
     logged: list[dict] = []
     monkeypatch.setattr(
@@ -3736,22 +3773,27 @@ def test_download_model_legacy_timeout_kills_the_transfer_and_guides_the_caller(
         "_log_failure",
         lambda kind, args, **kwargs: logged.append({"kind": kind, **kwargs}),
     )
-    procs = patched_async_run(hang=True)  # a child that outlives its deadline
+    # A child that outlives its deadline, having printed some progress first: the
+    # runner's drain reads that into its sinks before the bound cancels it, which
+    # is the whole reason those sinks are owned by the caller rather than by the
+    # reader coroutine.
+    procs = patched_async_run(stderr="Downloading big.safetensors... 12%", hang=True)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         _download_model(
             "https://hf.co/big.safetensors",
             relative_path="models/checkpoints",
             filename="big.safetensors",
-            # All but exhausted, so the floor decides the bound (see above).
-            timeout_seconds=0.01,
+            # Enough budget to start the transfer, nowhere near enough to finish.
+            timeout_seconds=0.3,
         )
 
     message = str(excinfo.value)
     assert excinfo.value.timed_out is True
-    # The original diagnosis is APPENDED to, not replaced — the stderr/stdout
-    # tails the runner collected have to survive.
-    assert "comfy-cli timed out after 0.05s" in message
+    # The original diagnosis is APPENDED to, not replaced — including the stderr
+    # tail the CANCELLED reader had already collected.
+    assert "comfy-cli timed out after" in message
+    assert "Downloading big.safetensors... 12%" in message
     assert "predates `model download --background`" in message
     # Name the exact partial file: `filename` was supplied, so it is knowable.
     assert "models/checkpoints/big.safetensors" in message
@@ -3774,31 +3816,64 @@ def test_download_model_legacy_timeout_names_the_folder_without_a_filename(
     patched_async_run(hang=True)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        _download_model("https://hf.co/big.safetensors", timeout_seconds=0.01)
+        _download_model("https://hf.co/big.safetensors", timeout_seconds=0.3)
 
     message = str(excinfo.value)
     assert "models/ (relative to the workspace root" in message  # the default dir
     assert "name from the URL" in message
 
 
-def test_download_model_legacy_timeout_on_wait_false_does_not_suggest_a_bigger_bound(
-    patched_async_run, legacy_comfy_cli, monkeypatch
+@pytest.mark.parametrize("wait", [False, True])
+def test_download_model_legacy_timeout_at_the_cap_does_not_suggest_a_bigger_bound(
+    patched_async_run, legacy_comfy_cli, monkeypatch, wait
 ):
-    """wait=False already ran at the cap, so "raise timeout_seconds" is dead advice.
+    """A bound that WAS the cap makes "raise timeout_seconds" dead advice.
 
-    It never reads the parameter on this path, so pointing at it would send the
-    caller round a loop that changes nothing. The upgrade route is the real one.
+    Keyed off the effective bound, not off `wait`, because both callers here were
+    already capped: `wait=False` never reads `timeout_seconds` on this path, and a
+    waiting caller who passed a value at or above the cap was clamped to it. Either
+    way, pointing them at the parameter would send them round a loop that changes
+    nothing — the upgrade route is the real one.
     """
     monkeypatch.setattr(server, "_DOWNLOAD_SYNC_TIMEOUT", 0.05)
     patched_async_run(hang=True)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        _download_model("https://hf.co/big.safetensors", wait=False)
+        # `timeout_seconds` far above the (shrunken) cap, so the waiting call is
+        # clamped to it exactly as `wait=False` always is.
+        _download_model(
+            "https://hf.co/big.safetensors", wait=wait, timeout_seconds=30.0
+        )
 
     message = str(excinfo.value)
     assert "retry with a larger `timeout_seconds`" not in message
-    assert "already ran at its" in message
+    assert "cannot widen it" in message
     assert "upgrade comfy-cli" in message
+
+
+def test_download_model_legacy_timeout_message_redacts_the_signed_url(
+    patched_async_run, legacy_comfy_cli, monkeypatch
+):
+    """The argv echoed in a timeout must not carry the URL's credential.
+
+    A CivitAI / HuggingFace model URL keeps its token in a `?token=…` query (or in
+    `user:pass@` userinfo), and this message lands in the tool response the MCP
+    client renders and in the host's logs — the same exposure that makes
+    `_synthesize_plain_result` omit raw args altogether.
+    """
+    monkeypatch.setattr(server, "_DOWNLOAD_SYNC_TIMEOUT", 0.05)
+    patched_async_run(hang=True)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model(
+            "https://user:pw@hf.co/big.safetensors?token=SECRETTOKEN", wait=False
+        )
+
+    message = str(excinfo.value)
+    assert "SECRETTOKEN" not in message
+    assert "user:pw" not in message
+    # Masked, not dropped: which command wedged is still legible.
+    assert "model download --url https://***@hf.co/big.safetensors" in message
 
 
 @pytest.mark.parametrize(
@@ -3893,6 +3968,48 @@ def test_run_comfy_async_matches_the_plain_runners_argv_and_unwrap(patched_async
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
     assert cmd[4:] == ["jobs", "status", "abc"]  # subcommand strictly after
     assert procs[0].env["COMFY_WHERE"] == "local"
+
+
+def test_run_comfy_async_keeps_the_envelope_behind_oversized_output(patched_async_run):
+    """The runner bounds each captured stream to its TAIL, and loses nothing by it.
+
+    `communicate()` would retain every byte a child writes — for this runner that
+    means up to `_DOWNLOAD_SYNC_TIMEOUT` of a multi-GB download's verbose progress
+    text, the unbounded allocation `_STDERR_MAX_CHARS` exists to prevent. Keeping
+    the tail is safe precisely because comfy-cli's envelope is the LAST JSON object
+    it prints, so it survives however much noise precedes it.
+    """
+    noise = "Downloading... chunk\n" * 8000  # comfortably past the cap
+    assert len(noise) > server._STDERR_MAX_CHARS
+    patched_async_run(noise + json.dumps(envelope(data={"x": 1})), stderr=noise)
+
+    assert asyncio.run(server._run_comfy_async("model", "download")) == {"x": 1}
+
+
+def test_drain_capped_into_bounds_the_tail_and_survives_cancellation():
+    """The sink keeps only the trailing bytes, and outlives a cancelled reader.
+
+    Both halves are load-bearing for `_run_comfy_async`: the bound is what keeps a
+    long-lived child's output from accumulating in this process, and the
+    CALLER-owned sink is what lets a transfer killed at its deadline still report
+    the tail it had printed — a local the coroutine returns dies with the
+    cancellation, which is exactly when the diagnostic is wanted.
+    """
+
+    async def drive():
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"abcdef")  # no EOF: the "child" is still running
+        sink = [b""]
+        task = asyncio.ensure_future(server._drain_capped_into(reader, 4, sink))
+        # Let the reader consume what is buffered, then block on the open pipe.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return sink[0]
+
+    assert asyncio.run(drive()) == b"cdef"
 
 
 def test_run_comfy_async_raises_an_error_envelopes_code(patched_async_run):
