@@ -165,7 +165,13 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
 - Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
   which SPENDS the user's Comfy credits — local `run_workflow` / `generate_image`
-  runs are free. Every call confirms the spend with the USER first: on a client
+  runs are free. Discover them here, never in a terminal: `list_partner_models()`
+  is the alias catalog (filter it with `style="text-to-image"` /
+  `partner="bfl"`), and `partner_model_schema(alias)` is that model's parameter
+  list. Nothing in `discover` / `search_nodes` / `search_templates` carries the
+  partner alias set, so those three are not a substitute — but neither is
+  shelling out to `comfy generate list`, which returns a rendered table.
+  Every call confirms the spend with the USER first: on a client
   that supports MCP elicitation you will be shown a confirmation prompt, and a
   decline cancels the call without spending. On a client that cannot elicit,
   comfy-cli's gate fails closed and the call errors unless you pass
@@ -4149,6 +4155,236 @@ def _validate_generate_model(model: str) -> None:
     _reject_nul("model", model)
 
 
+# Upper bound on one page of the partner catalog, so an oversized `limit` can't
+# build a response that trips the MCP client's tool-output cap; callers page the
+# rest via `offset`. Same reasoning — and the same shape — as
+# `_TEMPLATE_LIST_MAX_LIMIT`, but no projection alongside it: a catalog row is
+# already only six short fields, and the two the projection would have to drop
+# (`id`, `summary`) are exactly what tells two aliases of the same partner apart.
+_PARTNER_MODEL_MAX_LIMIT = 200
+
+
+def _is_pre_json_generate_verb(exc: ComfyCliError) -> bool:
+    """Whether ``exc`` is a ``generate`` sub-action that predates JSON output.
+
+    Two conditions together, and both are load-bearing, because this claims to
+    know WHY comfy-cli failed:
+
+    - ``no_envelope`` — comfy-cli emitted no envelope at all (see
+      :class:`ComfyCliError`; a real error envelope from a current comfy-cli, an
+      unknown model alias say, carries its own diagnosis and must reach the
+      caller untouched).
+    - exit status **0** — it ran to completion and reported success. That is what
+      rules out every other way to reach a missing envelope: a crash, a macOS TCC
+      denial, an unreadable spec cache and a usage error all exit non-zero, and
+      mis-labelling one of those "upgrade comfy-cli" would send the caller after
+      the wrong thing. A clean exit with nothing machine-readable on stdout
+      leaves only one explanation — this comfy-cli's ``generate list`` /
+      ``generate schema`` still just render a table.
+    """
+    return exc.no_envelope and exc.returncode == 0
+
+
+def _generate_catalog_gap(exc: ComfyCliError, verb: str) -> ComfyCliError:
+    """Name the version gap :func:`_is_pre_json_generate_verb` identified.
+
+    Left alone, the raw failure is the wrapper's generic "comfy-cli returned no
+    JSON", whose stdout tail is the rendered table itself — which reads like a
+    broken MCP and, worse, invites the caller to go scrape the box-drawing
+    characters back out of the error message. Name the actual cause and the
+    actual fix instead, keeping the original text as the stated cause.
+    """
+    return ComfyCliError(
+        f"the installed comfy-cli's `comfy generate {verb}` emitted no JSON — it "
+        "only renders a human table, which this server does not parse. Upgrade "
+        "comfy-cli (`pip install --upgrade comfy-cli`) to a release whose "
+        f"`generate {verb}` speaks the machine-output contract. "
+        f"(underlying failure: {exc})",
+        no_envelope=True,
+        returncode=exc.returncode,
+    )
+
+
+@mcp.tool()
+def list_partner_models(
+    style: str = "",
+    partner: str = "",
+    query: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> Any:
+    """List the hosted PARTNER models ``partner_generate`` can run.
+
+    Thin passthrough to ``comfy generate list``. This is the ONLY source of the
+    partner alias catalog — ``discover`` does not carry it and ``search_nodes`` /
+    ``search_templates`` read the local install's node and template catalogs,
+    which is a different set. So when the question is "which partner models are
+    available?", or "what is this model called?", this is the tool; there is no
+    reason to shell out to comfy-cli for it.
+
+    Each record is ``{alias, id, partner, category, mode, summary}``:
+
+    - ``alias`` — the short name to pass to ``partner_generate(model=…)`` /
+      ``partner_model_schema(model=…)`` (``id`` is accepted there too).
+    - ``id`` — the canonical endpoint id, e.g. ``bfl/flux-pro-1.1/generate``.
+    - ``partner`` — the partner namespace (``bfl``, ``openai``, ``ideogram``, …).
+    - ``category`` — the model's style, and the axis the ``style`` filter takes.
+      The live values as this is written are ``background``, ``controlnet``,
+      ``image-edit``, ``image-to-image``, ``image-to-video``, ``inpaint``,
+      ``lipsync``, ``outpaint``, ``text-to-image``, ``text-to-video``,
+      ``upscale``, ``vectorize`` and ``video-extend``; comfy-cli owns that set,
+      so read it off an unfiltered call rather than trusting this list.
+    - ``mode`` — ``async`` when the partner returns a job comfy-cli polls,
+      ``sync`` when the result comes back on the create call. It describes the
+      PARTNER's protocol, not this tool: ``partner_generate`` waits either way.
+    - ``summary`` — the model's full one-line description (not the ``…``-clipped
+      form comfy-cli's human table has to cut to fit its column).
+
+    Filters, all forwarded to comfy-cli rather than applied here:
+
+    - ``style`` — ``--style``, EXACT and case-sensitive, so ``text-to-image``
+      matches and ``Text-To-Image`` does not. Matching nothing is an empty
+      result, not an error; re-run unfiltered to see the real category strings.
+    - ``partner`` — ``--partner``, exact but case-insensitive.
+    - ``query`` — ``--query``, a case-insensitive substring over each model's
+      ``id`` and ``summary``.
+    - ``limit`` (default 100, capped at 200) / ``offset`` page the result, on
+      the same terms as ``search_templates``. The catalog is 52 models as this is
+      written, so the default returns all of it in one call — but it grows with
+      every partner comfy-cli adds, so page with ``offset`` whenever ``shown`` is
+      less than ``total`` rather than assuming one call is the whole list.
+
+    Returns ``{"total", "shown", "offset", "filters", "models"}`` — ``total`` is
+    the match count BEFORE paging, ``filters`` is comfy-cli's echo of what it
+    actually applied, and ``models`` is the current page. Follow an alias with
+    ``partner_model_schema(alias)`` for that model's parameters, then
+    ``partner_generate`` to run it (which SPENDS credits) or
+    ``emit_partner_workflow`` for the few aliases that can run on the local
+    install instead.
+    """
+    if limit < 0:
+        raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
+    limit = min(limit, _PARTNER_MODEL_MAX_LIMIT)
+
+    args = ["generate", "list"]
+    for flag, value in (
+        ("--style", style),
+        ("--partner", partner),
+        ("--query", query),
+    ):
+        if value:
+            # Input hygiene, on the same terms as `search_templates`' gallery
+            # filters — and here one dash-leading shape is a genuine hazard
+            # rather than only a caller mistake: `comfy generate` splits its own
+            # run-level flags out of the tail BEFORE reading these, so a
+            # `--`-leading value collides with that split and the filter silently
+            # loses its value (an unfiltered catalog, reported as a match). A
+            # dash-leading value is not real data for any of the three: `style`
+            # and `partner` are exact matches against enumerated strings, and
+            # `query` is a substring of an endpoint id or summary, neither of
+            # which begins with a dash. See `_reject_option_like`.
+            _reject_option_like(f"{flag} value", value)
+            _reject_nul(f"{flag} value", value)
+            args += [flag, value]
+    try:
+        data = _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        if _is_pre_json_generate_verb(exc):
+            raise _generate_catalog_gap(exc, "list") from exc
+        raise
+
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        shape = (
+            "keys {" + ", ".join(sorted(map(str, data))) + "}"
+            if isinstance(data, dict)
+            else data.__class__.__name__
+        )
+        raise ComfyCliError(
+            "unexpected `comfy generate list` payload: expected a dict with a "
+            f"`models` list, got {shape}. comfy-cli's output shape may have drifted."
+        )
+
+    models = data["models"]
+    bad = sum(1 for m in models if not isinstance(m, dict))
+    if bad:
+        # Fail loudly on shape drift rather than silently dropping rows (which
+        # would undercount `total`), matching the payload guard above.
+        raise ComfyCliError(
+            f"unexpected `comfy generate list` payload: {bad} of {len(models)} "
+            "models are not objects. comfy-cli's output shape may have drifted."
+        )
+
+    total = len(models)
+    offset = max(0, offset)
+    page = models[offset : offset + limit]
+    return {
+        "total": total,
+        "shown": len(page),
+        "offset": offset,
+        # comfy-cli's own echo of the filters it applied, so a caller that got
+        # zero rows can tell "the filter was read as I meant it" from a typo.
+        "filters": data.get("filters"),
+        "models": page,
+    }
+
+
+@mcp.tool()
+def partner_model_schema(model: str) -> Any:
+    """Show one partner model's callable parameters — the input to ``partner_generate``.
+
+    Thin passthrough to ``comfy generate schema <model>``. ``model`` is an alias
+    or endpoint id from ``list_partner_models`` (``flux-pro``, ``ideogram-edit``,
+    …). Call this before ``partner_generate``: its ``params`` argument is
+    schema-driven per model and forwarded verbatim, so this is how you learn what
+    that model actually accepts rather than guessing and burning a paid call on a
+    rejected request. It reads the spec only — it calls no partner API and spends
+    nothing.
+
+    Returns comfy-cli's own envelope data: ``{model, id, partner, category,
+    summary, mode, polling, content_type, params, example}``. ``params`` is one
+    record per callable parameter, required ones first, each carrying:
+
+    - ``name`` — the key to put in ``partner_generate``'s ``params`` dict.
+    - ``type`` — ``string`` / ``integer`` / ``number`` / ``boolean`` / ``enum`` /
+      ``object`` / ``array`` / ``binary``. ``binary`` means a LOCAL FILE PATH,
+      which comfy-cli uploads or inlines for you (see ``upload_mode``).
+    - ``required`` — whether ``partner_generate`` fails without it.
+    - ``default`` — what applies when it is omitted (``null`` if the spec
+      declares none), ``enum`` — the only accepted values (empty when the
+      parameter is not enumerated), and ``description`` — the full spec text.
+    - ``kind`` duplicates ``type`` for backwards compatibility; prefer ``type``.
+
+    ``example`` is a copy-pasteable ``comfy generate`` invocation filling every
+    required parameter — read it as documentation of the VALUES, and translate
+    its ``--flag value`` pairs into ``partner_generate(model, params={...})``
+    rather than running it in a shell.
+
+    An unknown alias raises with comfy-cli's own ``generate_model_unknown``
+    error; ``list_partner_models()`` is the list of what is spelled how.
+    """
+    if not model:
+        raise ComfyCliError(
+            "invalid model: empty value — pass a partner model alias (e.g. "
+            "'flux-pro'); `list_partner_models()` returns the available aliases."
+        )
+    # A leading-dash target is read by comfy-cli as an option rather than the
+    # model positional (the same guard `_validate_generate_model` applies).
+    _reject_option_like(
+        "model", model, expected="a partner model alias (e.g. 'flux-pro')"
+    )
+    _reject_nul("model", model)
+    # Returned verbatim: this is a single-model lookup, so — like `get_template`
+    # — there is nothing to page or narrow, and passing comfy-cli's payload
+    # straight through means a parameter field it gains later reaches the caller
+    # without a change here.
+    try:
+        return _run_comfy("generate", "schema", model, timeout=60.0)
+    except ComfyCliError as exc:
+        if _is_pre_json_generate_verb(exc):
+            raise _generate_catalog_gap(exc, "schema") from exc
+        raise
+
+
 @mcp.tool()
 async def partner_generate(
     model: str,
@@ -4203,12 +4439,14 @@ async def partner_generate(
 
     ``params`` carries the model's OWN inputs (``prompt``, ``aspect_ratio``,
     ``seed``, …). These are schema-driven per model and are forwarded verbatim.
-    To discover what is available, stay in this server: ``search_nodes`` /
-    ``get_node`` read the live install's node catalog, including the partner API
-    node classes these aliases map onto, and ``search_templates`` finds ready-made
-    graphs that already wire them up. comfy-cli's ``generate list`` /
-    ``generate schema`` are not exposed as tools yet because they emit no
-    ``envelope/1`` for this wrapper to parse — that gap is tracked upstream.
+    Discover them IN THIS SERVER — there is no reason to shell out to comfy-cli
+    for any of it: ``list_partner_models()`` returns the alias catalog (filter it
+    with ``style="text-to-image"`` / ``partner="bfl"``), and
+    ``partner_model_schema(model)`` returns that model's parameters as records
+    carrying ``name`` / ``type`` / ``required`` / ``default`` / ``enum``. Those
+    two are the ``model`` and ``params`` arguments of this call. (``search_nodes``
+    / ``get_node`` and ``search_templates`` answer a different question — the
+    LOCAL install's node classes and ready-made graphs.)
     ``out_path`` forwards ``--download <path>`` so comfy-cli saves the
     generated asset there. It is a save-path TEMPLATE, not just a filename: a
     plain path (``/tmp/out.png``) names the file; ``{request_id}`` / ``{index}``
@@ -4392,7 +4630,7 @@ async def emit_partner_workflow(
     COVERAGE IS NARROW — this is not a general substitute for
     ``partner_generate``. comfy-cli maps only five aliases to a node class:
     ``flux-2``, ``flux-pro``, ``kling-i2v``, ``nano-banana``, ``seedance``. That
-    is a small subset of what ``comfy generate list`` offers (only two of the
+    is a small subset of what ``list_partner_models()`` returns (only two of the
     eleven text-to-image aliases, for instance); every other model reaches its
     partner exclusively through the proxy, so route those to ``partner_generate``
     rather than reporting them as impossible. An unsupported model raises with
