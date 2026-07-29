@@ -6932,12 +6932,27 @@ def search_models(query: str = "", folder: str = "") -> Any:
 
     Thin passthrough with three modes, in precedence order:
 
-    - ``query`` given → ``comfy models search --text <query>`` (match model
-      filenames). ``--text`` is required: comfy-cli's ``search`` takes the query
-      as an option, not a positional (a positional exits 2 with a usage error).
+    - ``query`` given → ``comfy models search --text <query>`` — a
+      case-insensitive substring match on model FILENAMES across ALL local
+      model folders (``checkpoints``, ``diffusion_models``, ``loras``, ``vae``,
+      …), so a LoRA or VAE is findable by name without knowing its folder.
+      ``--text`` is required: comfy-cli's ``search`` takes the query as an
+      option, not a positional (a positional exits 2 with a usage error).
+      The cross-folder walk needs a comfy-cli release NEWER than v1.13.0 — the
+      fix landed in Comfy-Org/comfy-cli#603, after v1.13.0 was cut. On v1.13.0
+      and older this mode searches ``checkpoints`` only, and anything outside
+      that folder is reachable via ``folder`` mode below.
     - else ``folder`` given → ``comfy models list-folder <folder>`` (list one
       model folder, e.g. ``checkpoints``, ``loras``).
     - else (both empty) → ``comfy models list-folders`` (list the folder names).
+
+    RESPONSE SHAPE DIFFERS BY MODE — this split is by design in comfy-cli, not a
+    bug, so parse per mode: ``query`` returns the cloud-asset row projection
+    ``{mode, filters, total, shown, rows: [{name, type, tags, ...}]}`` (on local
+    ``type``/``tags`` carry the source folder and the enrichment fields are
+    ``null``), while ``folder`` returns the raw listing ``{mode, url, folder,
+    total, shown, files: [{name, pathIndex}]}``. Model names live under ``rows``
+    for a query and under ``files`` for a folder.
 
     LOCAL DEGRADATION: unlike the cloud catalog, this returns only what is on
     disk — filenames, with no enrichment (no base-model / hash / description /
