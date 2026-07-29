@@ -15,6 +15,7 @@ MCP progress notifications, and still returns the final envelope's data.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import os
 import shutil
@@ -775,6 +776,199 @@ def test_get_logs_other_error_still_raises(patched_run):
 
     with pytest.raises(server.ComfyCliError, match="server_not_running"):
         server.get_logs()
+
+
+def test_get_logs_forwards_port_hint(patched_run):
+    """An explicit `port` is appended as `--port <n>`, after the tail."""
+    calls = patched_run(envelope(data={"lines": []}))
+
+    server.get_logs(port=8189)
+
+    assert calls[0]["cmd"][4:] == ["logs", "--tail", "200", "--port", "8189"]
+
+
+def test_get_logs_without_port_leaves_argv_unchanged(patched_run):
+    """`port=None` (the default) is byte-identical to the pre-hint argv."""
+    calls = patched_run(envelope(data={"lines": []}))
+
+    server.get_logs(tail=50)
+
+    assert calls[0]["cmd"][4:] == ["logs", "--tail", "50"]
+    assert "--port" not in calls[0]["cmd"]
+
+
+@pytest.mark.parametrize(
+    "bad_port",
+    [
+        0,  # below the IANA range
+        -1,  # would render as `--port -1`, which Click reads as an option
+        70000,  # above the IANA range
+        True,  # `bool` is an `int` subclass — must not forward `--port 1`
+        8189.5,  # a non-integer would be silently truncated by `int()`
+        "8189",  # a string never becomes argv unchecked
+    ],
+)
+def test_get_logs_rejects_invalid_port(no_spawn, bad_port):
+    """An out-of-range or non-integer port is refused before comfy-cli is spawned."""
+    with pytest.raises(server.ComfyCliError, match="port"):
+        server.get_logs(port=bad_port)
+
+
+def test_get_logs_normalizes_an_int_subclass_port(patched_run):
+    """An `IntEnum` port reaches argv as its NUMBER, not as `Port.COMFY`.
+
+    It passes the `isinstance` and range checks, so the guard's job is to hand
+    back `int(port)` — otherwise `str()` renders the member name onto argv.
+    """
+
+    class _Port(enum.IntEnum):
+        COMFY = 8189
+
+    calls = patched_run(envelope(data={"lines": []}))
+
+    server.get_logs(port=_Port.COMFY)
+
+    assert calls[0]["cmd"][4:] == ["logs", "--tail", "200", "--port", "8189"]
+
+
+def test_get_logs_bounds_the_rejected_port_it_echoes(no_spawn):
+    """An oversized value is summarized, not copied verbatim into the error.
+
+    Same rule as `_guard_prompt_id` / `_guard_download_id`: an in-process caller
+    can pass a megabyte-long "port", and reflecting it whole floods the caller's
+    context with the very input the guard refused.
+    """
+    huge = "8" * 50_000
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.get_logs(port=huge)
+
+    message = str(excinfo.value)
+    assert huge not in message
+    assert f"({len(repr(huge))} characters)" in message
+    # A summary of the input, not the input: a few lines of prose around the cap,
+    # nowhere near the 50k it was handed.
+    assert len(message) < server._MAX_PORT_REPR_CHARS + 200
+
+
+def test_get_logs_rejects_an_unrenderable_int_port_as_a_range_error(no_spawn):
+    """An int too large to stringify still fails as a `ComfyCliError`.
+
+    On 3.11+ an int with more than `sys.get_int_max_str_digits()` digits raises
+    `ValueError` on conversion to text, so formatting the value into the
+    out-of-range message would escape this guard as an internal error.
+    """
+    with pytest.raises(server.ComfyCliError, match="outside the valid range"):
+        server.get_logs(port=10**5000)
+
+
+def test_get_logs_passes_through_source_and_staleness_metadata(patched_run):
+    """`source` / `mtime` / `size` / `port_mismatch` reach the caller untouched.
+
+    A wrong-port empty log is otherwise indistinguishable from success, so the
+    staleness signal must not be dropped — while the per-line cap still applies.
+    This is the auto-resolved shape (no `port` argument), the only one comfy-cli
+    ever sets `port_mismatch` on.
+    """
+    blob = "x" * (server._MAX_LOG_LINE_CHARS + 5_000)
+    payload = {
+        "lines": ["boot ok\n", blob],
+        "path": "/ws/user/comfyui_8188.log",
+        "truncated": True,
+        "source": "fallback_glob",
+        "port_mismatch": True,
+        "mtime": "2026-07-20T11:02:03+00:00",
+        "size": 4096,
+        # A field this MCP has never heard of: the payload is forwarded, not
+        # projected, so a newer comfy-cli's additions must survive too.
+        "rotated_from": "/ws/user/comfyui_8188.log.1",
+    }
+    patched_run(envelope(data=payload))
+
+    result = server.get_logs()
+
+    assert result["source"] == "fallback_glob"
+    assert result["port_mismatch"] is True
+    assert result["mtime"] == "2026-07-20T11:02:03+00:00"
+    assert result["size"] == 4096
+    assert result["path"] == "/ws/user/comfyui_8188.log"
+    assert result["truncated"] is True
+    assert result["rotated_from"] == "/ws/user/comfyui_8188.log.1"
+    assert result["lines"][0] == "boot ok\n"  # capping is unchanged
+    assert len(result["lines"][1]) <= server._MAX_LOG_LINE_CHARS
+
+
+def test_get_logs_explicit_port_fallback_source_passes_through(patched_run):
+    """With an explicit `port`, `source` — not `port_mismatch` — is the signal.
+
+    comfy-cli suppresses `port_mismatch` when a port was asked for, so a
+    `--port` that fell back to ComfyUI-Manager's unsuffixed log (which records
+    no port, and may be another session's) shows up only as `source`.
+    """
+    payload = {
+        "lines": ["boot ok\n"],
+        "path": "/ws/user/comfyui.log",
+        "truncated": False,
+        "source": "fallback_unsuffixed",
+        "port_mismatch": False,
+        "mtime": "2026-07-20T11:02:03+00:00",
+        "size": 128,
+    }
+    patched_run(envelope(data=payload))
+
+    result = server.get_logs(port=8189)
+
+    assert result["source"] == "fallback_unsuffixed"
+    assert result["port_mismatch"] is False
+
+
+def test_get_logs_no_log_file_message_is_preserved_verbatim(patched_run):
+    """The multi-candidate `no_log_file` message still returns as data, intact."""
+    message = (
+        "No captured ComfyUI log was found. Looked for: "
+        "/ws/user/comfyui_8189.log, /ws/user/comfyui.log"
+    )
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "no_log_file", "message": message},
+        }
+    )
+
+    result = server.get_logs(port=8189)
+
+    assert result["error"] == "no_log_file"
+    assert message in result["message"]
+
+
+def test_get_logs_port_on_old_comfy_cli_raises_upgrade_error(patched_run):
+    """An older comfy-cli that has no `--port` fails loudly — it never retries.
+
+    A silent retry without the flag would return whichever log comfy-cli resolves
+    on its own, i.e. the wrong-instance answer the hint exists to prevent.
+    """
+    calls = patched_run("", returncode=2, stderr="Error: No such option '--port'.\n")
+
+    with pytest.raises(server.ComfyCliError, match="upgrade") as excinfo:
+        server.get_logs(port=8189)
+
+    assert "--port" in str(excinfo.value)
+    # comfy-cli's own text survives: `raise ... from exc` sets `__cause__`, which
+    # no MCP client sees, so a rewrite would be the only thing the caller reads —
+    # and if this match were ever wrong, the real diagnostic would be gone.
+    assert "No such option" in str(excinfo.value)
+    assert len(calls) == 1  # exactly one spawn: no fallback attempt
+
+
+def test_get_logs_unrelated_usage_error_keeps_its_own_message(patched_run):
+    """The upgrade hint is scoped to `--port`; another usage error passes through."""
+    patched_run("", returncode=2, stderr="Error: No such option '--tail'.\n")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.get_logs(port=8189)
+
+    assert "upgrade" not in str(excinfo.value)
 
 
 def test_cancel_job_maps_command_and_returns_data(patched_run):
