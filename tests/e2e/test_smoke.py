@@ -130,6 +130,25 @@ def test_no_model_round_trip(tmp_path):
     assert pngs, f"no valid PNG downloaded into {out_dir}"
 
 
+def test_system_stats_reports_devices():
+    """system_stats returns a real, non-empty devices list from the live server.
+
+    The unit tests pin the argv and pass a canned envelope through; only a live
+    run proves the pinned comfy-cli actually HAS the `system-stats` verb and that
+    ComfyUI answers it with the shape the tool's docstring promises. That gap is
+    exactly what this tool's version-skew hint exists for, so it is worth one
+    real call.
+    """
+    stats = server.system_stats()
+
+    assert isinstance(stats, dict), f"system-stats returned {stats!r}"
+    devices = stats.get("devices")
+    assert isinstance(devices, list) and devices, f"no devices in {stats!r}"
+    # `vram_free` is the number the VRAM-coordination recipe reads; prove it is
+    # a usable number rather than a string or a missing key.
+    assert isinstance(devices[0].get("vram_free"), (int, float))
+
+
 def test_generate_image_round_trip(tmp_path):
     """generate_image(prompt, wait=True) enqueues a real job and yields a PNG.
 

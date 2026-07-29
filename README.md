@@ -40,7 +40,7 @@ Each tool shells out to the `comfy` command with `--where local --json`, parses 
 `envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
 Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** beta. 42 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 45 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -48,6 +48,7 @@ Cloud MCP** — comfy-cli is the engine.
 
 - [Prerequisites](#prerequisites)
 - [When to use this server](#when-to-use-this-server)
+- [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
 - [Partner-API nodes](#partner-api-nodes)
 - [Spending credits on partner models](#spending-credits-on-partner-models)
 - [Templates your install can't run](#templates-your-install-cant-run)
@@ -156,6 +157,25 @@ The instructions walk these as an ordered procedure, because several of the chec
 The `hardware` block comes straight through from `comfy env`, and a comfy-cli that predates it simply omits the key. There is no HTTP client and no cloud code here — the cloud/partner steer is guidance text only.
 
 **Which model to use is deliberately not encoded here.** The instructions tell the agent to pick via `search_templates` / `search_models` rather than assume a classic default (e.g. SDXL), because the gallery tracks current models and a hardcoded name would rot. Current-model guidance lives in **[Comfy-Org/comfy-skills](https://github.com/Comfy-Org/comfy-skills)**, which is its canonical home.
+
+## Using with local LLMs (VRAM coordination)
+
+Running a local LLM (Ollama, LM Studio, llama.cpp) and ComfyUI on the same GPU means the two compete for the same VRAM, and the LLM is usually the one holding it when the image job needs it. This server gives the agent both halves of the read/free loop, but the *coordination* is the client's — see why below.
+
+The recipe, in order:
+
+1. **Read the headroom.** `system_stats()` returns per-device `vram_free` / `vram_total` straight from the live ComfyUI. Compare `vram_free` against what the workflow's checkpoint needs.
+2. **If it is tight, the client unloads its own LLM** using its runtime's own mechanism — this server has no way to do it (step 5 below):
+   - **Ollama** — send `keep_alive: 0` on the next `/api/generate` (or `/api/chat`) call, which unloads the model as soon as that call returns, or run `ollama stop <model>`.
+   - **LM Studio** — let the model's TTL / JIT auto-evict expire, or unload explicitly with `lms unload <model>` (`lms unload --all` for everything).
+   - **llama.cpp (`llama-server`)** — in [router mode](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) (started with no `-m`, or with `--models-dir`) `POST /models/unload` with `{"model": "<name>"}` unloads one model; `GET /models` lists what is currently loaded. Independently of router mode, `--sleep-idle-seconds N` makes the server unload the model and its KV cache after N idle seconds and reload it automatically on the next request — which handles both step 2 and step 5 with no orchestration at all. Only a classic single-model server started without either (`llama-server -m model.gguf`) has nothing to call: there, stopping and restarting the process is the reclaim.
+3. **Free ComfyUI's own models too** with `free_memory()`. ComfyUI applies it when its queue worker next iterates — immediate if idle, after the current job if busy — and it never interrupts a running job. Re-read `system_stats()` to confirm the VRAM actually came back before committing to a big run.
+4. **Run the job** — `run_workflow(...)` / `run_template(...)` / `generate_image(...)` — then collect with `fetch_outputs(...)`.
+5. **The client reloads its LLM** afterwards, again through its own runtime. Ollama, LM Studio and a sleep-idle `llama-server` all reload on demand, so for those "reload" is just the next request; a single-model `llama-server` stopped in step 2 has to be started again.
+
+**Why steps 2 and 5 cannot live in this MCP server.** This server is a **stdio subprocess of your MCP client** — it holds no handle on whatever LLM runtime that client is using, is not told which one it is, and has no business reaching into a process it does not own. Reaching one anyway would also breach the [thin-wrapper rule](AGENTS.md): every tool here is a `comfy` passthrough, and there is no `comfy` subcommand for "unload someone else's model". The deeper reason is step 5: the *model* that was unloaded cannot ask for itself back, so something still running has to sequence unload → run → reload. Where the LLM's own runtime can do that (Ollama's on-demand load, LM Studio's JIT, `llama-server --sleep-idle-seconds`) it should — that is the least-coordination option and it needs nothing from this server. Otherwise the client, or the orchestrator driving it, is the only participant present throughout. Either way the split is structural rather than a missing feature: this server owns reading and freeing **ComfyUI's** memory, and the client owns its **own** model's lifecycle.
+
+A note on scope: `free_memory()` asks ComfyUI to release *its* models. It does nothing about VRAM held by an LLM runtime, a browser, or another process — if `system_stats()` still shows little free VRAM after a `free_memory()` call, the memory is someone else's and step 2 is what reclaims it.
 
 ## Partner-API nodes
 
@@ -515,7 +535,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-42 tools, grouped below by what they do. Every tool runs `comfy` with the global
+45 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
@@ -539,6 +559,13 @@ handle is `prompt_id`.
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known **local** jobs with status (pending/running/completed); cloud-tracked rows are filtered out. |
 | `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+
+### Resource management
+
+| Tool | Wraps | What it does |
+|---|---|---|
+| `system_stats()` | `comfy system-stats` | Read the live local ComfyUI's VRAM per device and system RAM — a `devices` list (`name`, `type`, `index`, `vram_free`, `vram_total`, all byte counts) plus a `system` dict (`ram_free`, `ram_total`, `comfyui_version`), returned exactly as ComfyUI's own `/system_stats` reports it. Call it before a heavy `run_workflow` / `run_template` to decide whether to free memory first, and again afterwards to confirm the headroom landed. Read-only. Needs a running ComfyUI (the numbers come from the server), and unlike the run/job tools it is **not** diverted by `COMFYUI_URL`/`COMFYUI_HOST` — `comfy system-stats` takes no `--host`/`--port`. |
+| `free_memory(unload_models=True, free_memory=True)` | `comfy free [--unload-models\|--no-unload-models] [--free-memory]` | Ask ComfyUI to unload models from VRAM and reset its executor cache (`POST /free`). **`free_memory` defaults to `True` here while comfy-cli's `--free-memory` defaults to `False`** — an agent reaching for this tool wants maximum headroom, so the cache reset is on by default; pass `free_memory=False` for the CLI's lighter unload that keeps cached executor state. **Not immediate and never destructive:** ComfyUI applies the request when its queue worker next iterates — immediate if idle, after the current job if busy — and it does **not** interrupt a running job, so it cannot be used to stop one (`cancel_job` does that). Returns comfy-cli's acknowledgement of what was *requested*, not a measurement; read `system_stats` afterwards to confirm. See [Using with local LLMs](#using-with-local-llms-vram-coordination). |
 
 ### Diagnostics
 

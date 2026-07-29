@@ -128,6 +128,14 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
   before running.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
+- VRAM is shared with everything else on the machine. Before a heavy run, read
+  `system_stats` for per-device `vram_free`; if it is short, `free_memory`
+  releases ComfyUI's own models (applied when the queue worker next iterates —
+  it never interrupts a running job, so it is NOT a way to stop one; use
+  `cancel_job`). `free_memory` cannot touch VRAM held by ANOTHER process — a
+  local LLM runtime (Ollama / LM Studio / llama.cpp) has to be unloaded by
+  whoever owns it, which is the client, not this server. Re-read `system_stats`
+  to confirm the headroom before committing to the run.
 - Before running a workflow whose nodes call partner APIs (Seedream / Veo /
   Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials.
   Treat credentials as GOOD if `signed_in` is true OR
@@ -5155,6 +5163,126 @@ def get_queue() -> Any:
     those ids here would only invite calls that cannot work.
     """
     return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
+
+
+# `comfy system-stats` and `comfy free` landed in comfy-cli AFTER 1.13.0 — the
+# newest release when these two tools were written — so there is no released
+# version number to name yet, and `_MIN_COMFY_CLI` (the 1.13.0 floor
+# `_check_comfy_version` enforces) cannot cover them. The hint therefore points
+# at the upgrade rather than at a floor, the same shape
+# `_require_emit_workflow_capability` uses for `--emit-workflow`: name the verb,
+# say it is newer than the floor, and give the one command that fixes it.
+_RESOURCE_VERB_UPGRADE_HINT = (
+    f"requires a comfy-cli NEWER than {_MIN_COMFY_CLI_STR} (the verb landed after "
+    "that release); upgrade with `pip install -U comfy-cli`"
+)
+
+
+def _resource_verb_upgrade_error(
+    exc: ComfyCliError, verb: str, tool: str
+) -> ComfyCliError | None:
+    """A version-skew ``ComfyCliError`` for *verb*, or ``None`` to keep *exc* raw.
+
+    `system_stats` / `free_memory` wrap comfy-cli verbs newer than the version
+    floor this server enforces, so an otherwise-current install can be missing
+    them. Left alone, that surfaces as `_unwrap_envelope`'s generic "comfy-cli
+    returned no JSON (exit 2)" wrapped around Click's raw usage dump — which
+    reads like a broken MCP rather than the one-command capability gap it is.
+
+    Returning a *new* error (rather than degrading to an `unsupported: True`
+    payload the way `download_status` does) is deliberate: those tools have a
+    working alternative to point at, whereas here the missing verb IS the whole
+    call — there is no partial answer to hand back, so failing loudly with the
+    fix in the message is the honest shape, and it matches how every other tool
+    surfaces a `ComfyCliError`.
+
+    :func:`_is_missing_verb_error` decides the case and is deliberately strict
+    (no envelope AND Click's usage exit status AND the phrase naming this verb),
+    so a real failure from a verb comfy-cli DID dispatch — ComfyUI not running,
+    an HTTP error — keeps its own message instead of being mislabelled a version
+    problem. ``None`` means exactly that: the caller re-raises untouched.
+    """
+    if not _is_missing_verb_error(exc, verb):
+        return None
+    return ComfyCliError(
+        f"{tool} unavailable: the installed comfy-cli has no `comfy {verb}` verb. "
+        f"It {_RESOURCE_VERB_UPGRADE_HINT}.",
+        no_envelope=exc.no_envelope,
+        returncode=exc.returncode,
+    )
+
+
+@mcp.tool()
+def system_stats() -> Any:
+    """Read the live local ComfyUI's VRAM per device and system RAM.
+
+    Wraps ``comfy system-stats`` (ComfyUI's own ``GET /system_stats``, reached by
+    comfy-cli — no HTTP from here). Returns comfy-cli's envelope ``data``
+    unmodified: a ``devices`` list (per device ``name`` / ``type`` / ``index`` /
+    ``vram_free`` / ``vram_total``, all byte counts) plus a ``system`` dict
+    (``ram_free`` / ``ram_total``, ``comfyui_version``).
+
+    Call it BEFORE a heavy ``run_workflow`` / ``run_template`` to decide whether
+    to free memory first: if ``vram_free`` is short of what the graph's
+    checkpoint needs, call ``free_memory`` (and, when the shortfall is another
+    process's, have the CLIENT unload its own model — see "Using with local LLMs"
+    in the README) and read this again to confirm the headroom actually landed.
+    It reads state and changes nothing, so it is safe to poll.
+
+    A running ComfyUI is required — the numbers come from the server, so with
+    nothing running this raises comfy-cli's ``server_not_running`` rather than
+    reporting zeros. Unlike the run/job tools this is NOT diverted by
+    ``COMFYUI_URL`` / ``COMFYUI_HOST`` (``comfy system-stats`` takes no
+    ``--host`` / ``--port``), so it describes whichever ComfyUI comfy-cli itself
+    targets.
+    """
+    try:
+        return _run_comfy("system-stats", timeout=60.0)
+    except ComfyCliError as exc:
+        hinted = _resource_verb_upgrade_error(exc, "system-stats", "system_stats")
+        if hinted is not None:
+            raise hinted from exc
+        raise
+
+
+@mcp.tool()
+def free_memory(unload_models: bool = True, free_memory: bool = True) -> Any:
+    """Ask the local ComfyUI to unload models / reset its executor cache.
+
+    Wraps ``comfy free`` (ComfyUI's own ``POST /free``). Use it to reclaim VRAM
+    before a heavy run — pair it with ``system_stats`` to see the before/after.
+
+    ``unload_models=True`` (default) unloads all models from VRAM; pass ``False``
+    to send ``--no-unload-models`` and leave them resident. ``free_memory=True``
+    ALSO resets the executor cache, which implies unloading server-side.
+
+    **``free_memory`` defaults to ``True`` here, while comfy-cli's ``--free-memory``
+    defaults to ``False``.** The divergence is deliberate: an agent that reaches
+    for this tool wants maximum headroom for the run it is about to start, and the
+    cache reset is the difference between "most of the VRAM back" and "all of it".
+    Pass ``free_memory=False`` for the CLI's own default — the lighter unload that
+    keeps the cached executor state, so a re-run of the same graph re-warms faster.
+
+    NOT IMMEDIATE, and never destructive: ComfyUI applies the request when its
+    queue worker next iterates — immediate if the server is idle, after the
+    current job finishes if it is busy. It does **not** interrupt a running job,
+    so this cannot be used to stop one; use ``cancel_job`` for that. The return is
+    comfy-cli's acknowledgement of what was REQUESTED (``{"requested": {...},
+    "note": ...}``), not a measurement — read ``system_stats`` afterwards to
+    confirm the memory actually came back.
+    """
+    args = ["free", "--unload-models" if unload_models else "--no-unload-models"]
+    if free_memory:
+        # `--free-memory` is a plain on-switch in comfy-cli (there is no
+        # `--no-free-memory` counterpart), so "off" is expressed by omitting it.
+        args.append("--free-memory")
+    try:
+        return _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        hinted = _resource_verb_upgrade_error(exc, "free", "free_memory")
+        if hinted is not None:
+            raise hinted from exc
+        raise
 
 
 # Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
