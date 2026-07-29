@@ -45,9 +45,12 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _WORKFLOW = Path(__file__).parent / "workflow_smoke.json"
 
 
+_DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
+
+
 def _comfyui_url() -> str:
     """Base URL of the local ComfyUI to probe (env override, else the default)."""
-    return os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+    return os.environ.get("COMFYUI_URL", _DEFAULT_COMFYUI_URL).rstrip("/")
 
 
 def _server_responds() -> bool:
@@ -128,6 +131,37 @@ def test_no_model_round_trip(tmp_path):
         if p.is_file() and p.read_bytes()[:8] == _PNG_MAGIC
     ]
     assert pngs, f"no valid PNG downloaded into {out_dir}"
+
+
+def test_system_stats_reports_devices():
+    """system_stats returns a real, non-empty devices list from the live server.
+
+    The unit tests pin the argv and pass a canned envelope through; only a live
+    run proves the pinned comfy-cli actually HAS the `system-stats` verb and that
+    ComfyUI answers it with the shape the tool's docstring promises. That gap is
+    exactly what this tool's version-skew hint exists for, so it is worth one
+    real call.
+
+    Skipped when `COMFYUI_URL` points somewhere other than the default loopback:
+    the module gate probes THAT url, but `system_stats` is explicitly not
+    diverted by it (`comfy system-stats` takes no `--host`/`--port`), so it would
+    query whatever comfy-cli resolves locally — possibly nothing. Without this
+    guard a remote-ComfyUI setup fails the test spuriously instead of skipping.
+    """
+    if _comfyui_url() != _DEFAULT_COMFYUI_URL:
+        pytest.skip(
+            f"COMFYUI_URL={_comfyui_url()} is remote, but `comfy system-stats` "
+            "always targets comfy-cli's own local resolution"
+        )
+
+    stats = server.system_stats()
+
+    assert isinstance(stats, dict), f"system-stats returned {stats!r}"
+    devices = stats.get("devices")
+    assert isinstance(devices, list) and devices, f"no devices in {stats!r}"
+    # `vram_free` is the number the VRAM-coordination recipe reads; prove it is
+    # a usable number rather than a string or a missing key.
+    assert isinstance(devices[0].get("vram_free"), (int, float))
 
 
 def test_generate_image_round_trip(tmp_path):
