@@ -181,23 +181,42 @@ an INPUT workflow file is always `workflow_path` (`run_workflow`,
 tool takes a bare `path` or `workflow` argument.
 
 Routing — check the machine before running local diffusion:
-- `server_info` includes a `hardware` block (platform, GPU vendor/model, VRAM
-  or unified memory, total RAM). Read it before the first generation.
-- Discrete NVIDIA GPU with >= 24 GB VRAM: local generation is a good default.
-  8-24 GB: images are fine (prefer current, smaller models); expect video to
-  be slow or infeasible. Under 8 GB, or no GPU: do NOT run local diffusion —
+- `server_info` passes through comfy-cli's `hardware` block (platform, GPU
+  vendor/model, VRAM, total RAM) when the installed comfy-cli reports one.
+  Read it before the first generation. Sizes are in BYTES (`ram_bytes`,
+  `gpu.vram_bytes`) — divide by 1073741824 for GB. On a unified-memory
+  machine `gpu.vram_bytes` is null and `gpu.unified_memory` is true: read
+  `ram_bytes` there, and never compare a null or a raw byte count against
+  the GB thresholds below.
+- `hardware` describes the machine THIS server runs on. If `server_info` also
+  reports a `comfy_target` block (`COMFYUI_URL`/`COMFYUI_HOST` is set), the
+  workload actually runs on that OTHER machine — these thresholds do not
+  apply to it, so ask the user about the target rather than routing off local
+  hardware.
+- Discrete GPU (NVIDIA, or an AMD/Intel card on a ROCm/XPU build), by VRAM:
+  >= 24 GB, local generation is a good default; 8 GB to under 24 GB, images
+  are fine (prefer current, smaller models) but expect video to be slow or
+  infeasible; under 8 GB, or no GPU at all, do NOT run local diffusion —
   steer the user to partner nodes (plain web calls, fine on any machine) or
   the Comfy Cloud MCP if their client has it connected.
-- Apple Silicon: image generation is OK on high-memory machines (>= 32 GB
-  unified memory). Do NOT attempt local VIDEO generation on any Mac — time
-  estimates are unreliable and thermals suffer; recommend cloud instead. That
-  rules out video on the Mac's OWN GPU, not video as such: the `API`-tagged
-  video templates (`search_templates(tag="Video")`) and `emit_partner_workflow`
-  put the model on partner infrastructure, so they are fine on any Mac.
-- If `hardware` is missing (older comfy-cli), run a quick probe yourself
-  (`system_profiler SPDisplaysDataType` on macOS; `nvidia-smi
-  --query-gpu=name,memory.total --format=csv,noheader` elsewhere) and apply
-  the same thresholds.
+- Apple Silicon, by unified memory: >= 32 GB, image generation is OK; under
+  32 GB, treat it as the no-GPU case above. Either way do NOT attempt local
+  VIDEO generation on any Mac — time estimates are unreliable and thermals
+  suffer; recommend cloud instead. That rules out video on the Mac's OWN GPU,
+  not video as such: `API`-tagged video templates
+  (`search_templates(tag="API", type="video")` — filter on BOTH, since `tag`
+  alone would also return locally-run video templates and the compact rows
+  omit `tags`) and `emit_partner_workflow` put the model on partner
+  infrastructure, so they are fine on any Mac.
+- If `hardware` is absent (older comfy-cli), ASK the user for their GPU and
+  VRAM/RAM — that is the reliable answer. Shell probes are a weak substitute:
+  no single command yields both numbers (on macOS `sysctl -n hw.memsize` for
+  unified memory in bytes plus `system_profiler SPDisplaysDataType` to name
+  the GPU; elsewhere `nvidia-smi --query-gpu=name,memory.total
+  --format=csv,noheader` covers NVIDIA VRAM only — not system RAM, and
+  nothing for AMD/Intel). They also run outside this server's audited
+  comfy-cli path, so keep any such call short-lived (a few seconds —
+  `nvidia-smi` can hang on a broken driver) and prefer asking over stalling.
 - Model choice: pick models via `search_templates` / `search_models` instead
   of assuming a classic default (e.g. SDXL) — current templates track current
   models.
@@ -2695,10 +2714,12 @@ def server_info() -> Any:
     its URL, plus the selected workspace and Python info. Call this first to
     confirm a local ComfyUI is up before running a workflow.
 
-    The result includes a ``hardware`` block (GPU/VRAM/RAM); consult the routing
-    guidance in the server instructions before starting local generation. It
-    passes straight through from ``comfy env``, so an older comfy-cli that does
-    not report it simply omits the key — the instructions say what to do then.
+    The result carries a ``hardware`` block (GPU/VRAM/RAM) when the installed
+    comfy-cli reports one; consult the routing guidance in the server
+    instructions before starting local generation. It passes straight through
+    from ``comfy env``, so an older comfy-cli that does not report it simply
+    omits the key — check for it rather than indexing blindly, and the
+    instructions say what to do when it is absent.
 
     The reported server URL is the address comfy-cli RESOLVED, not a fixed
     default: ``COMFY_LOCAL_URL`` wins, else a background record, else

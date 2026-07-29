@@ -132,19 +132,23 @@ Cloud MCP** — comfy-cli is the engine.
 
 ## When to use this server
 
-Local diffusion is only a good default on a machine that can actually carry it, so the server's client instructions tell your agent to read `server_info`'s `hardware` block (platform, GPU vendor/model, VRAM or unified memory, total RAM) **before** the first generation and route on it. The thresholds:
+Local diffusion is only a good default on a machine that can actually carry it, so the server's client instructions tell your agent to read `server_info`'s `hardware` block (platform, GPU vendor/model, VRAM, total RAM) **before** the first generation and route on it. The thresholds:
 
 | Machine | Guidance |
 |---|---|
-| Discrete NVIDIA GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
-| Discrete NVIDIA GPU, **8–24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
+| Discrete GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
+| Discrete GPU, **8 GB to under 24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
 | **< 8 GB** VRAM, or no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the Comfy Cloud MCP if your client has it connected. |
 | **Apple Silicon**, **≥ 32 GB** unified memory | Images are OK. Video on the Mac's *own* GPU is not recommended — time estimates are unreliable and thermals suffer. |
 | **Apple Silicon**, under 32 GB unified memory | Same as the no-GPU row above — go partner/cloud rather than local. |
 
-"No local video on a Mac" is about the Mac's own GPU, not about video as such: `API`-tagged video templates (`search_templates(tag="Video")`) and `emit_partner_workflow` run the model on partner infrastructure, so they work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
+The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card on a ROCm/XPU build too — the VRAM number is what matters.
 
-The `hardware` block comes straight through from `comfy env` — a comfy-cli that predates it simply omits the key, and the instructions then tell the agent to probe the machine itself (`system_profiler SPDisplaysDataType` on macOS, `nvidia-smi` elsewhere) and apply the same thresholds. Nothing in this repo probes hardware; there is no HTTP client and no cloud code here — the cloud/partner steer is guidance text only.
+Two things the agent is told to watch when reading the block: the sizes are **bytes** (`ram_bytes`, `gpu.vram_bytes`), so they need converting before they meet a GB threshold, and on a unified-memory machine `gpu.vram_bytes` is `null` — the figure to use there is `ram_bytes`. `hardware` also describes the machine *this server* runs on, so when a `comfy_target` block is present ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) the workload runs elsewhere and these thresholds don't describe it.
+
+"No local video on a Mac" is about the Mac's own GPU, not about video as such: `API`-tagged video templates (`search_templates(tag="API", type="video")` — both filters, since `tag="Video"` alone would also return locally-run templates and the compact rows omit `tags`) and `emit_partner_workflow` run the model on partner infrastructure, so they work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
+
+The `hardware` block comes straight through from `comfy env` — a comfy-cli that predates it simply omits the key, and the instructions then tell the agent to **ask the user** for the GPU and VRAM/RAM, noting that shell probes are a weak substitute (no one command gives both numbers, and `nvidia-smi` says nothing about AMD/Intel or about system RAM). Nothing in this repo probes hardware; there is no HTTP client and no cloud code here — the cloud/partner steer is guidance text only.
 
 **Which model to use is deliberately not encoded here.** The instructions tell the agent to pick via `search_templates` / `search_models` rather than assume a classic default (e.g. SDXL), because the gallery tracks current models and a hardcoded name would rot. Current-model guidance lives in **[Comfy-Org/comfy-skills](https://github.com/Comfy-Org/comfy-skills)**, which is its canonical home.
 
