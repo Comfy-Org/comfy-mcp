@@ -47,6 +47,7 @@ Cloud MCP** — comfy-cli is the engine.
 ## Table of contents
 
 - [Prerequisites](#prerequisites)
+- [When to use this server](#when-to-use-this-server)
 - [Partner-API nodes](#partner-api-nodes)
 - [Spending credits on partner models](#spending-credits-on-partner-models)
 - [Templates your install can't run](#templates-your-install-cant-run)
@@ -128,6 +129,24 @@ Cloud MCP** — comfy-cli is the engine.
   other template, prefer the `run_template` tool over these.
 
 </details>
+
+## When to use this server
+
+Local diffusion is only a good default on a machine that can actually carry it, so the server's client instructions tell your agent to read `server_info`'s `hardware` block (platform, GPU vendor/model, VRAM or unified memory, total RAM) **before** the first generation and route on it. The thresholds:
+
+| Machine | Guidance |
+|---|---|
+| Discrete NVIDIA GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
+| Discrete NVIDIA GPU, **8–24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
+| **< 8 GB** VRAM, or no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the Comfy Cloud MCP if your client has it connected. |
+| **Apple Silicon**, **≥ 32 GB** unified memory | Images are OK. Video on the Mac's *own* GPU is not recommended — time estimates are unreliable and thermals suffer. |
+| **Apple Silicon**, under 32 GB unified memory | Same as the no-GPU row above — go partner/cloud rather than local. |
+
+"No local video on a Mac" is about the Mac's own GPU, not about video as such: `API`-tagged video templates (`search_templates(tag="Video")`) and `emit_partner_workflow` run the model on partner infrastructure, so they work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
+
+The `hardware` block comes straight through from `comfy env` — a comfy-cli that predates it simply omits the key, and the instructions then tell the agent to probe the machine itself (`system_profiler SPDisplaysDataType` on macOS, `nvidia-smi` elsewhere) and apply the same thresholds. Nothing in this repo probes hardware; there is no HTTP client and no cloud code here — the cloud/partner steer is guidance text only.
+
+**Which model to use is deliberately not encoded here.** The instructions tell the agent to pick via `search_templates` / `search_models` rather than assume a classic default (e.g. SDXL), because the gallery tracks current models and a hardcoded name would rot. Current-model guidance lives in **[Comfy-Org/comfy-skills](https://github.com/Comfy-Org/comfy-skills)**, which is its canonical home.
 
 ## Partner-API nodes
 
@@ -516,7 +535,7 @@ handle is `prompt_id`.
 
 | Tool | Wraps | What it does |
 |---|---|---|
-| `server_info()` | `comfy env` + `comfy outdated` | Is a local ComfyUI running, where, and which workspace. **Call first.** Also attaches a `freshness` block (`comfy outdated`): installed-vs-latest for ComfyUI core and each custom node pack, so a stale install is flagged before it masquerades as a missing model/node. On a comfy-cli without the `outdated` verb the block degrades to `freshness: {"error": "freshness unavailable: …", "unsupported": true}` (a benign capability gap — skip staleness advice, nothing is broken); on any other probe failure such as a network error it degrades to `freshness: {"error": …}` carrying the real reason. Either way the tool itself still succeeds. Reports the configured remote under a `comfy_target` block when `COMFYUI_URL`/`COMFYUI_HOST` is set (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)). |
+| `server_info()` | `comfy env` + `comfy outdated` | Is a local ComfyUI running, where, and which workspace. **Call first.** Passes through comfy-cli's `hardware` block (GPU vendor/model, VRAM or unified memory, total RAM) when the installed comfy-cli reports one — the signal behind [When to use this server](#when-to-use-this-server). Also attaches a `freshness` block (`comfy outdated`): installed-vs-latest for ComfyUI core and each custom node pack, so a stale install is flagged before it masquerades as a missing model/node. On a comfy-cli without the `outdated` verb the block degrades to `freshness: {"error": "freshness unavailable: …", "unsupported": true}` (a benign capability gap — skip staleness advice, nothing is broken); on any other probe failure such as a network error it degrades to `freshness: {"error": …}` carrying the real reason. Either way the tool itself still succeeds. Reports the configured remote under a `comfy_target` block when `COMFYUI_URL`/`COMFYUI_HOST` is set (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)). |
 | `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
 | `auth_login()` | `comfy cloud login --no-browser --timeout 600` | Start Comfy Cloud sign-in and return `{"status": "awaiting_browser", "login_url": …, "expires_in_s": …}` — the URL for the **user** to open, so an agent can get them signed in instead of telling them to run the CLI by hand. Returns as soon as comfy-cli emits the URL; the sign-in keeps running in the background (comfy-cli owns the OAuth flow and the loopback callback, so no OAuth logic lives here). Confirm the result with `auth_status`. Only one sign-in at a time: calling it again while one is pending re-reports the same URL without spawning a second flow, and calling it after the flow ended reports `completed` / `failed` once and then clears. Never returns tokens. |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |

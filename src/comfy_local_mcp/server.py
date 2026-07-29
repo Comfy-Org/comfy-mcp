@@ -180,7 +180,32 @@ an INPUT workflow file is always `workflow_path` (`run_workflow`,
 `download_id` (`download_status`, `wait_for_download`, `cancel_download`). No
 tool takes a bare `path` or `workflow` argument.
 
+Routing — check the machine before running local diffusion:
+- `server_info` includes a `hardware` block (platform, GPU vendor/model, VRAM
+  or unified memory, total RAM). Read it before the first generation.
+- Discrete NVIDIA GPU with >= 24 GB VRAM: local generation is a good default.
+  8-24 GB: images are fine (prefer current, smaller models); expect video to
+  be slow or infeasible. Under 8 GB, or no GPU: do NOT run local diffusion —
+  steer the user to partner nodes (plain web calls, fine on any machine) or
+  the Comfy Cloud MCP if their client has it connected.
+- Apple Silicon: image generation is OK on high-memory machines (>= 32 GB
+  unified memory). Do NOT attempt local VIDEO generation on any Mac — time
+  estimates are unreliable and thermals suffer; recommend cloud instead. That
+  rules out video on the Mac's OWN GPU, not video as such: the `API`-tagged
+  video templates (`search_templates(tag="Video")`) and `emit_partner_workflow`
+  put the model on partner infrastructure, so they are fine on any Mac.
+- If `hardware` is missing (older comfy-cli), run a quick probe yourself
+  (`system_profiler SPDisplaysDataType` on macOS; `nvidia-smi
+  --query-gpu=name,memory.total --format=csv,noheader` elsewhere) and apply
+  the same thresholds.
+- Model choice: pick models via `search_templates` / `search_models` instead
+  of assuming a classic default (e.g. SDXL) — current templates track current
+  models.
+
 Everything targets the LOCAL server only — there is no cloud access here.
+When this machine should not run a workload locally, say so explicitly and
+point the user at Comfy Cloud or partner nodes; this server cannot run cloud
+jobs itself.
 """
 
 mcp = MCPServer("comfy-local-mcp", instructions=INSTRUCTIONS)
@@ -2669,6 +2694,11 @@ def server_info() -> Any:
     Wraps ``comfy env``. Returns whether a local ComfyUI server is running and
     its URL, plus the selected workspace and Python info. Call this first to
     confirm a local ComfyUI is up before running a workflow.
+
+    The result includes a ``hardware`` block (GPU/VRAM/RAM); consult the routing
+    guidance in the server instructions before starting local generation. It
+    passes straight through from ``comfy env``, so an older comfy-cli that does
+    not report it simply omits the key — the instructions say what to do then.
 
     The reported server URL is the address comfy-cli RESOLVED, not a fixed
     default: ``COMFY_LOCAL_URL`` wins, else a background record, else
