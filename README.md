@@ -40,7 +40,7 @@ Each tool shells out to the `comfy` command with `--where local --json`, parses 
 `envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
 Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** beta. 45 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 46 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -540,7 +540,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-45 tools, grouped below by what they do. Every tool runs `comfy` with the global
+46 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake

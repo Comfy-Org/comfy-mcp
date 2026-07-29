@@ -63,13 +63,17 @@ second copy of that handling. Adding *product* behavior here is still a
 guardrail breach; adapting comfy-cli's contract to an MCP primitive is this
 repo's job.
 
-The two differ where the engine's own shape differs, and those differences are
-load-bearing rather than incidental: `comfy generate` always spends so it always
-prompts and honors `spend.auto_confirm`, while `comfy run-template` is usually
-free and never reads that setting — so `run_template` prompts only when
-`confirm_spend=True` asks to unlock spending, and treats the generate-scoped
-always-proceed as granting nothing. Mirror the engine's contract; do not
-generalize one tool's consent rules onto the other.
+The two *spend* gates — `partner_generate` and `run_template` — differ where the
+engine's own shape differs, and those differences are load-bearing rather than
+incidental: `comfy generate` always spends so it always prompts and honors
+`spend.auto_confirm`, while `comfy run-template` is usually free and never reads
+that setting — so `run_template` prompts only when `confirm_spend=True` asks to
+unlock spending, and treats the generate-scoped always-proceed as granting
+nothing. `switch_comfyui_version` sits outside that axis entirely: it spends no
+credits and the CLI does not gate it at all, so its prompt is not a spend
+interlock but this server's only gate — raised on every call, with no
+always-proceed setting to read. Mirror the engine's contract per tool; do not
+generalize one tool's consent rules onto another.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via
