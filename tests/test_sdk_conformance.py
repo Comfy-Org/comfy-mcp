@@ -90,7 +90,7 @@ def test_fake_check_client_capability_matches_the_real_session_signature(label, 
 
 
 def test_the_spend_prompt_keywords_bind_to_the_real_elicit():
-    """`_elicit_spend_approval` passes `message=`/`schema=` — they must still bind.
+    """`_elicit_approval` passes `message=`/`schema=` — they must still bind.
 
     The fakes above are checked against the real signature, but this asserts the
     other direction directly on the SDK: the exact keywords server.py sends are

@@ -18,7 +18,10 @@ Tools so far: the run -> get-output core loop plus job management
 ``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` /
 ``restart_comfyui`` lifecycle trio (``comfy launch --background`` /
 ``comfy stop`` / stop-then-launch) with ``get_logs`` (``comfy logs``) to read a
-detached launch's captured output, and the
+detached launch's captured output, the install verbs ``update_comfyui``
+(``comfy update``, forward-only) and ``switch_comfyui_version``
+(``comfy update comfy --version <X>``, which can also roll BACK and so asks the
+user to confirm per call), and the
 ``discover`` / ``which`` introspection pair (``comfy discover`` /
 ``comfy which``) that lets an agent learn the CLI's own contract and selection.
 ``partner_generate`` (``comfy generate <model>``) reaches the hosted PARTNER
@@ -63,7 +66,7 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 from urllib.parse import urlparse
 
 from mcp import types
@@ -163,6 +166,15 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   alternatives.
 - After a detached `launch_comfyui`, read the background server's own output with
   `get_logs` — it tails the captured ComfyUI log (invisible otherwise).
+- Rolling ComfyUI back (or forward) to a specific version — "does this break on
+  0.24.0?" — is `switch_comfyui_version(version)`, in this order:
+  `stop_comfyui` -> `switch_comfyui_version` -> `launch_comfyui` -> `server_info`
+  to confirm what came up. It refuses while a server is running, it does NOT
+  restart anything for you, and it is DESTRUCTIVE (uncommitted ComfyUI changes
+  are stashed, dependencies are reinstalled), so the USER is asked to confirm
+  every call; on a client that cannot show prompts it errors unless you pass
+  `confirm_switch=True`, which you may set ONLY when the user has agreed.
+  `update_comfyui` is the different, forward-only "get me current" verb.
 - Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
   which SPENDS the user's Comfy credits — local `run_workflow` / `generate_image`
   runs are free. Discover them here, never in a terminal: `list_partner_models()`
@@ -3899,12 +3911,13 @@ def _client_elicitation_support(ctx: Context | None) -> bool | None:
         return None
 
 
-# How long the user gets to answer the spend prompt before it lapses into a
-# refusal. `timeout_seconds` bounds only the generation that follows, so without
-# this a client that advertises elicitation but never answers leaves the request
-# pending forever and stuck calls accumulate with nothing to reclaim them.
-# Generous, because a human has to notice the prompt and decide.
-_SPEND_ELICIT_TIMEOUT = 300.0
+# How long the user gets to answer a consent prompt before it lapses into a
+# refusal. `timeout_seconds` bounds only the work that follows, so without this a
+# client that advertises elicitation but never answers leaves the request pending
+# forever and stuck calls accumulate with nothing to reclaim them. Generous,
+# because a human has to notice the prompt and decide. Shared by every gate that
+# elicits — the two spend prompts and `switch_comfyui_version`'s destructive one.
+_ELICIT_TIMEOUT = 300.0
 
 # Cap on how much of a caller-supplied model name is echoed into the prompt.
 _ELICIT_MODEL_DISPLAY_MAX = 80
@@ -3936,37 +3949,74 @@ def _display_model(model: str) -> str:
     return cleaned or "<unnamed model>"
 
 
-async def _elicit_spend_approval(ctx: Context, message: str, schema: type) -> bool:
-    """Raise one spend-confirmation prompt and report whether it was approved.
+class _ApprovalWording(NamedTuple):
+    """The parts of a consent-prompt failure message that differ per gate.
 
-    The shared body behind every spend prompt (``partner_generate``'s and
-    ``run_template``'s): only the wording and the answer schema differ, while the
-    fail-closed handling below must not. True = the user affirmatively approved.
+    :func:`_elicit_approval` owns the fail-closed BEHAVIOR — a timeout, a client
+    that errors, a decline, a cancel, and an accept that never actually said yes
+    all mean "not approved" — and that must be identical everywhere. Only the
+    wording legitimately differs: a spend prompt reassures that nothing was
+    SPENT, ``switch_comfyui_version``'s that nothing was CHANGED. Hoisting the
+    strings out here is what lets one body serve both without either gate's
+    error text drifting from the other's semantics.
+    """
+
+    #: Names the gate in the timeout message: ``"<subject> not confirmed: …"``.
+    subject: str
+    #: Names it in the client-error message: ``"could not confirm <what> …"``.
+    what: str
+    #: The reassurance sentence, e.g. ``"Nothing was spent."``
+    nothing_done: str
+    #: Optional trailing sentence naming another route for a client that cannot
+    #: be prompted. Begins with a space — it is concatenated, not joined.
+    escape_hatch: str = ""
+
+
+_SPEND_APPROVAL_WORDING = _ApprovalWording(
+    subject="spend",
+    what="the credit spend",
+    nothing_done="Nothing was spent.",
+    # Name the way out. Because an errored capability probe routes to the
+    # elicitation rather than to `confirm_spend`, a client this server cannot
+    # prompt would otherwise dead-end with no route to a generation it is
+    # entitled to run — and the user's own durable consent is exactly that route.
+    escape_hatch=(
+        " If this client cannot show prompts, record your consent with "
+        "comfy-cli directly — `comfy generate consent always` — and this tool "
+        "will honor it without asking."
+    ),
+)
+
+
+async def _elicit_approval(
+    ctx: Context, message: str, schema: type, wording: _ApprovalWording
+) -> bool:
+    """Raise one confirmation prompt and report whether it was approved.
+
+    The shared body behind every per-call consent prompt — ``partner_generate``'s
+    and ``run_template``'s spend gates, and ``switch_comfyui_version``'s
+    destructive gate. Only the message, the answer schema, and ``wording`` differ;
+    the fail-closed handling below must not. True = the user affirmatively
+    approved.
     """
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message=message, schema=schema),
-            timeout=_SPEND_ELICIT_TIMEOUT,
+            timeout=_ELICIT_TIMEOUT,
         )
     except (asyncio.TimeoutError, TimeoutError) as exc:
         # Ordered before the catch-all: on 3.11+ these are the same class, but
         # an unanswered prompt deserves its own message.
         raise ComfyCliError(
-            "spend not confirmed: the confirmation prompt went unanswered for "
-            f"{_SPEND_ELICIT_TIMEOUT:.0f}s, so it was treated as a refusal. "
-            "Nothing was spent."
+            f"{wording.subject} not confirmed: the confirmation prompt went "
+            f"unanswered for {_ELICIT_TIMEOUT:.0f}s, so it was treated as a "
+            f"refusal. {wording.nothing_done}"
         ) from exc
     except Exception as exc:
-        # Name the way out. Because an errored capability probe now routes here
-        # rather than to `confirm_spend`, a client this server cannot prompt
-        # would otherwise dead-end with no route to a generation it is entitled
-        # to run — and the user's own durable consent is exactly that route.
         raise ComfyCliError(
-            "could not confirm the credit spend with the user: the client "
-            f"failed to answer the confirmation prompt ({exc}). Nothing was "
-            "spent. If this client cannot show prompts, record your consent "
-            "with comfy-cli directly — `comfy generate consent always` — and "
-            "this tool will honor it without asking."
+            f"could not confirm {wording.what} with the user: the client failed "
+            f"to answer the confirmation prompt ({exc}). "
+            f"{wording.nothing_done}{wording.escape_hatch}"
         ) from exc
     # Every read is a `getattr`: a non-conforming client can return an object
     # with no `.action`/`.data`, and an AttributeError here would escape as an
@@ -3983,9 +4033,9 @@ async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
     human, never remembered. A decline, a cancel, an accept that did not
     actually say yes, a client that errors on the request, a client that answers
     with something malformed, and a prompt left unanswered past
-    :data:`_SPEND_ELICIT_TIMEOUT` all fail closed — the caller spends nothing.
+    :data:`_ELICIT_TIMEOUT` all fail closed — the caller spends nothing.
     """
-    return await _elicit_spend_approval(
+    return await _elicit_approval(
         ctx,
         (
             f"Run the hosted partner model `{_display_model(model)}`? "
@@ -3993,6 +4043,7 @@ async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
             "signed into. Running a workflow on the local ComfyUI is free."
         ),
         SpendApproval,
+        _SPEND_APPROVAL_WORDING,
     )
 
 
@@ -4803,7 +4854,7 @@ async def _resolve_template_spend_consent(
 
 async def _elicit_template_spend_consent(ctx: Context, name: str) -> bool:
     """Ask the USER to approve credit spend for this one template run."""
-    return await _elicit_spend_approval(
+    return await _elicit_approval(
         ctx,
         (
             f"Run the gallery template `{_display_model(name)}` with credit "
@@ -4812,6 +4863,7 @@ async def _elicit_template_spend_consent(ctx: Context, name: str) -> bool:
             "from the account this machine is signed into."
         ),
         TemplateSpendApproval,
+        _SPEND_APPROVAL_WORDING,
     )
 
 
@@ -6050,6 +6102,436 @@ def update_comfyui(target: str = "comfy") -> Any:
         return _run_comfy("update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True)
     finally:
         _UPDATE_LOCK.release()
+
+
+# The two moving targets `comfy update comfy --version` accepts alongside a
+# pinned release. Matched case-insensitively and forwarded lowercased, the way
+# `update_comfyui` normalizes its own target.
+_VERSION_ALIASES = ("nightly", "latest")
+
+# A pinned ComfyUI release: `MAJOR.MINOR.PATCH`, optionally `v`-prefixed (both
+# `0.24.0` and `v0.24.0` name the same tag), with semver's optional prerelease
+# AND build suffixes — both, in that order, because that is what comfy-cli's own
+# validator accepts (it strips a leading `v` and hands the rest to
+# `semver.VersionInfo.parse`). Deliberately no stricter than the engine: a
+# pattern that refused a version comfy-cli would have taken would be this wrapper
+# inventing a limitation rather than mirroring one.
+#
+# Anchored end-to-end, so a value that matches carries no whitespace, no NUL, no
+# shell metacharacter, and no leading dash — which is why the interpolations
+# below can quote it directly and why `_reject_nul` is not repeated here. It is a
+# client-side SANITY check, not an authority on which tags exist: comfy-cli (and
+# git) own that, and a well-formed version with no such release still fails
+# there, with the engine's own message.
+#
+# Digits are `[0-9]`, NOT `\d`: on a `str` pattern `\d` is Unicode-aware and
+# matches fullwidth or Arabic-Indic digits (`１.２.３`, `٠.٢٤.٠`), which would
+# raise the destructive prompt and be forwarded verbatim to comfy-cli and git
+# while this comment claimed the match was ASCII-safe. The `v` prefix is accepted
+# in either case for the same reason the aliases are matched case-insensitively;
+# `_guard_version` normalizes `V` down, because comfy-cli strips only a lowercase
+# one.
+_SEMVER_RE = re.compile(
+    r"^[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+# Generous ceiling on `version`, set the way :data:`_MAX_PROMPT_ID_LEN` is: the
+# regex above would reject an oversized value anyway, but the length is checked
+# FIRST so the error reports a size instead of echoing a megabyte-long "version"
+# back at the caller.
+_MAX_VERSION_LEN = 64
+
+
+def _guard_version(version: str) -> str:
+    """Validate a ``switch_comfyui_version`` target and return it normalized.
+
+    Two jobs, in the order their error messages want to fire:
+
+    - **Argument injection.** ``version`` is forwarded as the value of
+      ``--version``, and while Click reads the token after a value-taking option
+      verbatim (see :func:`_reject_option_like`), a dash-leading value is a caller
+      mistake worth naming rather than a flag worth forwarding — the same
+      treatment :func:`_guard_prompt_id` gives its positional.
+    - **Format.** ``nightly`` / ``latest`` / a semver tag is the whole accepted
+      set, checked here so a typo (``0.24``, ``main``, ``HEAD``) is refused
+      BEFORE a subprocess is spawned that would stash the user's working tree
+      and move HEAD before discovering the same thing.
+    """
+    if not isinstance(version, str):
+        raise ComfyCliError(
+            f"invalid version: expected a string, got {type(version).__name__}."
+        )
+    stripped = version.strip()
+    if not stripped:
+        raise ComfyCliError("invalid version: empty.")
+    if len(stripped) > _MAX_VERSION_LEN:
+        # Report the length, not the value — see `_MAX_VERSION_LEN`.
+        raise ComfyCliError(
+            f"invalid version: {len(stripped)} characters exceeds the "
+            f"{_MAX_VERSION_LEN}-character maximum."
+        )
+    _reject_option_like(
+        "version",
+        stripped,
+        expected="'nightly', 'latest', or a release like '0.24.0'",
+    )
+    lowered = stripped.lower()
+    if lowered in _VERSION_ALIASES:
+        return lowered
+    if _SEMVER_RE.match(stripped):
+        # comfy-cli's `validate_version` strips a leading `v` with a
+        # case-SENSITIVE `startswith("v")` and hands the rest to
+        # `semver.VersionInfo.parse`, so `V0.24.0` would die in the engine. The
+        # aliases above are already case-insensitive and the refusal text
+        # promises a leading `v` works, so normalize rather than refuse. Only the
+        # prefix is lowered: semver prerelease/build identifiers are
+        # case-sensitive and must reach the engine as written.
+        return f"v{stripped[1:]}" if stripped.startswith("V") else stripped
+    raise ComfyCliError(
+        f"invalid version: {stripped!r} — expected 'nightly', 'latest', or a "
+        "ComfyUI release like '0.24.0' (a leading 'v' is accepted). Nothing was "
+        "changed."
+    )
+
+
+class VersionSwitchApproval(BaseModel):
+    """What the client returns from the version-switch confirmation prompt.
+
+    Same affirmative-answer design as :class:`SpendApproval`, for the same
+    reason: an accept that never actually answered lands on the ``False`` default
+    and is treated as a refusal. The question differs — this one destroys local
+    state rather than spending money — so it gets its own wording.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Switch the local ComfyUI install to this version?",
+        description=(
+            "Yes stashes any uncommitted changes in the ComfyUI checkout, moves "
+            "it to the requested version, and reinstalls its Python "
+            "dependencies. No cancels it and changes nothing."
+        ),
+    )
+
+
+_SWITCH_APPROVAL_WORDING = _ApprovalWording(
+    subject="version switch",
+    what="the ComfyUI version switch",
+    nothing_done="Nothing was changed.",
+    # The route out for a client this server cannot prompt. Unlike the spend
+    # gate there is no engine-side durable consent to point at — `comfy update`
+    # has no equivalent of `comfy generate consent always` — so the escape hatch
+    # is the user running the same command themselves.
+    escape_hatch=(
+        " If this client cannot show prompts, run "
+        "`comfy update comfy --version <VERSION>` in a terminal instead."
+    ),
+)
+
+
+async def _elicit_version_switch_consent(ctx: Context, version: str) -> bool:
+    """Ask the USER to approve this one version switch. True = approved.
+
+    ``version`` is interpolated directly rather than through
+    :func:`_display_model`: :func:`_guard_version` has already pinned it to an
+    alias or an anchored semver match, so it cannot carry the backticks or
+    newlines that sanitizer exists to neutralize.
+    """
+    return await _elicit_approval(
+        ctx,
+        (
+            f"Switch the local ComfyUI install to `{version}`? This STASHES any "
+            "uncommitted changes in the ComfyUI checkout, moves it to that "
+            "version, and REINSTALLS its Python dependencies — it can take "
+            "several minutes. The running server keeps executing the OLD code "
+            "until it is restarted, so it has to be restarted afterwards. "
+            "Declining cancels the switch and changes nothing."
+        ),
+        VersionSwitchApproval,
+        _SWITCH_APPROVAL_WORDING,
+    )
+
+
+async def _resolve_switch_consent(
+    version: str, confirm_switch: bool, ctx: Context | None
+) -> None:
+    """Return only if the USER approved this switch; otherwise raise.
+
+    The destructive-op counterpart to :func:`_resolve_spend_consent`, and it
+    keeps that function's two load-bearing properties:
+
+    1. **Elicitation wins, and is raised even when ``confirm_switch=True``.** The
+       agent host's permission to CALL this tool is a different question from the
+       user's consent to rewrite their ComfyUI checkout, and an "always allow
+       this tool" toggle answers only the first. So on a client that can be
+       prompted the human is asked every time, and ``confirm_switch`` grants
+       nothing.
+    2. **An unknown capability counts as CAPABLE.** ``None`` from
+       :func:`_client_elicitation_support` is the probe failing, not a "no";
+       guessing "cannot elicit" would silently demote a real client onto the
+       caller's own say-so. Being wrong the other way costs a prompt that lapses
+       into a refusal at :data:`_ELICIT_TIMEOUT`, having changed nothing.
+
+    What it does NOT keep is the engine-consent branch: ``comfy update`` has no
+    durable "always proceed" to read, so there is nothing that could consent on
+    the user's behalf.
+    """
+    if _client_elicitation_support(ctx) is not False:
+        if await _elicit_version_switch_consent(ctx, version):
+            return
+        raise ComfyCliError(
+            f"version switch not confirmed: the user declined to switch the "
+            f"local ComfyUI to {version!r}. Nothing was changed."
+        )
+    # Client cannot be prompted: `confirm_switch` is the documented fallback, and
+    # its `False` default is why a bare call from such a client destroys nothing.
+    if not confirm_switch:
+        raise ComfyCliError(
+            "version switch not confirmed: this client cannot show a "
+            f"confirmation prompt, so switching the local ComfyUI to "
+            f"{version!r} requires confirm_switch=True. Ask the USER first — the "
+            "switch stashes uncommitted ComfyUI changes, moves the checkout to "
+            "that version, and reinstalls its Python dependencies — and pass it "
+            "only once they have actually agreed, never just to clear this "
+            "error. Nothing was changed."
+        )
+
+
+def _local_comfyui_running() -> bool:
+    """Whether ``comfy env`` reports a local ComfyUI answering right now.
+
+    Reads :func:`server_info` rather than shelling out separately, so the
+    compatibility gate that call carries also runs before anything destructive —
+    and so this composes an existing tool the way ``restart_comfyui`` composes
+    ``stop_comfyui``/``launch_comfyui``.
+
+    **Fails CLOSED**: an unreadable answer raises rather than reading as "not
+    running". comfy-cli's ``env`` payload is a pinned contract, not a guess:
+    ``fill_data`` sets ``server.running`` from ``check_comfy_server_running``,
+    which returns a bool on every path, and ``schemas/env.json`` lists ``running``
+    under ``server``'s ``required`` as a ``boolean``. On top of that
+    :func:`server_info` refuses any comfy-cli whose envelope schema major differs
+    from the one this server speaks. So the refusal below cannot fire against a
+    conforming comfy-cli; it fires only where that contract is ALREADY broken,
+    and there "could not tell" is a much better answer than reinstalling
+    dependencies under a possibly-live server — the one thing this tool documents
+    that it will not do. Both routes out are named in the message.
+
+    ``server_info`` itself can also fail (a ``comfy env`` timeout, no envelope, a
+    version mismatch, or an ``OSError``/``UnicodeDecodeError`` decoding a
+    workspace path). Those are re-raised as :class:`ComfyCliError` naming the
+    switch, so every bad path out of this tool honors one error contract and says
+    that nothing was changed.
+    """
+    try:
+        info = server_info()
+    except ComfyCliError as exc:
+        raise ComfyCliError(
+            "cannot switch versions: could not determine whether the local "
+            f"ComfyUI is running — `comfy env` failed: {exc} Nothing was changed."
+        ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ComfyCliError(
+            "cannot switch versions: could not determine whether the local "
+            f"ComfyUI is running — reading `comfy env` failed: {exc} Nothing was "
+            "changed."
+        ) from exc
+    block = info.get("server") if isinstance(info, dict) else None
+    running = block.get("running") if isinstance(block, dict) else None
+    if isinstance(running, bool):
+        return running
+    raise ComfyCliError(
+        "cannot switch versions: `comfy env` did not report whether the local "
+        "ComfyUI is running — expected a boolean `server.running`, which "
+        "comfy-cli's own env schema requires. Refusing rather than reinstalling "
+        "Python dependencies under a server that may be live. Run `comfy env` in "
+        "a terminal to see what it reports; if the install is healthy and you "
+        "know ComfyUI is stopped, run `comfy update comfy --version <VERSION>` "
+        "there directly. Nothing was changed."
+    )
+
+
+# Shared by the pre-consent gate and the re-check under the lock, so the two
+# cannot drift into telling the caller different things.
+_RUNNING_REFUSAL = (
+    "refusing to switch versions while the local ComfyUI is running: the switch "
+    "reinstalls Python dependencies underneath the live process, which can leave "
+    "it serving half-replaced code. Call `stop_comfyui` first, then this tool, "
+    "then `launch_comfyui` and `server_info` to confirm the new version. Nothing "
+    "was changed."
+)
+
+# Shared by the advisory pre-consent peek and the authoritative acquire below.
+_SWITCH_UPDATE_BUSY = (
+    "an update is already running in this server; switching versions mutates the "
+    "same ComfyUI git checkout and Python environment, so the two at once can "
+    "corrupt the install. Wait for the in-flight update to finish and call "
+    "again. Nothing was changed."
+)
+
+
+def _refuse_if_local_comfyui_running() -> None:
+    """Raise the running-server refusal if ``comfy env`` reports one up."""
+    if _local_comfyui_running():
+        raise ComfyCliError(_RUNNING_REFUSAL)
+
+
+# `comfy update comfy --version <X>` does a `git fetch` + checkout and then
+# reinstalls `requirements.txt` (multi-GB torch wheels), so it is minutes rather
+# than seconds. Shorter than `_UPDATE_TIMEOUT` because it never walks every
+# custom node pack the way `update_comfyui(target="all")` can.
+_SWITCH_TIMEOUT = 900.0
+
+# Kept OFF asyncio's shared default executor for the reason `_GENERATE_EXECUTOR`
+# spells out: a run abandoned by its caller keeps its worker for up to
+# `_SWITCH_TIMEOUT`, and on the default pool that starves every other
+# `to_thread` caller in the process (`_check_comfy_version`,
+# `_engine_auto_confirms`, the download pollers). One worker is enough and says
+# what is true: `_UPDATE_LOCK` — which is now released only when the submitted
+# job finishes, never when the awaiting coroutine is cancelled — already admits
+# exactly one switch at a time, so a second can never be queued behind the first.
+_SWITCH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comfy-switch")
+
+
+def _run_version_switch(version: str) -> Any:
+    """Run the switch, translating an old comfy-cli's refusal into a fix.
+
+    ``--version`` on ``comfy update`` is newer than the verb itself, so a
+    comfy-cli that predates it rejects the flag at parse time with Click's usage
+    error. :func:`_is_missing_option_error` is deliberately narrow about what
+    counts (no envelope AND the usage exit status), so a genuine failure that
+    merely quotes the phrase keeps its own message instead of being relabelled a
+    version gap — the same contract ``download_model``'s ``--background`` degrade
+    relies on. The difference here is that this one does not silently degrade to
+    another path: there is no other path, so it re-raises with the upgrade step.
+
+    Re-probes for a running ComfyUI FIRST, under ``_UPDATE_LOCK`` and on this
+    worker thread. The tool's pre-consent gate can be minutes stale by the time
+    it gets here — an elicitation may sit for ``_ELICIT_TIMEOUT`` — and
+    ``launch_comfyui`` does not take that lock, so a server started in the
+    meantime would otherwise get its dependencies reinstalled underneath it,
+    which is precisely what the gate exists to refuse.
+    """
+    _refuse_if_local_comfyui_running()
+    try:
+        return _run_comfy(
+            "update",
+            "comfy",
+            "--version",
+            version,
+            timeout=_SWITCH_TIMEOUT,
+            plain_ok=True,
+        )
+    except ComfyCliError as exc:
+        if not _is_missing_option_error(exc, "--version"):
+            raise
+        raise ComfyCliError(
+            "the installed comfy-cli cannot switch ComfyUI versions: its "
+            "`comfy update comfy` does not accept `--version`, which ships in a "
+            'later release. Upgrade comfy-cli — `update_comfyui(target="cli")`, '
+            "or `comfy update cli` in a terminal — and call this again. Nothing "
+            "was changed."
+        ) from exc
+
+
+@mcp.tool()
+async def switch_comfyui_version(
+    version: str,
+    confirm_switch: bool = False,
+    ctx: Context | None = None,
+) -> Any:
+    """Move the LOCAL ComfyUI install to a specific version — DESTRUCTIVE, asks first.
+
+    Thin passthrough to ``comfy update comfy --version <version>``, the engine's
+    own version switch: it stashes any uncommitted changes in the ComfyUI
+    checkout, moves it to the requested version, and reinstalls that version's
+    Python dependencies. This is the tool for "roll ComfyUI back to 0.24.0 and
+    see if the bug goes away" — ``update_comfyui`` only ever moves FORWARD to the
+    latest.
+
+    ``version`` accepts ``"nightly"``, ``"latest"``, or a release like
+    ``"0.24.0"`` / ``"v0.24.0"``. Anything else is refused before a subprocess is
+    spawned; whether a well-formed release actually EXISTS is comfy-cli's
+    question, and it answers it with its own error.
+
+    **The canonical flow — this tool does not restart anything.** A running
+    ComfyUI keeps executing the code it loaded at boot, so::
+
+        stop_comfyui -> switch_comfyui_version -> launch_comfyui -> server_info
+
+    with ``server_info`` at the end to confirm the version that actually came up.
+    Restarting is left to the caller rather than folded in here because the
+    lifecycle verbs are deliberately orthogonal (``restart_comfyui`` is itself
+    just stop-then-launch), and because a switch the user wants to inspect before
+    booting should not boot.
+
+    **It refuses while a local ComfyUI is running.** Reinstalling dependencies
+    underneath a live process can leave it serving half-replaced code, so the
+    call fails and tells you to ``stop_comfyui`` first rather than doing it for
+    you. That check runs before the confirmation prompt, so a caller that forgot
+    the stop is not asked to approve something that cannot proceed — and again
+    immediately before the switch, because a prompt may sit unanswered for
+    minutes and ``launch_comfyui`` is free to start a server in that window. It
+    fails CLOSED: an answer this server cannot read is refused too, not taken as
+    "not running".
+
+    **Consent is per call, and the USER gives it — not the agent.** On a client
+    that supports MCP elicitation the human is shown a prompt naming exactly what
+    will happen, and a decline cancels with nothing changed. That prompt is
+    raised even when ``confirm_switch=True``: the host's permission to call this
+    tool is not the user's permission to rewrite their ComfyUI install. On a
+    client that CANNOT be prompted, ``confirm_switch=True`` is the documented
+    fallback — set it ONLY when the user has actually agreed, never to clear the
+    error — and its ``False`` default means a bare call from such a client
+    changes nothing.
+
+    **One at a time.** Shares ``update_comfyui``'s lock: both drive ``git`` and
+    ``pip`` against the same workspace and Python environment, so a call made
+    while either is in flight is refused immediately rather than queued behind a
+    job that may run for many minutes.
+
+    An installed comfy-cli whose ``comfy update`` predates ``--version`` fails at
+    argument parsing; that is caught and re-raised naming the upgrade
+    (``update_comfyui(target="cli")``) rather than relayed as a raw usage dump.
+
+    Returns ``{"switched_to", "result", "restart_required"}`` —
+    ``restart_required`` is always ``True``, because the switch never takes
+    effect in a process that is already running.
+    """
+    target = _guard_version(version)
+    # Everything before the prompt answers one question: could this switch
+    # proceed at all? A user should not be asked to approve something that is
+    # then refused. This peek is advisory — the authoritative, race-free acquire
+    # is below — but it means an in-flight update refuses here rather than after
+    # a prompt the user answered and two subprocesses this call spawned.
+    if _UPDATE_LOCK.locked():
+        raise ComfyCliError(_SWITCH_UPDATE_BUSY)
+    # `server_info` is sync and spawns children, so it runs off the event loop.
+    await asyncio.to_thread(_refuse_if_local_comfyui_running)
+    await _resolve_switch_consent(target, confirm_switch, ctx)
+    # Refuse rather than queue, exactly as `update_comfyui` does and for the same
+    # reason — see its comment. Acquired AFTER consent so a declined call never
+    # blocks an update that is legitimately in flight.
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        raise ComfyCliError(_SWITCH_UPDATE_BUSY)
+    try:
+        job = _SWITCH_EXECUTOR.submit(_run_version_switch, target)
+    except BaseException:
+        _UPDATE_LOCK.release()
+        raise
+    # The lock belongs to the SUBPROCESS, not to this coroutine. Cancelling the
+    # request (a client disconnect, `notifications/cancelled`, a deadline on a
+    # 15-minute call) makes the await below raise `CancelledError`, but it
+    # neither interrupts the worker thread nor kills the `comfy update` it
+    # spawned — git and pip keep rewriting the checkout. Releasing in a `finally`
+    # here would hand the lock to a retry or an `update_comfyui` that then runs a
+    # second concurrent install against the same workspace and venv: exactly the
+    # half-installed state the lock exists to prevent. A done-callback instead
+    # ties the release to the job's own lifetime, and still fires if the job is
+    # cancelled before it ever starts, so the lock cannot leak either way.
+    job.add_done_callback(lambda _job: _UPDATE_LOCK.release())
+    result = await asyncio.wrap_future(job)
+    return {"switched_to": target, "result": result, "restart_required": True}
 
 
 # comfy-cli's `logs` reports this error code when no persisted log file exists
