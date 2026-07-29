@@ -135,7 +135,12 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `cancel_job`). `free_memory` cannot touch VRAM held by ANOTHER process — a
   local LLM runtime (Ollama / LM Studio / llama.cpp) has to be unloaded by
   whoever owns it, which is the client, not this server. Re-read `system_stats`
-  to confirm the headroom before committing to the run.
+  to confirm the headroom, allowing for the same lag: on a busy server the free
+  lands only when the current job ends, so an immediate re-read can still show
+  the old number. Both tools describe/act on whichever ComfyUI comfy-cli itself
+  targets and are NOT redirected by `COMFYUI_URL`/`COMFYUI_HOST` — so when those
+  are set, they report and free the LOCAL install while `run_workflow` submits to
+  the remote one. Do not sequence them against a remote run.
 - Before running a workflow whose nodes call partner APIs (Seedream / Veo /
   Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials.
   Treat credentials as GOOD if `signed_in` is true OR
@@ -5216,11 +5221,21 @@ def _resource_verb_upgrade_error(
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
 
-    Wraps ``comfy system-stats`` (ComfyUI's own ``GET /system_stats``, reached by
-    comfy-cli — no HTTP from here). Returns comfy-cli's envelope ``data``
-    unmodified: a ``devices`` list (per device ``name`` / ``type`` / ``index`` /
-    ``vram_free`` / ``vram_total``, all byte counts) plus a ``system`` dict
-    (``ram_free`` / ``ram_total``, ``comfyui_version``).
+    Wraps ``comfy system-stats`` (ComfyUI's own ``GET /system_stats``, also served
+    at ``/api/system_stats``, reached by comfy-cli — no HTTP from here). The whole
+    payload is forwarded UNMODIFIED, so treat it as a passthrough rather than a
+    fixed schema: a ``devices`` list plus a ``system`` dict, whose keys are
+    whatever the ComfyUI on the other end reports. The fields this server's
+    guidance actually reads are per-device ``vram_free`` / ``vram_total`` (byte
+    counts, alongside e.g. ``name`` / ``type`` / ``index`` / ``torch_vram_free``)
+    and ``system.ram_free`` / ``ram_total`` / ``comfyui_version`` — examples, not
+    an exhaustive list, and a newer ComfyUI may add more.
+
+    Because nothing is filtered, the ``system`` block also carries what ComfyUI
+    reports about its own process — including ``python_version`` and ``argv``, its
+    full launch command line. On an install whose ComfyUI is started with paths or
+    secrets on the command line, those reach the caller (and so the model's
+    context) verbatim.
 
     Call it BEFORE a heavy ``run_workflow`` / ``run_template`` to decide whether
     to free memory first: if ``vram_free`` is short of what the graph's
@@ -5246,22 +5261,32 @@ def system_stats() -> Any:
 
 
 @mcp.tool()
-def free_memory(unload_models: bool = True, free_memory: bool = True) -> Any:
+def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> Any:
     """Ask the local ComfyUI to unload models / reset its executor cache.
 
     Wraps ``comfy free`` (ComfyUI's own ``POST /free``). Use it to reclaim VRAM
     before a heavy run — pair it with ``system_stats`` to see the before/after.
 
-    ``unload_models=True`` (default) unloads all models from VRAM; pass ``False``
-    to send ``--no-unload-models`` and leave them resident. ``free_memory=True``
-    ALSO resets the executor cache, which implies unloading server-side.
+    ``unload_models=True`` (default) unloads all models from VRAM. ``free_memory``
+    ALSO resets the executor cache; it defaults to ``None``, meaning "follow
+    ``unload_models``", so the default call asks for both — the maximum-headroom
+    form an agent reaching for this tool wants, and a deliberate divergence from
+    comfy-cli's own ``--free-memory``, which defaults to off. Pass
+    ``free_memory=False`` for the CLI's default: the lighter unload that keeps the
+    cached executor state, so a re-run of the same graph re-warms faster.
 
-    **``free_memory`` defaults to ``True`` here, while comfy-cli's ``--free-memory``
-    defaults to ``False``.** The divergence is deliberate: an agent that reaches
-    for this tool wants maximum headroom for the run it is about to start, and the
-    cache reset is the difference between "most of the VRAM back" and "all of it".
-    Pass ``free_memory=False`` for the CLI's own default — the lighter unload that
-    keeps the cached executor state, so a re-run of the same graph re-warms faster.
+    **The cache reset cannot be had without the unload**, because ComfyUI's queue
+    worker resolves the pair as ``flags.get("unload_models", free_memory)`` and
+    its ``POST /free`` handler only records ``unload_models`` when it is true — so
+    a false one is not stored and ``free_memory`` supplies the default. Asking for
+    ``unload_models=False, free_memory=True`` would therefore unload every model:
+    the exact opposite of what it says. That pair is rejected rather than sent, so
+    the contradiction surfaces as an error instead of as silently evicted models.
+
+    ``unload_models=False`` consequently asks ComfyUI to do NOTHING — both flags
+    are off, and the worker skips both branches. It is a deliberate no-op kept for
+    symmetry with the CLI, not a "reset the cache but keep the models" mode; the
+    returned ``requested`` block reports the flags so the caller can see it.
 
     NOT IMMEDIATE, and never destructive: ComfyUI applies the request when its
     queue worker next iterates — immediate if the server is idle, after the
@@ -5269,8 +5294,24 @@ def free_memory(unload_models: bool = True, free_memory: bool = True) -> Any:
     so this cannot be used to stop one; use ``cancel_job`` for that. The return is
     comfy-cli's acknowledgement of what was REQUESTED (``{"requested": {...},
     "note": ...}``), not a measurement — read ``system_stats`` afterwards to
-    confirm the memory actually came back.
+    confirm the memory actually came back (allowing for the lag above).
+
+    Like ``system_stats``, and unlike the run/job tools, this is NOT diverted by
+    ``COMFYUI_URL`` / ``COMFYUI_HOST`` — it frees memory on whichever ComfyUI
+    comfy-cli itself targets, which with a remote URL configured is NOT the server
+    the run tools submit to.
     """
+    if free_memory is None:
+        # Mirror `unload_models` so the default call asks for both and
+        # `unload_models=False` cannot silently imply the unload it disclaims.
+        free_memory = unload_models
+    if free_memory and not unload_models:
+        raise ComfyCliError(
+            "invalid free_memory=True with unload_models=False: ComfyUI resolves "
+            'the pair as flags.get("unload_models", free_memory), so the cache '
+            "reset would unload every model anyway. Pass free_memory=False to "
+            "keep them resident, or unload_models=True to accept the unload."
+        )
     args = ["free", "--unload-models" if unload_models else "--no-unload-models"]
     if free_memory:
         # `--free-memory` is a plain on-switch in comfy-cli (there is no
