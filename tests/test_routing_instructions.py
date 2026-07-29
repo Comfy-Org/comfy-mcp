@@ -74,19 +74,35 @@ def test_routing_names_the_hardware_block_as_its_signal(routing):
     assert "`hardware` block" in routing
 
 
-def test_routing_states_the_units_and_the_unified_memory_null(routing):
+def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     """The block's thresholds are GB; the payload's fields are bytes.
 
-    comfy-cli reports ``ram_bytes`` / ``gpu.vram_bytes`` as raw byte counts, and
-    on a unified-memory machine ``vram_bytes`` is ``None`` with the real figure
-    in ``ram_bytes``. Without both facts stated, a literal reading compares
-    ``None`` or a ten-digit byte count against "8 GB" and routes wrong — the
-    exact misread this block exists to prevent.
+    comfy-cli reports ``ram_bytes`` / ``gpu.vram_bytes`` as raw byte counts, so
+    without the units stated a literal reading compares a ten-digit number
+    against "8 GB" and routes wrong. The rounding half matters just as much: the
+    divisor yields GiB and drivers report just under nominal capacity, so a
+    nominal 24 GB card reads 23.99 and would silently drop into the band below —
+    the exact misclassification the threshold rows exist to make unambiguous.
+
+    Anchors are backticked (```ram_bytes```` is NOT a substring of
+    ```gpu.vram_bytes````, where the name is preceded by ``v``) so each field
+    name can fail independently.
     """
     assert "BYTES" in routing
-    assert "ram_bytes" in routing and "gpu.vram_bytes" in routing
-    assert "1073741824" in routing  # the bytes -> GB divisor, stated explicitly
-    assert "null" in routing  # vram_bytes on a unified-memory machine
+    assert "`ram_bytes`" in routing and "`gpu.vram_bytes`" in routing
+    assert "1073741824" in routing  # the bytes -> GiB divisor, stated explicitly
+    assert "ROUND TO THE NEAREST WHOLE GB" in routing
+
+
+def test_routing_scopes_the_unified_memory_substitution_to_apple(routing):
+    """A null ``vram_bytes`` means "read ``ram_bytes``" only on Apple Silicon.
+
+    Stated generically it would hand a 32 GB Intel/AMD integrated-GPU laptop the
+    Apple ">= 32 GB, images OK" verdict, when the only row keyed on
+    ``ram_bytes`` is the Apple one and such a machine belongs in partner/cloud.
+    """
+    assert "`gpu.unified_memory` is true" in routing
+    assert "APPLE-ONLY" in routing
 
 
 def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
@@ -115,8 +131,12 @@ def test_routing_covers_non_nvidia_discrete_gpus(routing):
 
     ``hardware.gpu.vendor`` reports these, so a block scoped only to NVIDIA
     leaves a machine that plainly has a usable GPU with no verdict at all.
+
+    Anchored on ``ROCm/XPU`` rather than ``AMD/Intel``: the latter also appears
+    in the ``nvidia-smi`` caveat further down, so it would keep passing after
+    this row's non-NVIDIA coverage was deleted.
     """
-    assert "AMD/Intel" in routing
+    assert "ROCm/XPU" in routing
 
 
 def test_routing_covers_apple_silicon_below_the_32gb_line(routing):
@@ -151,9 +171,15 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     ``test_templates.py``), so ``tag="Video"`` alone returns LOCAL video
     templates the caller cannot tell apart. ``tag="API"`` plus ``type="video"``
     narrows on both axes.
+
+    The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
+    with a discrete card follows the discrete-GPU row, and "any Mac" handed that
+    machine two contradictory verdicts.
     """
     assert 'search_templates(tag="API", type="video")' in routing
+    assert 'tag="Video"' in routing  # the value the caveat is actually about
     assert "emit_partner_workflow" in routing
+    assert "APPLE-GPU rule, not" in routing
 
 
 def test_routing_steers_model_choice_to_discovery_not_a_hardcoded_default(routing):
@@ -164,6 +190,19 @@ def test_routing_steers_model_choice_to_discovery_not_a_hardcoded_default(routin
     """
     assert "search_templates" in routing and "search_models" in routing
     assert "classic default" in routing  # phrase unique to this bullet
+
+
+def test_routing_asks_rather_than_reading_an_unknown_gpu_as_no_gpu(routing):
+    """Present-but-incomplete ``hardware`` must route like absent, not like "no GPU".
+
+    A discrete card comfy-cli cannot size reports ``vram_bytes: null`` with
+    ``unified_memory`` false or absent, and ``gpu`` itself can be null/missing.
+    Scoping the escape hatch to ``hardware`` being *absent* left those machines
+    falling through to "no GPU at all -> do NOT run local diffusion", stranding a
+    machine that has a perfectly usable GPU.
+    """
+    assert "present but missing the figure" in routing
+    assert 'never read an UNKNOWN as "no GPU"' in routing
 
 
 def test_routing_prefers_asking_over_an_unreliable_shell_probe(routing):

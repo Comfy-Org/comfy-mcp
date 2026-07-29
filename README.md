@@ -132,19 +132,23 @@ Cloud MCP** — comfy-cli is the engine.
 
 ## When to use this server
 
-Local diffusion is only a good default on a machine that can actually carry it, so the server's client instructions tell your agent to read `server_info`'s `hardware` block (platform, GPU vendor/model, VRAM, total RAM) **before** the first generation and route on it. The thresholds:
+Local diffusion is only a good default on a machine that can actually carry it, so the server's client instructions tell your agent to read `server_info`'s `hardware` block (`os`, `arch`, `ram_bytes`, and a `gpu` object with `vendor` / `model` / `vram_bytes` / `unified_memory`) **before** the first generation and route on it. The thresholds:
 
 | Machine | Guidance |
 |---|---|
 | Discrete GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
 | Discrete GPU, **8 GB to under 24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
 | **< 8 GB** VRAM, or no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the Comfy Cloud MCP if your client has it connected. |
-| **Apple Silicon**, **≥ 32 GB** unified memory | Images are OK. Video on the Mac's *own* GPU is not recommended — time estimates are unreliable and thermals suffer. |
+| **Apple Silicon**, **≥ 32 GB** unified memory | Images are OK. Video on the Apple GPU is not recommended — time estimates are unreliable and thermals suffer. |
 | **Apple Silicon**, under 32 GB unified memory | Same as the no-GPU row above — go partner/cloud rather than local. |
 
-The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card on a ROCm/XPU build too — the VRAM number is what matters.
+The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card on a ROCm/XPU build too — the VRAM number is what matters. The no-local-video rule is an *Apple GPU* rule rather than a Mac rule: an Intel Mac with a discrete card follows the discrete-GPU rows.
 
-Two things the agent is told to watch when reading the block: the sizes are **bytes** (`ram_bytes`, `gpu.vram_bytes`), so they need converting before they meet a GB threshold, and on a unified-memory machine `gpu.vram_bytes` is `null` — the figure to use there is `ram_bytes`. `hardware` also describes the machine *this server* runs on, so when a `comfy_target` block is present ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) the workload runs elsewhere and these thresholds don't describe it.
+Three things the agent is told to watch when reading the block:
+
+- **The sizes are bytes** (`ram_bytes`, `gpu.vram_bytes`), and the byte→GB divisor gives GiB while drivers report just under nominal capacity — so a nominal 24 GB card reads 23.99. The instructions say to round to the nearest whole GB, otherwise both 24 GB and 8 GB cards silently drop a band.
+- **`gpu.vram_bytes` is `null` on Apple Silicon** (with `gpu.unified_memory` true) and the figure to use there is `ram_bytes`. That substitution is Apple-only — a non-Apple integrated GPU sharing system memory goes to partner/cloud rather than borrowing the Apple row. A `null` on a *discrete* card, or a missing `gpu` object, means **unknown**, not "no GPU": the agent asks rather than stranding a machine that has one.
+- **`hardware` describes the machine *this server* runs on**, so when a `comfy_target` block is present ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) the workload runs elsewhere and these thresholds don't describe it.
 
 "No local video on a Mac" is about the Mac's own GPU, not about video as such: `API`-tagged video templates (`search_templates(tag="API", type="video")` — both filters, since `tag="Video"` alone would also return locally-run templates and the compact rows omit `tags`) and `emit_partner_workflow` run the model on partner infrastructure, so they work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
 

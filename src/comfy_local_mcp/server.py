@@ -181,13 +181,19 @@ an INPUT workflow file is always `workflow_path` (`run_workflow`,
 tool takes a bare `path` or `workflow` argument.
 
 Routing — check the machine before running local diffusion:
-- `server_info` passes through comfy-cli's `hardware` block (platform, GPU
-  vendor/model, VRAM, total RAM) when the installed comfy-cli reports one.
-  Read it before the first generation. Sizes are in BYTES (`ram_bytes`,
-  `gpu.vram_bytes`) — divide by 1073741824 for GB. On a unified-memory
-  machine `gpu.vram_bytes` is null and `gpu.unified_memory` is true: read
-  `ram_bytes` there, and never compare a null or a raw byte count against
-  the GB thresholds below.
+- `server_info` passes through comfy-cli's `hardware` block (`os`, `arch`,
+  `ram_bytes`, and a `gpu` object carrying `vendor` / `model` / `vram_bytes` /
+  `unified_memory`) when the installed comfy-cli reports one. Read it before
+  the first generation. The sizes are BYTES: divide by 1073741824 and then
+  ROUND TO THE NEAREST WHOLE GB before comparing — that divisor yields GiB and
+  drivers report just under nominal capacity, so a 24 GB card reads 23.99 and
+  an 8 GB card 7.99; both must land in the row their nominal size names, not
+  the one below.
+- On Apple Silicon (`arch` `arm64`, `gpu.vendor` Apple) `gpu.vram_bytes` is
+  null and `gpu.unified_memory` is true — the figure to use there is
+  `ram_bytes`. That substitution is APPLE-ONLY: a non-Apple integrated GPU
+  that shares system memory does not earn the Apple row, so treat it as the
+  no-GPU case below rather than reading its `ram_bytes` as VRAM.
 - `hardware` describes the machine THIS server runs on. If `server_info` also
   reports a `comfy_target` block (`COMFYUI_URL`/`COMFYUI_HOST` is set), the
   workload actually runs on that OTHER machine — these thresholds do not
@@ -201,15 +207,19 @@ Routing — check the machine before running local diffusion:
   the Comfy Cloud MCP if their client has it connected.
 - Apple Silicon, by unified memory: >= 32 GB, image generation is OK; under
   32 GB, treat it as the no-GPU case above. Either way do NOT attempt local
-  VIDEO generation on any Mac — time estimates are unreliable and thermals
-  suffer; recommend cloud instead. That rules out video on the Mac's OWN GPU,
-  not video as such: `API`-tagged video templates
-  (`search_templates(tag="API", type="video")` — filter on BOTH, since `tag`
-  alone would also return locally-run video templates and the compact rows
-  omit `tags`) and `emit_partner_workflow` put the model on partner
-  infrastructure, so they are fine on any Mac.
-- If `hardware` is absent (older comfy-cli), ASK the user for their GPU and
-  VRAM/RAM — that is the reliable answer. Shell probes are a weak substitute:
+  VIDEO generation on Apple Silicon's OWN GPU — time estimates are unreliable
+  and thermals suffer; recommend cloud instead. That is an APPLE-GPU rule, not
+  a Mac rule: an Intel Mac with a discrete card follows the discrete-GPU row
+  above. And it rules out video on that GPU, not video as such: `API`-tagged
+  video templates (`search_templates(tag="API", type="video")` — filter on
+  BOTH, since `tag="Video"` alone would also return locally-run video
+  templates and the compact rows omit `tags`) and `emit_partner_workflow` put
+  the model on partner infrastructure, so they are fine on any Mac.
+- If `hardware` is absent (older comfy-cli), OR present but missing the figure
+  you need (`gpu` null or absent, or `vram_bytes` null on a card that is not
+  unified-memory), ASK the user for their GPU and VRAM/RAM — never read an
+  UNKNOWN as "no GPU" and strand a machine that has one. Shell probes are a
+  weak substitute:
   no single command yields both numbers (on macOS `sysctl -n hw.memsize` for
   unified memory in bytes plus `system_profiler SPDisplaysDataType` to name
   the GPU; elsewhere `nvidia-smi --query-gpu=name,memory.total
