@@ -19,10 +19,9 @@
 </p>
 
 <p>
-  <a href="#install"><strong>Install</strong></a> ·
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#tools">Tools</a> ·
+  <a href="#quickstart"><strong>Quickstart</strong></a> ·
   <a href="#configure-your-ai-client">Configure your client</a> ·
+  <a href="#tools">Tools</a> ·
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -39,15 +38,154 @@
 - ♻️ **Manage ComfyUI** — launch / stop / restart the server, tail its logs, and stage input assets.
 
 Each tool shells out to the `comfy` command with `--where local --json`, parses comfy-cli's
-`envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
-Cloud MCP** — comfy-cli is the engine.
+`envelope/1` output, and returns it — comfy-cli is the engine, and by default everything targets
+the ComfyUI on **your** machine (`127.0.0.1:8188`).
+
+**Scope — local-first, not local-only.** A few flows already reach beyond your machine:
+[`partner_generate`](#spending-credits-on-partner-models) runs hosted partner models
+(Flux / Ideogram / Kling / …) entirely on partner infrastructure — no local ComfyUI in the
+execution path — and [partner-API nodes](#partner-api-nodes) let a locally-executed workflow call
+those same hosted models, while [`COMFYUI_URL`](#driving-a-remote-comfyui) points the run/job tools
+at a ComfyUI on another machine you control. What this server is **not** is a Comfy Cloud client:
+it shares no code with the Comfy Cloud MCP and implements none of its cloud-native feature set. If
+your workflows live in Comfy Cloud, use that MCP — alongside this one if you like.
 
 > **Status:** beta. 49 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
+## Quickstart
+
+Four steps take you from a fresh install to your first generated image.
+
+1. **Install the pieces.**
+
+   ```bash
+   pip install 'comfy-cli>=1.13.0'  # the engine (>= 1.13.0 required)
+   comfy install                  # create a ComfyUI workspace (skip if you have one)
+   pip install .                  # this MCP server → the `comfy-local-mcp` command
+   ```
+
+   Run that last one from a checkout of this repo (`pip install -e .` for a working copy).
+   `pip install .` puts a `comfy-local-mcp` console script on your `PATH`; that command is what you
+   point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
+   venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
+
+2. **Launch ComfyUI** and leave it running:
+
+   ```bash
+   comfy launch
+   ```
+
+3. **Add the server to your client** using the snippet for your client in
+   [Configure your AI client](#configure-your-ai-client) just below, then restart / reload it so
+   the tools appear.
+
+4. **Ask your agent to run a workflow.** For example:
+
+   > "Confirm my local ComfyUI is running, then run the workflow at
+   > `~/workflows/txt2img.json` and show me the image."
+
+   Under the hood the agent calls `server_info` to confirm ComfyUI is up, `run_workflow` to
+   execute your workflow JSON (API-format or a UI export), and `fetch_outputs` to collect the
+   result. No hand-authored workflow? Ask it to start from a template instead — it can
+   `search_templates`, `fetch_template` to write a runnable JSON, and run that — and
+   `fetch_template` tells it up front if [your install can't run that
+   template](#templates-your-install-cant-run) yet.
+
+**Where the images land.** ComfyUI writes generated files into your ComfyUI **workspace's
+`output/` directory** (part of the workspace `comfy install` created). On top of that,
+`fetch_outputs(prompt_id, out_dir)` **copies** a finished job's outputs into any directory you
+name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
+the originals stay in the ComfyUI workspace.
+
+## Configure your AI client
+
+All three clients speak the same MCP stdio contract: run the `comfy-local-mcp` command as a
+server. Pick your client.
+
+> The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
+> environment your client launches the server with; keep it (pointing at the absolute path) if
+> it isn't. `COMFY_API_KEY` is also shown, commented as optional — keep it only if you use
+> [partner-API nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …); drop it
+> otherwise.
+
+> **On macOS, keep ComfyUI out of `~/Documents`, `~/Desktop` and `~/Downloads`** — or grant your
+> client Full Disk Access. macOS blocks apps (and everything they launch) from reading those
+> folders, so an install there fails with `Operation not permitted` before anything runs. See
+> [Troubleshooting](#troubleshooting).
+
+### Claude Code
+
+One command registers the server:
+
+```bash
+# COMFY_API_KEY is optional — add it only if you use partner-API nodes
+# (see the Partner-API nodes section).
+claude mcp add comfy-local \
+  -e COMFY_BIN=/path/to/venv/bin/comfy \
+  -e COMFY_API_KEY=<your-comfy-api-key> \
+  -- comfy-local-mcp
+```
+
+Or, to check it into a project, add a `.mcp.json` at the repo root:
+
+```json
+{
+  "mcpServers": {
+    "comfy-local": {
+      "command": "comfy-local-mcp",
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_API_KEY": "<your-comfy-api-key>"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Edit `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS it lives at
+`~/Library/Application Support/Claude/claude_desktop_config.json`) and add the server, then
+restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "comfy-local": {
+      "command": "comfy-local-mcp",
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_API_KEY": "<your-comfy-api-key>"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a project:
+
+```json
+{
+  "mcpServers": {
+    "comfy-local": {
+      "command": "comfy-local-mcp",
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_API_KEY": "<your-comfy-api-key>"
+      }
+    }
+  }
+}
+```
+
 ## Table of contents
 
+- [Quickstart](#quickstart)
+- [Configure your AI client](#configure-your-ai-client)
 - [Prerequisites](#prerequisites)
 - [When to use this server](#when-to-use-this-server)
 - [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
@@ -56,9 +194,6 @@ Cloud MCP** — comfy-cli is the engine.
 - [Templates your install can't run](#templates-your-install-cant-run)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
-- [Install](#install)
-- [Configure your AI client](#configure-your-ai-client)
-- [Quickstart](#quickstart)
 - [Tools](#tools)
 - [Troubleshooting](#troubleshooting)
 - [Failure log (opt-in)](#failure-log-opt-in)
@@ -100,8 +235,9 @@ Cloud MCP** — comfy-cli is the engine.
 - **`COMFY_BIN` override (optional).** By default the server calls `comfy` from `PATH`. MCP
   clients launch the server with their own environment, which often does **not** include your
   shell's `PATH` — so if `comfy` lives in a virtualenv or a non-standard location, set
-  `COMFY_BIN` to its absolute path (e.g. `/path/to/venv/bin/comfy`). Every client example below
-  shows where it goes. Setting it is sufficient on its own — you do **not** also have to put
+  `COMFY_BIN` to its absolute path (e.g. `/path/to/venv/bin/comfy`). Every example in
+  [Configure your AI client](#configure-your-ai-client) shows where it goes. Setting it is
+  sufficient on its own — you do **not** also have to put
   that directory on the client's `PATH`. The server prepends the resolved binary's directory to
   the `PATH` it hands comfy-cli, because some comfy-cli commands (notably the background
   `launch`) re-invoke `comfy` by name and have to be able to find themselves.
@@ -110,7 +246,8 @@ Cloud MCP** — comfy-cli is the engine.
   credential, and — exactly like `COMFY_BIN` — an MCP client launches the server with its own
   minimal environment, so a key from your shell won't reach it. Set `COMFY_API_KEY` in the
   client registration `env` block. See **[Partner-API nodes](#partner-api-nodes)** below for the
-  full precedence chain; every client example shows where it goes.
+  full precedence chain; every example in
+  [Configure your AI client](#configure-your-ai-client) shows where it goes.
 - **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a *remote* ComfyUI).** By
   default every tool targets the local `127.0.0.1:8188`. Set `COMFYUI_URL`
   (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`, default `8188`)
@@ -198,7 +335,8 @@ Option 2 does not have to be typed into a terminal: the agent can call **`auth_l
 
 Because an MCP client spawns the server with its own minimal environment (the same reason
 `COMFY_BIN` exists), a `COMFY_API_KEY` from your interactive shell is **not** inherited — put it
-in the client registration `env` block (shown in every example below). If a run fails with
+in the client registration `env` block (shown in every
+[client example](#configure-your-ai-client)). If a run fails with
 `partner_node_requires_credential`, the error now carries comfy-cli's hint verbatim, including
 the `comfy auth set comfy-cloud-api-key --key …` fallback and the list of offending nodes; the
 server also retries a transient credential failure briefly before surfacing it.
@@ -405,140 +543,6 @@ effect, rather than the version alone.
 > `COMFYUI_URL` while every other verb followed `COMFY_LOCAL_URL`. For a non-default address on
 > *this* machine prefer `COMFY_LOCAL_URL` alone: it also covers the verbs that accept no
 > `--host`/`--port` (`comfy env`, templates, models, download), which `COMFYUI_URL` cannot reach.
-
-## Install
-
-From a checkout of this repo:
-
-```bash
-pip install .          # or `pip install -e .` for a working copy
-comfy-local-mcp        # serves the MCP over stdio
-```
-
-`pip install` puts a `comfy-local-mcp` console script on your `PATH`; that command is what you
-point your AI client at below. (Installing into a dedicated venv is fine — just remember MCP
-clients may not see that venv's `PATH`, which is exactly what `COMFY_BIN` is for.)
-
-## Configure your AI client
-
-All three clients speak the same MCP stdio contract: run the `comfy-local-mcp` command as a
-server. Pick your client.
-
-> The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
-> environment your client launches the server with; keep it (pointing at the absolute path) if
-> it isn't. `COMFY_API_KEY` is also shown, commented as optional — keep it only if you use
-> [partner-API nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …); drop it
-> otherwise.
-
-> **On macOS, keep ComfyUI out of `~/Documents`, `~/Desktop` and `~/Downloads`** — or grant your
-> client Full Disk Access. macOS blocks apps (and everything they launch) from reading those
-> folders, so an install there fails with `Operation not permitted` before anything runs. See
-> [Troubleshooting](#troubleshooting).
-
-### Claude Code
-
-One command registers the server:
-
-```bash
-# COMFY_API_KEY is optional — add it only if you use partner-API nodes (see above).
-claude mcp add comfy-local \
-  -e COMFY_BIN=/path/to/venv/bin/comfy \
-  -e COMFY_API_KEY=<your-comfy-api-key> \
-  -- comfy-local-mcp
-```
-
-Or, to check it into a project, add a `.mcp.json` at the repo root:
-
-```json
-{
-  "mcpServers": {
-    "comfy-local": {
-      "command": "comfy-local-mcp",
-      "env": {
-        "COMFY_BIN": "/path/to/venv/bin/comfy",
-        "COMFY_API_KEY": "<your-comfy-api-key>"
-      }
-    }
-  }
-}
-```
-
-### Claude Desktop
-
-Edit `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS it lives at
-`~/Library/Application Support/Claude/claude_desktop_config.json`) and add the server, then
-restart Claude Desktop:
-
-```json
-{
-  "mcpServers": {
-    "comfy-local": {
-      "command": "comfy-local-mcp",
-      "env": {
-        "COMFY_BIN": "/path/to/venv/bin/comfy",
-        "COMFY_API_KEY": "<your-comfy-api-key>"
-      }
-    }
-  }
-}
-```
-
-### Cursor
-
-Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a project:
-
-```json
-{
-  "mcpServers": {
-    "comfy-local": {
-      "command": "comfy-local-mcp",
-      "env": {
-        "COMFY_BIN": "/path/to/venv/bin/comfy",
-        "COMFY_API_KEY": "<your-comfy-api-key>"
-      }
-    }
-  }
-}
-```
-
-## Quickstart
-
-Zero to a generated image:
-
-1. **Install the pieces.**
-
-   ```bash
-   pip install 'comfy-cli>=1.13.0'  # the engine (>= 1.13.0 required)
-   comfy install                  # create a ComfyUI workspace (skip if you have one)
-   pip install .                  # this MCP server → the `comfy-local-mcp` command
-   ```
-
-2. **Launch ComfyUI** and leave it running:
-
-   ```bash
-   comfy launch
-   ```
-
-3. **Add the server to your client** using the snippet for your client above, then restart /
-   reload it so the tools appear.
-
-4. **Ask your agent to run a workflow.** For example:
-
-   > "Confirm my local ComfyUI is running, then run the workflow at
-   > `~/workflows/txt2img.json` and show me the image."
-
-   Under the hood the agent calls `server_info` to confirm ComfyUI is up, `run_workflow` to
-   execute your workflow JSON (API-format or a UI export), and `fetch_outputs` to collect the
-   result. No hand-authored workflow? Ask it to start from a template instead — it can
-   `search_templates`, `fetch_template` to write a runnable JSON, and run that — and
-   `fetch_template` tells it up front if [your install can't run that
-   template](#templates-your-install-cant-run) yet.
-
-**Where the images land.** ComfyUI writes generated files into your ComfyUI **workspace's
-`output/` directory** (part of the workspace `comfy install` created). On top of that,
-`fetch_outputs(prompt_id, out_dir)` **copies** a finished job's outputs into any directory you
-name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
-the originals stay in the ComfyUI workspace.
 
 ## Tools
 
