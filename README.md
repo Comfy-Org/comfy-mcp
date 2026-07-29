@@ -28,6 +28,8 @@
 
 </div>
 
+> Looking for the cloud-hosted version? See the [Comfy Cloud MCP docs](https://docs.comfy.org/agent-tools/mcp).
+
 **What it does:**
 
 - 🖼️ **Generate** — run a workflow JSON (API-format or UI export), or go text-prompt → image in one call.
