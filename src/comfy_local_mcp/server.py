@@ -5834,6 +5834,37 @@ _MAX_LOG_LINE_CHARS = 4000
 _MIN_LOG_PORT = 1
 _MAX_LOG_PORT = 65535
 
+# How much of a rejected `port` the error message may quote back. Same reason
+# `_guard_prompt_id` reports a length instead of the value: an in-process caller
+# can pass a megabyte-long "port", and echoing it whole is the denial-of-legibility
+# the guard exists to prevent.
+_MAX_PORT_REPR_CHARS = 80
+
+
+def _render_bad_port(port: Any) -> str:
+    """Render a rejected ``port`` for an error message, bounded and total.
+
+    Two hazards, both of which would otherwise escape :func:`_guard_log_port` as
+    something other than the :class:`ComfyCliError` it exists to raise. An
+    oversized value (a long string or list from an in-process caller) floods the
+    caller's context, so it is truncated with its length reported — the shape
+    :func:`_guard_prompt_id` and :func:`_guard_download_id` use. And an int with
+    more than ``sys.get_int_max_str_digits()`` digits (4300 by default on 3.11+)
+    raises ``ValueError`` on conversion to text, so ``port=10**5000`` would
+    surface as an unhandled internal error instead of "out of range"; that case
+    is caught and described by type rather than by value.
+    """
+    try:
+        text = repr(port)
+    except ValueError:
+        # Narrow on purpose: the only in-practice raiser is the int-digit limit
+        # above. A `__repr__` that fails some other way is a caller bug worth
+        # seeing whole, not swallowing here.
+        return f"<{type(port).__name__} too large to render>"
+    if len(text) > _MAX_PORT_REPR_CHARS:
+        return f"{text[:_MAX_PORT_REPR_CHARS]}… ({len(text)} characters)"
+    return text
+
 
 def _guard_log_port(port: Any) -> int:
     """Reject a ``get_logs`` ``port`` that has no business reaching argv.
@@ -5847,20 +5878,26 @@ def _guard_log_port(port: Any) -> int:
     because it is an ``int`` subclass in Python, so ``port=True`` would otherwise
     forward ``--port 1``.
 
+    Returns ``int(port)`` rather than the caller's object for the same
+    argv-shape reason: an ``IntEnum``/``IntFlag`` member passes both the
+    ``isinstance`` and the range check, but stringifies as ``Color.RED``, which
+    would reach comfy-cli as ``--port Color.RED``. Normalizing here is what makes
+    the call site's "forward the guarded int" true.
+
     Whether the port names a ComfyUI that ever ran is comfy-cli's answer to give
     (it reports the candidates it checked), not this wrapper's to guess.
     """
     if isinstance(port, bool) or not isinstance(port, int):
         raise ComfyCliError(
-            f"invalid port: {port!r} (expected an integer between "
+            f"invalid port: {_render_bad_port(port)} (expected an integer between "
             f"{_MIN_LOG_PORT} and {_MAX_LOG_PORT})."
         )
     if not (_MIN_LOG_PORT <= port <= _MAX_LOG_PORT):
         raise ComfyCliError(
-            f"invalid port: {port} is outside the valid range "
+            f"invalid port: {_render_bad_port(port)} is outside the valid range "
             f"{_MIN_LOG_PORT}-{_MAX_LOG_PORT}."
         )
-    return port
+    return int(port)
 
 
 # `comfy logs --port` landed in comfy-cli AFTER 1.13.0 (:data:`_MIN_COMFY_CLI`,
@@ -5939,23 +5976,35 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
     """
     tail = max(_MIN_LOG_TAIL, min(int(tail), _MAX_LOG_TAIL))
     args = ["logs", "--tail", str(tail)]
-    if port is not None:
-        # Forward the guarded int, not the caller's raw value.
-        args += ["--port", str(_guard_log_port(port))]
+    # Forward the guarded int, not the caller's raw value — and keep it, so the
+    # version-skew message below quotes the normalized port rather than the
+    # object that produced it.
+    guarded_port = None if port is None else _guard_log_port(port)
+    if guarded_port is not None:
+        args += ["--port", str(guarded_port)]
     try:
         data = _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
         if exc.code == _NO_LOG_FILE_CODE:
             return {"error": _NO_LOG_FILE_CODE, "message": str(exc)}
-        if port is not None and _is_missing_option_error(exc, "--port"):
+        if guarded_port is not None and _is_missing_option_error(exc, "--port"):
             # Deliberately NOT a retry without the flag: the whole point of the
             # hint is that the default resolution can serve another instance's
             # log, so a silent fallback would answer the question wrongly and
             # look like a success. Fail with the one command that fixes it.
+            #
+            # comfy-cli's own text is APPENDED rather than replaced: `raise ...
+            # from exc` only sets `__cause__`, which no MCP client ever sees, so
+            # a rewrite would be the sole thing the caller reads. If this match
+            # were ever wrong — some other usage error that happens to carry
+            # Click's "no such option: --port" phrasing — the real diagnostic is
+            # still in the message instead of lost. It is already bounded: the
+            # no-envelope error is built from `_tail`-capped stderr/stdout.
             raise ComfyCliError(
-                f"get_logs(port={port}) unavailable: {_LOG_PORT_UPGRADE_HINT}. "
+                f"get_logs(port={guarded_port}) unavailable: "
+                f"{_LOG_PORT_UPGRADE_HINT}. "
                 "Call get_logs() without `port` only if you accept whichever log "
-                "file comfy-cli resolves on its own.",
+                f"file comfy-cli resolves on its own. comfy-cli reported: {exc}",
                 no_envelope=exc.no_envelope,
                 returncode=exc.returncode,
             ) from exc

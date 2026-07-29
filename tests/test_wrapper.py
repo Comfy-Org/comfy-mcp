@@ -15,6 +15,7 @@ MCP progress notifications, and still returns the final envelope's data.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import os
 import shutil
@@ -813,6 +814,54 @@ def test_get_logs_rejects_invalid_port(no_spawn, bad_port):
         server.get_logs(port=bad_port)
 
 
+def test_get_logs_normalizes_an_int_subclass_port(patched_run):
+    """An `IntEnum` port reaches argv as its NUMBER, not as `Port.COMFY`.
+
+    It passes the `isinstance` and range checks, so the guard's job is to hand
+    back `int(port)` — otherwise `str()` renders the member name onto argv.
+    """
+
+    class _Port(enum.IntEnum):
+        COMFY = 8189
+
+    calls = patched_run(envelope(data={"lines": []}))
+
+    server.get_logs(port=_Port.COMFY)
+
+    assert calls[0]["cmd"][4:] == ["logs", "--tail", "200", "--port", "8189"]
+
+
+def test_get_logs_bounds_the_rejected_port_it_echoes(no_spawn):
+    """An oversized value is summarized, not copied verbatim into the error.
+
+    Same rule as `_guard_prompt_id` / `_guard_download_id`: an in-process caller
+    can pass a megabyte-long "port", and reflecting it whole floods the caller's
+    context with the very input the guard refused.
+    """
+    huge = "8" * 50_000
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.get_logs(port=huge)
+
+    message = str(excinfo.value)
+    assert huge not in message
+    assert f"({len(repr(huge))} characters)" in message
+    # A summary of the input, not the input: a few lines of prose around the cap,
+    # nowhere near the 50k it was handed.
+    assert len(message) < server._MAX_PORT_REPR_CHARS + 200
+
+
+def test_get_logs_rejects_an_unrenderable_int_port_as_a_range_error(no_spawn):
+    """An int too large to stringify still fails as a `ComfyCliError`.
+
+    On 3.11+ an int with more than `sys.get_int_max_str_digits()` digits raises
+    `ValueError` on conversion to text, so formatting the value into the
+    out-of-range message would escape this guard as an internal error.
+    """
+    with pytest.raises(server.ComfyCliError, match="outside the valid range"):
+        server.get_logs(port=10**5000)
+
+
 def test_get_logs_passes_through_source_and_staleness_metadata(patched_run):
     """`source` / `mtime` / `size` / `port_mismatch` reach the caller untouched.
 
@@ -905,6 +954,10 @@ def test_get_logs_port_on_old_comfy_cli_raises_upgrade_error(patched_run):
         server.get_logs(port=8189)
 
     assert "--port" in str(excinfo.value)
+    # comfy-cli's own text survives: `raise ... from exc` sets `__cause__`, which
+    # no MCP client sees, so a rewrite would be the only thing the caller reads —
+    # and if this match were ever wrong, the real diagnostic would be gone.
+    assert "No such option" in str(excinfo.value)
     assert len(calls) == 1  # exactly one spawn: no fallback attempt
 
 
