@@ -6,8 +6,9 @@ the comfy-cli spawn to emit canned envelopes and assert the exact argv — a str
 `comfy --version` call would consume that stub and pollute those assertions. So
 by default we mark the guard "already checked" for every test; the dedicated
 guard tests (`test_wrapper.py`) re-enable it explicitly and mock `--version`.
-``partner_generate``'s spend-gate probe is a second such once-per-process
-shell-out and is neutralized the same way.
+``partner_generate``'s spend-gate probe and ``emit_partner_workflow``'s
+capability probe are two more such once-per-process shell-outs, each
+neutralized the same way.
 
 This module also holds the shared test helpers for both comfy-cli spawn paths,
 so a change to how ``server`` shells out lands in ONE fake rather than in a
@@ -57,6 +58,19 @@ def _skip_spend_gate_probe(monkeypatch):
     The dedicated probe tests (`test_partner_generate.py`) re-enable it.
     """
     monkeypatch.setattr(server, "_spend_gate_probed", True)
+
+
+@pytest.fixture(autouse=True)
+def _skip_emit_workflow_capability_probe(monkeypatch):
+    """Neutralize ``emit_partner_workflow``'s once-per-process capability probe.
+
+    Same reason as the spend-gate probe above: it shells out to ``comfy
+    generate --help`` before the first emit call, which would consume the
+    stubbed spawn and shift every exact-argv assertion in the emit-workflow
+    tests. The dedicated probe tests (`test_emit_partner_workflow.py`) restore
+    it explicitly.
+    """
+    monkeypatch.setattr(server, "_emit_workflow_capability_probed", True)
 
 
 @pytest.fixture(autouse=True)

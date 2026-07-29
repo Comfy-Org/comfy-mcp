@@ -4264,6 +4264,77 @@ async def partner_generate(
 # deadline would be a dial with nothing behind it.
 _EMIT_WORKFLOW_TIMEOUT = 120.0
 
+# Whether the installed comfy-cli's `comfy generate` recognises `--emit-workflow`
+# as a run-level flag, established once per process by
+# `_require_emit_workflow_capability`. Latched only on a positive result — same
+# posture as `_spend_gate_probed`: a probe that fails for a transient reason
+# (a hung binary, a bad spawn) must not wedge the tool for the life of the
+# process.
+_emit_workflow_capability_probed = False
+
+
+def _require_emit_workflow_capability() -> None:
+    """Refuse ``emit_partner_workflow`` unless this comfy-cli actually has ``--emit-workflow``.
+
+    ``emit_partner_workflow``'s whole safety claim is that ``comfy generate
+    <model> --emit-workflow <path>`` returns before any partner-proxy call, so it
+    deliberately skips :func:`_require_spend_gate` — spending nothing means there
+    is nothing to gate. That is true only if the INSTALLED comfy-cli recognises
+    ``--emit-workflow`` as a run-level flag at all. ``comfy generate`` is
+    registered with Click's ``ignore_unknown_options``/``allow_extra_args``, so on
+    a comfy-cli that predates the flag it is instead forwarded as a MODEL
+    PARAMETER and the real, spending proxy call runs — silently, from a tool
+    whose contract says it spends nothing and which therefore never raises the
+    per-call consent prompt :func:`partner_generate` does.
+
+    :data:`_MIN_COMFY_CLI` is the release that added the SPEND GATE, not
+    necessarily the release that added ``--emit-workflow`` (they are unrelated
+    features that happened to land in the same command), and
+    :func:`_check_comfy_version` fails OPEN on a ``--version`` it cannot read (a
+    fork, a source build) — so neither the floor nor the version guard can PROVE
+    the flag exists. This probe can.
+
+    The probe runs ``comfy generate --help`` — no model, no params — and checks
+    its printed usage for ``--emit-workflow``. That specific invocation is safe
+    on ANY comfy-cli, capable or not: with no target positional, ``comfy
+    generate``'s own entry point takes the built-in "print help and exit" branch
+    before it ever reaches model dispatch or the meta-flag/param split that would
+    treat an unrecognised flag as a proxy call. Probing with the real
+    ``--emit-workflow`` flag against a live model, by contrast, would on an
+    incapable install BE the unguarded spending call this function exists to
+    prevent — so this deliberately does not do that.
+
+    Fails CLOSED, like :func:`_require_spend_gate` and unlike
+    :func:`_check_comfy_version`: the cost of guessing wrong here is the user's
+    money, not an error message.
+    """
+    global _emit_workflow_capability_probed
+    if _emit_workflow_capability_probed:
+        return
+    try:
+        _, stdout, _, returncode, _ = _run_comfy_raw("generate", "--help", timeout=30.0)
+    # Broad on purpose, exactly like `_require_spend_gate`: the probe must fail
+    # CLOSED with THIS explanation, not leak a raw OSError/UnicodeDecodeError
+    # from a present-but-unusable binary.
+    except Exception as exc:
+        raise ComfyCliError(
+            "could not confirm this comfy-cli's `comfy generate` supports "
+            "`--emit-workflow` — refusing emit_partner_workflow rather than risk "
+            "a comfy-cli without the flag silently running a real, spending "
+            f"partner generation. (probe: {exc})"
+        ) from exc
+    if returncode != 0 or "--emit-workflow" not in stdout:
+        raise ComfyCliError(
+            "this comfy-cli's `comfy generate` does not recognise "
+            "`--emit-workflow`, so emit_partner_workflow would forward it as a "
+            "MODEL PARAMETER instead of the run-level flag it needs to be — "
+            "running a real, spending partner generation with no consent "
+            "interlock. Upgrade comfy-cli (`pip install --upgrade "
+            f"'comfy-cli>={_MIN_COMFY_CLI_STR}'`) to a release with "
+            "`--emit-workflow`, or use partner_generate if you intend to spend."
+        )
+    _emit_workflow_capability_probed = True
+
 
 @mcp.tool()
 async def emit_partner_workflow(
@@ -4332,6 +4403,13 @@ async def emit_partner_workflow(
     exist. RUNNING the emitted graph can still spend — a partner API node bills
     the user's Comfy account when it executes — so the spend happens at
     ``run_workflow`` time, under that tool's own posture, not here.
+
+    That "spends nothing" claim holds only on a comfy-cli that actually
+    recognises ``--emit-workflow`` as a flag — see
+    :func:`_require_emit_workflow_capability`, which this checks (once per
+    process) before ever building the call, and which raises rather than fall
+    through to a comfy-cli that would silently treat it as a model parameter
+    and run a real, spending generation instead.
     """
     _validate_generate_model(model)
     if not out_path:
@@ -4359,6 +4437,11 @@ async def emit_partner_workflow(
         # `--flag=value` so a path beginning with `-` stays the value.
         f"--emit-workflow={out_path}",
     ]
+    # Prove the installed comfy-cli actually treats `--emit-workflow` as a
+    # run-level flag BEFORE running the call above — on a comfy-cli that does
+    # not, this exact argv would instead run a real, spending proxy generation.
+    # See `_require_emit_workflow_capability`.
+    await asyncio.to_thread(_require_emit_workflow_capability)
     # No `plain_ok`: `generate emit-workflow` DOES emit an `envelope/1` (unlike
     # the proxy path this shares a verb with), so the normal contract applies —
     # `data` on success, and a failure raises with comfy-cli's structured

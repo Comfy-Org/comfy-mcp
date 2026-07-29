@@ -16,6 +16,9 @@ ComfyUI. What the wrapper is responsible for, and what these lock in:
    ``--emit-workflow`` DOES emit an ``envelope/1``, so ``data`` comes back
    structured and a failure surfaces comfy-cli's ``emit_workflow_failed``
    message intact, supported-model list and all.
+5. The capability gate — this tool's "spends nothing" claim only holds on a
+   comfy-cli that actually recognises ``--emit-workflow`` as a flag, so it must
+   REFUSE (not silently run a spending proxy call) against one that does not.
 
 comfy-cli is mocked throughout: nothing here runs a real CLI or writes a graph.
 """
@@ -23,6 +26,7 @@ comfy-cli is mocked throughout: nothing here runs a real CLI or writes a graph.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from conftest import envelope
@@ -264,6 +268,103 @@ def test_emit_takes_no_confirm_spend_argument():
 
     assert "confirm_spend" not in tool.parameters["properties"]
     assert set(tool.parameters["required"]) == {"model", "out_path"}
+
+
+# --- comfy-cli must actually support --emit-workflow (BE-4971) -------------
+#
+# `emit_partner_workflow`'s whole safety claim is that `--emit-workflow`
+# returns before any partner-proxy call, so it deliberately skips the spend
+# gate above. That is true only on a comfy-cli that recognises the flag —
+# `comfy generate` is registered with Click's `ignore_unknown_options` /
+# `allow_extra_args`, so on an older install `--emit-workflow` is instead
+# forwarded as a MODEL PARAMETER and a real, spending proxy call runs. These
+# lock in the capability probe that stands between this tool and that outcome.
+
+
+def test_emit_refuses_when_comfy_cli_lacks_the_emit_workflow_flag(
+    monkeypatch, patched_run
+):
+    """No `--emit-workflow` in `comfy generate --help` -> refuse, never run.
+
+    This is the regression the ticket is about: on an incapable comfy-cli, the
+    argv this tool builds would run a real, spending partner generation with no
+    consent interlock — from a tool whose contract says it spends nothing and
+    so raises no prompt. Refusing is what stands in for the missing prompt.
+    """
+    monkeypatch.setattr(server, "_emit_workflow_capability_probed", False)
+    # An older comfy-cli's `generate --help` text never mentions the flag.
+    calls = patched_run(
+        "comfy generate — call ComfyUI partner nodes\n\n"
+        "Usage:\n"
+        "  comfy generate <model> [--<param> value]... [--download PATH] [--yes]\n"
+    )
+
+    with pytest.raises(server.ComfyCliError, match="does not recognise"):
+        _emit("flux-pro", "/tmp/flux.json", params={"prompt": "a cat"})
+
+    assert len(calls) == 1  # only the probe ran — never the spending call
+    assert calls[0]["cmd"][4:] == ["generate", "--help"]
+    assert server._emit_workflow_capability_probed is False  # not latched
+
+
+def test_emit_capability_probe_uses_generate_help_not_a_real_emit_call(
+    monkeypatch, patched_run
+):
+    """The probe itself must not be the spending call it exists to prevent.
+
+    Probing with a real `comfy generate <model> --emit-workflow <path>` would,
+    on the exact incapable install this guards against, BE an unguarded
+    spending call — reproducing the hazard instead of catching it. The probe
+    argv must carry no model and no `--emit-workflow`.
+    """
+    monkeypatch.setattr(server, "_emit_workflow_capability_probed", False)
+    calls = patched_run("--emit-workflow")
+
+    server._require_emit_workflow_capability()
+
+    assert len(calls) == 1
+    probe_argv = calls[0]["cmd"][4:]
+    assert probe_argv == ["generate", "--help"]
+    assert "flux-pro" not in probe_argv
+
+
+def test_emit_capability_probe_failure_is_not_latched(monkeypatch, patched_run):
+    """A probe that cannot even run fails CLOSED, and does not wedge the process.
+
+    Mirrors `_require_spend_gate`'s posture: a transient spawn failure must not
+    be latched as "no capability" forever, so a later, healthy call can still
+    succeed.
+    """
+    monkeypatch.setattr(server, "_emit_workflow_capability_probed", False)
+    patched_run(raises=OSError("no such file or directory: comfy"))
+
+    with pytest.raises(server.ComfyCliError, match="could not confirm"):
+        _emit("flux-pro", "/tmp/flux.json")
+
+    assert server._emit_workflow_capability_probed is False
+
+
+def test_emit_probes_the_capability_once_then_emits(monkeypatch, patched_run):
+    """A CLI that HAS the flag is probed once; every later emit call skips it."""
+    monkeypatch.setattr(server, "_emit_workflow_capability_probed", False)
+    # One canned stdout that answers BOTH calls the fake cannot tell apart: a
+    # help line carrying the flag (what the probe greps for), followed by the
+    # envelope the real emit call parses — `_last_json_object` keeps the last
+    # JSON line on stdout and ignores the leading prose ahead of it.
+    calls = patched_run(
+        '  comfy generate flux-pro --prompt "a fox" --emit-workflow flux.json\n'
+        + json.dumps(envelope(data=_EMIT_DATA))
+    )
+
+    _emit("flux-pro", "/tmp/flux.json")
+    _emit("flux-pro", "/tmp/flux.json")
+
+    assert [c["cmd"][4:6] for c in calls] == [
+        ["generate", "--help"],  # probed once...
+        ["generate", "flux-pro"],
+        ["generate", "flux-pro"],  # ...not again on the second call
+    ]
+    assert server._emit_workflow_capability_probed is True
 
 
 # --- result contract (emit-workflow DOES emit an envelope) ------------------
