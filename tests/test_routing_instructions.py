@@ -30,7 +30,7 @@ from comfy_local_mcp import server
 # guarding that the POLICY is still stated, not where the line breaks fall.
 FLAT = " ".join(server.INSTRUCTIONS.split())
 
-_ROUTING_HEADER = "Routing — check the machine before running local diffusion:"
+_ROUTING_HEADER = "Routing — check the machine before running local diffusion."
 _ROUTING_END = "Everything targets the LOCAL server only"
 
 
@@ -89,9 +89,14 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     against "8 GB" and routes wrong. The rounding half matters just as much: the
     divisor yields GiB and drivers report under the advertised size — a consumer
     24 GB card reads 23.99, and an ECC/reserving datacenter card (A10, L4) about
-    22.3 — so any exact-rounding recipe still drops a band. The block states the
-    intent instead: read the figure as a lower bound on the card's nominal
-    capacity, which is the misclassification the threshold rows exist to avoid.
+    22.3 — so any exact-rounding recipe still drops a band.
+
+    Rounding up is bounded to that driver overhead, though. On a MIG/vGPU
+    partition ``gpu.model`` still names the whole card while ``vram_bytes`` is
+    the slice actually available, so mapping the figure up to the model's
+    nominal size would route a 6 GB slice of an A100 into the ">= 24 GB" band
+    and OOM the run. Both halves have to be stated or one failure mode replaces
+    the other.
 
     Anchors are backticked (```ram_bytes```` is NOT a substring of
     ```gpu.vram_bytes````, where the name is preceded by ``v``) so each field
@@ -100,8 +105,8 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     assert "BYTES" in routing
     assert "`ram_bytes`" in routing and "`gpu.vram_bytes`" in routing
     assert "1073741824" in routing  # the bytes -> GiB divisor, stated explicitly
-    assert "NOMINAL capacity" in routing
-    assert "LOWER BOUND" in routing
+    assert "SMALL shortfall" in routing  # rounds up only within driver overhead
+    assert "MIG/vGPU PARTITION" in routing  # ...but never on a partitioned card
 
 
 def test_routing_scopes_the_unified_memory_substitution_to_apple(routing):
@@ -128,11 +133,19 @@ def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
     host is this same machine; and a malformed config yields an error-shaped
     block that resolves no remote at all. Treating any ``comfy_target`` as
     "runs elsewhere" would switch routing off on all three.
+
+    Loopback is stated as a RANGE, not a pair of literals: ``_comfy_target``
+    accepts a bracketed IPv6 host (``COMFYUI_URL=http://[::1]:8188``, see
+    ``_strip_brackets``) and the rest of ``127.0.0.0/8`` is equally this
+    machine. And ``comfy_target`` is not the only remoting signal —
+    ``COMFY_LOCAL_URL`` repoints comfy-cli's resolved ``server`` URL without
+    producing the block at all.
     """
     assert "comfy_target" in routing
     assert "generate_image" in routing  # named as still-local
     assert "ERROR-shaped" in routing
-    assert "127.0.0.1" in routing
+    assert "127.0.0.0/8" in routing and "::1" in routing
+    assert "COMFY_LOCAL_URL" in routing
 
 
 def test_routing_thresholds_do_not_overlap_at_24gb(routing):
@@ -186,18 +199,20 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
 
     Read as a blanket "no video on a Mac" it would deny a capability this server
     really has. The named escape hatch also has to be a filter that actually
-    isolates partner-run graphs: ``tag`` is a single exact-match forward to
-    ``--tag``, and the compact rows omit ``tags`` (see
-    ``test_templates.py``), so ``tag="Video"`` alone returns LOCAL video
-    templates the caller cannot tell apart. ``tag="API"`` plus ``type="video"``
-    narrows on both axes.
+    isolates partner-run graphs, and the caveat has to justify BOTH axes without
+    pinning the failure on either one: ``tag`` and ``type`` are separate
+    exact-match forwards to ``--tag`` / ``--type``, so ``tag`` alone does not
+    constrain the output type and ``type`` alone does not constrain where the
+    model runs. Either way the compact rows omit ``tags`` (see
+    ``test_templates.py``), so the caller cannot tell a local template from an
+    ``API`` one in the results.
 
     The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
     with a discrete card follows the discrete-GPU row, and "any Mac" handed that
     machine two contradictory verdicts.
     """
     assert 'search_templates(tag="API", type="video")' in routing
-    assert 'tag="Video"' in routing  # the value the caveat is actually about
+    assert "neither alone isolates partner-run video" in routing
     assert "emit_partner_workflow" in routing
     assert "APPLE-GPU rule, not" in routing
 
@@ -225,28 +240,39 @@ def test_routing_asks_rather_than_reading_an_unknown_gpu_as_no_gpu(routing):
     non-Apple UNIFIED part (Jetson/Grace, a Strix Halo APU) also reports a null
     ``vram_bytes``, and the ``ram_bytes`` substitution above is Apple-only, so
     keying on unified-memory left that machine matching neither branch — with
-    64-128 GB of usable memory and a "do NOT run local diffusion" verdict.
+    64-128 GB of usable memory and a "do NOT run local diffusion" verdict. The
+    Apple path needs the mirror case too: a missing or zero ``ram_bytes`` is the
+    one figure that branch depends on.
+
+    Because UNKNOWN swallows every shape that used to read as "no GPU", the
+    no-GPU verdict has to say what a CONFIRMED absence looks like, or step 4's
+    branch becomes unreachable.
     """
-    assert "present but missing the figure" in routing
-    assert 'never read an UNKNOWN as "no GPU"' in routing
+    assert "is UNKNOWN, NOT" in routing
     assert "ANY non-Apple GPU" in routing
     assert "Jetson/Grace" in routing and "Strix Halo" in routing
+    assert "`ram_bytes` missing or zero on the Apple path" in routing
+    assert "CONFIRMED absence" in routing
 
 
-def test_routing_prefers_asking_over_an_unreliable_shell_probe(routing):
-    """``hardware`` is new in comfy-cli, so the absent case needs an answer.
+def test_routing_asks_the_user_and_names_no_shell_probe(routing):
+    """The missing-figure answer is to ASK — the block must not hand out probes.
 
-    It has to be an answer that WORKS: no single probe yields both numbers —
-    ``system_profiler SPDisplaysDataType`` names the GPU but not unified-memory
-    size (that is ``sysctl -n hw.memsize``), and ``nvidia-smi`` gives VRAM but no
-    system RAM and nothing at all for AMD/Intel. These also run outside the
-    audited ``_run_comfy`` path, so the block leads with asking the user and
-    bounds any probe it does mention.
+    An earlier draft named ``system_profiler`` / ``sysctl`` / ``nvidia-smi`` as a
+    fallback. They could not actually supply what the thresholds key on (no one
+    command yields both numbers, and ``nvidia-smi`` reports nothing for
+    AMD/Intel), and they steer the client agent into shelling out on a path this
+    server can neither bound nor audit — a ``PATH``-shadowed ``nvidia-smi`` runs
+    whatever it likes with the agent's privileges, against advisory prose as the
+    only mitigation. Asking the user is both more reliable and free of that
+    surface, so the probe commands are gone and this test keeps them gone.
     """
-    assert "ASK the user" in routing
-    assert "sysctl -n hw.memsize" in routing  # the RAM figure system_profiler lacks
-    assert "system_profiler" in routing and "nvidia-smi" in routing
-    assert "short-lived" in routing  # no unbounded shell-out
+    assert "Ask the user what GPU" in routing
+    assert "do not shell out to probe" in routing
+    for probe in ("system_profiler", "sysctl", "nvidia-smi"):
+        assert probe not in routing, (
+            f"routing block re-introduced a shell probe: {probe}"
+        )
 
 
 def test_instructions_retain_the_local_only_closing_guarantee():
@@ -284,11 +310,12 @@ def test_server_info_adds_no_hardware_parsing(monkeypatch, patched_run):
     A future edit that starts branching on VRAM here would breach it, and this
     is the test that fails when it does.
 
-    ``patched_run`` replays one canned stdout for every invocation, and
-    ``server_info`` makes two (``comfy env`` then the ``outdated`` freshness
-    probe), so the recorded ``calls`` are asserted as well — otherwise the test
-    could not tell which probe the block was read from, and would keep passing
-    if ``hardware`` started being sourced from somewhere else.
+    ``patched_run`` replays one canned stdout for every invocation and
+    ``server_info`` makes two (``comfy env``, then the ``outdated`` freshness
+    probe), so equality alone cannot say WHICH call the block came from. Pin it
+    by asserting the first invocation is the ``env`` one — that is the call the
+    canned envelope is standing in for, and the only one this passthrough claim
+    is about.
     """
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
     monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
@@ -311,11 +338,5 @@ def test_server_info_adds_no_hardware_parsing(monkeypatch, patched_run):
     )
     result = server.server_info()
     assert result["hardware"] == hardware
-    # `hardware` rides the `comfy env` passthrough, not a probe of our own.
-    assert any("env" in call["cmd"] for call in calls)
-    assert not any(
-        arg
-        for call in calls
-        for arg in call["cmd"]
-        if "hardware" in arg or "gpu" in arg
-    )
+    # `hardware` rides the FIRST call, `comfy env` — not a probe of our own.
+    assert "env" in calls[0]["cmd"]
