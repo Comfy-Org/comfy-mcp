@@ -180,7 +180,87 @@ an INPUT workflow file is always `workflow_path` (`run_workflow`,
 `download_id` (`download_status`, `wait_for_download`, `cancel_download`). No
 tool takes a bare `path` or `workflow` argument.
 
+Routing — check the machine before running local diffusion. `server_info`
+passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a
+`gpu` object carrying `vendor` / `model` / `vram_bytes` / `unified_memory`)
+when the installed comfy-cli reports one. Read it before the first generation
+and work through these steps IN ORDER — a later step never overrides an
+earlier one:
+- STEP 1, is the work even local? `hardware` describes the machine THIS server
+  runs on, and that is where MOST tools execute. A `comfy_target` block
+  carrying a `host` diverts only `run_workflow` and the queue/`jobs` tools;
+  `generate_image`, `run_template` and everything else still run HERE, so the
+  thresholds below keep governing them. Count the target as another machine
+  only when its `host` is neither a loopback address (anything in
+  `127.0.0.0/8`, `localhost`, or IPv6 `::1`) nor this host's own name or
+  address; an ERROR-shaped `comfy_target` (`{"error": …, "note": …}` from a
+  malformed config) resolves no remote at all. Nothing this server returns
+  carries the local hostname or interface addresses, so if the `host` is a name
+  or LAN IP you cannot place, ASK the user which machine it is rather than
+  guessing — a hostname can be this same box, and a loopback host can be an SSH
+  tunnel to a remote GPU. Check the reported `server` URL too:
+  `COMFY_LOCAL_URL` can repoint comfy-cli at another host WITHOUT producing any
+  `comfy_target` block. For a genuine remote, ask the user about that machine
+  rather than routing its work off local hardware.
+- STEP 2, get a memory figure. The sizes are BYTES — divide by 1073741824. A
+  driver reports a little under the advertised size (a 24 GB card reads 23.99,
+  and ~22.3 once ECC or a driver reserve is in play), so read a SMALL shortfall
+  — within ~10% of a nominal size — as that nominal capacity rather than
+  dropping a band. More than ~10% below what `gpu.model` names is NOT driver
+  overhead, so do NOT round it up: on a MIG/vGPU PARTITION the model string
+  still names the whole card while `vram_bytes` is the slice you actually get,
+  and rounding a 6 GB slice of an A100 up into the `>= 24 GB` band will OOM the
+  run. Trust the reported figure whenever the gap is wider than that.
+  On Apple Silicon (`arch` `arm64`, `gpu.vendor` Apple) `gpu.vram_bytes` is
+  null and `gpu.unified_memory` is true — use `ram_bytes` instead. That
+  substitution is APPLE-ONLY.
+- STEP 3, if the figure you need is missing, ASK — do not guess and do not
+  probe. `hardware` absent (older comfy-cli), `gpu` null or absent,
+  `vram_bytes` null or zero on ANY non-Apple GPU (including a non-Apple
+  unified-memory part such as a Jetson/Grace board or a Strix Halo APU), or
+  `ram_bytes` missing or zero on the Apple path: every one of these is UNKNOWN,
+  NOT "no GPU". Ask the user what GPU and how much VRAM/RAM they have and route on
+  their answer. Never let an UNKNOWN strand a machine that has a usable GPU,
+  and do not shell out to probe the hardware yourself — this server can neither
+  bound nor audit a command it did not run.
+- STEP 4, route on the figure. Discrete GPU (NVIDIA, or an AMD/Intel card on a
+  ROCm/XPU build), by VRAM: >= 24 GB, local generation is a good default;
+  8 GB to under 24 GB, images are fine (prefer current, smaller models) but
+  expect video to be slow or infeasible; under 8 GB, do NOT run local
+  diffusion. Apple Silicon, by unified memory: >= 32 GB, image generation is
+  OK; under 32 GB, treat it as the no-GPU verdict. A non-Apple INTEGRATED GPU
+  that DOES report a `vram_bytes` figure routes on that figure like any other
+  card (one that does not is UNKNOWN — step 3). A figure the USER gave you
+  (step 3) routes on the row that fits their machine: the unified-memory row
+  for an Apple Silicon Mac, the VRAM bands otherwise. The non-Apple
+  unified-memory boards step 3 sends you to ask about have no row of their own,
+  so route the GPU-usable figure they report on the VRAM bands — that is their
+  answer, not the Apple-only `ram_bytes` substitution of step 2, which stays
+  Apple-only. A CONFIRMED absence of a GPU is the USER telling you
+  there is none — no `hardware` payload states it, since a null or absent `gpu`
+  is UNKNOWN by step 3 — and that answer also means do NOT run local diffusion.
+- STEP 5, when the answer is "not on this machine", REDIRECT rather than
+  dead-end: partner nodes (plain web calls, fine on any machine) or the Comfy
+  Cloud MCP if their client has it connected.
+- Video on Apple Silicon's OWN GPU: do NOT attempt it — time estimates are
+  unreliable and thermals suffer; recommend cloud instead. That is an
+  APPLE-GPU rule, not a Mac rule (an Intel Mac with a discrete card follows the
+  discrete-GPU row), and it rules out video on that GPU, not video as such:
+  `API`-tagged video templates and `emit_partner_workflow` put the model on
+  partner infrastructure, so they are fine on any Mac. Reach them with
+  `search_templates(tag="API", type="video")` — filter on BOTH axes, because
+  neither alone isolates partner-run video (`tag` does not constrain the output
+  type, `type` does not constrain WHERE the model runs) and the compact rows
+  omit `tags`, so the caller cannot tell a local template from an `API` one in
+  the results.
+- Model choice: pick models via `search_templates` / `search_models` instead
+  of assuming a classic default (e.g. SDXL) — current templates track current
+  models.
+
 Everything targets the LOCAL server only — there is no cloud access here.
+When this machine should not run a workload locally, say so explicitly and
+point the user at Comfy Cloud or partner nodes; this server cannot run cloud
+jobs itself.
 """
 
 mcp = MCPServer("comfy-local-mcp", instructions=INSTRUCTIONS)
@@ -2669,6 +2749,13 @@ def server_info() -> Any:
     Wraps ``comfy env``. Returns whether a local ComfyUI server is running and
     its URL, plus the selected workspace and Python info. Call this first to
     confirm a local ComfyUI is up before running a workflow.
+
+    The result carries a ``hardware`` block (GPU/VRAM/RAM) when the installed
+    comfy-cli reports one; consult the routing guidance in the server
+    instructions before starting local generation. It passes straight through
+    from ``comfy env``, so an older comfy-cli that does not report it simply
+    omits the key — check for it rather than indexing blindly, and the
+    instructions say what to do when it is absent.
 
     The reported server URL is the address comfy-cli RESOLVED, not a fixed
     default: ``COMFY_LOCAL_URL`` wins, else a background record, else
