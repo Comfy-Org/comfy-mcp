@@ -50,18 +50,19 @@ it finished, rather than reading comfy-cli's `status`.
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
-confirmation on the three tools that can spend money or destroy local state:
-`partner_generate`, `run_template`, and `switch_comfyui_version`. comfy-cli owns
-the credit-spend interlock and the durable "always proceed"
-(`comfy generate consent always`), and this server only raises the confirmation
-over MCP **elicitation** — the protocol's equivalent of the CLI's y/N prompt —
-then forwards the answer as `--yes` / `--allow-spend`, or (for the version
-switch, which the CLI does not gate at all) simply refuses to run the command.
-It stores no consent of its own. All three share one fail-closed body,
-`_elicit_approval`; give a new gate its own `_ApprovalWording` rather than a
-second copy of that handling. Adding *product* behavior here is still a
-guardrail breach; adapting comfy-cli's contract to an MCP primitive is this
-repo's job.
+confirmation on the tools that can spend money, destroy local state, or expose
+the machine: `partner_generate`, `run_template`, `switch_comfyui_version`, and
+the `launch_comfyui` / `restart_comfyui` pair when `extra_args` would publish
+ComfyUI to the network. comfy-cli owns the credit-spend interlock and the
+durable "always proceed" (`comfy generate consent always`), and this server only
+raises the confirmation over MCP **elicitation** — the protocol's equivalent of
+the CLI's y/N prompt — then forwards the answer as `--yes` / `--allow-spend`,
+or (for the version switch and the launch flags, which the CLI does not gate at
+all) simply refuses to run the command. It stores no consent of its own. All of
+them share one fail-closed body, `_elicit_approval`; give a new gate its own
+`_ApprovalWording` rather than a second copy of that handling. Adding *product*
+behavior here is still a guardrail breach; adapting comfy-cli's contract to an
+MCP primitive is this repo's job.
 
 The two *spend* gates — `partner_generate` and `run_template` — differ where the
 engine's own shape differs, and those differences are load-bearing rather than
@@ -72,8 +73,13 @@ unlock spending, and treats the generate-scoped always-proceed as granting
 nothing. `switch_comfyui_version` sits outside that axis entirely: it spends no
 credits and the CLI does not gate it at all, so its prompt is not a spend
 interlock but this server's only gate — raised on every call, with no
-always-proceed setting to read. Mirror the engine's contract per tool; do not
-generalize one tool's consent rules onto another.
+always-proceed setting to read. The launch pair sits outside it too, and
+differs again in WHEN it fires: the argument is what is dangerous, not the
+verb, so the prompt is raised only for the `extra_args` that would publish an
+unauthenticated ComfyUI (`_network_exposing_args` — a non-loopback `--listen`,
+including its bare form, or `--enable-cors-header`) and an ordinary launch is
+untouched. Mirror the engine's contract per tool; do not generalize one tool's
+consent rules onto another.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via
