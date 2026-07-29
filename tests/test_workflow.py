@@ -13,6 +13,9 @@ that same template carries. The behaviors they own on top of the passthrough:
 3. ``vary_workflow`` pre-checks each slot entry's value against the JSON-array
    contract comfy-cli enforces, so an unquoted comma-bearing prompt is named
    here instead of failing opaquely (or behind a server-connection error) later.
+4. ``list_workflow_notes`` degrades to the ``unsupported`` shape on a comfy-cli
+   that predates the ``workflow notes`` verb, instead of relaying Click's raw
+   usage dump — the common case while the verb is newer than the version floor.
 """
 
 from __future__ import annotations
@@ -84,6 +87,80 @@ def test_list_workflow_notes_empty_is_not_an_error(patched_run):
     patched_run(envelope(data=data))
 
     assert server.list_workflow_notes("/tmp/flux.json") == data
+
+
+def test_list_workflow_notes_degrades_without_the_verb(patched_run):
+    """A comfy-cli predating `workflow notes` reads as a version gap, not a break.
+
+    The verb ships in releases AFTER the `_MIN_COMFY_CLI` floor, so an install
+    that satisfies the version guard can still lack it — the common path today.
+    Relaying Click's raw usage dump would read as a broken MCP server, so this
+    degrades to the `unsupported` shape `_freshness_report` established, and
+    points at the path that still works: the notes are in the frontend-format
+    JSON `fetch_template` already wrote.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr="Usage: comfy workflow [OPTIONS] COMMAND\nNo such command 'notes'.",
+    )
+
+    result = server.list_workflow_notes("/tmp/flux.json")
+
+    assert result["unsupported"] is True
+    assert "workflow notes unavailable" in result["error"]
+    # Redirects to the reachable fallback rather than dead-ending.
+    assert "fetch_template" in result["error"]
+    assert "widgets_values[0]" in result["error"]
+    assert "/tmp/flux.json" in result["error"]
+    # None of the raw wrapper/CLI text leaks through.
+    assert "No such command" not in result["error"]
+    assert "Usage: comfy" not in result["error"]
+    assert "returned no JSON" not in result["error"]
+
+
+def test_list_workflow_notes_keeps_a_real_error_raw(patched_run):
+    """A verb comfy-cli DID dispatch must never be waved through as a gap.
+
+    An API-format export is the case that matters: comfy-cli rejects it with
+    `workflow_not_frontend_format`, and the agent has to see that to know to
+    re-fetch. Degrading it would instead assert nothing is wrong while the
+    template's documentation silently never gets read.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "workflow_not_frontend_format",
+                "message": "`comfy workflow` requires the frontend-format workflow.",
+            },
+        )
+    )
+
+    with pytest.raises(server.ComfyCliError, match="workflow_not_frontend_format"):
+        server.list_workflow_notes("/tmp/api.json")
+
+
+def test_list_workflow_notes_relayed_phrase_is_not_unsupported(patched_run):
+    """A failure that merely QUOTES the phrase, inside an envelope, stays raw.
+
+    `_is_missing_verb_error` requires the no-envelope + usage-exit pair exactly
+    so a nested error relaying "No such command 'notes'" from somewhere else
+    cannot be mistaken for the verb itself being absent.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "workflow_read_failed",
+                "message": "a hook failed: No such command 'notes'.",
+            },
+        ),
+        returncode=2,
+    )
+
+    with pytest.raises(server.ComfyCliError, match="workflow_read_failed"):
+        server.list_workflow_notes("/tmp/flux.json")
 
 
 def test_set_workflow_slot_argv_default_stdout(patched_run):
