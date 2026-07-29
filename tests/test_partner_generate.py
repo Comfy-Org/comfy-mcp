@@ -769,7 +769,7 @@ def test_an_errored_capability_probe_still_asks_before_spending(patched_plain_ru
 def test_an_unanswered_prompt_lapses_into_a_refusal(patched_plain_run, monkeypatch):
     """A client that advertises elicitation but never answers must not hang forever."""
     calls = patched_plain_run(0, stdout="done")
-    monkeypatch.setattr(server, "_SPEND_ELICIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(server, "_ELICIT_TIMEOUT", 0.05)
 
     class _SilentCtx(_FakeCtx):
         async def elicit(self, message, schema):

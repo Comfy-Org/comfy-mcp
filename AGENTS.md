@@ -50,12 +50,16 @@ it finished, rather than reading comfy-cli's `status`.
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
-spend confirmation on the two tools that can spend, `partner_generate` and
-`run_template`: comfy-cli owns the credit-spend interlock and the durable
-"always proceed" (`comfy generate consent always`), and this server only raises
-the confirmation over MCP **elicitation** — the protocol's equivalent of the
-CLI's y/N prompt — then forwards the answer as `--yes` / `--allow-spend`. It
-stores no consent of its own. Adding *product* behavior here is still a
+confirmation on the three tools that can spend money or destroy local state:
+`partner_generate`, `run_template`, and `switch_comfyui_version`. comfy-cli owns
+the credit-spend interlock and the durable "always proceed"
+(`comfy generate consent always`), and this server only raises the confirmation
+over MCP **elicitation** — the protocol's equivalent of the CLI's y/N prompt —
+then forwards the answer as `--yes` / `--allow-spend`, or (for the version
+switch, which the CLI does not gate at all) simply refuses to run the command.
+It stores no consent of its own. All three share one fail-closed body,
+`_elicit_approval`; give a new gate its own `_ApprovalWording` rather than a
+second copy of that handling. Adding *product* behavior here is still a
 guardrail breach; adapting comfy-cli's contract to an MCP primitive is this
 repo's job.
 
