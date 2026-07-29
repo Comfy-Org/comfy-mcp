@@ -44,6 +44,22 @@ def _download_model(*args, **kwargs):
     return asyncio.run(server.download_model(*args, **kwargs))
 
 
+def _launch(*args, **kwargs):
+    """Drive the async ``launch_comfyui`` from these synchronous tests.
+
+    Both lifecycle tools went async when ``extra_args`` gained the
+    network-exposure consent gate (see ``test_network_exposure.py``): an
+    elicitation can only be awaited. Nothing else about them changed — the
+    spawn itself still runs off the event loop, on a worker thread.
+    """
+    return asyncio.run(server.launch_comfyui(*args, **kwargs))
+
+
+def _restart(*args, **kwargs):
+    """Drive the async ``restart_comfyui`` from these synchronous tests."""
+    return asyncio.run(server.restart_comfyui(*args, **kwargs))
+
+
 # What Click prints when a comfy-cli that predates the background download is
 # handed `--background`: `NoSuchOption`, i.e. a `UsageError` (exit 2) raised
 # while PARSING, so no envelope is ever emitted. The message body is Click's own
@@ -3109,7 +3125,7 @@ def test_launch_comfyui_passes_background_flag(patched_run):
     """launch_comfyui must run `comfy … launch --background` (detached start)."""
     calls = patched_run(envelope(data={"pid": 42}))
 
-    assert server.launch_comfyui() == {"pid": 42}
+    assert _launch() == {"pid": 42}
 
     cmd = calls[0]["cmd"]
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
@@ -3120,7 +3136,7 @@ def test_launch_comfyui_forwards_extra_args_after_separator(patched_run):
     """Extra args are forwarded to ComfyUI after a `--` separator."""
     calls = patched_run(envelope(data={}))
 
-    server.launch_comfyui(["--port", "8189"])
+    _launch(["--port", "8189"])
 
     assert calls[0]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
 
@@ -3162,7 +3178,7 @@ def test_launch_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
     """`comfy launch --background` exits 0 with no envelope -> synthesized success."""
     patched_plain_run(0, stdout="Launched ComfyUI in the background.")
 
-    result = server.launch_comfyui()
+    result = _launch()
 
     assert result["ok"] is True
     assert result["action"] == "launch"
@@ -3174,7 +3190,7 @@ def test_launch_comfyui_nonzero_exit_still_raises(patched_plain_run):
     patched_plain_run(1, stderr="Address already in use: port 8188")
 
     with pytest.raises(server.ComfyCliError, match="returned no JSON"):
-        server.launch_comfyui()
+        _launch()
 
 
 def test_plain_ok_synthesizes_despite_stray_non_envelope_json(patched_plain_run):
@@ -3190,7 +3206,7 @@ def test_plain_ok_synthesizes_despite_stray_non_envelope_json(patched_plain_run)
         stderr="Launched ComfyUI in the background.",
     )
 
-    result = server.launch_comfyui()
+    result = _launch()
 
     assert result["ok"] is True
     assert result["action"] == "launch"
@@ -4496,7 +4512,7 @@ def test_restart_comfyui_runs_stop_then_launch(patched_run):
 
     # patched_run's fake emits the same envelope for every call, so launch's
     # data ({"pid": 7}) is what restart returns.
-    assert server.restart_comfyui() == {"pid": 7}
+    assert _restart() == {"pid": 7}
 
     assert len(calls) == 2  # exactly stop then launch, nothing else
     assert calls[0]["cmd"][4:] == ["stop"]
@@ -4507,7 +4523,7 @@ def test_restart_comfyui_forwards_extra_args_to_launch(patched_run):
     """extra_args ride the launch step after the `--` separator, not the stop."""
     calls = patched_run(envelope(data={}))
 
-    server.restart_comfyui(["--port", "8189"])
+    _restart(["--port", "8189"])
 
     assert calls[0]["cmd"][4:] == ["stop"]  # stop takes no extras
     assert calls[1]["cmd"][4:] == ["launch", "--background", "--", "--port", "8189"]
@@ -4525,9 +4541,9 @@ def test_restart_comfyui_tolerates_no_recorded_server(monkeypatch):
         return {"pid": 1}
 
     monkeypatch.setattr(server, "stop_comfyui", fake_stop)
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
-    assert server.restart_comfyui(["--cpu"]) == {"pid": 1}
+    assert _restart(["--cpu"]) == {"pid": 1}
     assert launched == [["--cpu"]]  # launch happened despite the stop error
 
 
@@ -4543,11 +4559,13 @@ def test_restart_comfyui_reraises_genuine_stop_failure(monkeypatch):
 
     monkeypatch.setattr(server, "stop_comfyui", fake_stop)
     monkeypatch.setattr(
-        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+        server,
+        "_launch_comfyui_sync",
+        lambda extra_args=None: launched.append(extra_args),
     )
 
     with pytest.raises(server.ComfyCliError, match="permission_denied"):
-        server.restart_comfyui()
+        _restart()
     assert launched == []  # genuine failure is not masked by a relaunch
 
 
@@ -4576,9 +4594,9 @@ def test_restart_comfyui_tolerates_plain_no_comfyui_running_text(
         launched.append(extra_args)
         return {"pid": 3}
 
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
-    assert server.restart_comfyui(["--cpu"]) == {"pid": 3}
+    assert _restart(["--cpu"]) == {"pid": 3}
 
     assert calls[0]["cmd"][4:] == ["stop"]  # the stop really was attempted
     assert launched == [["--cpu"]]  # and the relaunch still happened
@@ -4735,11 +4753,13 @@ def test_restart_comfyui_reraises_a_timed_out_stop_that_printed_the_phrase(monke
     launched: list = []
     monkeypatch.setattr(server, "stop_comfyui", fake_stop)
     monkeypatch.setattr(
-        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+        server,
+        "_launch_comfyui_sync",
+        lambda extra_args=None: launched.append(extra_args),
     )
 
     with pytest.raises(server.ComfyCliError, match="timed out"):
-        server.restart_comfyui()
+        _restart()
     assert launched == []
 
 
@@ -4750,11 +4770,13 @@ def test_restart_comfyui_reraises_unrelated_plain_stop_failure(
     patched_plain_run(1, stderr="Failed to kill pid 7: operation not permitted")
     launched: list = []
     monkeypatch.setattr(
-        server, "launch_comfyui", lambda extra_args=None: launched.append(extra_args)
+        server,
+        "_launch_comfyui_sync",
+        lambda extra_args=None: launched.append(extra_args),
     )
 
     with pytest.raises(server.ComfyCliError, match="operation not permitted"):
-        server.restart_comfyui()
+        _restart()
     assert launched == []
 
 
@@ -4773,10 +4795,10 @@ def test_restart_comfyui_explains_port_clash_after_nothing_to_stop(monkeypatch):
         )
 
     monkeypatch.setattr(server, "stop_comfyui", fake_stop)
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.restart_comfyui()
+        _restart()
 
     message = str(excinfo.value)
     assert "The 8188 port is already in use." in message  # original kept verbatim
@@ -4794,10 +4816,10 @@ def test_restart_comfyui_leaves_port_clash_alone_after_a_real_stop(monkeypatch):
     def fake_launch(extra_args=None):
         raise server.ComfyCliError("The 8188 port is already in use.")
 
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.restart_comfyui()
+        _restart()
 
     assert str(excinfo.value) == "The 8188 port is already in use."
 
@@ -4815,10 +4837,10 @@ def test_restart_comfyui_leaves_non_port_launch_failure_alone(monkeypatch):
     def fake_launch(extra_args=None):
         raise server.ComfyCliError("ComfyUI exited during startup: missing torch")
 
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.restart_comfyui()
+        _restart()
 
     assert str(excinfo.value) == "ComfyUI exited during startup: missing torch"
 
@@ -4872,10 +4894,10 @@ def test_restart_comfyui_leaves_a_non_port_resource_clash_alone(monkeypatch):
     def fake_launch(extra_args=None):
         raise server.ComfyCliError("Cannot load model: the file is already in use")
 
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.restart_comfyui()
+        _restart()
 
     assert str(excinfo.value) == "Cannot load model: the file is already in use"
 
@@ -4961,10 +4983,10 @@ def test_restart_comfyui_port_guidance_reflects_the_requested_port(monkeypatch):
         raise server.ComfyCliError("The 8189 port is already in use.")
 
     monkeypatch.setattr(server, "stop_comfyui", fake_stop)
-    monkeypatch.setattr(server, "launch_comfyui", fake_launch)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.restart_comfyui(["--port", str(server._ALT_PORT_SUGGESTION)])
+        _restart(["--port", str(server._ALT_PORT_SUGGESTION)])
 
     message = str(excinfo.value)
     assert "The 8189 port is already in use." in message  # original kept verbatim
@@ -4990,10 +5012,124 @@ def test_restart_comfyui_returns_new_server_status(monkeypatch):
     """restart returns launch_comfyui's data (the fresh server status), not stop's."""
     monkeypatch.setattr(server, "stop_comfyui", lambda: {"stopped": True})
     monkeypatch.setattr(
-        server, "launch_comfyui", lambda extra_args=None: {"pid": 42, "port": 8188}
+        server,
+        "_launch_comfyui_sync",
+        lambda extra_args=None: {"pid": 42, "port": 8188},
     )
 
-    assert server.restart_comfyui() == {"pid": 42, "port": 8188}
+    assert _restart() == {"pid": 42, "port": 8188}
+
+
+# --- the lifecycle trio is serialized against itself ------------------------
+#
+# `launch` / `stop` / `restart` all drive comfy-cli's ONE recorded pid and the one
+# ComfyUI port. Being dispatched onto a worker thread does not order them — both
+# `asyncio.to_thread` and MCPServer's sync-tool pool have many workers — so
+# `_LIFECYCLE_LOCK` has to, and a `stop` slipping into the gap between a restart's
+# stop and its launch is exactly the interleaving that leaves a server comfy-cli
+# can no longer stop.
+
+
+@pytest.fixture
+def _lifecycle_lock_reset():
+    """Fail loudly rather than leak a held lifecycle lock into later tests."""
+    yield
+    free = server._LIFECYCLE_LOCK.acquire(blocking=False)
+    if free:
+        server._LIFECYCLE_LOCK.release()
+    assert free, "a lifecycle call left `_LIFECYCLE_LOCK` held"
+
+
+def _held_lifecycle_lock():
+    """Simulate another thread mid-launch, from a thread that is not this one."""
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with server._LIFECYCLE_LOCK:
+            acquired.set()
+            release.wait(5)
+
+    worker = threading.Thread(target=hold, daemon=True)
+    worker.start()
+    assert acquired.wait(5)
+    return release, worker
+
+
+@pytest.mark.parametrize(
+    ("call", "verb"),
+    [
+        (lambda: _launch(["--port", "8189"]), "start"),
+        (lambda: server.stop_comfyui(), "stop"),
+        (lambda: _restart(), "restart"),
+    ],
+    ids=["launch", "stop", "restart"],
+)
+def test_lifecycle_call_is_refused_while_another_is_in_flight(
+    patched_run, call, verb, _lifecycle_lock_reset
+):
+    """Refused immediately — never queued behind a subprocess the caller can't see."""
+    calls = patched_run(envelope(data={}))
+    release, worker = _held_lifecycle_lock()
+    try:
+        with pytest.raises(server.ComfyCliError) as excinfo:
+            call()
+    finally:
+        release.set()
+        worker.join(5)
+
+    message = str(excinfo.value)
+    assert f"cannot {verb} the local ComfyUI right now" in message
+    assert "already in flight" in message
+    assert calls == []  # in particular, restart did not stop the running server
+
+
+def test_restart_holds_one_slot_across_both_halves(
+    patched_run, monkeypatch, _lifecycle_lock_reset
+):
+    """A `stop_comfyui` arriving mid-restart is refused, not slipped into the gap."""
+    patched_run(envelope(data={}))
+    from_other_thread: list = []
+    # Bound BEFORE the patch below, so the concurrent attempt exercises the real
+    # `stop_comfyui` (and therefore the real lock) rather than re-entering the
+    # stand-in that stands in for the restart's own stop half.
+    real_stop = server.stop_comfyui
+
+    def stop_from_another_thread():
+        def attempt():
+            try:
+                real_stop()
+            except server.ComfyCliError as exc:  # what a real concurrent call sees
+                from_other_thread.append(exc)
+            else:
+                from_other_thread.append(None)
+
+        thread = threading.Thread(target=attempt, daemon=True)
+        thread.start()
+        thread.join(5)
+        return {"stopped": True}
+
+    # The restart's own stop half; it runs while the slot is held.
+    monkeypatch.setattr(server, "stop_comfyui", stop_from_another_thread)
+    monkeypatch.setattr(server, "_launch_comfyui_sync", lambda extra: {"pid": 7})
+
+    assert _restart() == {"pid": 7}
+
+    assert len(from_other_thread) == 1
+    assert "already in flight" in str(from_other_thread[0])
+
+
+def test_lifecycle_lock_is_released_after_a_failed_launch(
+    patched_plain_run, _lifecycle_lock_reset
+):
+    """A failure must not wedge the slot: the next call has to be able to run."""
+    patched_plain_run(1, stderr="Address already in use: port 8188")
+
+    with pytest.raises(server.ComfyCliError):
+        _launch()
+
+    assert server._LIFECYCLE_LOCK.acquire(blocking=False)
+    server._LIFECYCLE_LOCK.release()
 
 
 # --- update_comfyui (`comfy update [all|comfy|cli]`) ------------------------

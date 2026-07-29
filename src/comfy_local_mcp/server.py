@@ -17,7 +17,9 @@ Tools so far: the run -> get-output core loop plus job management
 (``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
 ``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` /
 ``restart_comfyui`` lifecycle trio (``comfy launch --background`` /
-``comfy stop`` / stop-then-launch) with ``get_logs`` (``comfy logs``) to read a
+``comfy stop`` / stop-then-launch — the two that forward ``extra_args`` ask the
+user to confirm any flag that would publish the unauthenticated local ComfyUI to
+the network) with ``get_logs`` (``comfy logs``) to read a
 detached launch's captured output, the install verbs ``update_comfyui``
 (``comfy update``, forward-only) and ``switch_comfyui_version``
 (``comfy update comfy --version <X>``, which can also roll BACK and so asks the
@@ -50,7 +52,9 @@ against a real comfy-cli install and a running local ComfyUI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
+import ipaddress
 import json
 import logging
 import math
@@ -3923,30 +3927,38 @@ _ELICIT_TIMEOUT = 300.0
 _ELICIT_MODEL_DISPLAY_MAX = 80
 
 
-def _display_model(model: str) -> str:
-    """Render a caller-supplied model name safely inside the elicitation prompt.
+def _display_caller_text(text: str, limit: int) -> str:
+    """Render CALLER-supplied text safely inside an elicitation prompt's code span.
 
-    The prompt quotes the model in a markdown code span, and the name arrives
-    from the CALLER — an agent that may be relaying untrusted text. Backticks or
-    newlines in it would close that span on a client that renders markdown,
-    letting the name inject its own content: hiding the "SPENDS credits" warning
-    or appending a reassuring "this is free". That redresses the very prompt the
-    user is answering, so it is neutralized before display.
+    Every gate that quotes something the caller sent — a model name, a lifecycle
+    tool's ``extra_args`` — goes through here, because they all face the same
+    problem: the prompt puts that text in a markdown code span, and the caller is
+    an agent that may be relaying untrusted content. Backticks or newlines in it
+    would close the span on a client that renders markdown, letting the text
+    inject its own: hiding the "SPENDS credits" warning, appending a reassuring
+    "this is free", or — for the network gate — burying the exposure warning under
+    a fabricated "(loopback only)". That redresses the very prompt the user is
+    answering, so it is neutralized before display.
 
-    Display only — argv still carries the model verbatim, so a name comfy-cli
-    would accept is never mangled into one it would not.
+    Display only — argv still carries the caller's text verbatim, so an argument
+    comfy-cli would accept is never mangled into one it would not.
     """
     cleaned = "".join(
-        " " if ch.isspace() or not ch.isprintable() else ch for ch in model
+        " " if ch.isspace() or not ch.isprintable() else ch for ch in text
     )
     # The span delimiter itself: without a backtick the rest of markdown is
     # inert inside the code span, so this is the only character that must go.
     cleaned = " ".join(cleaned.replace("`", "'").split())
-    if len(cleaned) > _ELICIT_MODEL_DISPLAY_MAX:
-        cleaned = cleaned[:_ELICIT_MODEL_DISPLAY_MAX] + "…"
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "…"
+    return cleaned
+
+
+def _display_model(model: str) -> str:
+    """Render a caller-supplied model name for the spend prompt."""
     # `partner_generate` rejects an empty model before reaching here; the
     # fallback only covers a name that was ENTIRELY unprintable.
-    return cleaned or "<unnamed model>"
+    return _display_caller_text(model, _ELICIT_MODEL_DISPLAY_MAX) or "<unnamed model>"
 
 
 class _ApprovalWording(NamedTuple):
@@ -5766,8 +5778,508 @@ def fetch_outputs(
     return [data, *images]
 
 
+# Ceilings on a lifecycle tool's `extra_args`, set the way `_MAX_PROMPT_ID_LEN`
+# is: generous next to any real use, but finite, because these entries go
+# straight into argv and the kernel's own limit (`ARG_MAX`, ~256KB-1MB depending
+# on the platform) surfaces as `OSError: Argument list too long` from
+# `subprocess.Popen` — an internal error that no caller converts and that
+# `_guard_extra_args`' contract promises not to raise. Bounding here also keeps
+# `_network_exposing_args`' per-token scan (a `split(",")` and an
+# `ipaddress` parse per part, on the event loop, before the `to_thread` hop)
+# proportional to a plausible command line rather than to whatever the caller
+# sent. ComfyUI's own longest flag list is a handful of short tokens plus the
+# occasional filesystem path, so 64 x 4096 is orders of magnitude of headroom.
+_MAX_EXTRA_ARGS = 64
+_MAX_EXTRA_ARG_LEN = 4096
+
+
+def _guard_extra_args(extra_args: list[str] | None) -> list[str]:
+    """Validate a lifecycle tool's ``extra_args`` and return it as a plain list.
+
+    Three jobs, all about the fact that these entries go STRAIGHT into argv:
+
+    - **Shape.** ``None`` means "no extras". Anything that is not a list/tuple of
+      strings is a caller mistake worth naming: a bare ``str`` would be splatted
+      one CHARACTER per argv slot (``"--cpu"`` -> ``-``, ``-``, ``c``, …), and a
+      non-string entry dies inside ``subprocess`` with a ``TypeError`` this
+      module's error contract never promised.
+    - **NUL.** :func:`_reject_nul`, for the reason that function documents:
+      ``subprocess.Popen`` raises a bare ``ValueError: embedded null byte``, which
+      would escape as an internal error instead of a :class:`ComfyCliError`.
+    - **Size.** :data:`_MAX_EXTRA_ARGS` entries of :data:`_MAX_EXTRA_ARG_LEN`
+      characters each, for the reason those constants document: past the kernel's
+      ``ARG_MAX`` the failure is an unconverted ``OSError`` rather than a
+      :class:`ComfyCliError`.
+
+    Deliberately NOT rejected: a leading dash. These args are *meant* to be
+    ComfyUI flags — that is the whole point of the ``--`` separator — so
+    :func:`_reject_option_like` would refuse the intended input. Which of those
+    flags need the user's consent is :func:`_network_exposing_args`' question,
+    not this one's.
+    """
+    if extra_args is None:
+        return []
+    if isinstance(extra_args, str) or not isinstance(extra_args, (list, tuple)):
+        raise ComfyCliError(
+            "invalid extra_args: expected a list of strings, got "
+            f"{type(extra_args).__name__}."
+        )
+    if len(extra_args) > _MAX_EXTRA_ARGS:
+        raise ComfyCliError(
+            f"invalid extra_args: {len(extra_args)} entries exceeds the "
+            f"{_MAX_EXTRA_ARGS}-entry maximum (they are forwarded to ComfyUI as "
+            "command-line arguments)."
+        )
+    guarded: list[str] = []
+    for index, arg in enumerate(extra_args):
+        if not isinstance(arg, str):
+            raise ComfyCliError(
+                f"invalid extra_args[{index}]: expected a string, got "
+                f"{type(arg).__name__}."
+            )
+        if len(arg) > _MAX_EXTRA_ARG_LEN:
+            raise ComfyCliError(
+                f"invalid extra_args[{index}]: {len(arg)} characters exceeds the "
+                f"{_MAX_EXTRA_ARG_LEN}-character maximum for one command-line "
+                "argument."
+            )
+        guarded.append(_reject_nul(f"extra_args[{index}]", arg))
+    return guarded
+
+
+# ComfyUI's two network-EXPOSING flags. Both are declared `nargs="?"` in
+# ComfyUI's own argument parser, so each has a bare form whose implicit constant
+# is the exposing one: `--listen` with no value becomes `0.0.0.0,::` (every
+# interface, v4 and v6) and `--enable-cors-header` with no value becomes `*` (any
+# origin). That is why a BARE occurrence counts as exposure below rather than
+# being waved through as "no address was given".
+_LISTEN_FLAG = "--listen"
+_CORS_FLAG = "--enable-cors-header"
+
+# Hostnames `--listen` accepts that name only this machine. Address LITERALS are
+# classified by `ipaddress` instead — `127.0.0.0/8` and `::1` are both
+# `is_loopback`, which is exactly the carve-out this gate wants — so this set only
+# has to cover the one spelling that is a NAME rather than an address. Resolution
+# is deliberately not attempted: a `localhost` pointed somewhere else by a
+# doctored hosts file is not a threat this gate can adjudicate, and a DNS lookup
+# in an argument validator would be a blocking network call on the event loop.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost"})
+
+
+def _flag_match(token: str, flag: str) -> tuple[bool, str | None]:
+    """Whether ``token`` names ``flag``, plus any inline ``=`` value it carried.
+
+    Matches ABBREVIATIONS, not just the exact spelling, because ComfyUI parses
+    its arguments with a stock :mod:`argparse` parser and ``allow_abbrev``
+    defaults to ``True``: ``--liste 0.0.0.0`` and ``--lis=0.0.0.0`` reach
+    ``args.listen`` just as surely as the full flag does. A detector that
+    compared only the exact token would therefore be trivially side-stepped by
+    dropping one character — the whole gate, defeated by a typo-shaped argument.
+
+    So any ``--<prefix>`` of the flag name counts. That over-matches on purpose:
+    a short prefix like ``--l`` is ambiguous among ComfyUI's real flags and
+    argparse would refuse the launch outright, so treating it as exposing costs
+    at most one confirmation prompt on a command that was going to fail anyway.
+    The reverse error — waving through a prefix ComfyUI *would* have accepted —
+    publishes an unauthenticated API.
+    """
+    name, sep, value = token.partition("=")
+    # `len(name) < 3` excludes a bare `--`, which ends option parsing rather than
+    # naming any flag; every real abbreviation is at least `--` plus one letter.
+    if len(name) < 3 or not name.startswith("--") or not flag.startswith(name):
+        return False, None
+    return True, value if sep else None
+
+
+def _address_is_loopback(address: str) -> bool:
+    """Whether one ``--listen`` address names this machine only.
+
+    **Fails CLOSED.** Anything this function cannot positively classify as
+    loopback — a DNS name, an obfuscated literal (``0177.0.0.1``, which
+    :mod:`ipaddress` rejects), a typo, an empty string — is reported as NOT
+    loopback, so the caller asks the user. Being wrong in that direction costs
+    one prompt; being wrong the other way silently publishes an unauthenticated
+    HTTP API to the network.
+    """
+    candidate = address.strip()
+    if not candidate:
+        return False
+    if candidate.lower() in _LOOPBACK_HOSTNAMES:
+        return True
+    if candidate.startswith("[") and candidate.endswith("]"):
+        # The bracketed IPv6 form (`[::1]`), which is how a v6 literal is written
+        # anywhere a port could follow — so it is the spelling users copy in from
+        # a URL, even though `--listen` takes a bare address.
+        candidate = candidate[1:-1]
+    try:
+        parsed = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    # Unwrap an IPv4-mapped v6 address (`::ffff:127.0.0.1`) and judge the v4
+    # address it carries, which is what the kernel binds. Done explicitly rather
+    # than left to `IPv6Address.is_loopback`, which only started following the
+    # mapping partway through the range of interpreters this package supports
+    # (measured: 3.9 answers False, 3.11 answers True, and the declared floor is
+    # 3.10 — right on that boundary). Leaving it implicit would make the gate
+    # prompt on one supported Python and not another for the very same argument,
+    # and a security decision must not vary by interpreter version.
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    return (mapped if mapped is not None else parsed).is_loopback
+
+
+def _listen_value_exposes(value: str) -> bool:
+    """Whether a ``--listen`` value binds anything beyond loopback.
+
+    ComfyUI splits the value on commas (``--listen 127.0.0.1,::1`` binds both
+    loopback stacks), so EVERY address has to be loopback for the whole value to
+    keep the server private — one public entry exposes it regardless of what it
+    is listed alongside.
+    """
+    return not all(_address_is_loopback(part) for part in value.split(","))
+
+
+def _network_exposing_args(extra_args: list[str]) -> tuple[str, ...]:
+    """Which of ``extra_args`` would publish the local ComfyUI to the network.
+
+    Returns the canonical flag names found (``_LISTEN_FLAG`` / ``_CORS_FLAG``),
+    first-seen order, deduped — empty when the args keep the server private,
+    which is the case for every flag this server has ever forwarded by default
+    and for the overwhelmingly common ``["--port", "8189"]``.
+
+    Why these two flags specifically: the local ComfyUI has NO authentication, so
+    ``--listen`` on a non-loopback address hands its full HTTP API — arbitrary
+    workflow execution, and file reads/writes under the ComfyUI directory — to
+    anything that can route to this machine, and ``--enable-cors-header`` lets a
+    web page the user merely VISITS drive that API from their browser. Everything
+    else (``--port``, ``--cpu``, ``--lowvram``, …) passes through untouched.
+
+    The loopback carve-out is what keeps this gate from being noise. ``--listen
+    127.0.0.1`` is not exposure — it is the DEFAULT bind, spelled explicitly —
+    and a caller pinning it (or ``::1``, or ``localhost``, or the comma-joined
+    pair) is asking for *less* reach than a bare launch, not more. Prompting
+    there would train users to click through the prompt that actually matters.
+
+    Three deliberate over-rejections, so none reads as an oversight:
+
+    - **A repeated ``--listen`` where an EARLIER value was public.** argparse
+      keeps the last value, so ``--listen 0.0.0.0 --listen 127.0.0.1`` would in
+      fact bind loopback. It is flagged anyway: contradictory binds are a caller
+      mistake worth a prompt, and last-wins arithmetic is the kind of subtlety a
+      security gate should not stake itself on.
+    - **``--enable-cors-header`` with an explicit origin.** Only the bare form
+      means ``*``, but even a named origin is a cross-origin grant this server
+      will not make on the user's behalf.
+    - **A flag after a bare ``--``.** argparse stops option parsing at ``--``, so
+      ``["--", "--listen", "0.0.0.0"]`` would reach ComfyUI as positional junk and
+      never set ``args.listen``. The scan does not honor the terminator: it would
+      have to re-implement how ComfyUI's parser (and comfy-cli's own ``--``
+      forwarding, which already consumed one separator to get here) treat a
+      second one, and guessing that wrong in the *other* direction is what
+      publishes an API. Prompting for arguments that were going to be rejected
+      anyway costs one confirmation.
+    """
+    flags: list[str] = []
+    index = 0
+    while index < len(extra_args):
+        arg = extra_args[index]
+        index += 1
+        if _flag_match(arg, _CORS_FLAG)[0]:
+            # No value is safe (see the docstring), so nothing is parsed — and no
+            # following token is consumed either: `["--enable-cors-header",
+            # "--listen"]` must still let the `--listen` scan below happen.
+            flags.append(_CORS_FLAG)
+            continue
+        matched, inline = _flag_match(arg, _LISTEN_FLAG)
+        if not matched:
+            continue
+        if inline is not None:
+            if _listen_value_exposes(inline):
+                flags.append(_LISTEN_FLAG)
+            continue
+        # Separate-token form. `nargs="?"` only consumes the next token as the
+        # value when it is not itself option-like, so a `--listen` that is last
+        # or followed by another flag takes its exposing `const` instead.
+        value = extra_args[index] if index < len(extra_args) else None
+        if value is None or value.startswith("-"):
+            flags.append(_LISTEN_FLAG)
+            continue
+        index += 1  # the value belongs to this flag; do not rescan it
+        if _listen_value_exposes(value):
+            flags.append(_LISTEN_FLAG)
+    return tuple(dict.fromkeys(flags))
+
+
+# What each flagged argument does, in the user's terms. Keyed by this module's own
+# constants and never by caller text, which is why these strings can be
+# interpolated into a markdown prompt with no sanitizer in front of them: unlike
+# `partner_generate`'s model name (see `_display_model`), nothing here originates
+# with the agent, so there is no code span for it to break out of. (The ARGUMENTS
+# echoed alongside them do come from the caller — `_display_extra_args` is the
+# sanitizer for those.)
+#
+# HEDGED on purpose. `_network_exposing_args` over-rejects in three documented
+# cases — a last-wins repeat that actually binds loopback, an address it could not
+# parse at all, a `--enable-cors-header` carrying one named origin — so a flat
+# "binds ComfyUI to a non-loopback address" would assert as fact something the
+# detector itself does not know. The user's decision rests on this sentence, so it
+# claims only what was actually established: the flag is present and this server
+# could not confirm it keeps the server private.
+_NETWORK_EXPOSURE_EFFECTS = {
+    _LISTEN_FLAG: (
+        "`--listen` (this server could not confirm every address it names is a "
+        "loopback address, so it may bind ComfyUI where other machines can reach "
+        "it)"
+    ),
+    _CORS_FLAG: (
+        "`--enable-cors-header` (grants cross-origin access to its API — to any "
+        "web page, unless the flag names one origin)"
+    ),
+}
+
+
+def _network_exposure_summary(flags: tuple[str, ...]) -> str:
+    """Render the flagged arguments for a prompt or a refusal message."""
+    return " and ".join(_NETWORK_EXPOSURE_EFFECTS[flag] for flag in flags)
+
+
+# How much of the caller's argument list the prompt echoes. Larger than
+# `_ELICIT_MODEL_DISPLAY_MAX` because a whole command line has to stay legible to
+# be judged, but still bounded — a prompt that scrolls the flags out of a client's
+# dialog is one the user cannot actually read, which is the failure this echo
+# exists to prevent.
+_ELICIT_ARGS_DISPLAY_MAX = 400
+
+
+def _display_extra_args(extra_args: list[str]) -> str:
+    """Render the caller's whole ``extra_args`` for the network-exposure prompt.
+
+    Naming only the flag CATEGORIES would ask the user to approve less than what
+    runs: the same argument list can carry ``--base-directory`` (moving the file
+    roots the exposure reaches), a port, an address they did not expect. Consent
+    has to be to the actual command line, so it is shown — sanitized by
+    :func:`_display_caller_text`, since unlike the flag names these strings are
+    the caller's own.
+    """
+    joined = " ".join(extra_args)
+    # Elided rather than fatal: an argument list too long to display is still one
+    # the user can decline, and refusing to prompt at all would be the worse
+    # outcome. `_guard_extra_args` already bounds the input that gets here.
+    return _display_caller_text(joined, _ELICIT_ARGS_DISPLAY_MAX) or "(none)"
+
+
+# The consequence sentence, shared by the elicitation prompt and the
+# cannot-be-prompted refusal so the two cannot drift into describing different
+# stakes for the same decision.
+#
+# It does NOT name the ComfyUI directory as the bound on the file access, because
+# the same `extra_args` can carry `--base-directory` / `--input-directory` /
+# `--output-directory` and move those roots: stating a narrower blast radius than
+# the arguments actually permit would understate the very decision the user is
+# making. The prompt echoes the full argument list for that reason too.
+_NETWORK_EXPOSURE_STAKES = (
+    "The local ComfyUI has NO authentication, so that would publish its full "
+    "API — running arbitrary workflows, and reading and writing files under "
+    "whichever directories it was started with — to every machine that can reach "
+    "this one."
+)
+
+
+class NetworkExposureApproval(BaseModel):
+    """What the client returns from the network-exposure confirmation prompt.
+
+    Same affirmative-answer design as :class:`SpendApproval` and
+    :class:`VersionSwitchApproval`, for the same reason: an accept that never
+    actually answered lands on the ``False`` default and is treated as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Expose the local ComfyUI to the network?",
+        description=(
+            "Yes starts ComfyUI with the network-exposing flags you were shown, "
+            "reachable by other machines. No cancels it and leaves the local "
+            "ComfyUI as it is."
+        ),
+    )
+
+
+_NETWORK_APPROVAL_WORDING = _ApprovalWording(
+    subject="network exposure",
+    what="exposing the local ComfyUI to the network",
+    nothing_done="The local ComfyUI was left as it was.",
+    # The route out for a client this server cannot prompt. As with the version
+    # switch there is no engine-side durable consent to point at — comfy-cli does
+    # not gate `comfy launch` at all — so the escape hatch is the user running it
+    # themselves, where their shell IS the confirmation.
+    escape_hatch=(
+        " If this client cannot show prompts, run "
+        "`comfy launch --background -- <flags>` in a terminal instead."
+    ),
+)
+
+
+async def _elicit_network_exposure_consent(
+    ctx: Context, action: str, summary: str, args_display: str
+) -> bool:
+    """Ask the USER to approve one network-exposing launch. True = approved."""
+    return await _elicit_approval(
+        ctx,
+        (
+            f"{action.capitalize()} the local ComfyUI with {summary}? "
+            f"The full arguments it would be started with: `{args_display}`. "
+            f"{_NETWORK_EXPOSURE_STAKES} That means everything on your local "
+            "network, and the internet too if this machine is port-forwarded or "
+            "on a public network. Approve only if YOU asked for this, with those "
+            "arguments. Declining cancels it and leaves the local ComfyUI as it "
+            "is."
+        ),
+        NetworkExposureApproval,
+        _NETWORK_APPROVAL_WORDING,
+    )
+
+
+async def _resolve_network_exposure_consent(
+    extra_args: list[str],
+    confirm_network_exposure: bool,
+    ctx: Context | None,
+    action: str,
+) -> None:
+    """Return only if this launch may expose ComfyUI; otherwise raise.
+
+    Takes the guarded ``extra_args`` rather than a pre-computed flag tuple so the
+    arguments the prompt SHOWS and the arguments it JUDGED are the same list, by
+    construction.
+
+    A no-op when nothing in them exposes anything, which is the path every
+    existing caller takes: no prompt, no new failure mode, byte-identical
+    behavior.
+
+    Otherwise this is :func:`_resolve_switch_consent`'s shape, and it keeps both
+    of that function's load-bearing properties:
+
+    1. **Elicitation wins, and is raised even when
+       ``confirm_network_exposure=True``.** The agent host's permission to CALL a
+       lifecycle tool is a different question from the user's consent to publish
+       an unauthenticated API on their network, and an "always allow this tool"
+       toggle answers only the first. This gate exists precisely because the
+       caller may be a prompt-injected agent, so the caller's own assertion can
+       never be the authority on a promptable client.
+    2. **An unknown capability counts as CAPABLE.** ``None`` from
+       :func:`_client_elicitation_support` is the probe failing, not a "no";
+       guessing "cannot elicit" would silently demote a real client onto the
+       caller's say-so. Being wrong the other way costs a prompt that lapses into
+       a refusal at :data:`_ELICIT_TIMEOUT`, having started nothing.
+
+    Like the version switch there is no engine-consent branch to keep: comfy-cli
+    has no durable "always expose" for `comfy launch` to read, so nothing can
+    consent here on the user's behalf.
+    """
+    flags = _network_exposing_args(extra_args)
+    if not flags:
+        return
+    summary = _network_exposure_summary(flags)
+    if _client_elicitation_support(ctx) is not False:
+        if await _elicit_network_exposure_consent(
+            ctx, action, summary, _display_extra_args(extra_args)
+        ):
+            return
+        raise ComfyCliError(
+            f"network exposure not confirmed: the user declined to {action} the "
+            f"local ComfyUI with {summary}. "
+            f"{_NETWORK_APPROVAL_WORDING.nothing_done}"
+        )
+    # Client cannot be prompted: `confirm_network_exposure` is the documented
+    # fallback, and its `False` default is why a bare call from such a client
+    # exposes nothing.
+    if not confirm_network_exposure:
+        raise ComfyCliError(
+            "network exposure not confirmed: this client cannot show a "
+            f"confirmation prompt, so the request to {action} the local ComfyUI "
+            f"with {summary} requires confirm_network_exposure=True. "
+            f"{_NETWORK_EXPOSURE_STAKES} Ask the USER first and pass the flag "
+            "only once they have actually agreed — never just to clear this "
+            "error. To keep the server private instead, drop the flag (or pass "
+            "`--listen 127.0.0.1`, which needs no confirmation). "
+            f"{_NETWORK_APPROVAL_WORDING.nothing_done}"
+        )
+
+
+# Only one of `launch` / `stop` / `restart` may be in flight per server process.
+# They all drive comfy-cli's SINGLE recorded pid and the one ComfyUI port, so
+# concurrent calls interleave destructively: a `stop` landing between
+# `restart_comfyui`'s stop and its launch, or two launches racing, leaves either
+# an untracked server nothing can stop or a restart that killed the old server
+# and then lost the port to it. Being dispatched onto a worker thread — an
+# `asyncio.to_thread` hop for the two async tools, MCPServer's own sync-tool pool
+# for `stop_comfyui` — is NOT serialization: those pools have many workers, so a
+# second call runs alongside the first. This lock is.
+#
+# REENTRANT because `_restart_comfyui_sync` composes the other two on its own
+# thread: it holds the slot across the whole sequence (that is the point) and the
+# stop/launch it calls re-enter it. Reentrancy is per-thread, so a lifecycle call
+# arriving on ANY OTHER thread is still refused.
+#
+# Deliberately NOT `_UPDATE_LOCK`: an update runs for up to 30 minutes and its
+# documented contract is "do not launch/restart while one is running" (a caller's
+# error to make), whereas this lock is about two lifecycle calls landing at once
+# (a race no caller can avoid). Folding them together would park lifecycle calls
+# behind a half-hour install.
+_LIFECYCLE_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def _lifecycle_slot(action: str):
+    """Hold :data:`_LIFECYCLE_LOCK` for one lifecycle call, or refuse.
+
+    Refuses rather than queues, the way :func:`update_comfyui` does and for the
+    same reason: waiting would park a worker thread behind a subprocess the
+    caller cannot see (up to 180s for a launch, ~240s for a restart) and present
+    as a hang, and a launch that waited its turn would only go on to lose the
+    port anyway. Naming what is happening lets the caller decide.
+    """
+    if not _LIFECYCLE_LOCK.acquire(blocking=False):
+        raise ComfyCliError(
+            f"cannot {action} the local ComfyUI right now: another launch, stop, "
+            "or restart is already in flight in this server. They share "
+            "comfy-cli's single recorded server and the ComfyUI port, so running "
+            "two at once can leave a server comfy-cli cannot stop. Wait for the "
+            "in-flight call to return (up to ~4 minutes for a restart) and call "
+            "again; `server_info` reports what is running meanwhile."
+        )
+    try:
+        yield
+    finally:
+        _LIFECYCLE_LOCK.release()
+
+
+def _launch_comfyui_sync(extra_args: list[str]) -> Any:
+    """Spawn ``comfy launch --background``, with no consent gate of its own.
+
+    Split out of :func:`launch_comfyui` so :func:`restart_comfyui` can compose
+    stop-then-launch inside ONE lifecycle slot, and — the reason that matters —
+    so the network-exposure consent is resolved exactly once, at whichever tool
+    the client actually called, rather than a second time from inside the launch
+    half. Every caller must have passed ``extra_args`` through
+    :func:`_guard_extra_args` and :func:`_resolve_network_exposure_consent`
+    first; this function trusts them for that.
+
+    It does NOT trust them for serialization: it takes :func:`_lifecycle_slot`
+    itself, so no path can spawn a launch outside the lock. ``restart``'s already
+    holding it is fine — the lock is reentrant per-thread.
+    """
+    args = ["launch", "--background"]
+    if extra_args:
+        args += ["--", *extra_args]
+    with _lifecycle_slot("start"):
+        return _run_comfy(*args, timeout=180.0, plain_ok=True)
+
+
 @mcp.tool()
-def launch_comfyui(extra_args: list[str] | None = None) -> Any:
+async def launch_comfyui(
+    extra_args: list[str] | None = None,
+    confirm_network_exposure: bool = False,
+    ctx: Context | None = None,
+) -> Any:
     """Start the LOCAL ComfyUI server, detached, and return once it is up.
 
     Wraps ``comfy launch --background``, which boots ComfyUI as a background
@@ -5776,6 +6288,21 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     (e.g. ``["--port", "8189"]`` -> ``comfy launch --background -- --port 8189``).
     The timeout is generous because the first boot loads torch and can take a
     while.
+
+    **Network-exposing flags need the USER's confirmation.** ComfyUI has no
+    authentication, so ``--listen`` on a non-loopback address (including a BARE
+    ``--listen``, which ComfyUI expands to every interface) or
+    ``--enable-cors-header`` publishes its full API — arbitrary workflow
+    execution plus file reads/writes under the ComfyUI directory — to anything
+    that can reach this machine. Those flags therefore raise an MCP elicitation
+    naming exactly that, and a decline starts nothing; the prompt is raised even
+    when ``confirm_network_exposure=True``, because a host's "always allow this
+    tool" toggle is not the user's permission to publish their machine. On a
+    client that CANNOT be prompted, ``confirm_network_exposure=True`` is the
+    documented fallback — pass it ONLY when the user has actually agreed, never
+    to clear the error. ``--listen 127.0.0.1`` / ``::1`` / ``localhost`` is the
+    default bind spelled explicitly and needs no confirmation, and every other
+    flag (``--port``, ``--cpu``, …) passes straight through.
 
     Call ``server_info`` first if you only want to check whether a server is
     already running — launching a second one will fail on the port.
@@ -5808,10 +6335,25 @@ def launch_comfyui(extra_args: list[str] | None = None) -> Any:
     via ``sys.executable -m comfy_cli`` instead of a bare name — is still
     desirable, but this server no longer depends on it.
     """
-    args = ["launch", "--background"]
-    if extra_args:
-        args += ["--", *extra_args]
-    return _run_comfy(*args, timeout=180.0, plain_ok=True)
+    guarded = _guard_extra_args(extra_args)
+    await _resolve_network_exposure_consent(
+        guarded,
+        confirm_network_exposure,
+        ctx,
+        action="start",
+    )
+    # `_run_comfy` is blocking (a bounded `communicate` on a child process), so it
+    # cannot run on the event loop — the gate above is the only reason this tool
+    # is async at all. The SHARED `to_thread` pool is right here, unlike
+    # `partner_generate` / `switch_comfyui_version`: those hold a worker for up to
+    # 15-30 minutes if their caller walks away, which is what justifies a
+    # dedicated one. Here `_LIFECYCLE_LOCK` caps the exposure at ONE occupied
+    # worker across all three lifecycle tools — a second concurrent call is
+    # refused in microseconds rather than parking a thread — and that one is
+    # bounded by the 180s launch timeout (~240s if it is a restart). Cancelling
+    # this await abandons the worker rather than stopping it, which is precisely
+    # why the bound has to come from the lock and the timeout, not the caller.
+    return await asyncio.to_thread(_launch_comfyui_sync, guarded)
 
 
 @mcp.tool()
@@ -5828,8 +6370,14 @@ def stop_comfyui() -> Any:
     Like ``launch_comfyui``, ``comfy stop`` prints human text and exits 0 without
     a JSON envelope, so a successful stop returns a synthesized
     ``{"ok": True, ...}`` payload carrying that text (BE-2953).
+
+    **One lifecycle call at a time.** This takes the same ``_LIFECYCLE_LOCK`` as
+    ``launch_comfyui`` / ``restart_comfyui`` and is refused immediately if one of
+    those is in flight — a stop landing between a restart's stop and its launch
+    would otherwise race comfy-cli's single recorded pid.
     """
-    return _run_comfy("stop", timeout=60.0, plain_ok=True)
+    with _lifecycle_slot("stop"):
+        return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
 
 # A launch that lost the port race. Matched on the phrasing rather than a fixed
@@ -5951,30 +6499,26 @@ def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
     )
 
 
-@mcp.tool()
-def restart_comfyui(extra_args: list[str] | None = None) -> Any:
-    """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
+def _restart_comfyui_sync(extra_args: list[str]) -> Any:
+    """The stop-then-launch sequence, with no consent gate of its own.
 
-    Composes the existing :func:`stop_comfyui` and :func:`launch_comfyui` — there
-    is no ``comfy restart`` subcommand, so this is a thin stop-then-launch over
-    comfy-cli, not a new engine feature. ``extra_args`` are forwarded to the new
-    ComfyUI exactly as :func:`launch_comfyui` forwards them (after a ``--``
-    separator), so a restart is also how you relaunch with different flags.
-    Returns the new server's status (``launch_comfyui``'s envelope data).
+    Runs on ONE worker thread so the two blocking subprocess calls stay off the
+    event loop without hopping threads between them, and — the part the thread
+    alone does NOT buy, because `to_thread` dispatches onto a MULTI-worker pool —
+    holds :func:`_lifecycle_slot` across BOTH halves, so a concurrent
+    ``launch_comfyui`` / ``stop_comfyui`` cannot land in the gap between them and
+    race comfy-cli's single recorded pid. The stop and launch it calls take that
+    same reentrant lock, which on this thread is already held.
 
-    The stop step is best-effort ONLY for the benign "nothing to stop" case: if
-    comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
-    started outside comfy-cli) it reports that — as the ``no_recorded_server``
-    code, or as a bare non-zero exit printing "No ComfyUI is running in the
-    background" — and either form is swallowed so the restart still brings the
-    server up. Any OTHER stop failure (a process that couldn't be killed, a
-    permission error, a comfy-cli malfunction) is re-raised rather than silently
-    masked behind the launch.
-
-    When that benign stop is followed by a launch that loses the port, the port
-    error is re-raised with an explanation of the combined situation: a server is
-    running that comfy-cli did not start and therefore cannot stop.
+    Like :func:`_launch_comfyui_sync` it trusts its caller to have guarded
+    ``extra_args`` and resolved consent first.
     """
+    with _lifecycle_slot("restart"):
+        return _restart_comfyui_locked(extra_args)
+
+
+def _restart_comfyui_locked(extra_args: list[str]) -> Any:
+    """The stop-then-launch body, run with the lifecycle slot already held."""
     nothing_to_stop = False
     try:
         stop_comfyui()
@@ -5983,7 +6527,7 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
             raise
         nothing_to_stop = True
     try:
-        return launch_comfyui(extra_args)
+        return _launch_comfyui_sync(extra_args)
     except ComfyCliError as exc:
         # Only when BOTH halves happened — nothing recorded to stop, then the
         # port was taken anyway. A port clash after a stop that genuinely killed
@@ -5998,6 +6542,62 @@ def restart_comfyui(extra_args: list[str] | None = None) -> Any:
             returncode=exc.returncode,
             timed_out=exc.timed_out,
         ) from exc
+
+
+@mcp.tool()
+async def restart_comfyui(
+    extra_args: list[str] | None = None,
+    confirm_network_exposure: bool = False,
+    ctx: Context | None = None,
+) -> Any:
+    """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
+
+    Composes the existing :func:`stop_comfyui` and :func:`launch_comfyui` — there
+    is no ``comfy restart`` subcommand, so this is a thin stop-then-launch over
+    comfy-cli, not a new engine feature. ``extra_args`` are forwarded to the new
+    ComfyUI exactly as :func:`launch_comfyui` forwards them (after a ``--``
+    separator), so a restart is also how you relaunch with different flags.
+    Returns the new server's status (``launch_comfyui``'s envelope data).
+
+    Because it is the other way to hand ComfyUI new flags, it carries
+    ``launch_comfyui``'s **network-exposure confirmation** unchanged: ``--listen``
+    on a non-loopback address (a bare ``--listen`` included) or
+    ``--enable-cors-header`` asks the USER first, since ComfyUI has no
+    authentication and either flag publishes its full API to anything that can
+    reach this machine. The gate runs BEFORE the stop, so a declined restart
+    leaves the running server alone rather than killing it and then refusing to
+    bring it back. ``confirm_network_exposure`` is the fallback for a client that
+    cannot show prompts — see :func:`launch_comfyui` for the full contract.
+
+    The stop step is best-effort ONLY for the benign "nothing to stop" case: if
+    comfy-cli has no recorded server (e.g. nothing is running, or ComfyUI was
+    started outside comfy-cli) it reports that — as the ``no_recorded_server``
+    code, or as a bare non-zero exit printing "No ComfyUI is running in the
+    background" — and either form is swallowed so the restart still brings the
+    server up. Any OTHER stop failure (a process that couldn't be killed, a
+    permission error, a comfy-cli malfunction) is re-raised rather than silently
+    masked behind the launch.
+
+    When that benign stop is followed by a launch that loses the port, the port
+    error is re-raised with an explanation of the combined situation: a server is
+    running that comfy-cli did not start and therefore cannot stop.
+
+    **One lifecycle call at a time.** The stop and the launch run inside a single
+    ``_LIFECYCLE_LOCK`` slot, so a ``launch_comfyui`` / ``stop_comfyui`` /
+    ``restart_comfyui`` arriving while this one is mid-sequence is refused
+    immediately (rather than slipping into the gap between the two halves and
+    racing comfy-cli's single recorded server). The whole sequence is bounded by
+    its two subprocess timeouts — ~240s worst case — so a refusal is never
+    permanent.
+    """
+    guarded = _guard_extra_args(extra_args)
+    await _resolve_network_exposure_consent(
+        guarded,
+        confirm_network_exposure,
+        ctx,
+        action="restart",
+    )
+    return await asyncio.to_thread(_restart_comfyui_sync, guarded)
 
 
 # The exact targets `comfy update` accepts (comfy-cli `cmdline.py`:
