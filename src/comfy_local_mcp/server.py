@@ -111,6 +111,9 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
+  A template's authored documentation (LoRA trigger words, model links, usage
+  caveats) lives in Note/MarkdownNote nodes, which are NOT slots — read them with
+  `list_workflow_notes` after `fetch_template` rather than grepping the raw JSON.
   For a one-shot run, `run_template(name, params=...)` does fetch + fill + run in a
   single call; a template that embeds partner (paid) nodes spends credits and is
   gated by the same `confirm_spend` flag as `partner_generate` (free templates ignore it).
@@ -169,8 +172,8 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
 
 Argument naming is uniform across the whole tool surface, so do not guess it:
 an INPUT workflow file is always `workflow_path` (`run_workflow`,
-`validate_workflow`, `list_workflow_slots`, `set_workflow_slot`,
-`vary_workflow`); an OUTPUT file is `out_path` (`fetch_template`,
+`validate_workflow`, `list_workflow_slots`, `list_workflow_notes`,
+`set_workflow_slot`, `vary_workflow`); an OUTPUT file is `out_path` (`fetch_template`,
 `partner_generate`, `emit_partner_workflow`); an OUTPUT directory is
 `out_dir` (`fetch_outputs`,
 `vary_workflow`); a registry lookup key is `name` (`get_template`, `get_node`,
@@ -7120,6 +7123,10 @@ def list_workflow_slots(workflow_path: str) -> Any:
     proxy widgets promoted onto the instance node itself (e.g. ``130.text``).
     Both forms come back in the slot's ``address`` field and are set the same
     way; subgraphs never need hand-editing.
+
+    Slots are tweakable PARAMETERS only. Note/MarkdownNote documentation text is
+    not a slot — use ``list_workflow_notes`` to read what the template's author
+    wrote (trigger words, model links, usage instructions).
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
@@ -7133,6 +7140,43 @@ def list_workflow_slots(workflow_path: str) -> Any:
     )
     _reject_nul("workflow_path", workflow_path)
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+
+
+@mcp.tool()
+def list_workflow_notes(workflow_path: str) -> Any:
+    """List the documentation notes a frontend-format workflow carries.
+
+    Wraps ``comfy workflow notes <path>``. Surfaces the text of ``Note`` /
+    ``MarkdownNote`` nodes — the authored documentation a template ships with
+    (e.g. a LoRA's trigger words, model download links, usage instructions) —
+    which ``list_workflow_slots`` does NOT include: those are UI-only nodes with
+    no entry in the live node catalog, so they can never appear as a slot, and
+    slots are tweakable parameters only. Read them after ``fetch_template``
+    instead of hand-grepping the workflow JSON.
+
+    Operates on the frontend-format workflow that ``fetch_template`` writes;
+    API-format files are rejected, because that conversion drops note nodes
+    entirely. Unlike ``list_workflow_slots`` this needs no running ComfyUI — it
+    is pure offline JSON reading.
+
+    Returns comfy-cli's own ``envelope/1`` data — ``{"workflow", "count",
+    "notes"}``. Each note carries ``id``, ``type``, ``title``, ``text``, ``pos``,
+    ``size`` and ``subgraph`` (``null`` for a top-level note, else the owning
+    subgraph's ``{"id", "name"}``). A workflow with no notes is a normal
+    ``count: 0`` result, not an error.
+    """
+    # Bare positional, same as `list_workflow_slots` — a leading-dash path is
+    # read as a flag rather than the path comfy-cli is meant to read.
+    _reject_option_like(
+        "workflow_path",
+        workflow_path,
+        expected=(
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        ),
+    )
+    _reject_nul("workflow_path", workflow_path)
+    return _run_comfy("workflow", "notes", workflow_path, timeout=60.0)
 
 
 class SlotOverride(BaseModel):

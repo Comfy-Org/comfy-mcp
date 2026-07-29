@@ -40,7 +40,7 @@ Each tool shells out to the `comfy` command with `--where local --json`, parses 
 `envelope/1` output, and returns it. There is no HTTP client and **no code shared with the Comfy
 Cloud MCP** — comfy-cli is the engine.
 
-> **Status:** beta. 42 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 44 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -515,7 +515,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Tools
 
-42 tools, grouped below by what they do. Every tool runs `comfy` with the global
+44 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
@@ -556,7 +556,8 @@ handle is `prompt_id`.
 | Tool | Wraps | What it does |
 |---|---|---|
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
-| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. |
+| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. Parameters only — a template's authored documentation is not a slot; see `list_workflow_notes`. |
+| `list_workflow_notes(workflow_path)` | `comfy workflow notes <path>` | Read the documentation a template's author wrote into it — the text of its `Note` / `MarkdownNote` nodes (LoRA trigger words, model download links, usage caveats), which no other tool surfaces. Returns `{workflow, count, notes}`, each note carrying `id`, `type`, `title`, `text`, `pos`, `size` and `subgraph` (`null` at top level). Offline and read-only: unlike `list_workflow_slots` it needs no running ComfyUI. Frontend-format only — API-format exports drop note nodes in conversion, so there is nothing to read there. |
 | `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
 | `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. Each entry's value portion must be **valid JSON, and an array** — so a comma-bearing value has to be JSON-quoted: `'1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]'`, not `1.prompt=[a lighthouse at dawn, oil painting]`. |
 

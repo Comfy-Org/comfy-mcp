@@ -1,10 +1,11 @@
-"""Tests for the workflow slot-editing tools — list / set-slot / vary.
+"""Tests for the ``comfy workflow`` tools — list / set-slot / vary / notes.
 
 These lock in the passthrough argv (global flags before the subcommand, same
-rule the wrapper enforces) for the three tools that let an agent parameterize a
+rule the wrapper enforces) for the tools that let an agent parameterize a
 fetched template — the ``fetch_template`` -> ``set_workflow_slot`` ->
-``run_workflow`` loop — without hand-editing raw workflow JSON. The behaviors
-they own on top of the passthrough:
+``run_workflow`` loop — without hand-editing raw workflow JSON, plus
+``list_workflow_notes``, the read-only reader for the authored documentation
+that same template carries. The behaviors they own on top of the passthrough:
 1. ``set_workflow_slot`` passes each override as a positional ``ADDR=VALUE`` and
    defaults to ``--stdout`` (non-destructive), togglable off.
 2. ``vary_workflow`` repeats ``--slot`` per address and forwards ``--out-dir``
@@ -36,6 +37,53 @@ def test_list_workflow_slots_argv(patched_run):
     cmd = calls[0]["cmd"]
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
     assert cmd[4:] == ["workflow", "slots", "/tmp/flux.json"]  # subcommand after
+
+
+def test_list_workflow_notes_argv(patched_run):
+    """Passthrough: `comfy --json --where local workflow notes <path>`.
+
+    The envelope `data` is a `{workflow, count, notes[]}` dict and comes back
+    unchanged — this repo parses no workflow JSON of its own (AGENTS.md).
+    """
+    data = {
+        "workflow": "/tmp/flux.json",
+        "count": 2,
+        "notes": [
+            {
+                "id": 5,
+                "type": "MarkdownNote",
+                "title": "Note",
+                "text": "Trigger word: `ohwx person`",
+                "pos": [-5870, 1890],
+                "size": [230, 88],
+                "subgraph": None,
+            },
+            {
+                "id": 7,
+                "type": "Note",
+                "title": None,
+                "text": "Download the LoRA into models/loras.",
+                "pos": [10, 20],
+                "size": [200, 60],
+                "subgraph": {"id": "abc-123", "name": "sampler"},
+            },
+        ],
+    }
+    calls = patched_run(envelope(data=data))
+
+    assert server.list_workflow_notes("/tmp/flux.json") == data
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["workflow", "notes", "/tmp/flux.json"]  # subcommand after
+
+
+def test_list_workflow_notes_empty_is_not_an_error(patched_run):
+    """A workflow with no notes is a normal `count: 0` payload, not a raise."""
+    data = {"workflow": "/tmp/flux.json", "count": 0, "notes": []}
+    patched_run(envelope(data=data))
+
+    assert server.list_workflow_notes("/tmp/flux.json") == data
 
 
 def test_set_workflow_slot_argv_default_stdout(patched_run):
@@ -84,7 +132,7 @@ def test_set_workflow_slot_rejects_option_like_override(no_spawn):
 def test_workflow_path_positional_rejects_option_like(no_spawn):
     """The sibling `workflow_path` positional is guarded too, not just the overrides.
 
-    All three tools splat the path in bare, so a leading-dash path is read as a
+    All four tools splat the path in bare, so a leading-dash path is read as a
     flag: for `set-slot` that shifts the first override into the path slot,
     which is the very injection the override guard exists to stop. The error
     names the escape hatch — a genuinely dash-leading filename works as `./-x`.
@@ -95,6 +143,9 @@ def test_workflow_path_positional_rejects_option_like(no_spawn):
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
         server.list_workflow_slots("--stdout")
 
+    with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
+        server.list_workflow_notes("--stdout")
+
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
         server.vary_workflow("--out-dir", ["3.seed=[1,2]"])
 
@@ -104,6 +155,7 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     calls = patched_run(envelope(data={"modified": True}))
 
     server.set_workflow_slot("./-flux.json", ["6.text=x"])
+    server.list_workflow_notes("./-flux.json")
 
     assert calls[0]["cmd"][4:] == [
         "workflow",
@@ -112,6 +164,7 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
         "6.text=x",
         "--stdout",
     ]
+    assert calls[1]["cmd"][4:] == ["workflow", "notes", "./-flux.json"]
 
 
 def test_workflow_tools_reject_embedded_nul(no_spawn):
@@ -123,6 +176,7 @@ def test_workflow_tools_reject_embedded_nul(no_spawn):
     """
     for call in (
         lambda: server.list_workflow_slots("/tmp/f\0.json"),
+        lambda: server.list_workflow_notes("/tmp/f\0.json"),
         lambda: server.set_workflow_slot("/tmp/f\0.json", ["6.text=x"]),
         lambda: server.set_workflow_slot("/tmp/f.json", ["6.text=\0"]),
         lambda: server.vary_workflow("/tmp/f\0.json", ["3.seed=[1,2]"]),
