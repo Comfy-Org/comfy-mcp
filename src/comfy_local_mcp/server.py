@@ -52,6 +52,7 @@ against a real comfy-cli install and a running local ComfyUI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import ipaddress
 import json
@@ -3926,30 +3927,38 @@ _ELICIT_TIMEOUT = 300.0
 _ELICIT_MODEL_DISPLAY_MAX = 80
 
 
-def _display_model(model: str) -> str:
-    """Render a caller-supplied model name safely inside the elicitation prompt.
+def _display_caller_text(text: str, limit: int) -> str:
+    """Render CALLER-supplied text safely inside an elicitation prompt's code span.
 
-    The prompt quotes the model in a markdown code span, and the name arrives
-    from the CALLER — an agent that may be relaying untrusted text. Backticks or
-    newlines in it would close that span on a client that renders markdown,
-    letting the name inject its own content: hiding the "SPENDS credits" warning
-    or appending a reassuring "this is free". That redresses the very prompt the
-    user is answering, so it is neutralized before display.
+    Every gate that quotes something the caller sent — a model name, a lifecycle
+    tool's ``extra_args`` — goes through here, because they all face the same
+    problem: the prompt puts that text in a markdown code span, and the caller is
+    an agent that may be relaying untrusted content. Backticks or newlines in it
+    would close the span on a client that renders markdown, letting the text
+    inject its own: hiding the "SPENDS credits" warning, appending a reassuring
+    "this is free", or — for the network gate — burying the exposure warning under
+    a fabricated "(loopback only)". That redresses the very prompt the user is
+    answering, so it is neutralized before display.
 
-    Display only — argv still carries the model verbatim, so a name comfy-cli
-    would accept is never mangled into one it would not.
+    Display only — argv still carries the caller's text verbatim, so an argument
+    comfy-cli would accept is never mangled into one it would not.
     """
     cleaned = "".join(
-        " " if ch.isspace() or not ch.isprintable() else ch for ch in model
+        " " if ch.isspace() or not ch.isprintable() else ch for ch in text
     )
     # The span delimiter itself: without a backtick the rest of markdown is
     # inert inside the code span, so this is the only character that must go.
     cleaned = " ".join(cleaned.replace("`", "'").split())
-    if len(cleaned) > _ELICIT_MODEL_DISPLAY_MAX:
-        cleaned = cleaned[:_ELICIT_MODEL_DISPLAY_MAX] + "…"
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "…"
+    return cleaned
+
+
+def _display_model(model: str) -> str:
+    """Render a caller-supplied model name for the spend prompt."""
     # `partner_generate` rejects an empty model before reaching here; the
     # fallback only covers a name that was ENTIRELY unprintable.
-    return cleaned or "<unnamed model>"
+    return _display_caller_text(model, _ELICIT_MODEL_DISPLAY_MAX) or "<unnamed model>"
 
 
 class _ApprovalWording(NamedTuple):
@@ -5769,10 +5778,25 @@ def fetch_outputs(
     return [data, *images]
 
 
+# Ceilings on a lifecycle tool's `extra_args`, set the way `_MAX_PROMPT_ID_LEN`
+# is: generous next to any real use, but finite, because these entries go
+# straight into argv and the kernel's own limit (`ARG_MAX`, ~256KB-1MB depending
+# on the platform) surfaces as `OSError: Argument list too long` from
+# `subprocess.Popen` — an internal error that no caller converts and that
+# `_guard_extra_args`' contract promises not to raise. Bounding here also keeps
+# `_network_exposing_args`' per-token scan (a `split(",")` and an
+# `ipaddress` parse per part, on the event loop, before the `to_thread` hop)
+# proportional to a plausible command line rather than to whatever the caller
+# sent. ComfyUI's own longest flag list is a handful of short tokens plus the
+# occasional filesystem path, so 64 x 4096 is orders of magnitude of headroom.
+_MAX_EXTRA_ARGS = 64
+_MAX_EXTRA_ARG_LEN = 4096
+
+
 def _guard_extra_args(extra_args: list[str] | None) -> list[str]:
     """Validate a lifecycle tool's ``extra_args`` and return it as a plain list.
 
-    Two jobs, both about the fact that these entries go STRAIGHT into argv:
+    Three jobs, all about the fact that these entries go STRAIGHT into argv:
 
     - **Shape.** ``None`` means "no extras". Anything that is not a list/tuple of
       strings is a caller mistake worth naming: a bare ``str`` would be splatted
@@ -5782,6 +5806,10 @@ def _guard_extra_args(extra_args: list[str] | None) -> list[str]:
     - **NUL.** :func:`_reject_nul`, for the reason that function documents:
       ``subprocess.Popen`` raises a bare ``ValueError: embedded null byte``, which
       would escape as an internal error instead of a :class:`ComfyCliError`.
+    - **Size.** :data:`_MAX_EXTRA_ARGS` entries of :data:`_MAX_EXTRA_ARG_LEN`
+      characters each, for the reason those constants document: past the kernel's
+      ``ARG_MAX`` the failure is an unconverted ``OSError`` rather than a
+      :class:`ComfyCliError`.
 
     Deliberately NOT rejected: a leading dash. These args are *meant* to be
     ComfyUI flags — that is the whole point of the ``--`` separator — so
@@ -5796,12 +5824,24 @@ def _guard_extra_args(extra_args: list[str] | None) -> list[str]:
             "invalid extra_args: expected a list of strings, got "
             f"{type(extra_args).__name__}."
         )
+    if len(extra_args) > _MAX_EXTRA_ARGS:
+        raise ComfyCliError(
+            f"invalid extra_args: {len(extra_args)} entries exceeds the "
+            f"{_MAX_EXTRA_ARGS}-entry maximum (they are forwarded to ComfyUI as "
+            "command-line arguments)."
+        )
     guarded: list[str] = []
     for index, arg in enumerate(extra_args):
         if not isinstance(arg, str):
             raise ComfyCliError(
                 f"invalid extra_args[{index}]: expected a string, got "
                 f"{type(arg).__name__}."
+            )
+        if len(arg) > _MAX_EXTRA_ARG_LEN:
+            raise ComfyCliError(
+                f"invalid extra_args[{index}]: {len(arg)} characters exceeds the "
+                f"{_MAX_EXTRA_ARG_LEN}-character maximum for one command-line "
+                "argument."
             )
         guarded.append(_reject_nul(f"extra_args[{index}]", arg))
     return guarded
@@ -5919,7 +5959,7 @@ def _network_exposing_args(extra_args: list[str]) -> tuple[str, ...]:
     pair) is asking for *less* reach than a bare launch, not more. Prompting
     there would train users to click through the prompt that actually matters.
 
-    Two deliberate over-rejections, so neither reads as an oversight:
+    Three deliberate over-rejections, so none reads as an oversight:
 
     - **A repeated ``--listen`` where an EARLIER value was public.** argparse
       keeps the last value, so ``--listen 0.0.0.0 --listen 127.0.0.1`` would in
@@ -5929,6 +5969,14 @@ def _network_exposing_args(extra_args: list[str]) -> tuple[str, ...]:
     - **``--enable-cors-header`` with an explicit origin.** Only the bare form
       means ``*``, but even a named origin is a cross-origin grant this server
       will not make on the user's behalf.
+    - **A flag after a bare ``--``.** argparse stops option parsing at ``--``, so
+      ``["--", "--listen", "0.0.0.0"]`` would reach ComfyUI as positional junk and
+      never set ``args.listen``. The scan does not honor the terminator: it would
+      have to re-implement how ComfyUI's parser (and comfy-cli's own ``--``
+      forwarding, which already consumed one separator to get here) treat a
+      second one, and guessing that wrong in the *other* direction is what
+      publishes an API. Prompting for arguments that were going to be rejected
+      anyway costs one confirmation.
     """
     flags: list[str] = []
     index = 0
@@ -5965,10 +6013,27 @@ def _network_exposing_args(extra_args: list[str]) -> tuple[str, ...]:
 # constants and never by caller text, which is why these strings can be
 # interpolated into a markdown prompt with no sanitizer in front of them: unlike
 # `partner_generate`'s model name (see `_display_model`), nothing here originates
-# with the agent, so there is no code span for it to break out of.
+# with the agent, so there is no code span for it to break out of. (The ARGUMENTS
+# echoed alongside them do come from the caller — `_display_extra_args` is the
+# sanitizer for those.)
+#
+# HEDGED on purpose. `_network_exposing_args` over-rejects in three documented
+# cases — a last-wins repeat that actually binds loopback, an address it could not
+# parse at all, a `--enable-cors-header` carrying one named origin — so a flat
+# "binds ComfyUI to a non-loopback address" would assert as fact something the
+# detector itself does not know. The user's decision rests on this sentence, so it
+# claims only what was actually established: the flag is present and this server
+# could not confirm it keeps the server private.
 _NETWORK_EXPOSURE_EFFECTS = {
-    _LISTEN_FLAG: "`--listen` (binds ComfyUI to a non-loopback address)",
-    _CORS_FLAG: "`--enable-cors-header` (lets any web page call its API)",
+    _LISTEN_FLAG: (
+        "`--listen` (this server could not confirm every address it names is a "
+        "loopback address, so it may bind ComfyUI where other machines can reach "
+        "it)"
+    ),
+    _CORS_FLAG: (
+        "`--enable-cors-header` (grants cross-origin access to its API — to any "
+        "web page, unless the flag names one origin)"
+    ),
 }
 
 
@@ -5977,13 +6042,45 @@ def _network_exposure_summary(flags: tuple[str, ...]) -> str:
     return " and ".join(_NETWORK_EXPOSURE_EFFECTS[flag] for flag in flags)
 
 
+# How much of the caller's argument list the prompt echoes. Larger than
+# `_ELICIT_MODEL_DISPLAY_MAX` because a whole command line has to stay legible to
+# be judged, but still bounded — a prompt that scrolls the flags out of a client's
+# dialog is one the user cannot actually read, which is the failure this echo
+# exists to prevent.
+_ELICIT_ARGS_DISPLAY_MAX = 400
+
+
+def _display_extra_args(extra_args: list[str]) -> str:
+    """Render the caller's whole ``extra_args`` for the network-exposure prompt.
+
+    Naming only the flag CATEGORIES would ask the user to approve less than what
+    runs: the same argument list can carry ``--base-directory`` (moving the file
+    roots the exposure reaches), a port, an address they did not expect. Consent
+    has to be to the actual command line, so it is shown — sanitized by
+    :func:`_display_caller_text`, since unlike the flag names these strings are
+    the caller's own.
+    """
+    joined = " ".join(extra_args)
+    # Elided rather than fatal: an argument list too long to display is still one
+    # the user can decline, and refusing to prompt at all would be the worse
+    # outcome. `_guard_extra_args` already bounds the input that gets here.
+    return _display_caller_text(joined, _ELICIT_ARGS_DISPLAY_MAX) or "(none)"
+
+
 # The consequence sentence, shared by the elicitation prompt and the
 # cannot-be-prompted refusal so the two cannot drift into describing different
 # stakes for the same decision.
+#
+# It does NOT name the ComfyUI directory as the bound on the file access, because
+# the same `extra_args` can carry `--base-directory` / `--input-directory` /
+# `--output-directory` and move those roots: stating a narrower blast radius than
+# the arguments actually permit would understate the very decision the user is
+# making. The prompt echoes the full argument list for that reason too.
 _NETWORK_EXPOSURE_STAKES = (
     "The local ComfyUI has NO authentication, so that would publish its full "
-    "API — running arbitrary workflows, and reading and writing files under the "
-    "ComfyUI directory — to every machine that can reach this one."
+    "API — running arbitrary workflows, and reading and writing files under "
+    "whichever directories it was started with — to every machine that can reach "
+    "this one."
 )
 
 
@@ -6022,17 +6119,19 @@ _NETWORK_APPROVAL_WORDING = _ApprovalWording(
 
 
 async def _elicit_network_exposure_consent(
-    ctx: Context, action: str, summary: str
+    ctx: Context, action: str, summary: str, args_display: str
 ) -> bool:
     """Ask the USER to approve one network-exposing launch. True = approved."""
     return await _elicit_approval(
         ctx,
         (
             f"{action.capitalize()} the local ComfyUI with {summary}? "
+            f"The full arguments it would be started with: `{args_display}`. "
             f"{_NETWORK_EXPOSURE_STAKES} That means everything on your local "
             "network, and the internet too if this machine is port-forwarded or "
-            "on a public network. Approve only if YOU asked for this. Declining "
-            "cancels it and leaves the local ComfyUI as it is."
+            "on a public network. Approve only if YOU asked for this, with those "
+            "arguments. Declining cancels it and leaves the local ComfyUI as it "
+            "is."
         ),
         NetworkExposureApproval,
         _NETWORK_APPROVAL_WORDING,
@@ -6040,18 +6139,23 @@ async def _elicit_network_exposure_consent(
 
 
 async def _resolve_network_exposure_consent(
-    flags: tuple[str, ...],
+    extra_args: list[str],
     confirm_network_exposure: bool,
     ctx: Context | None,
     action: str,
 ) -> None:
     """Return only if this launch may expose ComfyUI; otherwise raise.
 
-    A no-op when ``flags`` is empty, which is the path every existing caller
-    takes: no prompt, no new failure mode, byte-identical behavior.
+    Takes the guarded ``extra_args`` rather than a pre-computed flag tuple so the
+    arguments the prompt SHOWS and the arguments it JUDGED are the same list, by
+    construction.
 
-    When it is not empty this is :func:`_resolve_switch_consent`'s shape, and it
-    keeps both of that function's load-bearing properties:
+    A no-op when nothing in them exposes anything, which is the path every
+    existing caller takes: no prompt, no new failure mode, byte-identical
+    behavior.
+
+    Otherwise this is :func:`_resolve_switch_consent`'s shape, and it keeps both
+    of that function's load-bearing properties:
 
     1. **Elicitation wins, and is raised even when
        ``confirm_network_exposure=True``.** The agent host's permission to CALL a
@@ -6070,11 +6174,14 @@ async def _resolve_network_exposure_consent(
     has no durable "always expose" for `comfy launch` to read, so nothing can
     consent here on the user's behalf.
     """
+    flags = _network_exposing_args(extra_args)
     if not flags:
         return
     summary = _network_exposure_summary(flags)
     if _client_elicitation_support(ctx) is not False:
-        if await _elicit_network_exposure_consent(ctx, action, summary):
+        if await _elicit_network_exposure_consent(
+            ctx, action, summary, _display_extra_args(extra_args)
+        ):
             return
         raise ComfyCliError(
             f"network exposure not confirmed: the user declined to {action} the "
@@ -6097,21 +6204,74 @@ async def _resolve_network_exposure_consent(
         )
 
 
+# Only one of `launch` / `stop` / `restart` may be in flight per server process.
+# They all drive comfy-cli's SINGLE recorded pid and the one ComfyUI port, so
+# concurrent calls interleave destructively: a `stop` landing between
+# `restart_comfyui`'s stop and its launch, or two launches racing, leaves either
+# an untracked server nothing can stop or a restart that killed the old server
+# and then lost the port to it. Being dispatched onto a worker thread — an
+# `asyncio.to_thread` hop for the two async tools, MCPServer's own sync-tool pool
+# for `stop_comfyui` — is NOT serialization: those pools have many workers, so a
+# second call runs alongside the first. This lock is.
+#
+# REENTRANT because `_restart_comfyui_sync` composes the other two on its own
+# thread: it holds the slot across the whole sequence (that is the point) and the
+# stop/launch it calls re-enter it. Reentrancy is per-thread, so a lifecycle call
+# arriving on ANY OTHER thread is still refused.
+#
+# Deliberately NOT `_UPDATE_LOCK`: an update runs for up to 30 minutes and its
+# documented contract is "do not launch/restart while one is running" (a caller's
+# error to make), whereas this lock is about two lifecycle calls landing at once
+# (a race no caller can avoid). Folding them together would park lifecycle calls
+# behind a half-hour install.
+_LIFECYCLE_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def _lifecycle_slot(action: str):
+    """Hold :data:`_LIFECYCLE_LOCK` for one lifecycle call, or refuse.
+
+    Refuses rather than queues, the way :func:`update_comfyui` does and for the
+    same reason: waiting would park a worker thread behind a subprocess the
+    caller cannot see (up to 180s for a launch, ~240s for a restart) and present
+    as a hang, and a launch that waited its turn would only go on to lose the
+    port anyway. Naming what is happening lets the caller decide.
+    """
+    if not _LIFECYCLE_LOCK.acquire(blocking=False):
+        raise ComfyCliError(
+            f"cannot {action} the local ComfyUI right now: another launch, stop, "
+            "or restart is already in flight in this server. They share "
+            "comfy-cli's single recorded server and the ComfyUI port, so running "
+            "two at once can leave a server comfy-cli cannot stop. Wait for the "
+            "in-flight call to return (up to ~4 minutes for a restart) and call "
+            "again; `server_info` reports what is running meanwhile."
+        )
+    try:
+        yield
+    finally:
+        _LIFECYCLE_LOCK.release()
+
+
 def _launch_comfyui_sync(extra_args: list[str]) -> Any:
     """Spawn ``comfy launch --background``, with no consent gate of its own.
 
     Split out of :func:`launch_comfyui` so :func:`restart_comfyui` can compose
-    stop-then-launch on ONE worker thread, and — the reason that matters — so the
-    network-exposure consent is resolved exactly once, at whichever tool the
-    client actually called, rather than a second time from inside the launch
+    stop-then-launch inside ONE lifecycle slot, and — the reason that matters —
+    so the network-exposure consent is resolved exactly once, at whichever tool
+    the client actually called, rather than a second time from inside the launch
     half. Every caller must have passed ``extra_args`` through
     :func:`_guard_extra_args` and :func:`_resolve_network_exposure_consent`
-    first; this function trusts them.
+    first; this function trusts them for that.
+
+    It does NOT trust them for serialization: it takes :func:`_lifecycle_slot`
+    itself, so no path can spawn a launch outside the lock. ``restart``'s already
+    holding it is fine — the lock is reentrant per-thread.
     """
     args = ["launch", "--background"]
     if extra_args:
         args += ["--", *extra_args]
-    return _run_comfy(*args, timeout=180.0, plain_ok=True)
+    with _lifecycle_slot("start"):
+        return _run_comfy(*args, timeout=180.0, plain_ok=True)
 
 
 @mcp.tool()
@@ -6177,7 +6337,7 @@ async def launch_comfyui(
     """
     guarded = _guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
-        _network_exposing_args(guarded),
+        guarded,
         confirm_network_exposure,
         ctx,
         action="start",
@@ -6185,10 +6345,14 @@ async def launch_comfyui(
     # `_run_comfy` is blocking (a bounded `communicate` on a child process), so it
     # cannot run on the event loop — the gate above is the only reason this tool
     # is async at all. The SHARED `to_thread` pool is right here, unlike
-    # `partner_generate` / `switch_comfyui_version`: those hold a worker for up
-    # to 15-30 minutes if their caller walks away, which is what justifies a
-    # dedicated one, while a launch is capped at the 180s below — the same
-    # reasoning `run_workflow(wait=False)` already applies to its 60s submit.
+    # `partner_generate` / `switch_comfyui_version`: those hold a worker for up to
+    # 15-30 minutes if their caller walks away, which is what justifies a
+    # dedicated one. Here `_LIFECYCLE_LOCK` caps the exposure at ONE occupied
+    # worker across all three lifecycle tools — a second concurrent call is
+    # refused in microseconds rather than parking a thread — and that one is
+    # bounded by the 180s launch timeout (~240s if it is a restart). Cancelling
+    # this await abandons the worker rather than stopping it, which is precisely
+    # why the bound has to come from the lock and the timeout, not the caller.
     return await asyncio.to_thread(_launch_comfyui_sync, guarded)
 
 
@@ -6206,8 +6370,14 @@ def stop_comfyui() -> Any:
     Like ``launch_comfyui``, ``comfy stop`` prints human text and exits 0 without
     a JSON envelope, so a successful stop returns a synthesized
     ``{"ok": True, ...}`` payload carrying that text (BE-2953).
+
+    **One lifecycle call at a time.** This takes the same ``_LIFECYCLE_LOCK`` as
+    ``launch_comfyui`` / ``restart_comfyui`` and is refused immediately if one of
+    those is in flight — a stop landing between a restart's stop and its launch
+    would otherwise race comfy-cli's single recorded pid.
     """
-    return _run_comfy("stop", timeout=60.0, plain_ok=True)
+    with _lifecycle_slot("stop"):
+        return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
 
 # A launch that lost the port race. Matched on the phrasing rather than a fixed
@@ -6333,11 +6503,22 @@ def _restart_comfyui_sync(extra_args: list[str]) -> Any:
     """The stop-then-launch sequence, with no consent gate of its own.
 
     Runs on ONE worker thread so the two blocking subprocess calls stay off the
-    event loop without hopping threads between them (an interleaved
-    ``launch_comfyui`` between the stop and the launch would race the port). Like
-    :func:`_launch_comfyui_sync` it trusts its caller to have guarded
+    event loop without hopping threads between them, and — the part the thread
+    alone does NOT buy, because `to_thread` dispatches onto a MULTI-worker pool —
+    holds :func:`_lifecycle_slot` across BOTH halves, so a concurrent
+    ``launch_comfyui`` / ``stop_comfyui`` cannot land in the gap between them and
+    race comfy-cli's single recorded pid. The stop and launch it calls take that
+    same reentrant lock, which on this thread is already held.
+
+    Like :func:`_launch_comfyui_sync` it trusts its caller to have guarded
     ``extra_args`` and resolved consent first.
     """
+    with _lifecycle_slot("restart"):
+        return _restart_comfyui_locked(extra_args)
+
+
+def _restart_comfyui_locked(extra_args: list[str]) -> Any:
+    """The stop-then-launch body, run with the lifecycle slot already held."""
     nothing_to_stop = False
     try:
         stop_comfyui()
@@ -6400,10 +6581,18 @@ async def restart_comfyui(
     When that benign stop is followed by a launch that loses the port, the port
     error is re-raised with an explanation of the combined situation: a server is
     running that comfy-cli did not start and therefore cannot stop.
+
+    **One lifecycle call at a time.** The stop and the launch run inside a single
+    ``_LIFECYCLE_LOCK`` slot, so a ``launch_comfyui`` / ``stop_comfyui`` /
+    ``restart_comfyui`` arriving while this one is mid-sequence is refused
+    immediately (rather than slipping into the gap between the two halves and
+    racing comfy-cli's single recorded server). The whole sequence is bounded by
+    its two subprocess timeouts — ~240s worst case — so a refusal is never
+    permanent.
     """
     guarded = _guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
-        _network_exposing_args(guarded),
+        guarded,
         confirm_network_exposure,
         ctx,
         action="restart",

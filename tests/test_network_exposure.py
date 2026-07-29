@@ -18,8 +18,13 @@ the USER, not the caller, authorizes that:
    ``False`` default means a bare call exposes nothing.
 3. That the gate costs the ordinary caller nothing: a launch with no extras, or
    with ``--port``, behaves exactly as before — no prompt, same argv.
-4. Input hygiene on ``extra_args``: a NUL is a named ``ComfyCliError`` rather
-   than a bare ``ValueError`` out of ``subprocess``.
+4. Input hygiene on ``extra_args``: a NUL, an oversized entry, or too many of
+   them is a named ``ComfyCliError`` rather than a bare ``ValueError`` /
+   ``OSError`` out of ``subprocess``.
+5. WHAT THE USER IS SHOWN, which is the thing their answer actually rests on:
+   the whole argument list is echoed (so consent is not to a narrower action
+   than the one that runs), that echo cannot restructure the prompt around
+   itself, and the wording claims only what the detector established.
 
 comfy-cli is mocked throughout: no real ComfyUI is ever launched.
 """
@@ -458,3 +463,97 @@ def test_malformed_extra_args_are_named_not_crashed(patched_run, drive, extra_ar
         drive(extra_args)
 
     assert calls == []
+
+
+@_TOOLS
+def test_too_many_extra_args_is_a_named_error(patched_run, drive):
+    """An argv the kernel would refuse must be this module's error, not an OSError."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="entry maximum"):
+        drive(["--cpu"] * (server._MAX_EXTRA_ARGS + 1))
+
+    assert calls == []
+
+
+@_TOOLS
+def test_oversized_extra_arg_entry_is_a_named_error(patched_run, drive):
+    """Same for one huge entry: `subprocess` would raise `Argument list too long`."""
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match="character maximum"):
+        drive(["--listen", "1" * (server._MAX_EXTRA_ARG_LEN + 1)])
+
+    assert calls == []
+
+
+def test_the_size_bound_leaves_realistic_argument_lists_alone(patched_run):
+    """The ceilings are guards, not a usability tax: a real flag list still runs."""
+    calls = patched_run(envelope(data={}))
+
+    _launch(["--port", "8189", "--cpu", "--base-directory", "/tmp/" + "x" * 200])
+
+    assert calls[0]["cmd"][4:5] == ["launch"]
+
+
+# --- what the user is actually shown ----------------------------------------
+
+
+@_TOOLS
+def test_prompt_echoes_the_whole_argument_list(patched_run, drive):
+    """Consent must be to the ACTUAL command line, not just the flag categories.
+
+    The same `extra_args` that trip the gate can carry `--base-directory` (which
+    moves the file roots the exposure reaches) or an address the user did not
+    expect, so naming only "`--listen`" would ask them to approve a materially
+    narrower action than the one that runs.
+    """
+    patched_run(envelope(data={"pid": 1}))
+    ctx = _FakeCtx()
+
+    drive(["--listen", "0.0.0.0", "--base-directory", "/srv/models"], ctx=ctx)
+
+    prompt = ctx.elicitations[0]
+    assert "--listen 0.0.0.0 --base-directory /srv/models" in prompt
+
+
+@_TOOLS
+def test_prompt_cannot_be_rewritten_by_the_arguments_it_echoes(patched_run, drive):
+    """The echoed args are CALLER text, so they must not break out of the code span.
+
+    A backtick would close the markdown span on a client that renders it, letting
+    a prompt-injected agent append its own reassurance ("loopback only") to the
+    very warning the user is answering.
+    """
+    patched_run(envelope(data={}))
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError, match="declined"):
+        drive(["--listen", "0.0.0.0`\n**(loopback only)**"], ctx=ctx)
+
+    prompt = ctx.elicitations[0]
+    # Still shown — the user should see what was asked for — but with the span
+    # delimiter and the line break neutralized, so it cannot restructure the
+    # prompt around itself.
+    assert "--listen 0.0.0.0' **(loopback only)**" in prompt
+    assert "\n" not in prompt
+
+
+@_TOOLS
+def test_prompt_and_refusal_do_not_overstate_what_the_detector_knows(
+    patched_run, drive
+):
+    """A last-wins repeat really does bind loopback, so the wording stays hedged.
+
+    The gate flags it anyway (over-rejecting is the safe direction), but the
+    sentence the user decides on must claim only what was established: the flag
+    is there and this server could not confirm it keeps the server private.
+    """
+    patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        drive(["--listen", "0.0.0.0", "--listen", "127.0.0.1"], ctx=_blind_ctx())
+
+    message = str(excinfo.value)
+    assert "could not confirm" in message
+    assert "may bind" in message
