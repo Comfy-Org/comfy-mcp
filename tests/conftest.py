@@ -20,8 +20,12 @@ copy per test file:
   (``asyncio.create_subprocess_exec`` + incremental stream reads) —
   ``patched_stream``. ``run_workflow``, ``watch_job`` and ``generate_image``
   all drive the same NDJSON stream.
+* the plain-JSON ASYNC path (``asyncio.create_subprocess_exec`` + one bounded
+  ``communicate``) — ``patched_async_run``, for ``server._run_comfy_async``. Same
+  spawn as the streaming fake, output collected in one shot rather than read
+  line-by-line; ``download_model``'s legacy foreground fallback drives it.
 
-Both paths spawn with ``start_new_session=True`` so a timeout can kill the whole
+Every path spawns with ``start_new_session=True`` so a timeout can kill the whole
 process group; the fakes model that too (see ``_FakeRunProc``).
 
 The streaming fakes back their pipes with REAL :class:`asyncio.StreamReader`
@@ -435,6 +439,125 @@ def patched_stream(monkeypatch):
             *cmd, stdout, stderr, env, stdin=None, limit=None, **kwargs
         ):
             proc = _FakeProc(list(cmd), stdout_text, env=env, stdin=stdin, limit=limit)
+            procs.append(proc)
+            return proc
+
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        return procs
+
+    return setup
+
+
+class _FakeAsyncRunProc:
+    """A stand-in for ``asyncio.subprocess.Process`` on the plain-JSON ASYNC path.
+
+    ``server._run_comfy_async`` spawns exactly like the streaming runner but
+    collects the whole output with one ``communicate()`` instead of reading lines,
+    so this models that half rather than :class:`_FakeProc`'s stream readers. It
+    hands back BYTES, which is what the real ``communicate`` returns and what the
+    runner decodes with ``errors="replace"``.
+
+    ``hang=True`` makes ``communicate()`` never return, so the caller's
+    ``asyncio.wait_for`` bound fires — the timeout and cancellation cases both need
+    a child that outlives its deadline. It waits on an event that is never set
+    rather than sleeping a fixed span, so the test's wall-clock cost is the bound
+    the code under test chose and nothing more.
+
+    Deliberately carries NO ``pid``, exactly like :class:`_FakeProc` and
+    :class:`_FakeRunProc`: that sends ``server._kill_proc_tree_async`` down its
+    ``AttributeError`` fallback to ``proc.kill()``, which the fake records, instead
+    of ``os.killpg`` on a made-up pid that on a busy machine could land on a real
+    process group.
+    """
+
+    def __init__(
+        self,
+        cmd,
+        *,
+        stdout,
+        stderr,
+        returncode,
+        hang,
+        env=None,
+        stdin=None,
+        start_new_session=None,
+    ):
+        self.cmd = cmd
+        self.env = env
+        self.stdin_arg = stdin  # what `server` asked for, not a writable pipe
+        self.start_new_session = start_new_session
+        self._stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+        self._stderr = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
+        self._hang = hang
+        self._never = asyncio.Event()
+        # `_drain_timed_out_async` reads these AFTER the kill; empty readers stand
+        # in for the pipes a killed child leaves behind (its output went to the
+        # cancelled `communicate`). A test wanting a post-kill tail feeds them.
+        self.stdout = stream_reader(b"")
+        self.stderr = stream_reader(b"")
+        self.returncode = None
+        self._exit_code = returncode
+        self.killed = False
+
+    async def communicate(self):
+        if self._hang:
+            await self._never.wait()  # never fires: the caller's bound must win
+        self.returncode = self._exit_code
+        return self._stdout, self._stderr
+
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+@pytest.fixture
+def patched_async_run(monkeypatch):
+    """Patch ``shutil.which`` + ``asyncio.create_subprocess_exec`` for the async runner.
+
+    The plain-JSON counterpart to :func:`patched_stream`, for
+    ``server._run_comfy_async``. Returns
+    ``setup(stdout=…, returncode=…, stderr=…, hang=…) -> procs`` — the live list of
+    spawned :class:`_FakeAsyncRunProc` objects, so a test can assert the argv, the
+    spawn kwargs, and (on the timeout / cancellation cases) that ``killed`` fired.
+
+    ``stdout`` accepts a dict (JSON-encoded for you — pass an :func:`envelope`), a
+    string, or bytes, matching :func:`patched_run`'s ergonomics.
+    """
+
+    def setup(
+        stdout=None,
+        *,
+        returncode: int = 0,
+        stderr: str = "",
+        hang: bool = False,
+    ) -> list[_FakeAsyncRunProc]:
+        if stdout is None:
+            stdout = ""
+        if isinstance(stdout, dict):
+            stdout = json.dumps(stdout)
+        # Rebound because the inner fake's own `stdout=` kwarg (the PIPE sentinel
+        # `server` passes) shadows the name — same reason `_canonical_run` keeps a
+        # `canned_*` pair.
+        canned_stdout, canned_stderr = stdout, stderr
+        procs: list[_FakeAsyncRunProc] = []
+
+        async def fake_exec(
+            *cmd, stdout, stderr, env, stdin=None, start_new_session=None
+        ):
+            proc = _FakeAsyncRunProc(
+                list(cmd),
+                stdout=canned_stdout,
+                stderr=canned_stderr,
+                returncode=returncode,
+                hang=hang,
+                env=env,
+                stdin=stdin,
+                start_new_session=start_new_session,
+            )
             procs.append(proc)
             return proc
 

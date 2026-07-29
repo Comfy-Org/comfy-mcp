@@ -29,7 +29,7 @@ from pathlib import PurePosixPath
 import pytest
 from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope, stream_reader
 
-from comfy_local_mcp import server, textutil
+from comfy_local_mcp import failure_log, server, textutil
 
 
 def _download_model(*args, **kwargs):
@@ -68,14 +68,26 @@ def _missing_background_error() -> server.ComfyCliError:
     )
 
 
+def _reject_background(*args, **kwargs):
+    """Stand in for ``_run_comfy`` on a CLI too old to know ``--background``.
+
+    The whole-of-``_run_comfy`` counterpart to :func:`legacy_comfy_cli`, for the
+    tests that only care about what the FALLBACK is handed and stub
+    ``_run_comfy_async`` themselves — there is no second call to pass through, so
+    a per-argv dispatch would be ceremony.
+    """
+    raise _missing_background_error()
+
+
 @pytest.fixture
 def legacy_comfy_cli(monkeypatch):
     """Simulate a comfy-cli too old to know ``model download --background``.
 
     Answers only the ``--background`` submit with the Click usage error such a
-    CLI produces and passes every other call through to the REAL ``_run_comfy``,
-    so the fallback still exercises the genuine plain-exit machinery underneath
-    (``patched_plain_run`` + ``_synthesize_plain_result``) rather than a stub of
+    CLI produces and passes every other call through to the REAL ``_run_comfy``.
+    The fallback itself runs on ``_run_comfy_async``, which this leaves entirely
+    alone, so it still exercises the genuine plain-exit machinery underneath
+    (``patched_async_run`` + ``_synthesize_plain_result``) rather than a stub of
     it. This is a per-ARGV reply rather than a second spawn shape, which is why
     it lives here instead of in ``conftest``.
     """
@@ -2117,11 +2129,13 @@ def test_download_model_attaches_the_id_when_the_poll_raises(monkeypatch):
     assert isinstance(excinfo.value.__cause__, server.ComfyCliError)
 
 
-def test_download_model_falls_back_to_the_synchronous_call_on_an_old_cli(
-    patched_plain_run, legacy_comfy_cli
+def test_download_model_falls_back_to_the_foreground_call_on_an_old_cli(
+    patched_async_run, legacy_comfy_cli
 ):
     """A comfy-cli without `--background` still downloads, the old blocking way."""
-    calls = patched_plain_run(0, stderr="Done in 55.8s. Saved to /models/x.safetensors")
+    procs = patched_async_run(
+        stderr="Done in 55.8s. Saved to /models/x.safetensors",
+    )
 
     result = _download_model("https://hf.co/x.safetensors")
 
@@ -2129,16 +2143,20 @@ def test_download_model_falls_back_to_the_synchronous_call_on_an_old_cli(
     assert "Done in 55.8s" in result["message"]
     # Exactly one spawn reached comfy-cli — the rejected `--background` submit
     # never ran anything — and the retry drops the flag it choked on.
-    assert len(calls) == 1
-    assert "--background" not in calls[0]["cmd"]
-    assert calls[0]["timeout"] == server._DOWNLOAD_SYNC_TIMEOUT
-    # wait=True was honored as well as it can be here — the transfer really did
-    # finish inside the call — so nothing is flagged.
-    assert "background_unsupported" not in result
+    assert len(procs) == 1
+    assert "--background" not in procs[0].cmd
+    # Spawned through the ASYNC runner, with the same guardrails as every other
+    # async spawn: own process group (so a kill reaps the tree) and no inherited
+    # stdin (that fd is this server's JSON-RPC channel).
+    assert procs[0].start_new_session is True
+    assert procs[0].stdin_arg == asyncio.subprocess.DEVNULL
+    # It ran on the legacy path, and now says so even though `wait=True` was
+    # honored as well as it can be here — there is still no `download_id`.
+    assert result["background_unsupported"] is True
 
 
 def test_download_model_fallback_flags_a_wait_false_it_could_not_honor(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """The legacy path blocks even on wait=False, and says so in the payload.
 
@@ -2150,13 +2168,104 @@ def test_download_model_fallback_flags_a_wait_false_it_could_not_honor(
     Deliberately still a success: refusing would remove the only way to download
     a model on a comfy-cli that predates `--background`, and the file did land.
     """
-    patched_plain_run(0, stderr="Done in 55.8s. Saved to /models/x.safetensors")
+    patched_async_run(stderr="Done in 55.8s. Saved to /models/x.safetensors")
 
     result = _download_model("https://hf.co/x.safetensors", wait=False)
 
     assert result["ok"] is True
     assert result["background_unsupported"] is True
     assert "download_id" not in result
+
+
+def test_download_model_legacy_wait_true_spends_what_the_submit_left(monkeypatch):
+    """The waited fallback is bounded by `timeout_seconds`, not a silent 30 min.
+
+    The rejected `--background` submit already spent part of the caller's
+    deadline, so the foreground transfer gets the remainder — the same two-phase
+    spend the modern path does with its poll — and `_DOWNLOAD_SYNC_TIMEOUT` is
+    only the cap on it.
+    """
+    seen: dict[str, float] = {}
+    elapsed = 0.2
+
+    def fake_run(*args, **kwargs):
+        time.sleep(elapsed)  # the submit burns part of the deadline before failing
+        raise _missing_background_error()
+
+    async def fake_async(*args, timeout=None, **kwargs):
+        seen["bound"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server, "_run_comfy_async", fake_async)
+
+    _download_model("https://hf.co/x.safetensors", timeout_seconds=30.0)
+
+    assert seen["bound"] == pytest.approx(30.0 - elapsed, abs=0.5)
+
+
+def test_download_model_legacy_wait_true_is_capped_by_the_sync_ceiling(monkeypatch):
+    """A caller who budgeted more than the cap is still held only to the cap."""
+    seen: dict[str, float] = {}
+
+    async def fake_async(*args, timeout=None, **kwargs):
+        seen["bound"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_comfy", _reject_background)
+    monkeypatch.setattr(server, "_run_comfy_async", fake_async)
+
+    _download_model(
+        "https://hf.co/x.safetensors", timeout_seconds=server._MAX_DOWNLOAD_WAIT_TIMEOUT
+    )
+
+    assert seen["bound"] == server._DOWNLOAD_SYNC_TIMEOUT
+
+
+def test_download_model_legacy_floors_an_exhausted_remainder(monkeypatch):
+    """An all-but-spent deadline is floored, not passed through as ~0.
+
+    A sub-millisecond bound would fail before comfy-cli printed anything; the
+    floor buys the actionable timeout message (which names the possible partial
+    file) instead of a contentless instant error.
+    """
+    seen: dict[str, float] = {}
+
+    def fake_run(*args, **kwargs):
+        time.sleep(1.2)  # overspends the caller's whole 1s budget
+        raise _missing_background_error()
+
+    async def fake_async(*args, timeout=None, **kwargs):
+        seen["bound"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server, "_run_comfy_async", fake_async)
+
+    _download_model("https://hf.co/x.safetensors", timeout_seconds=1.0)
+
+    assert seen["bound"] == server._MIN_LEGACY_DOWNLOAD_TIMEOUT
+
+
+def test_download_model_legacy_wait_false_keeps_the_full_cap(monkeypatch):
+    """wait=False stays on the cap: it explicitly decoupled from waiting.
+
+    It never reads `timeout_seconds` (the docstring says so), so tightening its
+    bound would only truncate a transfer nobody asked to be quick. What it gains
+    from the async runner is the reaping on cancellation, not a shorter deadline.
+    """
+    seen: dict[str, float] = {}
+
+    async def fake_async(*args, timeout=None, **kwargs):
+        seen["bound"] = timeout
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_comfy", _reject_background)
+    monkeypatch.setattr(server, "_run_comfy_async", fake_async)
+
+    _download_model("https://hf.co/x.safetensors", wait=False, timeout_seconds=5.0)
+
+    assert seen["bound"] == server._DOWNLOAD_SYNC_TIMEOUT
 
 
 def test_download_model_does_not_fall_back_on_a_real_submit_failure(monkeypatch):
@@ -3465,7 +3574,7 @@ def test_error_envelope_whitespace_message_falls_back_to_stderr():
 
 
 def test_download_model_synthesizes_success_on_plain_exit(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """`comfy model download` streams text + exits 0, no envelope -> success.
 
@@ -3474,8 +3583,7 @@ def test_download_model_synthesizes_success_on_plain_exit(
     retry of a multi-GB fetch — a success payload is synthesized carrying the
     CLI's printed tail (where "Done in …" and the saved path live).
     """
-    patched_plain_run(
-        0,
+    patched_async_run(
         stderr="Downloading x.safetensors...\nDone in 55.8s. Saved to /models/x.safetensors",
     )
 
@@ -3486,16 +3594,16 @@ def test_download_model_synthesizes_success_on_plain_exit(
     assert "Done in 55.8s" in result["message"]
 
 
-def test_download_model_nonzero_exit_still_raises(patched_plain_run, legacy_comfy_cli):
+def test_download_model_nonzero_exit_still_raises(patched_async_run, legacy_comfy_cli):
     """A real download failure (non-zero exit, no envelope) must still raise."""
-    patched_plain_run(1, stderr="HTTP 404: model not found")
+    patched_async_run(returncode=1, stderr="HTTP 404: model not found")
 
     with pytest.raises(server.ComfyCliError, match="returned no JSON"):
         _download_model("https://hf.co/missing.safetensors")
 
 
 def test_download_model_synthesizes_despite_stray_non_envelope_json(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """A stray non-envelope JSON line on a clean download exit is still success.
 
@@ -3503,9 +3611,8 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(
     diagnostic line that happens to parse must NOT be mistaken for a result
     envelope and unwrapped into a spurious failure (BE-3345 edge case).
     """
-    patched_plain_run(
-        0,
-        stdout='{"level": "info", "msg": "connection reused"}\n',
+    patched_async_run(
+        '{"level": "info", "msg": "connection reused"}\n',
         stderr="Done in 12.3s. Saved to /models/x.safetensors",
     )
 
@@ -3517,7 +3624,7 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(
 
 
 def test_download_model_envelope_then_diagnostic_keeps_envelope_data(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """A real envelope FOLLOWED BY a diagnostic JSON line still wins (BE-3345).
 
@@ -3526,21 +3633,20 @@ def test_download_model_envelope_then_diagnostic_keeps_envelope_data(
     genuine success into the synthesized fast-path — the envelope's `data` (the
     real saved-path metadata) must be returned, not the printed-text stopgap.
     """
-    patched_plain_run(
-        0,
-        stdout=(
-            '{"type": "envelope", "ok": true, "data": {"saved": "/models/x"}}\n'
-            '{"level": "info", "msg": "cleanup done"}\n'
-        ),
+    patched_async_run(
+        '{"type": "envelope", "ok": true, "data": {"saved": "/models/x"}}\n'
+        '{"level": "info", "msg": "cleanup done"}\n'
     )
 
     result = _download_model("https://hf.co/x.safetensors")
 
-    assert result == {"saved": "/models/x"}
+    # The legacy marker rides along on the envelope's own data, which is
+    # otherwise returned verbatim.
+    assert result == {"saved": "/models/x", "background_unsupported": True}
 
 
 def test_download_model_error_envelope_then_diagnostic_still_raises(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """An error envelope followed by a diagnostic line still raises, not synthesized.
 
@@ -3548,13 +3654,10 @@ def test_download_model_error_envelope_then_diagnostic_still_raises(
     error envelope as a synthesized success — the error envelope is preferred and
     propagates its code (BE-3345).
     """
-    patched_plain_run(
-        0,
-        stdout=(
-            '{"type": "envelope", "ok": false, '
-            '"error": {"code": "download_failed", "message": "checksum mismatch"}}\n'
-            '{"level": "info", "msg": "cleanup done"}\n'
-        ),
+    patched_async_run(
+        '{"type": "envelope", "ok": false, '
+        '"error": {"code": "download_failed", "message": "checksum mismatch"}}\n'
+        '{"level": "info", "msg": "cleanup done"}\n'
     )
 
     with pytest.raises(server.ComfyCliError, match=r"download_failed"):
@@ -3576,7 +3679,7 @@ def test_download_model_still_honors_a_real_error_envelope(patched_run):
 
 
 def test_download_model_keeps_saved_path_tail_on_verbose_output(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """A verbose multi-GB fetch caps to the TAIL so the saved-path survives.
 
@@ -3586,7 +3689,7 @@ def test_download_model_keeps_saved_path_tail_on_verbose_output(
     """
     tail = "Done in 903.4s. Saved to /models/checkpoints/big.safetensors"
     noise = "\n".join(f"Downloading... {i}% ({i * 40} MiB)" for i in range(100))
-    patched_plain_run(0, stderr=f"{noise}\n{tail}")
+    patched_async_run(stderr=f"{noise}\n{tail}")
 
     result = _download_model("https://hf.co/big.safetensors")
 
@@ -3596,7 +3699,7 @@ def test_download_model_keeps_saved_path_tail_on_verbose_output(
 
 
 def test_download_model_fallback_omits_url_when_no_output(
-    patched_plain_run, legacy_comfy_cli
+    patched_async_run, legacy_comfy_cli
 ):
     """The no-output fallback message must not echo the (possibly signed) URL.
 
@@ -3604,7 +3707,7 @@ def test_download_model_fallback_omits_url_when_no_output(
     synthesized fallback lands in the tool response and host logs, so it reports
     only the flag-free `model download` action, never the raw args.
     """
-    patched_plain_run(0)  # exit 0 with no stdout/stderr -> fallback message
+    patched_async_run()  # exit 0 with no stdout/stderr -> fallback message
 
     result = _download_model("https://hf.co/x.safetensors?sig=SECRETTOKEN")
 
@@ -3612,6 +3715,238 @@ def test_download_model_fallback_omits_url_when_no_output(
     assert "SECRETTOKEN" not in result["message"]
     assert "hf.co" not in result["message"]
     assert "model download" in result["message"]
+
+
+def test_download_model_legacy_timeout_kills_the_transfer_and_guides_the_caller(
+    patched_async_run, legacy_comfy_cli, monkeypatch
+):
+    """A waited fallback that overruns its bound kills the transfer and says so.
+
+    This is the BE-5167 shape: the bytes were moving inside THIS call, so unlike
+    the `--background` path there is no detached worker left to poll — the
+    transfer is dead and a partial file may be on disk with no `download_id` to
+    check it with. The error has to carry all of that, plus the way out.
+    """
+    # Shrink the FLOOR, not the cap: `_DOWNLOAD_SYNC_TIMEOUT` has to stay real so
+    # the retry guidance quotes the number a caller would actually pass.
+    monkeypatch.setattr(server, "_MIN_LEGACY_DOWNLOAD_TIMEOUT", 0.05)
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        failure_log,
+        "_log_failure",
+        lambda kind, args, **kwargs: logged.append({"kind": kind, **kwargs}),
+    )
+    procs = patched_async_run(hang=True)  # a child that outlives its deadline
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model(
+            "https://hf.co/big.safetensors",
+            relative_path="models/checkpoints",
+            filename="big.safetensors",
+            # All but exhausted, so the floor decides the bound (see above).
+            timeout_seconds=0.01,
+        )
+
+    message = str(excinfo.value)
+    assert excinfo.value.timed_out is True
+    # The original diagnosis is APPENDED to, not replaced — the stderr/stdout
+    # tails the runner collected have to survive.
+    assert "comfy-cli timed out after 0.05s" in message
+    assert "predates `model download --background`" in message
+    # Name the exact partial file: `filename` was supplied, so it is knowable.
+    assert "models/checkpoints/big.safetensors" in message
+    assert "timeout_seconds" in message and "1800" in message  # how to retry
+    assert "upgrade comfy-cli" in message
+    # The process TREE was killed rather than left to keep writing.
+    assert procs[0].killed is True
+    assert [record["kind"] for record in logged] == ["timeout"]
+
+
+def test_download_model_legacy_timeout_names_the_folder_without_a_filename(
+    patched_async_run, legacy_comfy_cli, monkeypatch
+):
+    """Without `filename` the basename is comfy-cli's to derive, so name the dir.
+
+    Guessing a name from the URL would send the caller looking for the wrong
+    file — worse than reporting the folder the partial is somewhere inside.
+    """
+    monkeypatch.setattr(server, "_MIN_LEGACY_DOWNLOAD_TIMEOUT", 0.05)
+    patched_async_run(hang=True)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model("https://hf.co/big.safetensors", timeout_seconds=0.01)
+
+    message = str(excinfo.value)
+    assert "models/ (relative to the workspace root" in message  # the default dir
+    assert "name from the URL" in message
+
+
+def test_download_model_legacy_timeout_on_wait_false_does_not_suggest_a_bigger_bound(
+    patched_async_run, legacy_comfy_cli, monkeypatch
+):
+    """wait=False already ran at the cap, so "raise timeout_seconds" is dead advice.
+
+    It never reads the parameter on this path, so pointing at it would send the
+    caller round a loop that changes nothing. The upgrade route is the real one.
+    """
+    monkeypatch.setattr(server, "_DOWNLOAD_SYNC_TIMEOUT", 0.05)
+    patched_async_run(hang=True)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model("https://hf.co/big.safetensors", wait=False)
+
+    message = str(excinfo.value)
+    assert "retry with a larger `timeout_seconds`" not in message
+    assert "already ran at its" in message
+    assert "upgrade comfy-cli" in message
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "filename", "expected"),
+    [
+        # No `relative_path` -> comfy-cli's own DEFAULT_COMFY_MODEL_PATH.
+        (None, None, "models/ (relative"),
+        (None, "x.safetensors", "models/x.safetensors (relative"),
+        ("models/loras", None, "models/loras/ (relative"),
+        ("models/loras", "x.safetensors", "models/loras/x.safetensors (relative"),
+    ],
+)
+def test_legacy_download_partial_names_what_it_can(relative_path, filename, expected):
+    """The exact path is only knowable when the caller supplied `filename`.
+
+    Without it comfy-cli derives the basename from the URL, so naming a guessed
+    file would send the caller looking for the wrong one — report the directory.
+    """
+    described = server._legacy_download_partial(relative_path, filename)
+
+    assert described.startswith(expected)
+    if not filename:
+        assert "name from the URL" in described
+
+
+def test_download_model_legacy_non_timeout_failure_propagates_unwrapped(
+    patched_async_run, legacy_comfy_cli
+):
+    """Only a TIMEOUT gets the partial-file guidance; a real failure passes through.
+
+    A 404 or a checksum mismatch is comfy-cli's own verdict — dressing it up as
+    "the transfer was killed at its bound, a partial may remain" would be a lie.
+    """
+    patched_async_run(returncode=1, stderr="HTTP 404: model not found")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model("https://hf.co/missing.safetensors")
+
+    message = str(excinfo.value)
+    assert "HTTP 404" in message
+    assert excinfo.value.timed_out is False
+    assert "INCOMPLETE file may remain" not in message
+
+
+def test_download_model_legacy_cancellation_reaps_the_transfer(
+    patched_async_run, legacy_comfy_cli, monkeypatch
+):
+    """Cancelling the tool call must kill the transfer, not orphan it (BE-5167).
+
+    This is what `asyncio.to_thread(_run_comfy, …)` could not do: its cancellation
+    never reached the thread, so an MCP cancel notification (or a stdio shutdown
+    tearing the task group down) left `comfy model download` and its multi-GB
+    partial running, killable only by pid.
+    """
+    procs = patched_async_run(hang=True)
+
+    async def drive():
+        # Wrap the fixture's fake so the cancel fires at a DETERMINISTIC point —
+        # once the fallback child exists. Cancelling on a fixed number of loop
+        # turns would race the `to_thread` hop the rejected submit makes first.
+        spawned = asyncio.Event()
+        fake_exec = server.asyncio.create_subprocess_exec
+
+        async def notifying_exec(*args, **kwargs):
+            proc = await fake_exec(*args, **kwargs)
+            spawned.set()
+            return proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", notifying_exec)
+        task = asyncio.ensure_future(
+            server.download_model("https://hf.co/big.safetensors", wait=False)
+        )
+        await spawned.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+
+    assert len(procs) == 1
+    assert procs[0].killed is True  # the `finally` fired
+
+
+def test_run_comfy_async_matches_the_plain_runners_argv_and_unwrap(patched_async_run):
+    """The async twin is a twin: same global-flags-first argv, same unwrap."""
+    procs = patched_async_run(envelope(data={"x": 1}))
+
+    assert asyncio.run(server._run_comfy_async("jobs", "status", "abc")) == {"x": 1}
+
+    cmd = procs[0].cmd
+    assert cmd[0] == server.COMFY_BIN
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["jobs", "status", "abc"]  # subcommand strictly after
+    assert procs[0].env["COMFY_WHERE"] == "local"
+
+
+def test_run_comfy_async_raises_an_error_envelopes_code(patched_async_run):
+    """An error envelope still raises `ComfyCliError` carrying its code."""
+    patched_async_run(
+        envelope(ok=False, error={"code": "download_failed", "message": "checksum"}),
+        returncode=1,
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        asyncio.run(server._run_comfy_async("model", "download"))
+
+    assert excinfo.value.code == "download_failed"
+    assert excinfo.value.returncode == 1
+
+
+def test_run_comfy_async_nonzero_exit_without_an_envelope_raises(patched_async_run):
+    """`plain_ok` is not in play here, so a bare non-zero exit still raises."""
+    patched_async_run(returncode=3, stderr="boom")
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        asyncio.run(server._run_comfy_async("model", "download"))
+
+
+def test_run_comfy_async_plain_ok_synthesizes_on_a_clean_no_envelope_exit(
+    patched_async_run,
+):
+    """BE-3345 regression guard: exit 0 + human text + no envelope is a SUCCESS.
+
+    Losing this in the move off `_run_comfy` would turn every legacy download
+    that actually landed into a "returned no JSON" false negative — and invite a
+    retry of a multi-GB fetch.
+    """
+    patched_async_run(stderr="Done in 55.8s. Saved to /models/x.safetensors")
+
+    result = asyncio.run(server._run_comfy_async("model", "download", plain_ok=True))
+
+    assert result["ok"] is True
+    assert result["action"] == "model download"
+    assert "Done in 55.8s" in result["message"]
+
+
+def test_run_comfy_async_decodes_undecodable_bytes_instead_of_raising(
+    patched_async_run,
+):
+    """A mis-encoded byte degrades one character; it must not abort the call.
+
+    Same `errors="replace"` rationale as the streaming reader: comfy-cli's output
+    is forced to UTF-8, so a bad byte means truncation or corruption — not a
+    reason to fail a transfer that completed.
+    """
+    patched_async_run(b'{"type": "envelope", "ok": true, "data": {"n": "\xff"}}\n')
+
+    assert asyncio.run(server._run_comfy_async("model", "download")) == {"n": "�"}
 
 
 def test_discover_maps_command_and_returns_data(patched_run):
