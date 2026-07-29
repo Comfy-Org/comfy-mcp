@@ -5873,7 +5873,17 @@ _VERSION_ALIASES = ("nightly", "latest")
 # client-side SANITY check, not an authority on which tags exist: comfy-cli (and
 # git) own that, and a well-formed version with no such release still fails
 # there, with the engine's own message.
-_SEMVER_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+#
+# Digits are `[0-9]`, NOT `\d`: on a `str` pattern `\d` is Unicode-aware and
+# matches fullwidth or Arabic-Indic digits (`１.２.３`, `٠.٢٤.٠`), which would
+# raise the destructive prompt and be forwarded verbatim to comfy-cli and git
+# while this comment claimed the match was ASCII-safe. The `v` prefix is accepted
+# in either case for the same reason the aliases are matched case-insensitively;
+# `_guard_version` normalizes `V` down, because comfy-cli strips only a lowercase
+# one.
+_SEMVER_RE = re.compile(
+    r"^[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 # Generous ceiling on `version`, set the way :data:`_MAX_PROMPT_ID_LEN` is: the
 # regex above would reject an oversized value anyway, but the length is checked
@@ -5919,7 +5929,14 @@ def _guard_version(version: str) -> str:
     if lowered in _VERSION_ALIASES:
         return lowered
     if _SEMVER_RE.match(stripped):
-        return stripped
+        # comfy-cli's `validate_version` strips a leading `v` with a
+        # case-SENSITIVE `startswith("v")` and hands the rest to
+        # `semver.VersionInfo.parse`, so `V0.24.0` would die in the engine. The
+        # aliases above are already case-insensitive and the refusal text
+        # promises a leading `v` works, so normalize rather than refuse. Only the
+        # prefix is lowered: semver prerelease/build identifiers are
+        # case-sensitive and must reach the engine as written.
+        return f"v{stripped[1:]}" if stripped.startswith("V") else stripped
     raise ComfyCliError(
         f"invalid version: {stripped!r} — expected 'nightly', 'latest', or a "
         "ComfyUI release like '0.24.0' (a leading 'v' is accepted). Nothing was "
@@ -6038,21 +6055,75 @@ def _local_comfyui_running() -> bool:
     and so this composes an existing tool the way ``restart_comfyui`` composes
     ``stop_comfyui``/``launch_comfyui``.
 
-    comfy-cli reports the flag under ``server.running``; the top-level fallback
-    covers a payload that hoists it, and anything else (an absent or non-boolean
-    field) reads as NOT running. That is deliberate: this probe gates a refusal,
-    and failing closed on "could not tell" would make the tool unusable on any
-    comfy-cli whose ``env`` payload is shaped differently, for no safety gain the
-    consent prompt — which states outright that the server must be restarted —
-    does not already provide.
+    **Fails CLOSED**: an unreadable answer raises rather than reading as "not
+    running". comfy-cli's ``env`` payload is a pinned contract, not a guess:
+    ``fill_data`` sets ``server.running`` from ``check_comfy_server_running``,
+    which returns a bool on every path, and ``schemas/env.json`` lists ``running``
+    under ``server``'s ``required`` as a ``boolean``. On top of that
+    :func:`server_info` refuses any comfy-cli whose envelope schema major differs
+    from the one this server speaks. So the refusal below cannot fire against a
+    conforming comfy-cli; it fires only where that contract is ALREADY broken,
+    and there "could not tell" is a much better answer than reinstalling
+    dependencies under a possibly-live server — the one thing this tool documents
+    that it will not do. Both routes out are named in the message.
+
+    ``server_info`` itself can also fail (a ``comfy env`` timeout, no envelope, a
+    version mismatch, or an ``OSError``/``UnicodeDecodeError`` decoding a
+    workspace path). Those are re-raised as :class:`ComfyCliError` naming the
+    switch, so every bad path out of this tool honors one error contract and says
+    that nothing was changed.
     """
-    info = server_info()
-    if not isinstance(info, dict):
-        return False
-    block = info.get("server")
-    if isinstance(block, dict) and isinstance(block.get("running"), bool):
-        return block["running"]
-    return info.get("running") is True
+    try:
+        info = server_info()
+    except ComfyCliError as exc:
+        raise ComfyCliError(
+            "cannot switch versions: could not determine whether the local "
+            f"ComfyUI is running — `comfy env` failed: {exc} Nothing was changed."
+        ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ComfyCliError(
+            "cannot switch versions: could not determine whether the local "
+            f"ComfyUI is running — reading `comfy env` failed: {exc} Nothing was "
+            "changed."
+        ) from exc
+    block = info.get("server") if isinstance(info, dict) else None
+    running = block.get("running") if isinstance(block, dict) else None
+    if isinstance(running, bool):
+        return running
+    raise ComfyCliError(
+        "cannot switch versions: `comfy env` did not report whether the local "
+        "ComfyUI is running — expected a boolean `server.running`, which "
+        "comfy-cli's own env schema requires. Refusing rather than reinstalling "
+        "Python dependencies under a server that may be live. Run `comfy env` in "
+        "a terminal to see what it reports; if the install is healthy and you "
+        "know ComfyUI is stopped, run `comfy update comfy --version <VERSION>` "
+        "there directly. Nothing was changed."
+    )
+
+
+# Shared by the pre-consent gate and the re-check under the lock, so the two
+# cannot drift into telling the caller different things.
+_RUNNING_REFUSAL = (
+    "refusing to switch versions while the local ComfyUI is running: the switch "
+    "reinstalls Python dependencies underneath the live process, which can leave "
+    "it serving half-replaced code. Call `stop_comfyui` first, then this tool, "
+    "then `launch_comfyui` and `server_info` to confirm the new version. Nothing "
+    "was changed."
+)
+
+# Shared by the advisory pre-consent peek and the authoritative acquire below.
+_SWITCH_UPDATE_BUSY = (
+    "an update is already running in this server; switching versions mutates the "
+    "same ComfyUI git checkout and Python environment, so the two at once can "
+    "corrupt the install. Wait for the in-flight update to finish and call "
+    "again. Nothing was changed."
+)
+
+
+def _refuse_if_local_comfyui_running() -> None:
+    """Raise the running-server refusal if ``comfy env`` reports one up."""
+    if _local_comfyui_running():
+        raise ComfyCliError(_RUNNING_REFUSAL)
 
 
 # `comfy update comfy --version <X>` does a `git fetch` + checkout and then
@@ -6060,6 +6131,16 @@ def _local_comfyui_running() -> bool:
 # than seconds. Shorter than `_UPDATE_TIMEOUT` because it never walks every
 # custom node pack the way `update_comfyui(target="all")` can.
 _SWITCH_TIMEOUT = 900.0
+
+# Kept OFF asyncio's shared default executor for the reason `_GENERATE_EXECUTOR`
+# spells out: a run abandoned by its caller keeps its worker for up to
+# `_SWITCH_TIMEOUT`, and on the default pool that starves every other
+# `to_thread` caller in the process (`_check_comfy_version`,
+# `_engine_auto_confirms`, the download pollers). One worker is enough and says
+# what is true: `_UPDATE_LOCK` — which is now released only when the submitted
+# job finishes, never when the awaiting coroutine is cancelled — already admits
+# exactly one switch at a time, so a second can never be queued behind the first.
+_SWITCH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comfy-switch")
 
 
 def _run_version_switch(version: str) -> Any:
@@ -6073,7 +6154,15 @@ def _run_version_switch(version: str) -> Any:
     version gap — the same contract ``download_model``'s ``--background`` degrade
     relies on. The difference here is that this one does not silently degrade to
     another path: there is no other path, so it re-raises with the upgrade step.
+
+    Re-probes for a running ComfyUI FIRST, under ``_UPDATE_LOCK`` and on this
+    worker thread. The tool's pre-consent gate can be minutes stale by the time
+    it gets here — an elicitation may sit for ``_ELICIT_TIMEOUT`` — and
+    ``launch_comfyui`` does not take that lock, so a server started in the
+    meantime would otherwise get its dependencies reinstalled underneath it,
+    which is precisely what the gate exists to refuse.
     """
+    _refuse_if_local_comfyui_running()
     try:
         return _run_comfy(
             "update",
@@ -6130,7 +6219,11 @@ async def switch_comfyui_version(
     underneath a live process can leave it serving half-replaced code, so the
     call fails and tells you to ``stop_comfyui`` first rather than doing it for
     you. That check runs before the confirmation prompt, so a caller that forgot
-    the stop is not asked to approve something that cannot proceed.
+    the stop is not asked to approve something that cannot proceed — and again
+    immediately before the switch, because a prompt may sit unanswered for
+    minutes and ``launch_comfyui`` is free to start a server in that window. It
+    fails CLOSED: an answer this server cannot read is refused too, not taken as
+    "not running".
 
     **Consent is per call, and the USER gives it — not the agent.** On a client
     that supports MCP elicitation the human is shown a prompt naming exactly what
@@ -6156,31 +6249,38 @@ async def switch_comfyui_version(
     effect in a process that is already running.
     """
     target = _guard_version(version)
-    # Before the prompt: a switch that cannot proceed should not be approved.
+    # Everything before the prompt answers one question: could this switch
+    # proceed at all? A user should not be asked to approve something that is
+    # then refused. This peek is advisory — the authoritative, race-free acquire
+    # is below — but it means an in-flight update refuses here rather than after
+    # a prompt the user answered and two subprocesses this call spawned.
+    if _UPDATE_LOCK.locked():
+        raise ComfyCliError(_SWITCH_UPDATE_BUSY)
     # `server_info` is sync and spawns children, so it runs off the event loop.
-    if await asyncio.to_thread(_local_comfyui_running):
-        raise ComfyCliError(
-            "refusing to switch versions while the local ComfyUI is running: "
-            "the switch reinstalls Python dependencies underneath the live "
-            "process, which can leave it serving half-replaced code. Call "
-            "`stop_comfyui` first, then this tool, then `launch_comfyui` and "
-            "`server_info` to confirm the new version. Nothing was changed."
-        )
+    await asyncio.to_thread(_refuse_if_local_comfyui_running)
     await _resolve_switch_consent(target, confirm_switch, ctx)
     # Refuse rather than queue, exactly as `update_comfyui` does and for the same
     # reason — see its comment. Acquired AFTER consent so a declined call never
     # blocks an update that is legitimately in flight.
     if not _UPDATE_LOCK.acquire(blocking=False):
-        raise ComfyCliError(
-            "an update is already running in this server; switching versions "
-            "mutates the same ComfyUI git checkout and Python environment, so "
-            "the two at once can corrupt the install. Wait for the in-flight "
-            "update to finish and call again. Nothing was changed."
-        )
+        raise ComfyCliError(_SWITCH_UPDATE_BUSY)
     try:
-        result = await asyncio.to_thread(_run_version_switch, target)
-    finally:
+        job = _SWITCH_EXECUTOR.submit(_run_version_switch, target)
+    except BaseException:
         _UPDATE_LOCK.release()
+        raise
+    # The lock belongs to the SUBPROCESS, not to this coroutine. Cancelling the
+    # request (a client disconnect, `notifications/cancelled`, a deadline on a
+    # 15-minute call) makes the await below raise `CancelledError`, but it
+    # neither interrupts the worker thread nor kills the `comfy update` it
+    # spawned — git and pip keep rewriting the checkout. Releasing in a `finally`
+    # here would hand the lock to a retry or an `update_comfyui` that then runs a
+    # second concurrent install against the same workspace and venv: exactly the
+    # half-installed state the lock exists to prevent. A done-callback instead
+    # ties the release to the job's own lifetime, and still fires if the job is
+    # cancelled before it ever starts, so the lock cannot leak either way.
+    job.add_done_callback(lambda _job: _UPDATE_LOCK.release())
+    result = await asyncio.wrap_future(job)
     return {"switched_to": target, "result": result, "restart_required": True}
 
 
