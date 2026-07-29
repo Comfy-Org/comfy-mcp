@@ -949,6 +949,187 @@ def test_get_queue_passes_through_payload_without_jobs(patched_run):
     assert server.get_queue() == {"host": "127.0.0.1", "port": 8188}
 
 
+# --- system_stats / free_memory (the ComfyUI resource-management passthrough) ---
+
+
+def test_system_stats_maps_command_and_returns_data(patched_run):
+    """system_stats wraps `comfy system-stats` and returns the envelope data as-is."""
+    stats = {
+        "devices": [
+            {
+                "name": "cuda:0",
+                "type": "cuda",
+                "index": 0,
+                "vram_free": 11_000_000_000,
+                "vram_total": 24_000_000_000,
+            }
+        ],
+        "system": {
+            "ram_free": 30_000_000_000,
+            "ram_total": 64_000_000_000,
+            "comfyui_version": "0.3.0",
+        },
+    }
+    calls = patched_run(envelope(data=stats))
+
+    # Returned UNMODIFIED — no reshaping, no derived fields (thin wrapper rule).
+    assert server.system_stats() == stats
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
+    assert cmd[4:] == ["system-stats"]  # no positional args, no flags
+
+
+def test_free_memory_defaults_to_maximum_headroom(patched_run):
+    """The MCP default is the strongest form: unload models AND reset the cache.
+
+    `--free-memory` is opt-in on the CLI (default False) and on-by-default here
+    (via the `None` = "follow unload_models" sentinel) — an agent calling this
+    tool wants all the VRAM back, so the default diverges on purpose. Pinning the
+    argv is what keeps that divergence honest.
+    """
+    calls = patched_run(envelope(data={"requested": {}, "note": "…"}))
+
+    server.free_memory()
+
+    assert calls[0]["cmd"][4:] == ["free", "--unload-models", "--free-memory"]
+
+
+def test_free_memory_omits_free_memory_flag_when_off(patched_run):
+    """`free_memory=False` OMITS the flag — comfy-cli has no `--no-free-memory`."""
+    calls = patched_run(envelope(data={"requested": {}}))
+
+    server.free_memory(free_memory=False)
+
+    assert calls[0]["cmd"][4:] == ["free", "--unload-models"]
+    assert "--free-memory" not in calls[0]["cmd"]
+
+
+def test_free_memory_sends_no_unload_models_when_off(patched_run):
+    """`unload_models=False` sends the paired OFF flag and drops `--free-memory`.
+
+    The pair must not go out as `--no-unload-models --free-memory`: ComfyUI's
+    `POST /free` only records `unload_models` when it is TRUE (server.py's
+    `if unload_models: set_flag(...)`), and the queue worker then resolves
+    `flags.get("unload_models", free_memory)` — so a `free_memory` left on would
+    supply the default and unload every model, the exact opposite of what
+    `unload_models=False` asks for. Defaulting `free_memory` to `None` ("follow
+    `unload_models`") is what keeps the request honest.
+    """
+    calls = patched_run(envelope(data={"requested": {}}))
+
+    server.free_memory(unload_models=False)
+
+    assert calls[0]["cmd"][4:] == ["free", "--no-unload-models"]
+    assert "--free-memory" not in calls[0]["cmd"]
+
+
+def test_free_memory_rejects_the_contradictory_pair(patched_run):
+    """`unload_models=False, free_memory=True` is refused, not silently obeyed.
+
+    ComfyUI cannot reset the executor cache while keeping models resident, so
+    sending this pair would evict them anyway. Failing up front beats an
+    acknowledgement that reads as "kept your models" while they are being
+    unloaded — and it must not reach comfy-cli at all.
+    """
+    calls = patched_run(envelope(data={"requested": {}}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.free_memory(unload_models=False, free_memory=True)
+
+    assert "free_memory=True with unload_models=False" in str(excinfo.value)
+    assert not calls, "the contradictory pair must never be sent to comfy-cli"
+
+
+def test_free_memory_both_off_is_an_explicit_no_op(patched_run):
+    """Both flags off asks ComfyUI to do nothing — sent, but nothing implied.
+
+    The worker skips both branches, so this is a deliberate no-op kept for
+    symmetry with the CLI. It stays a passthrough rather than an error because
+    comfy-cli's own acknowledgement reports the flags back, letting the caller
+    see that nothing was requested.
+    """
+    calls = patched_run(envelope(data={"requested": {}}))
+
+    server.free_memory(unload_models=False, free_memory=False)
+
+    assert calls[0]["cmd"][4:] == ["free", "--no-unload-models"]
+
+
+def test_free_memory_returns_the_acknowledgement_payload(patched_run):
+    """The return is comfy-cli's request acknowledgement, passed through whole."""
+    payload = {
+        "requested": {"unload_models": True, "free_memory": True},
+        "note": "applies when the queue worker next iterates",
+    }
+    patched_run(envelope(data=payload))
+
+    assert server.free_memory() == payload
+
+
+_NO_SYSTEM_STATS = (
+    2,
+    "",
+    "Usage: comfy [OPTIONS] COMMAND\nNo such command 'system-stats'.",
+)
+_NO_FREE = (2, "", "Usage: comfy [OPTIONS] COMMAND\nNo such command 'free'.")
+
+
+@pytest.mark.parametrize(
+    "tool, reply, verb",
+    [
+        ("system_stats", _NO_SYSTEM_STATS, "system-stats"),
+        ("free_memory", _NO_FREE, "free"),
+    ],
+)
+def test_resource_tools_hint_at_the_upgrade_on_a_comfy_cli_without_the_verb(
+    patched_run, tool, reply, verb
+):
+    """A missing verb raises with the one-command fix, not Click's usage dump.
+
+    These two verbs landed in comfy-cli after the version floor this server
+    enforces, so a current-but-not-newest install hits this. Left raw it reads
+    as "comfy-cli returned no JSON (exit 2)" wrapped around a usage panel —
+    indistinguishable from a broken MCP.
+    """
+    returncode, stdout, stderr = reply
+    patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert f"`comfy {verb}`" in message
+    assert "pip install -U comfy-cli" in message
+    assert server._MIN_COMFY_CLI_STR in message
+    # The raw wrapper/CLI text must not leak through the annotated message.
+    assert "No such command" not in message
+    assert "Usage: comfy" not in message
+    assert "returned no JSON" not in message
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tools_keep_a_real_error_raw(patched_run, tool):
+    """A verb comfy-cli DID dispatch keeps its own error, unannotated.
+
+    Mislabelling "ComfyUI is not running" as a version problem would send the
+    user off to upgrade a comfy-cli that is already fine.
+    """
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert "server_not_running" in message
+    assert "pip install -U comfy-cli" not in message
+
+
 def test_upload_file_passes_paths_and_overwrite(patched_run):
     """upload_file forwards every path and appends --overwrite when asked."""
     calls = patched_run(envelope(data={"uploaded": 2}))
