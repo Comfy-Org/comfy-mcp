@@ -194,27 +194,32 @@ earlier one:
   only when its `host` is neither a loopback address (anything in
   `127.0.0.0/8`, `localhost`, or IPv6 `::1`) nor this host's own name or
   address; an ERROR-shaped `comfy_target` (`{"error": …, "note": …}` from a
-  malformed config) resolves no remote at all. Check the reported `server` URL
-  too: `COMFY_LOCAL_URL` can repoint comfy-cli at another host WITHOUT
-  producing any `comfy_target` block. For a genuine remote, ask the user about
-  that machine rather than routing its work off local hardware.
+  malformed config) resolves no remote at all. Nothing this server returns
+  carries the local hostname or interface addresses, so if the `host` is a name
+  or LAN IP you cannot place, ASK the user which machine it is rather than
+  guessing — a hostname can be this same box, and a loopback host can be an SSH
+  tunnel to a remote GPU. Check the reported `server` URL too:
+  `COMFY_LOCAL_URL` can repoint comfy-cli at another host WITHOUT producing any
+  `comfy_target` block. For a genuine remote, ask the user about that machine
+  rather than routing its work off local hardware.
 - STEP 2, get a memory figure. The sizes are BYTES — divide by 1073741824. A
   driver reports a little under the advertised size (a 24 GB card reads 23.99,
   and ~22.3 once ECC or a driver reserve is in play), so read a SMALL shortfall
-  as the nominal capacity rather than dropping a band. Do NOT map a figure far
-  below what `gpu.model` names up to that model's size: on a MIG/vGPU PARTITION
-  the model string still names the whole card while `vram_bytes` is the slice
-  you actually get, and rounding a 6 GB slice of an A100 up to 24 GB will OOM
-  the run. Trust the reported figure whenever it is nowhere near nominal.
+  — within ~10% of a nominal size — as that nominal capacity rather than
+  dropping a band. More than ~10% below what `gpu.model` names is NOT driver
+  overhead, so do NOT round it up: on a MIG/vGPU PARTITION the model string
+  still names the whole card while `vram_bytes` is the slice you actually get,
+  and rounding a 6 GB slice of an A100 up into the `>= 24 GB` band will OOM the
+  run. Trust the reported figure whenever the gap is wider than that.
   On Apple Silicon (`arch` `arm64`, `gpu.vendor` Apple) `gpu.vram_bytes` is
   null and `gpu.unified_memory` is true — use `ram_bytes` instead. That
   substitution is APPLE-ONLY.
 - STEP 3, if the figure you need is missing, ASK — do not guess and do not
   probe. `hardware` absent (older comfy-cli), `gpu` null or absent,
-  `vram_bytes` null on ANY non-Apple GPU (including a non-Apple unified-memory
-  part such as a Jetson/Grace board or a Strix Halo APU), or `ram_bytes`
-  missing or zero on the Apple path: every one of these is UNKNOWN, NOT "no
-  GPU". Ask the user what GPU and how much VRAM/RAM they have and route on
+  `vram_bytes` null or zero on ANY non-Apple GPU (including a non-Apple
+  unified-memory part such as a Jetson/Grace board or a Strix Halo APU), or
+  `ram_bytes` missing or zero on the Apple path: every one of these is UNKNOWN,
+  NOT "no GPU". Ask the user what GPU and how much VRAM/RAM they have and route on
   their answer. Never let an UNKNOWN strand a machine that has a usable GPU,
   and do not shell out to probe the hardware yourself — this server can neither
   bound nor audit a command it did not run.
@@ -225,9 +230,15 @@ earlier one:
   diffusion. Apple Silicon, by unified memory: >= 32 GB, image generation is
   OK; under 32 GB, treat it as the no-GPU verdict. A non-Apple INTEGRATED GPU
   that DOES report a `vram_bytes` figure routes on that figure like any other
-  card (one that does not is UNKNOWN — step 3). A CONFIRMED absence of a GPU —
-  the user says there is none, or `gpu` names no device — also means do NOT run
-  local diffusion.
+  card (one that does not is UNKNOWN — step 3). A figure the USER gave you
+  (step 3) routes on the row that fits their machine: the unified-memory row
+  for an Apple Silicon Mac, the VRAM bands otherwise. The non-Apple
+  unified-memory boards step 3 sends you to ask about have no row of their own,
+  so route the GPU-usable figure they report on the VRAM bands — that is their
+  answer, not the Apple-only `ram_bytes` substitution of step 2, which stays
+  Apple-only. A CONFIRMED absence of a GPU is the USER telling you
+  there is none — no `hardware` payload states it, since a null or absent `gpu`
+  is UNKNOWN by step 3 — and that answer also means do NOT run local diffusion.
 - STEP 5, when the answer is "not on this machine", REDIRECT rather than
   dead-end: partner nodes (plain web calls, fine on any machine) or the Comfy
   Cloud MCP if their client has it connected.

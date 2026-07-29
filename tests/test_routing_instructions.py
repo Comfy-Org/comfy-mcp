@@ -98,6 +98,12 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     and OOM the run. Both halves have to be stated or one failure mode replaces
     the other.
 
+    The ~10% cutoff is asserted because the two halves are otherwise a
+    contradiction rather than a rule: "small shortfall" and "far below nominal"
+    have no boundary between them, and a 20 GiB vGPU slice of a 24 GB card
+    (~17% short) reads as either one. A number puts the driver-overhead cases
+    (23.99 and ~22.3 of 24, i.e. ~0% and ~7%) inside and that slice outside.
+
     Anchors are backticked (```ram_bytes```` is NOT a substring of
     ```gpu.vram_bytes````, where the name is preceded by ``v``) so each field
     name can fail independently.
@@ -106,6 +112,7 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     assert "`ram_bytes`" in routing and "`gpu.vram_bytes`" in routing
     assert "1073741824" in routing  # the bytes -> GiB divisor, stated explicitly
     assert "SMALL shortfall" in routing  # rounds up only within driver overhead
+    assert "within ~10% of a nominal size" in routing  # ...and says how small
     assert "MIG/vGPU PARTITION" in routing  # ...but never on a partitioned card
 
 
@@ -148,6 +155,21 @@ def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
     assert "COMFY_LOCAL_URL" in routing
 
 
+def test_routing_asks_when_it_cannot_place_the_target_host(routing):
+    """Whether a host IS this machine is not answerable from tool output alone.
+
+    STEP 1 keys the local/remote split on the ``host`` being neither loopback
+    nor "this host's own name or address", but nothing the server returns
+    carries the local hostname or interface addresses — ``hardware`` reports
+    only ``os`` / ``arch`` / memory — and STEP 3 forbids shelling out to find
+    them. Left there, a ``host`` naming this same machine by hostname or LAN IP
+    reads as a genuine remote and switches routing off; the converse also bites,
+    since a loopback host can be a tunnel to a remote GPU. The block has to send
+    the unresolvable case to the user, the same answer STEP 3 gives.
+    """
+    assert "ASK the user which machine it is" in routing
+
+
 def test_routing_thresholds_do_not_overlap_at_24gb(routing):
     """A 24 GB card is a common capacity and must match exactly one row.
 
@@ -165,9 +187,11 @@ def test_routing_covers_non_nvidia_discrete_gpus(routing):
     ``hardware.gpu.vendor`` reports these, so a block scoped only to NVIDIA
     leaves a machine that plainly has a usable GPU with no verdict at all.
 
-    Anchored on ``ROCm/XPU`` rather than ``AMD/Intel``: the latter also appears
-    in the ``nvidia-smi`` caveat further down, so it would keep passing after
-    this row's non-NVIDIA coverage was deleted.
+    Anchored on ``ROCm/XPU`` rather than ``AMD/Intel`` because that is the
+    load-bearing half: such a card only routes on the VRAM bands when the
+    install is a ROCm/XPU build, and a row degraded to naming the vendors
+    without stating the build requirement would still satisfy an ``AMD/Intel``
+    anchor.
     """
     assert "ROCm/XPU" in routing
 
@@ -180,6 +204,20 @@ def test_routing_covers_apple_silicon_below_the_32gb_line(routing):
     """
     assert ">= 32 GB" in routing
     assert "under 32 GB" in routing
+
+
+def test_routing_can_act_on_the_answer_it_asks_for(routing):
+    """STEP 3 must not ask a question STEP 4 has no row to answer with.
+
+    STEP 3 sends non-Apple unified-memory machines (Jetson/Grace, Strix Halo) to
+    "ask the user ... and route on their answer", but STEP 4's rows are a VRAM
+    table for dedicated cards plus a unified-memory row declared APPLE-ONLY in
+    STEP 2. Without a row for the answer the procedure interrogates the user and
+    then has nowhere to go — the dead-end STEP 5 exists to prevent, arrived at
+    from the opposite direction.
+    """
+    assert "A figure the USER gave you" in routing
+    assert "have no row of their own" in routing
 
 
 def test_routing_redirects_rather_than_dead_ending_a_weak_machine(routing):
@@ -244,15 +282,27 @@ def test_routing_asks_rather_than_reading_an_unknown_gpu_as_no_gpu(routing):
     Apple path needs the mirror case too: a missing or zero ``ram_bytes`` is the
     one figure that branch depends on.
 
+    Zero is asserted alongside null on BOTH paths. A CLI or driver that reports
+    an unsizable card as ``vram_bytes: 0`` would otherwise skip this step
+    entirely and land on step 4's "under 8 GB, do NOT run local diffusion" —
+    stranding the very machine this step exists to rescue, and only on the
+    non-Apple path, since the Apple path already said "missing or zero".
+
     Because UNKNOWN swallows every shape that used to read as "no GPU", the
     no-GPU verdict has to say what a CONFIRMED absence looks like, or step 4's
-    branch becomes unreachable.
+    branch becomes unreachable. It is asserted to be the USER's answer
+    specifically: a data-shaped absence ("``gpu`` names no device") contradicts
+    this step, which already classifies a null-or-absent ``gpu`` as UNKNOWN, and
+    the block's header forbids step 4 overriding it — so that phrasing left the
+    branch dead and every CPU-only machine getting interrogated about its GPU.
     """
     assert "is UNKNOWN, NOT" in routing
-    assert "ANY non-Apple GPU" in routing
+    assert "`vram_bytes` null or zero on ANY non-Apple GPU" in routing
     assert "Jetson/Grace" in routing and "Strix Halo" in routing
     assert "`ram_bytes` missing or zero on the Apple path" in routing
-    assert "CONFIRMED absence" in routing
+    # the confirmed absence is the user's answer, not a payload shape
+    assert "CONFIRMED absence of a GPU is the USER telling you" in routing
+    assert "no `hardware` payload states it" in routing
 
 
 def test_routing_asks_the_user_and_names_no_shell_probe(routing):
