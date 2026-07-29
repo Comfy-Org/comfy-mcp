@@ -184,21 +184,28 @@ Routing — check the machine before running local diffusion:
 - `server_info` passes through comfy-cli's `hardware` block (`os`, `arch`,
   `ram_bytes`, and a `gpu` object carrying `vendor` / `model` / `vram_bytes` /
   `unified_memory`) when the installed comfy-cli reports one. Read it before
-  the first generation. The sizes are BYTES: divide by 1073741824 and then
-  ROUND TO THE NEAREST WHOLE GB before comparing — that divisor yields GiB and
-  drivers report just under nominal capacity, so a 24 GB card reads 23.99 and
-  an 8 GB card 7.99; both must land in the row their nominal size names, not
-  the one below.
+  the first generation. The sizes are BYTES: divide by 1073741824, then compare
+  on the card's NOMINAL capacity rather than the exact quotient — that divisor
+  yields GiB and drivers report under the advertised size, slightly for a
+  consumer card (a 24 GB card reads 23.99) and by more once ECC or a driver
+  reserve is in play (a 24 GB A10/L4 reads about 22.3). Read the figure as a
+  LOWER BOUND and map it up to the advertised capacity its `gpu.model` names;
+  never let a shortfall push a card into the band below its nominal size.
 - On Apple Silicon (`arch` `arm64`, `gpu.vendor` Apple) `gpu.vram_bytes` is
   null and `gpu.unified_memory` is true — the figure to use there is
   `ram_bytes`. That substitution is APPLE-ONLY: a non-Apple integrated GPU
   that shares system memory does not earn the Apple row, so treat it as the
   no-GPU case below rather than reading its `ram_bytes` as VRAM.
-- `hardware` describes the machine THIS server runs on. If `server_info` also
-  reports a `comfy_target` block (`COMFYUI_URL`/`COMFYUI_HOST` is set), the
-  workload actually runs on that OTHER machine — these thresholds do not
-  apply to it, so ask the user about the target rather than routing off local
-  hardware.
+- `hardware` describes the machine THIS server runs on, and that is where MOST
+  tools execute. A `comfy_target` block carrying a `host` diverts only
+  `run_workflow` and the queue/`jobs` tools to that host; `generate_image`,
+  `run_template` and the rest still run LOCALLY, so these thresholds keep
+  governing them. Treat the target as another machine only when it carries a
+  `host` that is NOT this one — a loopback host (`127.0.0.1`, `localhost`) is
+  still this machine, and an ERROR-shaped `comfy_target` (`{"error": …,
+  "note": …}` from a malformed config) resolves no remote at all. For a genuine
+  remote, ask the user about that machine rather than routing its work off
+  local hardware.
 - Discrete GPU (NVIDIA, or an AMD/Intel card on a ROCm/XPU build), by VRAM:
   >= 24 GB, local generation is a good default; 8 GB to under 24 GB, images
   are fine (prefer current, smaller models) but expect video to be slow or
@@ -216,11 +223,12 @@ Routing — check the machine before running local diffusion:
   templates and the compact rows omit `tags`) and `emit_partner_workflow` put
   the model on partner infrastructure, so they are fine on any Mac.
 - If `hardware` is absent (older comfy-cli), OR present but missing the figure
-  you need (`gpu` null or absent, or `vram_bytes` null on a card that is not
-  unified-memory), ASK the user for their GPU and VRAM/RAM — never read an
-  UNKNOWN as "no GPU" and strand a machine that has one. Shell probes are a
-  weak substitute:
-  no single command yields both numbers (on macOS `sysctl -n hw.memsize` for
+  you need (`gpu` null or absent, or `vram_bytes` null on ANY non-Apple GPU —
+  including a non-Apple unified-memory part such as a Jetson/Grace board or a
+  Strix Halo APU, which the Apple `ram_bytes` rule above deliberately does not
+  cover), ASK the user for their GPU and VRAM/RAM — never read an UNKNOWN as
+  "no GPU" and strand a machine that has one. Shell probes are a weak
+  substitute: no single command yields both numbers (on macOS `sysctl -n hw.memsize` for
   unified memory in bytes plus `system_profiler SPDisplaysDataType` to name
   the GPU; elsewhere `nvidia-smi --query-gpu=name,memory.total
   --format=csv,noheader` covers NVIDIA VRAM only — not system RAM, and

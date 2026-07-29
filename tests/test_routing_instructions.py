@@ -61,8 +61,15 @@ def test_instructions_carry_a_routing_block(routing):
     This is the tripwire the content tests hang off: delete the block and this
     fails outright, rather than the content checks quietly passing on phrases
     that also appear in unrelated bullets.
+
+    ``startswith`` would be tautological — the fixture slices from the header's
+    own index — so assert what the slice does NOT guarantee: that the block has
+    real substance between its header and terminator, and still ends on the
+    last bullet rather than having been hollowed out to a stub.
     """
-    assert routing.startswith(_ROUTING_HEADER)
+    assert len(routing) > 500, f"routing block hollowed out to {len(routing)} chars"
+    assert routing.count("- ") >= 6, "routing block lost bullets"
+    assert routing.rstrip().endswith("current templates track current models.")
 
 
 def test_routing_names_the_hardware_block_as_its_signal(routing):
@@ -80,9 +87,11 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     comfy-cli reports ``ram_bytes`` / ``gpu.vram_bytes`` as raw byte counts, so
     without the units stated a literal reading compares a ten-digit number
     against "8 GB" and routes wrong. The rounding half matters just as much: the
-    divisor yields GiB and drivers report just under nominal capacity, so a
-    nominal 24 GB card reads 23.99 and would silently drop into the band below —
-    the exact misclassification the threshold rows exist to make unambiguous.
+    divisor yields GiB and drivers report under the advertised size — a consumer
+    24 GB card reads 23.99, and an ECC/reserving datacenter card (A10, L4) about
+    22.3 — so any exact-rounding recipe still drops a band. The block states the
+    intent instead: read the figure as a lower bound on the card's nominal
+    capacity, which is the misclassification the threshold rows exist to avoid.
 
     Anchors are backticked (```ram_bytes```` is NOT a substring of
     ```gpu.vram_bytes````, where the name is preceded by ``v``) so each field
@@ -91,7 +100,8 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     assert "BYTES" in routing
     assert "`ram_bytes`" in routing and "`gpu.vram_bytes`" in routing
     assert "1073741824" in routing  # the bytes -> GiB divisor, stated explicitly
-    assert "ROUND TO THE NEAREST WHOLE GB" in routing
+    assert "NOMINAL capacity" in routing
+    assert "LOWER BOUND" in routing
 
 
 def test_routing_scopes_the_unified_memory_substitution_to_apple(routing):
@@ -111,8 +121,18 @@ def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
     ``COMFYUI_URL`` / ``COMFYUI_HOST`` point the run tools at another machine
     (surfaced as ``comfy_target``). Routing off local hardware would then reject
     a capable remote GPU, or pile work onto a weaker one.
+
+    The exemption has to be NARROW, though: only ``run`` and ``jobs`` are
+    target-aware (``_TARGET_AWARE_SUBCOMMANDS``), so ``generate_image`` and
+    friends still run locally and the thresholds still govern them; a loopback
+    host is this same machine; and a malformed config yields an error-shaped
+    block that resolves no remote at all. Treating any ``comfy_target`` as
+    "runs elsewhere" would switch routing off on all three.
     """
     assert "comfy_target" in routing
+    assert "generate_image" in routing  # named as still-local
+    assert "ERROR-shaped" in routing
+    assert "127.0.0.1" in routing
 
 
 def test_routing_thresholds_do_not_overlap_at_24gb(routing):
@@ -200,9 +220,17 @@ def test_routing_asks_rather_than_reading_an_unknown_gpu_as_no_gpu(routing):
     Scoping the escape hatch to ``hardware`` being *absent* left those machines
     falling through to "no GPU at all -> do NOT run local diffusion", stranding a
     machine that has a perfectly usable GPU.
+
+    The condition is keyed on non-Apple rather than on non-unified-memory: a
+    non-Apple UNIFIED part (Jetson/Grace, a Strix Halo APU) also reports a null
+    ``vram_bytes``, and the ``ram_bytes`` substitution above is Apple-only, so
+    keying on unified-memory left that machine matching neither branch — with
+    64-128 GB of usable memory and a "do NOT run local diffusion" verdict.
     """
     assert "present but missing the figure" in routing
     assert 'never read an UNKNOWN as "no GPU"' in routing
+    assert "ANY non-Apple GPU" in routing
+    assert "Jetson/Grace" in routing and "Strix Halo" in routing
 
 
 def test_routing_prefers_asking_over_an_unreliable_shell_probe(routing):
@@ -255,6 +283,12 @@ def test_server_info_adds_no_hardware_parsing(monkeypatch, patched_run):
     The thin-wrapper guardrail (AGENTS.md): the routing policy is text, not code.
     A future edit that starts branching on VRAM here would breach it, and this
     is the test that fails when it does.
+
+    ``patched_run`` replays one canned stdout for every invocation, and
+    ``server_info`` makes two (``comfy env`` then the ``outdated`` freshness
+    probe), so the recorded ``calls`` are asserted as well — otherwise the test
+    could not tell which probe the block was read from, and would keep passing
+    if ``hardware`` started being sourced from somewhere else.
     """
     monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
     monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
@@ -269,7 +303,7 @@ def test_server_info_adds_no_hardware_parsing(monkeypatch, patched_run):
             "unified_memory": True,
         },
     }
-    patched_run(
+    calls = patched_run(
         stdout=envelope(
             ok=True,
             data={"server": {"running": False}, "hardware": hardware},
@@ -277,3 +311,11 @@ def test_server_info_adds_no_hardware_parsing(monkeypatch, patched_run):
     )
     result = server.server_info()
     assert result["hardware"] == hardware
+    # `hardware` rides the `comfy env` passthrough, not a probe of our own.
+    assert any("env" in call["cmd"] for call in calls)
+    assert not any(
+        arg
+        for call in calls
+        for arg in call["cmd"]
+        if "hardware" in arg or "gpu" in arg
+    )
