@@ -200,6 +200,7 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 - [Smoke test](#smoke-test)
 - [Contributing](#contributing)
 - [License](#license)
+- [Trademarks](#trademarks)
 
 ## Prerequisites
 
@@ -775,3 +776,16 @@ GPL-3.0 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) by shelling out to
 the `comfy` binary as a separate process — no GPL code is imported or linked.
 `comfy-cli` remains GPL-3.0-licensed and is distributed separately; how its
 copyleft applies depends on how the programs interact.
+
+## Trademarks
+
+"Comfy," "ComfyUI," and the Comfy Org name and logos — including the mark in
+[`assets/logo.svg`](assets/logo.svg) — are trademarks of Comfy Org. Apache-2.0
+is a copyright and patent license; per [section 6 of the license](LICENSE) it
+grants **no** rights to use those names or logos. Forks and derivative works are
+welcome under the license, but must not be named or branded in a way that
+suggests they are official Comfy Org software or carry Comfy Org's endorsement.
+
+Accurate, descriptive references — tutorials, reviews, integrations — are
+welcome. See the [brand guidelines](https://www.comfy.org/brand) for the full
+rules and how to request permission beyond them.
