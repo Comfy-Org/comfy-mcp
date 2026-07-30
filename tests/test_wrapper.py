@@ -29,7 +29,7 @@ from pathlib import PurePosixPath
 import pytest
 from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope, stream_reader
 
-from comfy_local_mcp import failure_log, server, textutil
+from comfy_local_mcp import failure_log, server, tcc, textutil
 
 
 def _download_model(*args, **kwargs):
@@ -478,6 +478,32 @@ def test_missing_binary_raises(monkeypatch):
     monkeypatch.setattr(server.shutil, "which", lambda _: None)
     with pytest.raises(server.ComfyCliError, match="not found on PATH"):
         server._run_comfy("env")
+
+
+def test_missing_binary_install_advice_names_the_version_floor(monkeypatch):
+    """The not-found message's `pip install` must already satisfy the floor.
+
+    A bare ``pip install comfy-cli`` can land a release below
+    ``_MIN_COMFY_CLI``, which drops the user straight into
+    ``_check_comfy_version``'s separate "too old" error — so the first install
+    advice a fresh machine gets pins the floor.
+
+    It pins it with DOUBLE quotes, which is the only form that survives a
+    copy-paste into every shell an MCP client might be launched from: `>` needs
+    quoting everywhere, but cmd.exe does not quote with `'`.
+    """
+    monkeypatch.setattr(server.shutil, "which", lambda _: None)
+    monkeypatch.setattr(tcc, "_is_macos", lambda: False)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("env")
+
+    message = str(excinfo.value)
+    assert f'pip install "comfy-cli>={server._MIN_COMFY_CLI_STR}"' in message
+    # The bare form is what left users one call away from the "too old" error.
+    assert "pip install comfy-cli`" not in message
+    # The single-quoted form leaves cmd.exe users with a stray `=1.13.0'` file.
+    assert "'comfy-cli" not in message
 
 
 def test_error_envelope_carries_structured_code(patched_run):

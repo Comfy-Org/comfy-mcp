@@ -61,7 +61,7 @@ Four steps take you from a fresh install to your first generated image.
 1. **Install the pieces.**
 
    ```bash
-   pip install 'comfy-cli>=1.13.0'  # the engine (>= 1.13.0 required)
+   pip install "comfy-cli>=1.13.0"  # the engine (>= 1.13.0 required)
    comfy install                  # create a ComfyUI workspace (skip if you have one)
    pip install .                  # this MCP server → the `comfy-local-mcp` command
    ```
@@ -205,7 +205,7 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 ## Prerequisites
 
 - **Python ≥ 3.10.**
-- **comfy-cli ≥ 1.13.0** on your `PATH`: `pip install 'comfy-cli>=1.13.0'`. This is the engine
+- **comfy-cli ≥ 1.13.0** on your `PATH`: `pip install "comfy-cli>=1.13.0"`. This is the engine
   every tool wraps; the server refuses to run against an older comfy-cli with an upgrade message.
   1.13.0 is the first release carrying everything this server needs — the `comfy logs` verb, the
   `envelope/1` contract, the `comfy outdated` verb behind `server_info`'s `freshness` block, and
