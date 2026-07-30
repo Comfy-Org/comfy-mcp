@@ -3873,7 +3873,7 @@ def test_download_model_legacy_timeout_message_redacts_the_signed_url(
     """The argv echoed in a timeout must not carry the URL's credential.
 
     A CivitAI / HuggingFace model URL keeps its token in a `?token=…` query (or in
-    `user:pass@` userinfo), and this message lands in the tool response the MCP
+    `<user>:<pass>@` userinfo), and this message lands in the tool response the MCP
     client renders and in the host's logs — the same exposure that makes
     `_synthesize_plain_result` omit raw args altogether.
     """
@@ -3882,12 +3882,12 @@ def test_download_model_legacy_timeout_message_redacts_the_signed_url(
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         _download_model(
-            "https://user:pw@hf.co/big.safetensors?token=SECRETTOKEN", wait=False
+            "https://<user>:<pw>@hf.co/big.safetensors?token=SECRETTOKEN", wait=False
         )
 
     message = str(excinfo.value)
     assert "SECRETTOKEN" not in message
-    assert "user:pw" not in message
+    assert "<user>:<pw>" not in message
     # Masked, not dropped: which command wedged is still legible.
     assert "model download --url https://***@hf.co/big.safetensors" in message
 

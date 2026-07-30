@@ -135,8 +135,14 @@ def test_target_url_unbalanced_ipv6_raises_comfy_error(monkeypatch):
 
 
 def test_target_url_redacts_userinfo_in_error(monkeypatch):
-    """A credential embedded in COMFYUI_URL is not echoed raw in the error message."""
-    monkeypatch.setenv("COMFYUI_URL", "https://user:sekret@gpu.example:8188")
+    """A credential embedded in COMFYUI_URL is not echoed raw in the error message.
+
+    The userinfo is written with angle-bracket placeholders (see AGENTS.md) so a
+    secret scanner does not read the fixture itself as a leaked credential; the
+    masking under test is scheme- and content-blind, so the assertions below are
+    the same ones a bare ``user:sekret`` fixture would make.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://<user>:<sekret>@gpu.example:8188")
     with pytest.raises(server.ComfyCliError) as excinfo:
         server._comfy_target()
     assert "sekret" not in str(excinfo.value)

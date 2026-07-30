@@ -197,3 +197,12 @@ write as if it were already public:
 - **No internal-tracker references** in commits or PR titles/bodies — describe
   the change on its own terms.
 - Prefer environment variables and documented config over anything hardcoded.
+- **Write credential-in-URL fixtures with angle-bracket placeholders** —
+  `https://<user>:<pass>@host`, never the bare `user:pass@` form. The redaction
+  code and its tests need URLs that still carry userinfo before the `@`, and
+  the secret scanner's URI detector reads a bare one as a real leaked
+  credential (`.github/workflows/secret-scanning.yml`'s diff gate now runs that
+  detector, so a bare fixture added in a PR fails CI — including one added to a
+  comment or a doc like this file). Keep the real `http`/`https` scheme:
+  `failure_log._URL_RE` only matches `https?://`, so a made-up scheme would
+  document behavior the scrubber does not have.

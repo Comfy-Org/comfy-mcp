@@ -125,7 +125,7 @@ def _scrub_url(url: str) -> str:
 
 # A URL ANYWHERE in a recorded string — deliberately not anchored to the start.
 # argv is not all bare URLs: `_render_param_args` emits combined-flag tokens
-# (`--image_url=https://user:pass@host/x?token=…`, `--param=k={"https://…"}`)
+# (`--image_url=https://<user>:<pass>@host/x?token=…`, `--param=k={"https://…"}`)
 # whose URL sits mid-token, so a start-anchored test would wave the credential
 # straight through into `args`. Anchoring on the literal scheme still lets the
 # engine skip ahead to a candidate rather than re-scan from every offset, and
@@ -170,7 +170,7 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
     Scrubbing has to happen BEFORE the final clip to ``limit``, not after: the
     tail keeps the END of a capture, so a URL straddling the cut would arrive
     here already shorn of its ``https://`` and slip past :data:`_URL_RE`
-    entirely — leaving the ``user:pass@host`` remainder in the file. So bound
+    entirely — leaving the ``<user>:<pass>@host`` remainder in the file. So bound
     generously first (``_stream_tail`` slices raw bytes before decoding, so the
     wider window is still cheap on a multi-MB capture), scrub the whole window,
     and only then clip: any half-URL at the window's head is now beyond
@@ -320,7 +320,7 @@ def _log_failure(
             "exit_code": exit_code,
             "error_code": error_code,
             # Scrub first, THEN cap. Capping first would cut a
-            # `https://user:pass@host` URL straddling the boundary, and
+            # `https://<user>:<pass>@host` URL straddling the boundary, and
             # `_redact_url` only masks userinfo when it still finds the `@` in
             # the netloc — so the surviving `user:pass` half would be written
             # unredacted. `_URL_RE` is a linear single-pass scan, so running it
