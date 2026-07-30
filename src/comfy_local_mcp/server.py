@@ -963,9 +963,16 @@ def _require_comfy_bin() -> None:
     # newest release), which lands the user straight in `_check_comfy_version`'s
     # "too old" error on their very next call. The first install advice a
     # fresh-machine user sees should already satisfy the floor.
+    #
+    # DOUBLE quotes around the specifier, not single: the bare form this
+    # replaced was shell-agnostic and the advice must stay that way. `>` is a
+    # redirection operator in every shell here, so it has to be quoted — but
+    # cmd.exe does not treat `'` as a quoting character, so the single-quoted
+    # form would run `pip install 'comfy-cli` and leave a stray `=1.13.0'`
+    # file behind. `"` quotes in cmd.exe, PowerShell, and POSIX shells alike.
     message = (
         f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
-        f"(`pip install 'comfy-cli>={_MIN_COMFY_CLI_STR}'`) or set the "
+        f'(`pip install "comfy-cli>={_MIN_COMFY_CLI_STR}"`) or set the '
         "COMFY_BIN env var."
     )
     failure_log._log_failure("binary_missing", (), message=message)
@@ -1074,7 +1081,9 @@ def _check_comfy_version() -> None:
         raise ComfyCliError(
             f"comfy-cli {'.'.join(map(str, version))} is too old — this server "
             f"requires comfy-cli >= {_MIN_COMFY_CLI_STR}. Upgrade it with "
-            f"`pip install --upgrade 'comfy-cli>={_MIN_COMFY_CLI_STR}'`."
+            # Double-quoted for the same cross-shell reason as
+            # `_require_comfy_bin`'s install advice — see the note there.
+            f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
         )
     _version_checked = True
 
@@ -5120,7 +5129,7 @@ def _require_emit_workflow_capability() -> None:
             "MODEL PARAMETER instead of the run-level flag it needs to be — "
             "running a real, spending partner generation with no consent "
             "interlock. Upgrade comfy-cli (`pip install --upgrade "
-            f"'comfy-cli>={_MIN_COMFY_CLI_STR}'`) to a release with "
+            f'"comfy-cli>={_MIN_COMFY_CLI_STR}"`) to a release with '
             "`--emit-workflow`, or use partner_generate if you intend to spend."
         )
     _emit_workflow_capability_probed = True
