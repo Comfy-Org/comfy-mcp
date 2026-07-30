@@ -27,6 +27,9 @@ long enough to matter straddles a newline.
 
 from __future__ import annotations
 
+import ast
+import textwrap
+
 import pytest
 
 from comfy_local_mcp import server
@@ -61,8 +64,44 @@ ALL_CATALOG_TOOLS = (
 
 def doc(tool_name: str) -> str:
     """One tool's docstring, whitespace-collapsed. See the module docstring."""
-    tool = getattr(server, tool_name)
-    return " ".join((tool.__doc__ or "").split())
+    return " ".join(raw_doc(tool_name).split())
+
+
+def raw_doc(tool_name: str) -> str:
+    """One tool's docstring VERBATIM — for the few assertions about layout.
+
+    The example snippets are code an agent copies, so their indentation is part
+    of the contract (a gate the run sits outside of does not gate); those checks
+    need the lines the way they are written, not collapsed.
+    """
+    return getattr(server, tool_name).__doc__ or ""
+
+
+def on_ramp_snippet() -> str:
+    """``fetch_template``'s template on-ramp example, dedented and parseable.
+
+    Pulled out as real code rather than grepped as prose because its SHAPE is
+    what an agent copies: whether the run sits inside the gate's branch is a
+    structural fact, and asserting it on an AST cannot be fooled by a prose
+    sentence that happens to mention the same identifiers.
+    """
+    lines = raw_doc("fetch_template").splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.rstrip().endswith("on-ramp::"))
+    # The docstring reaches us already dedented (the tool decorator cleans it),
+    # so the block's own indent is whatever its first code line carries — read it
+    # rather than assuming a literal column.
+    body = lines[start + 1 :]
+    first = next(ln for ln in body if ln.strip())
+    indent = len(first) - len(first.lstrip())
+    assert indent, "the on-ramp example is no longer an indented literal block"
+    block: list[str] = []
+    for ln in body:
+        # Blank lines ride along; the first non-blank line back at prose level
+        # ends the block.
+        if ln.strip() and not ln.startswith(" " * indent):
+            break
+        block.append(ln)
+    return textwrap.dedent("\n".join(block)).strip("\n")
 
 
 @pytest.mark.parametrize("tool_name", ALL_CATALOG_TOOLS)
@@ -134,7 +173,24 @@ def test_search_models_is_documented_as_live_disk_filenames():
     text = doc("search_models")
     assert "Freshness: LIVE" in text
     assert "no registry metadata" in text
-    assert "never" in text and "no such model" in text
+    # The joined phrase, not two loose substrings: asserting `"never"` and
+    # `"no such model"` separately stays green if a rewrite drops the caveat
+    # while some unrelated sentence still happens to contain "never".
+    assert 'never means "no such model"' in text
+
+
+def test_search_models_absence_names_the_out_of_scope_reading_first():
+    """Absence has TWO readings here, and the wrong one costs a multi-GB download.
+
+    Each mode searches something narrower than "the install" — no-argument lists
+    folder names, ``folder`` reads one folder, and on the v1.13.0 floor ``query``
+    reads ``checkpoints`` only. A LoRA already on disk is absent from those
+    results, so "not downloaded here" cannot be the only documented reading.
+    """
+    text = doc("search_models")
+    assert "present but outside what this call searched" in text
+    assert 'folder="loras"' in text
+    assert "redundant multi-GB download" in text
 
 
 @pytest.mark.parametrize("tool_name", PINNED_PARTNER_TOOLS)
@@ -166,6 +222,22 @@ def test_partner_list_refuses_to_read_as_proof_of_non_existence():
     assert "partner_model_schema" in text
 
 
+def test_partner_list_names_the_upgrade_not_the_refresh_as_the_remedy():
+    """The two escape hatches are not interchangeable on THIS tool.
+
+    These rows are ``_ENDPOINT_ALLOWLIST`` (comfy-cli source) intersected with the
+    active spec's paths, so a model that is simply not allowlisted cannot be
+    surfaced by any spec re-pull — only a comfy-cli upgrade reaches it. Offering
+    ``comfy generate refresh`` as an equal remedy sends the user through a step
+    that cannot work for the cause the same paragraph names as likeliest.
+    ``partner_model_schema`` is the tool where refresh genuinely is the fix: its
+    variant enums are read from the spec.
+    """
+    text = doc("list_partner_models")
+    assert "comfy-cli UPGRADE, not" in text
+    assert "the allowlist is code" in text
+
+
 def test_partner_schema_refuses_the_silent_variant_substitution():
     """The Pro-to-Lite regression: a downgrade the user never agreed to.
 
@@ -193,6 +265,107 @@ def test_fetch_template_presents_validation_as_mandatory():
     # `checked: false` is not a pass — it is the gate left undone.
     assert "leaves step 4 UNDONE" in text
     assert "moves the gate onto you, it does not remove it" in text
+
+
+def test_fetch_template_example_gates_the_run_and_survives_an_unchecked_block():
+    """The SNIPPET is the contract — an LLM pattern-matches on its shape.
+
+    Two ways the example itself could teach the bug it warns about: putting
+    ``run_workflow`` after the ``if`` at the same indentation (so the run happens
+    either way), and indexing ``["runnable"]`` on a block that has no such key
+    (``_unchecked`` returns ``{"checked", "reason", "summary"}``, which is what
+    ``check_local=False`` and a not-running ComfyUI both produce). Assert the run
+    is reached only through the cleared branch.
+    """
+    tree = ast.parse(on_ramp_snippet())
+
+    gates = [n for n in ast.walk(tree) if isinstance(n, ast.If)]
+    assert len(gates) == 1, "the example should gate the run on exactly one `if`"
+    gate = gates[0]
+    # `.get("runnable")`, never `["runnable"]` — an `_unchecked` block has no
+    # such key, so a subscript raises KeyError on the documented-normal paths.
+    assert isinstance(gate.test, ast.Call), ast.dump(gate.test)
+    assert isinstance(gate.test.func, ast.Attribute) and gate.test.func.attr == "get"
+    assert [c.value for c in gate.test.args] == ["runnable"]
+
+    runs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "run_workflow"
+    ]
+    assert len(runs) == 1, "the example should call `run_workflow` exactly once"
+    # And it must be reachable ONLY through the cleared branch: a `run_workflow`
+    # that is a sibling of the `if` rather than inside its body runs either way,
+    # which is the fetch-then-run-anyway shape the surrounding prose forbids.
+    cleared = [n for stmt in gate.body for n in ast.walk(stmt)]
+    assert runs[0] in cleared, (
+        "`run_workflow` sits outside the gate's cleared branch, so the example "
+        "runs the workflow whether or not the check passed."
+    )
+
+
+def test_fetch_template_does_not_offer_a_world_writable_example_path():
+    """The mandated gate validates a FILE, so a predictable shared path breaks it.
+
+    ``/tmp/flux.json`` is pre-creatable as a symlink by any other local user and
+    rewritable between the validate and the run — a TOCTOU where the validated
+    bytes are not the executed bytes. The server's own ``_check_template_by_name``
+    uses ``tempfile.mkdtemp`` for the same reason.
+    """
+    snippet = on_ramp_snippet()
+    assert "fetch_template(" in snippet, "the on-ramp example lost its fetch call"
+    # Only the SNIPPET is constrained — the prose below it names `/tmp/flux.json`
+    # on purpose, as the anti-pattern.
+    assert "/tmp/" not in snippet, snippet
+    assert "only the user can write" in doc("fetch_template")
+
+
+def test_fetch_template_does_not_claim_validate_workflow_is_an_equal_gate():
+    """``validate_workflow`` alone is WEAKER than ``local_check``, and says so.
+
+    Gallery templates are UI-format exports; a comfy-cli too old to lower one to
+    API format checks zero nodes and reports ``valid: true``
+    (``validate_workflow``'s blind spot 3). ``_local_template_check`` catches that
+    and downgrades it to ``workflow_not_converted``, so presenting the raw call as
+    "the same gate" would let a vacuous pass clear a mandatory check.
+    """
+    text = doc("fetch_template")
+    assert "WEAKER" in text
+    assert "non_node_key" in text
+    assert "blind spot 3" in text
+
+
+def test_get_template_documents_local_check_as_conditional():
+    """``local_check`` is attached to comfy-cli's payload, not guaranteed by it.
+
+    On a drifted (non-dict) payload ``get_template`` hands the payload back
+    untouched, so there is no ``local_check`` key at all and a caller indexing it
+    gets a ``KeyError`` — document it the way ``server_info``'s ``hardware`` block
+    already is.
+    """
+    text = doc("get_template")
+    assert "CONDITIONAL" in text
+    assert "no ``local_check`` key at all" in text
+
+
+def test_server_instructions_agree_with_the_per_tool_freshness_policy():
+    """The tripwire's blind spot: ``INSTRUCTIONS`` is sent to every client too.
+
+    The docstring assertions above cannot see it, so a policy stated on the tools
+    and contradicted in the preamble would ship green — which is exactly what
+    happened while ``INSTRUCTIONS`` still called the gallery "served fresh" and
+    walked an agent from ``fetch_template`` straight to ``run_workflow``.
+    """
+    text = " ".join(server.INSTRUCTIONS.split())
+    assert "served fresh" not in text, (
+        "INSTRUCTIONS still calls the gallery live; it is comfy-cli's CACHED "
+        "gallery (see the template tools' `Freshness:` blocks)."
+    )
+    assert "CACHED" in text
+    assert "MANDATORY, not advisory" in text
+    assert '.get("runnable")' in text
 
 
 def test_search_templates_on_ramp_flags_validation_as_mandatory():
