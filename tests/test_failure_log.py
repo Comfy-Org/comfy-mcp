@@ -517,6 +517,37 @@ def test_stream_tail_scrubs_a_url_straddling_the_tail_cut(log_path):
     assert len(entry["stderr_tail"]) == limit + 3
 
 
+def test_stream_tail_scrubs_the_head_fragment_of_a_url_dense_capture(log_path):
+    """The straddling-URL guard holds even when scrubbing shrinks the window.
+
+    The double-width window is bounded generously so a half-URL at its head
+    falls outside the final clip — but scrubbing DELETES query strings and
+    userinfo, so a URL-dense capture can shrink to under ``limit`` and take
+    `_scrubbed_stream_tail`'s early return with that head still attached. The
+    head fragment has no ``https://`` left for ``_URL_RE`` to anchor on, so
+    nothing else in the pipeline can catch it.
+    """
+    limit = failure_log._FAILURE_LOG_TAIL_CHARS
+    head = "user:tok@host/x "
+    # Each unit scrubs 119 chars down to 12, so a window packed with them lands
+    # far under `limit` — that shrinkage is what reaches the early return.
+    unit = "https://h/a?token=" + "A" * 100 + " "
+    filler = unit * ((limit * 2 - len(head)) // len(unit))
+    # Exactly `limit * 2` after the scheme, so the window's cut lands right
+    # after `https://` and `head` arrives scheme-shorn. No trailing whitespace:
+    # `_tail` strips before slicing, which would otherwise shift the cut.
+    tail_bytes = head + filler + "B" * (limit * 2 - len(head) - len(filler))
+    stderr = "Z" * 10_000 + "https://" + tail_bytes
+
+    failure_log._log_failure("no_json", ("run",), stderr=stderr)
+
+    (entry,) = _entries(log_path)
+    assert len(entry["stderr_tail"]) <= limit  # it DID take the early return
+    assert "user:tok" not in log_path.read_text()
+    # Masked rather than dropped: the host still says which fetch was in flight.
+    assert entry["stderr_tail"].startswith("...***@host/x ")
+
+
 # --- best-effort + rotation --------------------------------------------------
 
 

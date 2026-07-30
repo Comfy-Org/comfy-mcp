@@ -133,6 +133,12 @@ def _scrub_url(url: str) -> str:
 # multi-KB message.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
+# The first whitespace-delimited token of a clipped stream window — the one
+# place a URL can appear with its `https://` already sliced off, so the one
+# place `_URL_RE` above is structurally unable to help. See
+# `_scrubbed_stream_tail`.
+_LEADING_TOKEN_RE = re.compile(r"\S*")
+
 
 def _scrub_text(text: str) -> str:
     """Apply :func:`_scrub_url` to every URL embedded anywhere in ``text``.
@@ -173,8 +179,16 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
     entirely — leaving the ``<user>:<pass>@host`` remainder in the file. So bound
     generously first (``_stream_tail`` slices raw bytes before decoding, so the
     wider window is still cheap on a multi-MB capture), scrub the whole window,
-    and only then clip: any half-URL at the window's head is now beyond
-    ``limit`` and is dropped rather than written.
+    and only then clip.
+
+    The generous bound is NOT on its own enough, which is why the head fragment
+    is masked explicitly below rather than left for the re-clip to push out of
+    range: scrubbing SHRINKS the window — ``_scrub_url`` deletes whole query
+    strings and userinfo — so a URL-dense capture can come out of it already at
+    or under ``limit``, take the early return, and be written with its
+    scheme-shorn head still attached. The re-clip is safe by contrast:
+    everything it can cut has been scrubbed already, so a URL it bisects has no
+    userinfo or query left to leak.
     """
     if limit <= 0:
         # Mirror `_stream_tail`'s own non-positive guard: `[-0:]` is the WHOLE
@@ -183,6 +197,18 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
         return "<empty>"
     window = _stream_tail(stream, limit * 2)
     scrubbed = _scrub_message(window)
+    if scrubbed.startswith("..."):
+        # `_stream_tail` prefixes that marker onto a window it CLIPPED, and a
+        # clipped window can begin part-way through a URL — past the `https://`
+        # that `_URL_RE` anchors on, which is precisely why the scrub above
+        # cannot see a credential sitting in that leading remainder.
+        # `_scrub_url` handles a scheme-less string (it reads offset 0 as the
+        # netloc's start), so mask the head token as if it were a whole URL.
+        # A capture whose real first line happens to start with `...` is masked
+        # the same way; over-redacting one debug-log token is the right side to
+        # err on.
+        head = _LEADING_TOKEN_RE.match(scrubbed, 3).group(0)
+        scrubbed = "..." + _scrub_url(head) + scrubbed[3 + len(head) :]
     if len(scrubbed) <= limit:
         return scrubbed
     # Re-clipping loses the marker `_stream_tail` may have added, so re-add it:
