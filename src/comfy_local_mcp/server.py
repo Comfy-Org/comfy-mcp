@@ -957,9 +957,16 @@ def _require_comfy_bin() -> None:
             # there is no argv to record — the failure IS that there is no binary.
             failure_log._log_failure("binary_missing", (), message=message)
             raise ComfyCliError(message)
+    # Name the floor in the install command, not just "comfy-cli": a bare
+    # `pip install comfy-cli` can resolve to a release below `_MIN_COMFY_CLI`
+    # (an old wheel pinned by an existing environment, a Python too old for the
+    # newest release), which lands the user straight in `_check_comfy_version`'s
+    # "too old" error on their very next call. The first install advice a
+    # fresh-machine user sees should already satisfy the floor.
     message = (
         f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
-        "(`pip install comfy-cli`) or set the COMFY_BIN env var."
+        f"(`pip install 'comfy-cli>={_MIN_COMFY_CLI_STR}'`) or set the "
+        "COMFY_BIN env var."
     )
     failure_log._log_failure("binary_missing", (), message=message)
     raise ComfyCliError(message)
