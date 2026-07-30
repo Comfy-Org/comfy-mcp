@@ -77,7 +77,7 @@ def _redact_url(url: str) -> str:
 
     :class:`ComfyCliError` messages echo the offending config value and may reach
     the MCP client or logs, so a credential embedded in ``COMFYUI_URL`` (e.g.
-    ``http://user:token@host``) must not be surfaced raw. Only the netloc
+    ``http://<user>:<token>@host``) must not be surfaced raw. Only the netloc
     (scheme-separator up to the first path/query/fragment delimiter) is inspected
     so a stray ``@`` in a path can't confuse the masking.
     """

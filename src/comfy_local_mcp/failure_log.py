@@ -125,13 +125,19 @@ def _scrub_url(url: str) -> str:
 
 # A URL ANYWHERE in a recorded string — deliberately not anchored to the start.
 # argv is not all bare URLs: `_render_param_args` emits combined-flag tokens
-# (`--image_url=https://user:pass@host/x?token=…`, `--param=k={"https://…"}`)
+# (`--image_url=https://<user>:<pass>@host/x?token=…`, `--param=k={"https://…"}`)
 # whose URL sits mid-token, so a start-anchored test would wave the credential
 # straight through into `args`. Anchoring on the literal scheme still lets the
 # engine skip ahead to a candidate rather than re-scan from every offset, and
 # `\S+` is a possessive-free single-pass match — no backtracking risk on a
 # multi-KB message.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+# The first whitespace-delimited token of a clipped stream window — the one
+# place a URL can appear with its `https://` already sliced off, so the one
+# place `_URL_RE` above is structurally unable to help. See
+# `_scrubbed_stream_tail`.
+_LEADING_TOKEN_RE = re.compile(r"\S*")
 
 
 def _scrub_text(text: str) -> str:
@@ -170,11 +176,19 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
     Scrubbing has to happen BEFORE the final clip to ``limit``, not after: the
     tail keeps the END of a capture, so a URL straddling the cut would arrive
     here already shorn of its ``https://`` and slip past :data:`_URL_RE`
-    entirely — leaving the ``user:pass@host`` remainder in the file. So bound
+    entirely — leaving the ``<user>:<pass>@host`` remainder in the file. So bound
     generously first (``_stream_tail`` slices raw bytes before decoding, so the
     wider window is still cheap on a multi-MB capture), scrub the whole window,
-    and only then clip: any half-URL at the window's head is now beyond
-    ``limit`` and is dropped rather than written.
+    and only then clip.
+
+    The generous bound is NOT on its own enough, which is why the head fragment
+    is masked explicitly below rather than left for the re-clip to push out of
+    range: scrubbing SHRINKS the window — ``_scrub_url`` deletes whole query
+    strings and userinfo — so a URL-dense capture can come out of it already at
+    or under ``limit``, take the early return, and be written with its
+    scheme-shorn head still attached. The re-clip is safe by contrast:
+    everything it can cut has been scrubbed already, so a URL it bisects has no
+    userinfo or query left to leak.
     """
     if limit <= 0:
         # Mirror `_stream_tail`'s own non-positive guard: `[-0:]` is the WHOLE
@@ -183,6 +197,18 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
         return "<empty>"
     window = _stream_tail(stream, limit * 2)
     scrubbed = _scrub_message(window)
+    if scrubbed.startswith("..."):
+        # `_stream_tail` prefixes that marker onto a window it CLIPPED, and a
+        # clipped window can begin part-way through a URL — past the `https://`
+        # that `_URL_RE` anchors on, which is precisely why the scrub above
+        # cannot see a credential sitting in that leading remainder.
+        # `_scrub_url` handles a scheme-less string (it reads offset 0 as the
+        # netloc's start), so mask the head token as if it were a whole URL.
+        # A capture whose real first line happens to start with `...` is masked
+        # the same way; over-redacting one debug-log token is the right side to
+        # err on.
+        head = _LEADING_TOKEN_RE.match(scrubbed, 3).group(0)
+        scrubbed = "..." + _scrub_url(head) + scrubbed[3 + len(head) :]
     if len(scrubbed) <= limit:
         return scrubbed
     # Re-clipping loses the marker `_stream_tail` may have added, so re-add it:
@@ -320,7 +346,7 @@ def _log_failure(
             "exit_code": exit_code,
             "error_code": error_code,
             # Scrub first, THEN cap. Capping first would cut a
-            # `https://user:pass@host` URL straddling the boundary, and
+            # `https://<user>:<pass>@host` URL straddling the boundary, and
             # `_redact_url` only masks userinfo when it still finds the `@` in
             # the netloc — so the surviving `user:pass` half would be written
             # unredacted. `_URL_RE` is a linear single-pass scan, so running it

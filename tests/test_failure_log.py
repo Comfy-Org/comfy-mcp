@@ -378,7 +378,7 @@ def test_scrub_arg_masks_userinfo_and_strips_query(log_path, fake_comfy):
     ``comfy <args> failed …`` — i.e. it echoes the RAW argv, so scrubbing only
     the ``args`` list would leave the credential in the very next key.
     """
-    url = "https://user:tok@host/x?token=abc#frag"
+    url = "https://<user>:<tok>@host/x?token=abc#frag"
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
     with pytest.raises(server.ComfyCliError):
@@ -396,7 +396,7 @@ def test_scrub_arg_masks_userinfo_and_strips_query(log_path, fake_comfy):
 
 def test_scrub_message_masks_urls_but_keeps_prose():
     """Only URL-shaped substrings are rewritten; the surrounding prose survives."""
-    text = "comfy model download --url https://u:p@h/m.safetensors?token=s failed"
+    text = "comfy model download --url https://<u>:<p>@h/m.safetensors?token=s failed"
     assert failure_log._scrub_message(text) == (
         "comfy model download --url https://***@h/m.safetensors failed"
     )
@@ -411,7 +411,7 @@ def test_scrub_message_masks_urls_but_keeps_prose():
         # would defeat the log.
         ("run", "run"),
         ("/Users/me/wf.json", "/Users/me/wf.json"),
-        ("user:pass@notaurl", "user:pass@notaurl"),
+        ("<user>:<pass>@notaurl", "<user>:<pass>@notaurl"),
         # Query stripped even with no credential in it (mirrors comfy-cli's own
         # scrubber: a CivitAI URL carries its token as `?token=…`).
         ("https://h/m.safetensors?token=abc", "https://h/m.safetensors"),
@@ -419,8 +419,8 @@ def test_scrub_message_masks_urls_but_keeps_prose():
         # A fragment BEFORE a query still cuts at the first delimiter.
         ("https://h/p#f?q=1", "https://h/p"),
         # Userinfo masked with no query present, and the scheme is case-blind.
-        ("https://u:p@h/path", "https://***@h/path"),
-        ("HTTPS://u:p@h/path", "HTTPS://***@h/path"),
+        ("https://<u>:<p>@h/path", "https://***@h/path"),
+        ("HTTPS://<u>:<p>@h/path", "HTTPS://***@h/path"),
         # A bare host URL is untouched.
         ("https://h/path", "https://h/path"),
     ],
@@ -435,12 +435,12 @@ def test_scrub_arg_cases(arg, expected):
         # `_render_param_args` emits combined-flag tokens, so the URL is not at
         # the token's start — a start-anchored test would log the credential.
         (
-            "--image_url=https://user:tok@host/x?token=abc",
+            "--image_url=https://<user>:<tok>@host/x?token=abc",
             "--image_url=https://***@host/x",
         ),
         # …and `run_template` wraps the value in JSON, offsetting it further.
         (
-            '--param=src={"https://u:p@h/i.png"}',
+            '--param=src={"https://<u>:<p>@h/i.png"}',
             '--param=src={"https://***@h/i.png"}',
         ),
     ],
@@ -453,24 +453,27 @@ def test_scrub_arg_finds_a_url_anywhere_in_the_token(arg, expected):
 def test_message_is_scrubbed_before_it_is_capped(log_path):
     """A URL straddling the message cap is masked, not cut into an unmasked half.
 
-    Capping first would slice ``https://user:pass@host`` before its ``@``, and
-    :func:`_redact_url` only masks userinfo it can still find in the netloc — so
-    the surviving ``user:pass`` would land in the file verbatim.
+    Capping first would slice ``https://<user>:<pass>@host`` before its ``@``,
+    and :func:`_redact_url` only masks userinfo it can still find in the netloc
+    — so the surviving ``<user>:<pass>`` would land in the file verbatim.
     """
     cap = failure_log._FAILURE_LOG_MESSAGE_CHARS
     # Place the URL so the cap falls on its `@` — the whole userinfo is inside
     # the kept prefix but the `@` that marks it as userinfo is not, which is
-    # precisely what defeats `_redact_url` when the cap runs first.
-    message = "x" * (cap - 16) + "https://user:tok@host/m.safetensors?token=abc"
+    # precisely what defeats `_redact_url` when the cap runs first. Both the
+    # 16 and the userinfo's width are that placement: `https://<u>:<pw>` is
+    # exactly 16 characters, and so is the `https://***@host` the masked URL
+    # gets clipped to below.
+    message = "x" * (cap - 16) + "https://<u>:<pw>@host/m.safetensors?token=abc"
 
     failure_log._log_failure("error_envelope", ("run",), message=message)
 
     (entry,) = _entries(log_path)
-    assert "user:tok" not in entry["message"]
+    assert "<u>:<pw>" not in entry["message"]
     assert "token=abc" not in entry["message"]
     assert len(entry["message"]) == cap
     # The cap now lands inside the *masked* URL, so what it clips is `***@…`
-    # rather than the raw `user:tok@…` the old cap-then-scrub order would leave.
+    # rather than the raw `<u>:<pw>@…` the old cap-then-scrub order would leave.
     assert entry["message"].endswith("https://***@host")
 
 
@@ -479,14 +482,14 @@ def test_stream_tails_are_scrubbed_like_the_message(log_path):
     failure_log._log_failure(
         "no_json",
         ("model", "download"),
-        stdout="fetching https://user:tok@host/m.safetensors?token=abc",
-        stderr="failed: https://u:p@h/x?sig=deadbeef",
+        stdout="fetching https://<user>:<tok>@host/m.safetensors?token=abc",
+        stderr="failed: https://<u>:<p>@h/x?sig=deadbeef",
     )
 
     (entry,) = _entries(log_path)
     assert entry["stdout_tail"] == "fetching https://***@host/m.safetensors"
     assert entry["stderr_tail"] == "failed: https://***@h/x"
-    assert "user:tok" not in log_path.read_text()
+    assert "tok" not in log_path.read_text()
     assert "deadbeef" not in log_path.read_text()
 
 
@@ -497,21 +500,52 @@ def test_stream_tail_scrubs_a_url_straddling_the_tail_cut(log_path):
     URL already shorn of its ``https://`` and skip it entirely.
     """
     limit = failure_log._FAILURE_LOG_TAIL_CHARS
-    url = "https://user:tok@host/x"
+    url = "https://<user>:<tok>@host/x"
     # Sized so the clip falls immediately after the URL's `https://` — the exact
     # case where a scrub-after-clip pass sees no scheme, matches nothing, and
-    # writes the whole `user:tok@host/x` remainder to disk.
+    # writes the whole `<user>:<tok>@host/x` remainder to disk.
     stderr = "A" * 100 + url + "B" * (limit + 108 - 100 - len(url))
     assert len(textutil._stream_tail(stderr, limit)) == limit + 3  # it IS clipped
 
     failure_log._log_failure("no_json", ("run",), stderr=stderr)
 
     (entry,) = _entries(log_path)
-    assert "user:tok" not in entry["stderr_tail"]
-    assert "tok@host" not in entry["stderr_tail"]
+    assert "<user>:<tok>" not in entry["stderr_tail"]
+    assert "<tok>@host" not in entry["stderr_tail"]
     # Still bounded, and still marked as truncated.
     assert entry["stderr_tail"].startswith("...")
     assert len(entry["stderr_tail"]) == limit + 3
+
+
+def test_stream_tail_scrubs_the_head_fragment_of_a_url_dense_capture(log_path):
+    """The straddling-URL guard holds even when scrubbing shrinks the window.
+
+    The double-width window is bounded generously so a half-URL at its head
+    falls outside the final clip — but scrubbing DELETES query strings and
+    userinfo, so a URL-dense capture can shrink to under ``limit`` and take
+    `_scrubbed_stream_tail`'s early return with that head still attached. The
+    head fragment has no ``https://`` left for ``_URL_RE`` to anchor on, so
+    nothing else in the pipeline can catch it.
+    """
+    limit = failure_log._FAILURE_LOG_TAIL_CHARS
+    head = "user:tok@host/x "
+    # Each unit scrubs 119 chars down to 12, so a window packed with them lands
+    # far under `limit` — that shrinkage is what reaches the early return.
+    unit = "https://h/a?token=" + "A" * 100 + " "
+    filler = unit * ((limit * 2 - len(head)) // len(unit))
+    # Exactly `limit * 2` after the scheme, so the window's cut lands right
+    # after `https://` and `head` arrives scheme-shorn. No trailing whitespace:
+    # `_tail` strips before slicing, which would otherwise shift the cut.
+    tail_bytes = head + filler + "B" * (limit * 2 - len(head) - len(filler))
+    stderr = "Z" * 10_000 + "https://" + tail_bytes
+
+    failure_log._log_failure("no_json", ("run",), stderr=stderr)
+
+    (entry,) = _entries(log_path)
+    assert len(entry["stderr_tail"]) <= limit  # it DID take the early return
+    assert "user:tok" not in log_path.read_text()
+    # Masked rather than dropped: the host still says which fetch was in flight.
+    assert entry["stderr_tail"].startswith("...***@host/x ")
 
 
 # --- best-effort + rotation --------------------------------------------------

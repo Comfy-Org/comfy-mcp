@@ -125,11 +125,9 @@ ruff format --check .     # format check (run `ruff format .` to fix)
 ```
 
 CI (`.github/workflows/ci.yml`) runs all three on Python 3.10 and 3.14 for every
-PR. Get them green locally before pushing. The workflow carries no path filter
-on `pull_request` — the `test (py3.10)` / `test (py3.14)` contexts are required
-by branch protection, so they have to report on every PR — and it decides
-internally whether to run the suite, no-opping when a PR changes only Markdown.
-Do not add a `paths` / `paths-ignore` filter to that trigger.
+PR; get them green locally first. Never add a `paths`/`paths-ignore` filter to its
+`pull_request` trigger — the required `test (py3.10)`/`test (py3.14)` contexts must
+report on every PR, and the workflow already no-ops on Markdown-only changes.
 
 ## Tests
 
@@ -191,7 +189,9 @@ This repository is **private but destined to go public.** Treat everything you
 write as if it were already public:
 
 - **No secrets** — API keys, tokens, or credentials in code, commits, tests,
-  fixtures, or PR text.
+  fixtures, or PR text. Credential-in-URL fixtures use `https://<user>:<pass>@host`:
+  a bare `user:pass@` fails the secret-scanning diff gate, and a fake scheme
+  documents behavior the scrubber lacks (`failure_log._URL_RE` needs `https?://`).
 - **No internal hostnames, IPs, or internal-only URLs** in code, comments, or
   commit messages.
 - **No internal-tracker references** in commits or PR titles/bodies — describe
