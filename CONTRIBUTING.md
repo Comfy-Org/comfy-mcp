@@ -74,6 +74,13 @@ ComfyUI; it **skips** cleanly when ComfyUI or the `comfy` binary is absent.
 2. Make your change, with tests, and get the three checks above green.
 3. Open a PR and fill in [the template](.github/PULL_REQUEST_TEMPLATE.md).
 
+Two more things run against your work without you asking for them: a
+[TruffleHog scan](.github/workflows/secret-scanning.yml) of the pushed range,
+and GitHub push protection, which rejects a push carrying a recognized provider
+credential to this repository outright. If a push is rejected that way, rotate
+the credential and rewrite it out of your commits rather than bypassing the block —
+see [`SECURITY.md`](SECURITY.md#automated-security-tooling).
+
 ## Reporting bugs and requesting features
 
 Use the [issue templates](.github/ISSUE_TEMPLATE/) — a bug report or a feature
