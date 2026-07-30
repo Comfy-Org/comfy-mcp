@@ -1,4 +1,4 @@
 # Default owners for everything in this repo.
-* @mattmillerai
-
-/AGENTS.md @mattmillerai
+# The team must keep explicit write access on this repo for GitHub to honor this
+# (org-inherited member permissions do not count for teams in CODEOWNERS).
+* @Comfy-Org/comfy-cloud-team
