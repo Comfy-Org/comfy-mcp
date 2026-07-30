@@ -8,6 +8,11 @@ drive a user's **local** ComfyUI by shelling out to
 By participating in this project you agree to abide by our
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Response times
+
+We review issues and pull requests on a best-effort basis and do not commit to a
+response-time SLA.
+
 ## The one architecture rule — thin wrapper only
 
 Before you write any code, read [`AGENTS.md`](AGENTS.md). The core rule:
