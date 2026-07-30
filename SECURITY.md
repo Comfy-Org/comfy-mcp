@@ -77,6 +77,16 @@ This server is a thin wrapper that shells out to the local [`comfy-cli`](https:/
 - Social engineering or phishing
 - Reports from automated scanners without a demonstrated exploit
 
+## Automated security tooling
+
+GitHub's own safety nets are enabled on this repository, alongside the workflows in [`.github/workflows/`](.github/workflows/). What each one actually covers — so a reporter can tell what is already watched, and a contributor knows what will block a push:
+
+- **Private vulnerability reporting** — the Security Advisories route in [How to report](#how-to-report) above. GitHub offers this on public repositories, so it is the preferred channel for a public release of this repository; the email route works either way.
+- **Secret scanning, with push protection** — GitHub matches known provider credential patterns across this repository, and push protection **rejects a push that introduces one** rather than reporting it afterwards. This is a narrower net than the [TruffleHog workflow](.github/workflows/secret-scanning.yml), not a replacement for it: TruffleHog runs many more detectors (verified *and* unverified, including private keys and providers GitHub has no pattern for) but only after the push, on a diff gate plus a weekly full-history rescan. Push protection covers fewer patterns and stops the push itself. Neither subsumes the other, which is why both are on.
+- **Dependabot alerts and security updates** — advisories against the `pip` and `github-actions` dependencies declared in [`.github/dependabot.yml`](.github/dependabot.yml), with fix PRs opened automatically. Alerts are independent of the version-update schedule in that file: a new advisory surfaces when it is published, not on the weekly/monthly cadence.
+
+If a push of yours is rejected by push protection, treat the credential as burned — **rotate it**, then rewrite it out of your commits. Do not take the bypass option: bypassing on a public repository publishes the secret, and the rotation is needed regardless.
+
 ## Supported Versions
 
 Security fixes are applied to the **latest release** on the `main` branch. We do not maintain patch branches for older versions.
