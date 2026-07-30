@@ -1,14 +1,15 @@
 comfy-local-mcp
-Copyright 2026 Comfy Org
+Copyright (c) Comfy Org
 
 This product includes software developed at Comfy Org
 (https://www.comfy.org/).
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+Dual-licensed under AGPL-3.0-or-later OR a commercial license from
+Comfy Org. See LICENSE for the full terms, or contact
+licensing@comfy.org for the commercial option.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+Third-party components
+----------------------
 
 This server invokes the comfy-cli (`comfy`) binary as a separate
 process; it does not import, link, or embed comfy-cli code. comfy-cli

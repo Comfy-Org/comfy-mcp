@@ -15,7 +15,7 @@
 <p>
   <a href="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml"><img src="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Comfy-Org/comfy-local-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/Comfy-Org/comfy-local-mcp" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later%20OR%20Commercial-blue.svg" alt="License: AGPL-3.0-or-later OR Commercial"></a>
 </p>
 
 <p>
@@ -742,8 +742,18 @@ vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License
 
-Apache-2.0 (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)). It wraps the
-GPL-3.0 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) by shelling out to
-the `comfy` binary as a separate process — no GPL code is imported or linked.
-`comfy-cli` remains GPL-3.0-licensed and is distributed separately; how its
-copyleft applies depends on how the programs interact.
+Comfy MCP is dual-licensed (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)):
+
+- **[GNU Affero General Public License v3.0 or later](LICENSE)** — free for use
+  under the AGPL's terms, including the network-use source-disclosure
+  obligation in section 13.
+- **Commercial license** — for use in proprietary products or hosted services
+  without AGPL obligations. Contact
+  **[licensing@comfy.org](mailto:licensing@comfy.org)**.
+
+It wraps the GPL-3.0 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) by
+shelling out to the `comfy` binary as a separate process — no GPL code is
+imported or linked. `comfy-cli` remains GPL-3.0-licensed and is distributed
+separately; how its copyleft applies depends on how the programs interact.
+
+© Comfy Org.
