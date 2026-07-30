@@ -108,15 +108,21 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
 - Start from a template: `search_templates(query=...)` to find one (free-text
   search, paged 25 at a time via `limit`/`offset`; narrow with `tag`/`type`/
   `model`/`provider`, or `exclude_api=True` for templates that run without a
-  hosted-API key), `fetch_template` to save its workflow JSON, then `run_workflow`
-  on `result["path"]`. `fetch_template` and `get_template` also return a
-  `local_check` block comparing the template against the live node catalog of the
-  installed ComfyUI — the gallery is served fresh, so a template can need a node
-  or model option this install does not have yet. On
+  hosted-API key), `fetch_template` to save its workflow JSON, then — only once
+  the check below has CLEARED — `run_workflow` on `result["path"]`.
+  `fetch_template` and `get_template` return a `local_check` block comparing the
+  template against the live node catalog of the installed ComfyUI. The gallery
+  catalog is CACHED by comfy-cli and maintained independently of the install (it
+  is not read from it at all), so a template can need a node or model option this
+  install does not have yet — clearing `local_check` is MANDATORY, not advisory,
+  and "the fetch succeeded" is not a substitute. On
   `{"checked": true, "runnable": false}` tell the USER what is missing (update
   ComfyUI / custom nodes, or pick another template) instead of running it and
   hitting the failure deep in execution; `{"checked": false}` is "could not
-  compare", not a verdict. To change the prompt / seed
+  compare", not a verdict — it leaves the gate UNDONE, so run
+  `validate_workflow(result["path"])` yourself before running anything. Read that
+  block with `.get("runnable")`: a `checked: false` block has no `runnable` key.
+  To change the prompt / seed
   / steps / model of a fetched template before running, inspect its tweakable slots
   with `list_workflow_slots` and edit them with `set_workflow_slot` (non-destructive
   by default) — the loop is `fetch_template` -> `set_workflow_slot` -> `run_workflow`.
@@ -4742,6 +4748,29 @@ def list_partner_models(
     ``partner_generate`` to run it (which SPENDS credits) or
     ``emit_partner_workflow`` for the few aliases that can run on the local
     install instead.
+
+    Freshness: PINNED, not live — this is comfy-cli's own catalog, not a registry
+    query. The rows come from a curated endpoint allowlist in the INSTALLED
+    comfy-cli's code, resolved against an OpenAPI spec vendored into that same
+    wheel (``comfy generate refresh`` — a terminal command this server does not
+    wrap — re-pulls the live spec into a 7-day cache at
+    ``~/.comfy/openapi-cache.yml``). Two consequences to caveat to the user
+    rather than swallow:
+
+    - A model absent from these rows is NOT evidence it does not exist. It may be
+      live upstream and simply not allowlisted in this comfy-cli — an old install
+      is the likeliest reason something you expected is missing. Say "the
+      installed comfy-cli does not list it"; do not tell the user the model does
+      not exist. The remedy for that likeliest cause is a comfy-cli UPGRADE, not
+      a refresh: the allowlist is code, so no spec re-pull can add a row it does
+      not name. (``comfy generate refresh`` helps only in the narrower case where
+      the endpoint IS allowlisted but the vendored spec lacks its path, which the
+      allowlist walk skips silently.) Where refresh genuinely is the fix is
+      ``partner_model_schema``'s variant enums, which are spec-derived.
+    - One row can stand for a whole FAMILY of dated model variants. The variants
+      live in ``partner_model_schema``'s ``model`` enum, not here, so this list
+      cannot tell you which one a run would use. Read that schema before
+      committing to a variant in front of a user.
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -4842,6 +4871,20 @@ def partner_model_schema(model: str) -> Any:
 
     An unknown alias raises with comfy-cli's own ``generate_model_unknown``
     error; ``list_partner_models()`` is the list of what is spelled how.
+
+    Freshness: PINNED, not live — the parameters, and every ``enum`` inside them,
+    come from the OpenAPI spec vendored into the INSTALLED comfy-cli wheel,
+    refreshed only by ``comfy generate refresh`` (a terminal command this server
+    does not wrap, which caches the live spec for 7 days at
+    ``~/.comfy/openapi-cache.yml``). This is nonetheless the finest-grained view
+    of what a partner currently offers — a ``model`` enum here typically
+    enumerates the dated variants that ``list_partner_models`` collapses into one
+    row — so read it before naming a specific variant to a user. But an outdated
+    comfy-cli reports an outdated variant set, so if a user asks for a variant
+    this enum lacks, say the installed comfy-cli does not list it and point at
+    ``comfy generate refresh``: do NOT assert the variant does not exist, and do
+    NOT quietly substitute a nearby one (silently swapping a ``pro`` for a
+    ``lite`` is a downgrade the user never agreed to).
     """
     if not model:
         raise ComfyCliError(
@@ -8015,8 +8058,19 @@ def search_templates(
 
     Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
     with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
-    a runnable workflow JSON and pass that path straight to ``run_workflow`` — a
-    working generation without hand-authoring workflow JSON.
+    a runnable workflow JSON. Step 4 — validating that JSON against this install
+    before ``run_workflow`` — is MANDATORY, not a nicety; see ``fetch_template``.
+
+    Freshness: CACHED, not live — comfy-cli serves the gallery out of
+    ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL on a comfy-cli
+    NEWER than v1.13.0 (the TTL landed in Comfy-Org/comfy-cli#559, after v1.13.0
+    was cut) and NO expiry at all on v1.13.0 and older, where the first fetch is
+    kept indefinitely until ``comfy templates refresh`` is run in a terminal
+    (this server does not wrap that verb). And the catalog is NOT read from the
+    local install: a listed template may need node classes this install lacks.
+    Nothing on these rows has been checked against the install — the check is
+    ``get_template`` / ``fetch_template``'s ``local_check``, and clearing it is
+    required before running anything from here.
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -8282,14 +8336,31 @@ def get_template(name: str, check_local: bool = True) -> Any:
 
     With ``check_local=True`` (the default) the response also carries a
     ``local_check`` block: the template's graph is compared against the LIVE
-    ``object_info`` of the running local ComfyUI, because the gallery is served
-    fresh while the user's install is whatever they installed — a template can
-    reference a node class, or a model option inside one, that only a newer
-    ComfyUI exposes. ``{"checked": true, "runnable": false, ...}`` means running
-    it will fail until the install is updated; ``{"checked": false, ...}`` means
-    the comparison could not be made (usually: ComfyUI is not running) and says
-    nothing either way. The check costs an extra gallery fetch plus a validate —
-    pass ``check_local=False`` to skip it when you only want the metadata.
+    ``object_info`` of the running local ComfyUI, because the gallery catalog is
+    maintained independently of the user's install — a template can reference a
+    node class, or a model option inside one, that only a newer ComfyUI exposes.
+    ``{"checked": true, "runnable": false, ...}`` means running it will fail
+    until the install is updated; ``{"checked": false, ...}`` means the
+    comparison could not be made (usually: ComfyUI is not running) and says
+    nothing either way — that block carries no ``runnable`` key, so read it with
+    ``.get("runnable")``. The check costs an extra gallery fetch plus a validate
+    — pass ``check_local=False`` to skip it when you only want the metadata, but
+    then the validation still has to happen before the run (see
+    ``fetch_template``).
+
+    ``local_check`` is CONDITIONAL, like ``server_info``'s ``hardware`` block: it
+    is attached to comfy-cli's payload, and on a drifted payload shape (anything
+    that is not a JSON object) the payload is handed back untouched with no
+    ``local_check`` key at all. Reach it defensively rather than by indexing.
+
+    Freshness: CACHED, not live — the template metadata comes from comfy-cli's
+    gallery cache at ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL on
+    a comfy-cli NEWER than v1.13.0 (the TTL landed in Comfy-Org/comfy-cli#559,
+    after v1.13.0 was cut) and NO expiry at all on v1.13.0 and older, where the
+    first fetch is kept indefinitely until ``comfy templates refresh`` is run in
+    a terminal (this server does not wrap that verb). The template fields are also
+    NOT read from the local install — only the ``local_check`` half of this
+    response is, which is exactly why that check exists.
     """
     # Bare positional: a leading-dash name is read by comfy-cli as an option
     # rather than the template to show (argument injection).
@@ -8319,22 +8390,61 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     ``run_workflow(workflow_path=...)`` takes, completing the template
     on-ramp::
 
-        search_templates("flux")               # find a template
-        get_template("flux_dev")               # inspect it
-        result = fetch_template("flux_dev", "/tmp/flux.json")
-        run_workflow(result["path"])           # generate — no hand-authored JSON
+        search_templates("flux")               # 1. find a template
+        get_template("flux_dev")               # 2. inspect it
+        out_path = os.path.expanduser("~/comfy-workflows/flux.json")
+        result = fetch_template("flux_dev", out_path)          # 3. write it
+        # 4. REQUIRED gate. `local_check` already ran it here; where it did not
+        #    (see below), validate_workflow(result["path"]) stands in for it.
+        #    `.get`, NOT `[...]`: a `{"checked": false, ...}` block carries no
+        #    `runnable` key at all, so indexing it raises KeyError on exactly
+        #    the paths this docstring documents as normal.
+        if result["local_check"].get("runnable"):
+            run_workflow(result["path"])       # 5. generate
+        else:
+            ...   # relay what is missing + offer update_comfyui, or validate
+                  # first — do NOT reach step 5
 
     so an agent reaches a working generation without hand-authoring workflow JSON.
 
+    Step 4 is not optional. A fetched template is gallery content that has never
+    been compared to this install (see Freshness below), so "it downloaded" says
+    nothing about whether it can run. Do not go from step 3 to step 5 on any
+    template, however ordinary it looks.
+
+    Pick an ``out_path`` only the user can write — a directory under their home,
+    as above — rather than a fixed name in a world-writable one (``/tmp/flux.json``).
+    Step 4 validates the FILE, so on a shared host another local user who can
+    pre-create that path as a symlink, or rewrite it between the check and the
+    run, turns the gate into a TOCTOU where the validated bytes are not the
+    executed bytes.
+
     ``local_check`` is the same cross-check ``get_template`` reports, run against
-    the file just written: the gallery serves templates that can be newer than
-    the user's ComfyUI, so one may reference a node class or an input option
-    this install does not expose. ``{"checked": true, "runnable": false, ...}``
-    means the run will fail until the install is updated — RELAY that to the
-    user instead of running it and letting the failure surface deep in
-    execution. ``{"checked": false, ...}`` means the comparison could not be made
-    (usually: ComfyUI is not running) and is NOT a verdict. The file is written
-    either way; pass ``check_local=False`` to skip the check.
+    the file just written, and it IS step 4 when ``check_local`` is left at its
+    default: the gallery is maintained independently of the user's ComfyUI, so a
+    template may reference a node class or an input option this install does not
+    expose. ``{"checked": true, "runnable": false, ...}`` means the run will fail
+    until the install is updated — RELAY that to the user instead of running it
+    and letting the failure surface deep in execution.
+    ``{"checked": false, ...}`` means the comparison could not be made (usually:
+    ComfyUI is not running) and is NOT a verdict — it leaves step 4 UNDONE, so
+    treat it like ``check_local=False``: run ``validate_workflow(result["path"])``
+    yourself once ComfyUI is up, and do not call ``run_workflow`` until something
+    has actually validated the file. That block has no ``runnable`` key, so read
+    it with ``.get("runnable")`` and treat a missing value as "not cleared". The
+    file is written either way; passing ``check_local=False`` moves the gate onto
+    you, it does not remove it.
+
+    Standing in for ``local_check`` with a raw ``validate_workflow`` is WEAKER,
+    not equivalent, and on one install shape it is not a gate at all: gallery
+    templates are UI-format exports, and a comfy-cli too old to lower one to API
+    format checks ZERO nodes and calls it valid (``validate_workflow``'s blind
+    spot 3). ``local_check`` detects that vacuous pass and downgrades it to
+    ``{"checked": false, "reason": "workflow_not_converted"}``; a bare
+    ``validate_workflow`` call reports ``valid: true``. So when you run it
+    yourself, a pass that arrives with ``non_node_key`` warnings and no UI
+    conversion means nothing was compared — upgrade comfy-cli, or leave
+    ``check_local`` at its default and let this tool make that distinction.
 
     The written JSON may contain a ``definitions.subgraphs`` block and nodes
     whose ``type`` is a UUID (the frontend's "subgraph" feature). That is NORMAL
@@ -8342,6 +8452,15 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     comfy-cli — so never refuse or swap a template over it. Do not hand-edit
     ``definitions.subgraphs``; route edits through ``list_workflow_slots`` /
     ``set_workflow_slot``, which address subgraph-interior inputs too.
+
+    Freshness: CACHED, not live — the template written here comes from comfy-cli's
+    gallery cache at ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL on
+    a comfy-cli NEWER than v1.13.0 (the TTL landed in Comfy-Org/comfy-cli#559,
+    after v1.13.0 was cut) and NO expiry at all on v1.13.0 and older, where the
+    first fetch is kept indefinitely until ``comfy templates refresh`` is run in
+    a terminal (this server does not wrap that verb). The gallery is NOT read from
+    the local install, which is the whole reason step 4 above is mandatory: a
+    template this call happily writes may need node classes this install lacks.
     """
     # `name` is a bare positional, so a leading-dash value is read as an option
     # and every later token shifts up a slot. `out_path` rides behind `--out` as
@@ -8375,6 +8494,10 @@ def search_nodes(query: str) -> Any:
     static/bundled catalog. Use this to find the class name of a node (e.g.
     "KSampler", "load image") before authoring or repairing a workflow graph;
     pass the returned name to ``get_node`` for its full schema.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     # Bare positional: a leading-dash query is read as an option, not a search
     # term (argument injection).
@@ -8394,6 +8517,10 @@ def get_node(name: str) -> Any:
     their types and defaults, and outputs — is what an agent needs to author or
     repair a workflow graph. Reflects the user's live install, so it resolves
     custom-node classes too (not just built-ins).
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     # Bare positional: a leading-dash name is read as an option rather than the
     # node class to show (argument injection).
@@ -8432,6 +8559,10 @@ def list_nodes(
 
     Reads the user's live install, so results include installed custom nodes —
     the broad "what nodes can do X?" companion to ``search_nodes``' name search.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     args = ["nodes", "ls"]
     for flag, value in (
@@ -8462,6 +8593,10 @@ def nodes_upstream(name: str, limit: int | None = None) -> Any:
     INTO this node?" — the candidates that produce the types ``name`` accepts,
     computed against the live local ``object_info`` (custom nodes included). Pass
     ``limit`` to cap the number of results; omit it for the full set.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     # Bare positional, and it sits beside this command's own `--limit`: a
     # leading-dash name is read as an option (argument injection).
@@ -8482,6 +8617,10 @@ def nodes_downstream(name: str, limit: int | None = None) -> Any:
     produces, computed against the live local ``object_info`` (custom nodes
     included). Pass ``limit`` to cap the number of results; omit it for the full
     set.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     # Bare positional, and it sits beside this command's own `--limit`: a
     # leading-dash name is read as an option (argument injection).
@@ -8504,6 +8643,10 @@ def nodes_path(
     whose wiring carries a value from ``from_type`` to ``to_type`` over the live
     local ``object_info`` graph. ``max_depth`` bounds the chain length and
     ``max_paths`` caps how many routes are returned.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     # Two bare positionals ahead of `--max-depth` / `--max-paths`: a leading-dash
     # type is read as an option and shifts every later token up a slot, so the
@@ -8538,6 +8681,10 @@ def nodes_types() -> Any:
     ``IMAGE``, ``LATENT``, ``CONDITIONING``, …) present across the user's
     installed nodes, ordered by how connective each is — the vocabulary you wire
     with. Reflects custom nodes, so install-specific types show up too.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     return _run_comfy("nodes", "types", timeout=60.0)
 
@@ -8550,6 +8697,10 @@ def nodes_categories() -> Any:
     user's installed nodes fall under — a map for browsing what is available by
     area (loaders, sampling, image, …) rather than by name. Reflects the live
     install, so custom-node categories appear too.
+
+    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
+    call; reflects exactly what THIS install has (including its staleness: an
+    outdated install lists outdated nodes).
     """
     return _run_comfy("nodes", "categories", timeout=60.0)
 
@@ -8586,6 +8737,22 @@ def search_models(query: str = "", folder: str = "") -> Any:
     disk — filenames, with no enrichment (no base-model / hash / description /
     download metadata). Agents should set expectations accordingly: it answers
     "which model files does this install have?", not "tell me about this model".
+
+    Freshness: LIVE — the model files on the target install's disk, re-read on
+    every call; filenames only, no registry metadata. So an absent name never
+    means "no such model". It means one of two things, and the SCOPE of the call
+    decides which, so rule that out before concluding anything:
+
+    - present but outside what this call searched. Each mode looks somewhere
+      narrower than "the install": the no-argument mode lists folder NAMES and no
+      files at all, ``folder`` mode reads one folder, and on the v1.13.0 floor
+      ``query`` mode reads ``checkpoints`` only (see the mode list above). A LoRA
+      or VAE already on disk is simply absent from those results — re-check with
+      ``folder="loras"`` / ``folder="vae"`` (or list the folders first) before
+      telling the user anything, since acting on this reading triggers a
+      redundant multi-GB download of a file they already have.
+    - genuinely "not downloaded here" — ``download_model`` is the way to add one,
+      and the hosted partner catalog is ``list_partner_models``.
     """
     # The guards sit INSIDE their branch so an empty value keeps meaning "mode
     # not selected" (the precedence above) rather than becoming an error.
