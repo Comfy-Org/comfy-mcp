@@ -37,8 +37,10 @@ it writes a runnable graph containing the partner's API NODE instead of calling
 the proxy, so ``emit_partner_workflow`` -> ``run_workflow`` -> ``fetch_outputs``
 runs the partner model on the user's OWN ComfyUI (the other way to get there is
 an existing ``API``-tagged gallery template via ``search_templates`` /
-``run_template``; this is the path from a model ALIAS). It reaches no partner
-API and spends nothing, so it carries no consent gate.
+``run_template``; this is the path from a model ALIAS). The EMIT step reaches no
+partner API and spends nothing, so it carries no consent gate — but the graph it
+writes does bill the partner node when it runs, so the ``run_workflow`` that
+follows takes the same opt-in ``confirm_spend`` gate ``run_template`` does.
 
 Requires comfy-cli >= 1.13.0 (the ``comfy logs`` verb, the ``envelope/1``
 contract, and the ``login_url`` event ``auth_login`` depends on):
@@ -126,6 +128,12 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   For a one-shot run, `run_template(name, params=...)` does fetch + fill + run in a
   single call; a template that embeds partner (paid) nodes spends credits and is
   gated by the same `confirm_spend` flag as `partner_generate` (free templates ignore it).
+  Running a FETCHED template through `run_workflow` is gated the same way — an
+  `API`-tagged template's graph still carries the paid nodes, so `run_workflow`
+  takes the same `confirm_spend` flag. On an engine carrying the `comfy run`
+  gate the default fails closed (`spend_consent_required`, naming the
+  `partner_nodes`); no release has it yet, so treat a paid graph as able to
+  spend either way and ASK before running one.
   For the quickest path from text to an image, `generate_image(prompt)` runs the
   default local text-to-image template through that same verb — free, no API key.
 - Templates that use the frontend's "subgraph" feature (UUID-typed nodes plus a
@@ -180,9 +188,11 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   `confirm_switch=True`, which you may set ONLY when the user has agreed.
   `update_comfyui` is the different, forward-only "get me current" verb.
 - Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
-  which SPENDS the user's Comfy credits — local `run_workflow` / `generate_image`
-  runs are free. Discover them here, never in a terminal: `list_partner_models()`
-  is the alias catalog (filter it with `style="text-to-image"` /
+  which SPENDS the user's Comfy credits. A local `generate_image` is always free,
+  and so is a `run_workflow` of an ordinary graph — but a workflow that embeds
+  partner-API nodes bills them wherever it runs, so `run_workflow` carries the
+  same `confirm_spend` gate (below). Discover them here, never in a terminal:
+  `list_partner_models()` is the alias catalog (filter it with `style="text-to-image"` /
   `partner="bfl"`), and `partner_model_schema(alias)` is that model's parameter
   list. Nothing in `discover` / `search_nodes` / `search_templates` carries the
   partner alias set, so those three are not a substitute — but neither is
@@ -200,9 +210,11 @@ This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
   THEIR OWN ComfyUI, use `emit_partner_workflow(model, out_path)` instead: it
   writes a runnable graph containing the partner's API node, which
   `run_workflow` then executes locally and `fetch_outputs` collects. That emit
-  step calls no partner API and spends nothing (running the graph still bills
-  the partner node), but it covers only the few models comfy-cli can render as
-  a node — `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana`, `seedance`. For any
+  step calls no partner API and spends nothing, but running the graph still
+  bills the partner node — so that `run_workflow` call needs
+  `confirm_spend=True` (with the user's actual agreement) and otherwise fails
+  closed on `spend_consent_required` having spent nothing. It covers only the
+  few models comfy-cli can render as a node — `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana`, `seedance`. For any
   other model, the local route is an existing `API`-tagged gallery template
   (`search_templates` → `run_template` / `run_workflow`), and the hosted route is
   `partner_generate` — never report a partner model as impossible here.
@@ -698,6 +710,18 @@ _STREAM_LINE_LIMIT = 1024 * 1024
 # once, up front, with an upgrade message. `auth_login` keeps its own timeout
 # branch as the backstop for an install that slips past the guard (which fails
 # OPEN on a `--version` it cannot read).
+#
+# NOT yet raised for `comfy run`'s paid-node spend gate (`--allow-spend`): that
+# gate landed after 1.13.0 and is in no comfy-cli RELEASE yet, so naming a
+# version here would refuse EVERY tool against every installed comfy-cli — the
+# floor is checked once for the whole server, not per verb. That verb-scoped
+# question is answered per call by `_comfy_run_takes_allow_spend` instead, which
+# is why forwarding the flag to an engine that lacks it never becomes a usage
+# error. Until the gate ships in a release the fail-closed behavior is whatever
+# the installed comfy-cli does (an older one spends silently, as it does today).
+# Raising the floor to that release is the one-line change that upgrades
+# `run_workflow`'s docstring promise from "upgrade to get this" to a guarantee —
+# see `run_workflow`'s SPEND CONSENT section.
 _MIN_COMFY_CLI = (1, 13, 0)
 _MIN_COMFY_CLI_STR = "1.13.0"
 
@@ -3667,6 +3691,7 @@ async def run_workflow(
     workflow_path: str,
     wait: bool = True,
     timeout_seconds: float = 110.0,
+    confirm_spend: bool = False,
     ctx: Context | None = None,
 ) -> Any:
     """Run a ComfyUI workflow JSON on the LOCAL ComfyUI.
@@ -3715,6 +3740,51 @@ async def run_workflow(
     transient credential failure is retried up to twice with a short backoff;
     the surfaced error carries comfy-cli's hint (including the working
     ``comfy auth set comfy-cloud-api-key`` fallback).
+
+    SPEND CONSENT — most workflows are free graphs that run entirely on the
+    user's own machine. SOME embed partner-API (paid) nodes — a graph written by
+    ``emit_partner_workflow``, or an ``API``-tagged gallery template fetched with
+    ``fetch_template`` — and running one spends the user's Comfy credits.
+    comfy-cli gates that path and this wrapper only passes consent through (see
+    :func:`_resolve_workflow_spend_consent`):
+
+    - ``confirm_spend=False`` (the default) forwards nothing, so on a comfy-cli
+      that HAS the gate a paid workflow fails CLOSED (``spend_consent_required``,
+      nothing spent — the error names the offending ``partner_nodes``) while a
+      free workflow runs normally. On one that does not — every release so far,
+      see the capability note below — nothing is withheld and a paid graph still
+      runs and spends. Either way nothing is unlocked FROM HERE, so the user is
+      NOT prompted: free runs, which is nearly all of them, stay a single silent
+      call.
+    - ``confirm_spend=True`` asks to unlock spending, and on a client that
+      supports MCP **elicitation** the USER is prompted per call before anything
+      runs. Approve and ``--allow-spend`` is forwarded; decline and this raises
+      :class:`ComfyCliError` without starting comfy-cli. Only on a client that
+      cannot elicit does the argument stand on its own, as the fallback.
+
+    So ``confirm_spend=True`` is a REQUEST to spend, not the consent itself: set
+    it only when the user has actually agreed, never merely to clear the error
+    you just hit. Spend consent is not tool permission — a host's "always allow
+    this tool" toggle authorizes calling this tool, never spending the user's
+    money, and is never read as consent here. Consent is resolved ONCE per call,
+    before the credential retry above, so a transient retry never re-prompts.
+
+    The fail-closed half of that guarantee is the ENGINE's, not this server's,
+    the same way it is for ``run_template`` — but the capability signal differs.
+    ``run_template`` can rely on the VERB (``comfy run-template`` shipped with its
+    gate inline, so a CLI with the verb and without the gate does not exist),
+    whereas ``comfy run`` long predates its gate, so the verb proves nothing and
+    the flag has to be PROBED — :func:`_comfy_run_takes_allow_spend`, run only on
+    the calls that actually granted consent. The gate landed after the 1.13.0
+    floor this server enforces (:data:`_MIN_COMFY_CLI`) and is in no comfy-cli
+    release yet, so on the comfy-cli you almost certainly have: an approved call
+    runs WITHOUT ``--allow-spend`` (the approval the user just gave is what
+    authorizes it — there is no engine interlock to engage), and the default
+    withholds nothing because there is nothing to withhold, so a paid graph
+    still runs and spends exactly as it did before this argument existed.
+    ``pip install -U comfy-cli`` is what turns ``confirm_spend=False`` into a
+    guarantee rather than a default; raising the floor once the gate ships in a
+    release is what will make it one unconditionally.
     """
     # Guarded HERE rather than inside `_attempt` so it covers BOTH the
     # `wait=False` submit and the streaming path, and so a bad path fails once
@@ -3730,6 +3800,18 @@ async def run_workflow(
         ),
     )
     _reject_nul("workflow_path", workflow_path)
+    if not workflow_path.strip():
+        # Before the consent gate below, deliberately: an empty path cannot
+        # possibly spend, and comfy-cli will reject it anyway, so raising a
+        # credit-spend prompt for `<unnamed workflow>` first would spend the
+        # user's ATTENTION on a call that was never going to run — the currency
+        # a per-call prompt actually costs. Only emptiness is checked here;
+        # whether a non-empty path resolves is comfy-cli's to answer, not this
+        # server's to second-guess.
+        raise ComfyCliError(
+            "workflow_path is empty: pass the path to a workflow JSON file "
+            "(API format or a UI export)."
+        )
     if wait:
         # Harden the caller's bound BEFORE it reaches `_run_comfy_streaming`
         # (and from there `asyncio.wait_for`): `inf` would wait on the child
@@ -3739,6 +3821,28 @@ async def run_workflow(
         # submit that works fine today.
         timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_RUN_WORKFLOW_TIMEOUT)
 
+    # Resolved ONCE, here, for two reasons. It is AFTER the input guards above,
+    # so a malformed call is rejected without ever raising a prompt at the user;
+    # and it is OUTSIDE `_attempt` (and so outside the retry loop below), so a
+    # transient credential retry re-runs the child, never the elicitation — one
+    # human decision per call, not one per attempt.
+    spend_args: tuple[str, ...] = ()
+    if await _resolve_workflow_spend_consent(
+        _display_workflow_path(workflow_path), confirm_spend, ctx
+    ):
+        # Consent granted — now, and only now, is it worth asking whether this
+        # comfy-cli can be TOLD about it. `comfy run` is a plain Click command
+        # (no `ignore_unknown_options`), so forwarding `--allow-spend` to one
+        # that predates the gate exits 2 with a usage error and no `envelope/1`,
+        # turning the approval the user just gave into an opaque "returned no
+        # JSON" failure. Dropping the flag instead runs the graph exactly as it
+        # ran before this argument existed: the human's approval is what
+        # authorizes the spend, and an engine that has no interlock has nothing
+        # to engage. Probed here rather than up front so a free run — nearly all
+        # of them — never pays for the extra `--help` spawn.
+        if await asyncio.to_thread(_comfy_run_takes_allow_spend):
+            spend_args = ("--allow-spend",)
+
     async def _attempt() -> Any:
         if not wait:
             # Fire-and-return: no stream to follow, so keep the plain --json
@@ -3746,13 +3850,19 @@ async def run_workflow(
             # submit doesn't stall the event loop (and other concurrent MCP
             # requests) for up to the 60s timeout.
             return await asyncio.to_thread(
-                _run_comfy, "run", "--workflow", workflow_path, timeout=60.0
+                _run_comfy,
+                "run",
+                "--workflow",
+                workflow_path,
+                *spend_args,
+                timeout=60.0,
             )
         return await _run_comfy_streaming(
             "run",
             "--workflow",
             workflow_path,
             "--wait",
+            *spend_args,
             ctx=ctx,
             timeout=timeout_seconds,
         )
@@ -4190,6 +4300,11 @@ _ELICIT_TIMEOUT = 300.0
 # Cap on how much of a caller-supplied model name is echoed into the prompt.
 _ELICIT_MODEL_DISPLAY_MAX = 80
 
+# The same cap for a caller-supplied workflow PATH. Separate constant only so
+# the two can move apart later; a path is the other identifier this server
+# quotes back at the user in a spend prompt.
+_ELICIT_PATH_DISPLAY_MAX = 80
+
 
 def _display_caller_text(text: str, limit: int) -> str:
     """Render CALLER-supplied text safely inside an elicitation prompt's code span.
@@ -4223,6 +4338,30 @@ def _display_model(model: str) -> str:
     # `partner_generate` rejects an empty model before reaching here; the
     # fallback only covers a name that was ENTIRELY unprintable.
     return _display_caller_text(model, _ELICIT_MODEL_DISPLAY_MAX) or "<unnamed model>"
+
+
+def _display_workflow_path(path: str) -> str:
+    """Render a caller-supplied workflow path for ``run_workflow``'s spend prompt.
+
+    Prefers the whole path — the directory is part of "which graph am I about to
+    pay for?" — but falls back to the BASENAME when the path is too long for the
+    cap. :func:`_display_caller_text` truncates the TAIL, which on a deep path
+    would drop the filename and leave the user reading a directory prefix: the
+    one part that cannot identify the graph. The basename is then capped the same
+    way, so a pathological name is still bounded.
+
+    The fallback is MARKED with a leading ``…/`` rather than shown bare. An
+    unmarked basename reads as the whole path, which loses the one distinction
+    the prompt is for: ``/tmp/x.json`` and ``~/my-graphs/x.json`` would render
+    identically, and a caller can pad a path (deep nesting, redundant ``./``
+    segments) past the cap on purpose to drop a directory the user would have
+    reacted to. The marker cannot restore the directory, but it does tell the
+    user one was omitted.
+    """
+    if len(path) > _ELICIT_PATH_DISPLAY_MAX:
+        # `or path` covers a trailing-separator path, whose basename is empty.
+        path = "…/" + (os.path.basename(path) or path)
+    return _display_caller_text(path, _ELICIT_PATH_DISPLAY_MAX) or "<unnamed workflow>"
 
 
 class _ApprovalWording(NamedTuple):
@@ -4261,6 +4400,21 @@ _SPEND_APPROVAL_WORDING = _ApprovalWording(
         "comfy-cli directly — `comfy generate consent always` — and this tool "
         "will honor it without asking."
     ),
+)
+
+# The same gate for the OPT-IN verbs (`run_template`, `run_workflow`), differing
+# in the one place it must: no escape hatch. `_SPEND_APPROVAL_WORDING`'s names
+# `comfy generate consent always`, which is the true way out for
+# `partner_generate` and a dead end here — neither `comfy run-template` nor
+# `comfy run` reads `spend.auto_confirm` (see `_resolve_optin_spend_consent`),
+# so a stuck user who followed it would broaden standing permission on the
+# GENERATE path, change nothing about this one, and hit the identical message on
+# the retry. There is no durable consent for these verbs to point at, and
+# offering a remedy that provably does nothing is worse than offering none.
+_OPTIN_SPEND_APPROVAL_WORDING = _ApprovalWording(
+    subject="spend",
+    what="the credit spend",
+    nothing_done="Nothing was spent.",
 )
 
 
@@ -4946,8 +5100,16 @@ async def emit_partner_workflow(
     The intended chain, all in this server::
 
         emit_partner_workflow("flux-pro", "/tmp/flux.json", {"prompt": "a red fox"})
-        run_workflow("/tmp/flux.json")     # local ComfyUI executes the node
-        fetch_outputs(prompt_id)           # collect the files it wrote
+        run_workflow("/tmp/flux.json", confirm_spend=True)   # the node bills here
+        fetch_outputs(prompt_id)                             # collect its files
+
+    ``confirm_spend=True`` on that middle step is not boilerplate: the emitted
+    graph contains a partner-API node, so that run is the one that bills. With
+    it the USER is prompted per call on any client that can elicit; without it
+    an engine carrying the ``comfy run`` gate refuses
+    (``spend_consent_required``), while one without it — every release so far —
+    spends silently. Pass it only once they have agreed, and do not read its
+    absence as protection.
 
     (``validate_workflow`` on the emitted file first is worth it if the install
     may not carry the partner node classes yet.) The three steps stay separate so
@@ -5084,28 +5246,62 @@ class TemplateSpendApproval(BaseModel):
     )
 
 
-async def _resolve_template_spend_consent(
-    name: str, confirm_spend: bool, ctx: Context | None
-) -> bool:
-    """Decide whether to forward ``--allow-spend`` for this template run.
+class WorkflowSpendApproval(BaseModel):
+    """What the client returns from the workflow spend-confirmation prompt.
 
-    The same principle as :func:`_resolve_spend_consent` — an agent's own
-    ``confirm_spend=True`` is not the user's consent to spend money, so on a
-    client that can elicit, the human is asked — but the shape differs on two
-    points that are specific to this verb:
+    A sibling of :class:`TemplateSpendApproval` for the same reason that one is
+    a sibling of :class:`SpendApproval` — only the wording differs. A
+    hand-authored or fetched workflow MAY spend (most run entirely on the user's
+    own machine) where a partner model always does, and the prompt should not
+    overstate. The affirmative-answer design is the same: an accept that never
+    answered lands on ``False`` and reads as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Allow this workflow to spend Comfy credits?",
+        description=(
+            "Yes lets the run proceed even if the workflow contains "
+            "partner-API (paid) nodes, spending credits from the Comfy account "
+            "this machine is signed into. No cancels it and spends nothing; a "
+            "workflow with no paid nodes runs free either way."
+        ),
+    )
+
+
+async def _resolve_optin_spend_consent(
+    confirm_spend: bool,
+    ctx: Context | None,
+    *,
+    schema: type[BaseModel],
+    prompt: str,
+    declined: str,
+) -> bool:
+    """The shared OPT-IN spend gate behind ``run_template`` and ``run_workflow``.
+
+    Both verbs are usually FREE — a gallery template is normally an OSS graph and
+    a workflow normally runs entirely on the user's own machine — so both take
+    the same shape, which differs from :func:`_resolve_spend_consent`'s on two
+    points, and only in the message text:
 
     1. **No prompt when nothing can be spent.** ``confirm_spend=False`` forwards
-       nothing, so comfy-cli's gate fails closed and a paid template cannot
-       spend; there is nothing to consent to. Most gallery templates are free
-       OSS graphs, so prompting on every call would train the user to click
-       through the one prompt that matters. The prompt is raised only when the
-       caller is actually asking to unlock spending.
-    2. **comfy-cli's durable always-proceed does NOT apply here.** ``run-template``
-       never reads ``spend.auto_confirm`` — the setting is scoped to
-       ``comfy generate`` (it is that gate's own configuration surface, and its
-       own status line says so). Unlike :func:`_resolve_spend_consent`, there is
-       therefore no branch that lets the engine consent to itself: it would send
-       no flag and the run would fail closed anyway, having asked nobody.
+       nothing, so comfy-cli's gate fails closed and a paid graph cannot spend;
+       there is nothing to consent to. Prompting on every call would train the
+       user to click through the one prompt that matters, so the prompt is
+       raised only when the caller is actually asking to unlock spending.
+    2. **comfy-cli's durable always-proceed does NOT apply.** Neither
+       ``run-template`` nor ``run`` reads ``spend.auto_confirm`` — the setting is
+       scoped to ``comfy generate`` (it is that gate's own configuration surface,
+       and its own status line says so). Unlike :func:`_resolve_spend_consent`
+       there is therefore no branch that lets the engine consent to itself: it
+       would send no flag and the run would fail closed anyway, having asked
+       nobody.
+
+    One body rather than one per verb because the part that must not drift is
+    the POLICY — what counts as consent, and that a refusal raises here instead
+    of relying on the engine. That is the same reasoning that put every gate's
+    fail-closed handling in :func:`_elicit_approval`; ``schema`` / ``prompt`` /
+    ``declined`` are this level's ``_ApprovalWording``.
 
     Returns True to append ``--allow-spend``. Raises :class:`ComfyCliError` —
     before any child is spawned — when the user actively declined.
@@ -5116,30 +5312,116 @@ async def _resolve_template_spend_consent(
     # on the generate path: guessing "cannot elicit" would silently demote a
     # capable client onto the caller's own say-so and spend without a human.
     if _client_elicitation_support(ctx) is not False:
-        if await _elicit_template_spend_consent(ctx, name):
+        if await _elicit_approval(ctx, prompt, schema, _OPTIN_SPEND_APPROVAL_WORDING):
             return True
-        raise ComfyCliError(
-            f"spend not confirmed: the user declined to let the template "
-            f"{name!r} spend Comfy credits. Nothing was spent and no run was "
-            "started. (A template with no partner-API nodes runs for free — "
-            "call again with confirm_spend=False to run it without spending.)"
-        )
+        raise ComfyCliError(declined)
     # Client cannot elicit: `confirm_spend` is the documented fallback.
     return True
 
 
-async def _elicit_template_spend_consent(ctx: Context, name: str) -> bool:
-    """Ask the USER to approve credit spend for this one template run."""
-    return await _elicit_approval(
+async def _resolve_template_spend_consent(
+    name: str, confirm_spend: bool, ctx: Context | None
+) -> bool:
+    """Decide whether to forward ``--allow-spend`` for this template run.
+
+    The template face of :func:`_resolve_optin_spend_consent` — see there for
+    why this verb neither prompts by default nor reads comfy-cli's durable
+    ``spend.auto_confirm``.
+    """
+    return await _resolve_optin_spend_consent(
+        confirm_spend,
         ctx,
-        (
+        schema=TemplateSpendApproval,
+        prompt=(
             f"Run the gallery template `{_display_model(name)}` with credit "
             "spending ALLOWED? Most templates are free graphs that run on this "
             "machine, but one containing partner-API nodes SPENDS Comfy credits "
             "from the account this machine is signed into."
         ),
-        TemplateSpendApproval,
-        _SPEND_APPROVAL_WORDING,
+        declined=(
+            f"spend not confirmed: the user declined to let the template "
+            f"{name!r} spend Comfy credits. Nothing was spent and no run was "
+            "started. (A template with no partner-API nodes runs for free — "
+            "call again with confirm_spend=False to run it without spending.)"
+        ),
+    )
+
+
+# Latch for `_comfy_run_takes_allow_spend`. Latched only on a POSITIVE result,
+# the same posture as `_emit_workflow_capability_probed`: a probe that fails for
+# a transient reason (a hung binary, a bad spawn) must not wedge the answer for
+# the life of the process, and an upgrade mid-process should be picked up.
+_run_allow_spend_probed = False
+
+
+def _comfy_run_takes_allow_spend() -> bool:
+    """Report whether THIS comfy-cli's ``comfy run`` recognises ``--allow-spend``.
+
+    ``run_template`` needs no probe — ``comfy run-template`` shipped with its
+    spend gate inline, so the verb IS the capability signal. ``comfy run``
+    long predates its gate, so the verb proves nothing and the flag has to be
+    asked about directly. Unlike :func:`_require_emit_workflow_capability` this
+    reports rather than raises, because the two failure modes are opposites: an
+    unrecognised ``--emit-workflow`` is silently swallowed as a model parameter
+    and SPENDS (so the only safe answer is to refuse), whereas an unrecognised
+    ``--allow-spend`` is loudly rejected by Click — exit 2, a usage error, no
+    ``envelope/1`` — and spends nothing. Refusing on that would take away a run
+    the user just approved and that worked fine before this argument existed;
+    dropping the flag runs it, which is what they asked for.
+
+    The probe is ``comfy run --help``, safe on ANY comfy-cli: Click prints the
+    usage and exits before the command body, so no workflow is submitted and
+    nothing is spent to learn the answer. Failure to probe reads as "no flag",
+    which is the conservative direction here — it costs a usage error, never a
+    surprise spend.
+    """
+    global _run_allow_spend_probed
+    if _run_allow_spend_probed:
+        return True
+    try:
+        _, stdout, _, returncode, _ = _run_comfy_raw("run", "--help", timeout=30.0)
+    # Broad on purpose, like the other probes: a present-but-unusable binary
+    # must read as "no flag", not leak an OSError out of a consent path.
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "comfy run --allow-spend probe failed", exc_info=True
+        )
+        return False
+    if returncode != 0 or "--allow-spend" not in stdout:
+        return False
+    _run_allow_spend_probed = True
+    return True
+
+
+async def _resolve_workflow_spend_consent(
+    path_display: str, confirm_spend: bool, ctx: Context | None
+) -> bool:
+    """Decide whether to forward ``--allow-spend`` for this ``run_workflow`` call.
+
+    The workflow face of :func:`_resolve_optin_spend_consent`. ``path_display``
+    is the ALREADY-sanitized path (:func:`_display_workflow_path`): it is echoed
+    into a markdown code span in the prompt and into the refusal message, and the
+    caller is an agent that may be relaying untrusted text.
+    """
+    return await _resolve_optin_spend_consent(
+        confirm_spend,
+        ctx,
+        schema=WorkflowSpendApproval,
+        prompt=(
+            f"Run the workflow `{path_display}` with credit spending ALLOWED? "
+            "Most workflows run for free on this machine, but one containing "
+            "partner-API nodes SPENDS Comfy credits from the account this "
+            "machine is signed into."
+        ),
+        declined=(
+            f"spend not confirmed: the user declined to let the workflow "
+            f"'{path_display}' spend Comfy credits. Nothing was spent and no "
+            "run was started. Do NOT retry this graph with confirm_spend=False "
+            "to get past this: unlike run_template, `comfy run`'s spend gate is "
+            "not in a comfy-cli release yet, so on the installed engine that "
+            "would run the workflow and spend the credits the user just "
+            "refused."
+        ),
     )
 
 
