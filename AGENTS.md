@@ -51,7 +51,8 @@ The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
 confirmation on the tools that can spend money, destroy local state, or expose
-the machine: `partner_generate`, `run_template`, `switch_comfyui_version`, and
+the machine: `partner_generate`, `run_template`, `run_workflow`,
+`switch_comfyui_version`, and
 the `launch_comfyui` / `restart_comfyui` pair when `extra_args` would publish
 ComfyUI to the network. comfy-cli owns the credit-spend interlock and the
 durable "always proceed" (`comfy generate consent always`), and this server only
@@ -64,13 +65,21 @@ them share one fail-closed body, `_elicit_approval`; give a new gate its own
 behavior here is still a guardrail breach; adapting comfy-cli's contract to an
 MCP primitive is this repo's job.
 
-The two *spend* gates — `partner_generate` and `run_template` — differ where the
+The three *spend* gates — `partner_generate`, `run_template` and `run_workflow`
+— differ where the
 engine's own shape differs, and those differences are load-bearing rather than
 incidental: `comfy generate` always spends so it always prompts and honors
-`spend.auto_confirm`, while `comfy run-template` is usually free and never reads
-that setting — so `run_template` prompts only when `confirm_spend=True` asks to
-unlock spending, and treats the generate-scoped always-proceed as granting
-nothing. `switch_comfyui_version` sits outside that axis entirely: it spends no
+`spend.auto_confirm`, while `comfy run-template` and `comfy run` are usually
+free and never read
+that setting — so those two prompt only when `confirm_spend=True` asks to
+unlock spending, and treat the generate-scoped always-proceed as granting
+nothing. That shared opt-in POLICY is one body, `_resolve_optin_spend_consent`
+(the per-verb wording is its argument, the way `_ApprovalWording` is
+`_elicit_approval`'s); what still differs between the two is the CAPABILITY
+SIGNAL, because `run-template` shipped with its gate inline while `comfy run`
+long predates its own — so `run_template` can trust the verb, and `run_workflow`
+depends on the comfy-cli version instead (see its docstring; the floor is not
+raised yet). `switch_comfyui_version` sits outside that axis entirely: it spends no
 credits and the CLI does not gate it at all, so its prompt is not a spend
 interlock but this server's only gate — raised on every call, with no
 always-proceed setting to read. The launch pair sits outside it too, and
