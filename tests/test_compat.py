@@ -18,7 +18,7 @@ import subprocess
 import pytest
 from conftest import _FakeRunProc, _raises_at_spawn
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 # --- envelope-version assertion (_unwrap_envelope) --------------------------
 

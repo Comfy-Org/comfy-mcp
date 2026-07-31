@@ -18,7 +18,7 @@ import json
 
 from conftest import envelope
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 # The UUID doubles as the instance node's `type` — the discriminator that makes
 # a workflow "subgraphed" in the frontend format.

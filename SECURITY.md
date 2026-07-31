@@ -7,7 +7,7 @@ If you discover a security vulnerability in this project, **please report it res
 ### How to report
 
 1. **GitHub Private Vulnerability Reporting (preferred)**
-   Navigate to the [Security Advisories page](https://github.com/Comfy-Org/comfy-local-mcp/security/advisories/new) and submit a new advisory. This keeps the report confidential until a fix is available.
+   Navigate to the [Security Advisories page](https://github.com/Comfy-Org/comfy-mcp/security/advisories/new) and submit a new advisory. This keeps the report confidential until a fix is available.
 
 2. **Email**
    Send a detailed report to **support@comfy.org**. Include:

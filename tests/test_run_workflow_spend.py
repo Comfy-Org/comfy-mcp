@@ -43,7 +43,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 
 def _run_workflow(*args, **kwargs):

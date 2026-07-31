@@ -1,4 +1,4 @@
-# Agent Guidelines — comfy-local-mcp
+# Agent Guidelines — comfy-mcp
 
 A short guide for AI agents (and humans) contributing to this repo. **Keep it in
 sync:** if a PR changes the architecture rule, the toolchain, or the tool set,
@@ -6,7 +6,7 @@ update the relevant section in the same PR.
 
 ## What this repo is
 
-`comfy-local-mcp` is a small, standalone [MCP](https://modelcontextprotocol.io)
+`comfy-mcp` is a small, standalone [MCP](https://modelcontextprotocol.io)
 server that lets an agent drive a user's **local** ComfyUI. It is a **thin
 wrapper over [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli)** — comfy-cli
 is the engine; this repo is just the MCP surface over it.
@@ -14,7 +14,7 @@ is the engine; this repo is just the MCP surface over it.
 ## The architecture rule — thin wrapper only (read this first)
 
 Every tool is a passthrough to the `comfy` binary. There is exactly one way to
-reach comfy-cli: the `_run_comfy(*args)` helper in `src/comfy_local_mcp/server.py`,
+reach comfy-cli: the `_run_comfy(*args)` helper in `src/comfy_mcp/server.py`,
 which shells out to `comfy --json --where local <args>` (global flags **before**
 the subcommand), parses comfy-cli's versioned `envelope/1` result, and returns
 its `data`. Do not bypass it.
@@ -101,7 +101,7 @@ dependency edges only ever point one way:
 |---|---|
 | `textutil.py` | pure text helpers: `_tail` / `_stream_tail` (bounded stream tails) and `_redact_url` (userinfo masking) |
 | `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
-| `failure_log.py` | the opt-in `COMFY_LOCAL_MCP_DEBUG_LOG` failure log: its config, its module state, and `_log_failure` |
+| `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` failure log: its config, its module state, and `_log_failure` |
 
 `server` reaches them **module-qualified** (`tcc._tcc_guidance(...)`,
 `failure_log._log_failure(...)`) and re-exports nothing. That is deliberate: a

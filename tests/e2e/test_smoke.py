@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 # PNG signature — the 8 magic bytes every PNG starts with. Enough to prove a real
 # image landed without pulling in an image library (Pillow etc.).

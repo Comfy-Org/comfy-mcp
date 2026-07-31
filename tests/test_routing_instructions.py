@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 from conftest import envelope
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 # ``INSTRUCTIONS`` is hard-wrapped prose, so any phrase long enough to matter can
 # straddle a newline. Match against a whitespace-collapsed copy: these tests are

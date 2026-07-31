@@ -9,7 +9,7 @@ body:
         below so we can reproduce and fix it.
 
         For security vulnerabilities, **do not** open a public issue — follow
-        [SECURITY.md](https://github.com/Comfy-Org/comfy-local-mcp/blob/main/SECURITY.md)
+        [SECURITY.md](https://github.com/Comfy-Org/comfy-mcp/blob/main/SECURITY.md)
         instead.
   - type: textarea
     id: what-happened
@@ -45,8 +45,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: comfy-local-mcp version
-      description: "`pip show comfy-local-mcp` (or the commit SHA if installed from source)."
+      label: comfy-mcp version
+      description: "`pip show comfy-mcp` (or the commit SHA if installed from source)."
       placeholder: 0.1.0
     validations:
       required: false

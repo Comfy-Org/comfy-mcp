@@ -44,7 +44,7 @@ import logging
 
 import pytest
 
-from comfy_local_mcp import failure_log, server
+from comfy_mcp import failure_log, server
 
 
 @pytest.fixture(autouse=True)
@@ -123,7 +123,7 @@ def _clear_columns_env(monkeypatch):
 def _isolate_failure_log(monkeypatch):
     """Default every test to the opt-in failure log being OFF, and never leak it.
 
-    ``failure_log._FAILURE_LOG_PATH`` is resolved from ``COMFY_LOCAL_MCP_DEBUG_LOG`` at
+    ``failure_log._FAILURE_LOG_PATH`` is resolved from ``COMFY_MCP_DEBUG_LOG`` at
     import, so a developer who has the var exported would otherwise have the whole
     suite writing real records into their app-support directory — and the
     "disabled by default" tests would fail for an environmental reason. Pin it off

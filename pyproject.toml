@@ -1,7 +1,7 @@
 [project]
-name = "comfy-local-mcp"
+name = "comfy-mcp"
 version = "0.4.0"
-description = "Local MCP server for ComfyUI — a thin wrapper over comfy-cli."
+description = "MCP server for ComfyUI — a thin wrapper over comfy-cli."
 readme = "README.md"
 requires-python = ">=3.10"
 # PEP 639 SPDX expression. `LicenseRef-Comfy-Commercial` is the SPDX form for a
@@ -46,7 +46,7 @@ dependencies = [
 # specific comfy-cli build rather than a hard-pinnable PyPI release. Compatibility
 # is enforced at RUNTIME instead — `server_info` asserts the comfy-cli envelope
 # schema major and, when COMFY_CLI_MIN_VERSION is set, a minimum version. See
-# src/comfy_local_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
+# src/comfy_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
 
 [project.optional-dependencies]
 # The ruff floor is 0.16, not 0.15, because `[tool.ruff.lint] select` below now
@@ -59,7 +59,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.16,<0.17"]
 
 [project.scripts]
-comfy-local-mcp = "comfy_local_mcp.server:main"
+comfy-mcp = "comfy_mcp.server:main"
 
 [build-system]
 requires = ["setuptools>=77"]

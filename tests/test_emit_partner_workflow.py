@@ -31,7 +31,7 @@ import json
 import pytest
 from conftest import envelope
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 
 def _emit(*args, **kwargs):

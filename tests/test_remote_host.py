@@ -21,7 +21,7 @@ import asyncio
 import pytest
 from conftest import _OK_STREAM, envelope
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 # --- _comfy_target env parsing ---------------------------------------------
 

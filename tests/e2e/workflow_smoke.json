@@ -13,7 +13,7 @@
     "class_type": "SaveImage",
     "inputs": {
       "images": ["1", 0],
-      "filename_prefix": "comfy_local_mcp_smoke"
+      "filename_prefix": "comfy_mcp_smoke"
     },
     "_meta": { "title": "SaveImage" }
   }

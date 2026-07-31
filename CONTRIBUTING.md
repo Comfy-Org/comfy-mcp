@@ -1,6 +1,6 @@
-# Contributing to comfy-local-mcp
+# Contributing to comfy-mcp
 
-Thanks for your interest in improving `comfy-local-mcp`! This is a small,
+Thanks for your interest in improving `comfy-mcp`! This is a small,
 standalone [MCP](https://modelcontextprotocol.io) server that lets AI agents
 drive a user's **local** ComfyUI by shelling out to
 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).
@@ -19,7 +19,7 @@ Before you write any code, read [`AGENTS.md`](AGENTS.md). The core rule:
 
 **Every tool is a passthrough to the `comfy` binary.** There is exactly one way
 to reach comfy-cli — the `_run_comfy(*args)` helper in
-`src/comfy_local_mcp/server.py`, which shells out to
+`src/comfy_mcp/server.py`, which shells out to
 `comfy --json --where local <args>`, parses comfy-cli's versioned `envelope/1`
 result, and returns its `data`. Do not bypass it.
 

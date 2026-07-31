@@ -1,4 +1,4 @@
-"""comfy-local-mcp — a thin MCP wrapper over comfy-cli.
+"""comfy-mcp — a thin MCP wrapper over comfy-cli.
 
 Every tool shells out to the ``comfy`` command (comfy-cli), pinned to the LOCAL
 target (``--where local``, defaulting to ComfyUI on ``127.0.0.1:8188``), asks
@@ -321,7 +321,7 @@ point the user at Comfy Cloud or partner nodes; this server cannot run cloud
 jobs itself.
 """
 
-mcp = MCPServer("comfy-local-mcp", instructions=INSTRUCTIONS)
+mcp = MCPServer("comfy-mcp", instructions=INSTRUCTIONS)
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
@@ -8312,7 +8312,7 @@ def _check_template_by_name(name: str) -> dict:
     the caller's filesystem untouched (``fetch_template`` is the tool that
     writes a file the user keeps).
     """
-    scratch = tempfile.mkdtemp(prefix="comfy-local-mcp-template-")
+    scratch = tempfile.mkdtemp(prefix="comfy-mcp-template-")
     try:
         path = os.path.join(scratch, "template.json")
         try:
@@ -10313,7 +10313,7 @@ def main() -> None:
         ):
             raise
         print(
-            f"comfy-local-mcp: {exc}\n\n{tcc._tcc_guidance(path)}",
+            f"comfy-mcp: {exc}\n\n{tcc._tcc_guidance(path)}",
             file=sys.stderr,
             flush=True,
         )

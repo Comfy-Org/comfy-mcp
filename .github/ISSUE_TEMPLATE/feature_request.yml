@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for the idea! Before filing, please note the **thin-wrapper**
         architecture rule: every tool is a passthrough to a `comfy` subcommand
-        (see [AGENTS.md](https://github.com/Comfy-Org/comfy-local-mcp/blob/main/AGENTS.md)).
+        (see [AGENTS.md](https://github.com/Comfy-Org/comfy-mcp/blob/main/AGENTS.md)).
         If the capability you want doesn't exist
         in [comfy-cli](https://github.com/Comfy-Org/comfy-cli) yet, the right
         home for it is usually a comfy-cli change rather than this repo.

@@ -27,7 +27,7 @@ import pytest
 from conftest import envelope
 from pydantic import ValidationError
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 
 def test_list_workflow_slots_argv(patched_run):

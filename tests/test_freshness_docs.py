@@ -32,7 +32,7 @@ import textwrap
 
 import pytest
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 # The node tools, all of which resolve against the live local `object_info`.
 LIVE_NODE_TOOLS = (

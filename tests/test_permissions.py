@@ -22,7 +22,7 @@ import subprocess
 import pytest
 from conftest import _FakeRunProc
 
-from comfy_local_mcp import server, tcc
+from comfy_mcp import server, tcc
 
 # The child's stderr when its venv sits in a TCC-protected folder.
 _DENIED_PATH = os.path.join(
