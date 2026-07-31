@@ -146,7 +146,9 @@ flows:
   `partner_nodes`); no release has it yet, so treat a paid graph as able to
   spend either way and ASK before running one.
   For the quickest path from text to an image, `generate_image(prompt)` runs the
-  default local text-to-image template through that same verb — free, no API key.
+  default OSS text-to-image template through that same verb — free, no API key.
+  It submits to the same ComfyUI `run_workflow` does: this machine, or the
+  remote a `comfy_target` names.
 - Templates that use the frontend's "subgraph" feature (UUID-typed nodes plus a
   `definitions.subgraphs` block in the workflow JSON) are FULLY supported:
   `run_workflow` and `run_template` expand them client-side via comfy-cli, and
@@ -170,8 +172,9 @@ flows:
   lands only when the current job ends, so an immediate re-read can still show
   the old number. Both tools describe/act on whichever ComfyUI comfy-cli itself
   targets and are NOT redirected by `COMFYUI_URL`/`COMFYUI_HOST` — so when those
-  are set, they report and free the LOCAL install while `run_workflow` submits to
-  the remote one. Do not sequence them against a remote run.
+  are set, they report and free the LOCAL install while `run_workflow`,
+  `generate_image` and `run_template` all submit to the remote one. Do not
+  sequence them against a remote run.
 - Before running a workflow whose nodes call partner APIs (Seedream / Veo /
   Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials.
   Treat credentials as GOOD if `signed_in` is true OR
@@ -199,8 +202,9 @@ flows:
   `confirm_switch=True`, which you may set ONLY when the user has agreed.
   `update_comfyui` is the different, forward-only "get me current" verb.
 - Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
-  which SPENDS the user's Comfy credits. A local `generate_image` is always free,
-  and so is a `run_workflow` of an ordinary graph — but a workflow that embeds
+  which SPENDS the user's Comfy credits. `generate_image` is always free — it
+  runs an OSS graph on the user's own ComfyUI, whichever machine that is — and
+  so is a `run_workflow` of an ordinary graph; but a workflow that embeds
   partner-API nodes bills them wherever it runs, so `run_workflow` carries the
   same `confirm_spend` gate (below). Discover them here, never in a terminal:
   `list_partner_models()` is the alias catalog (filter it with `style="text-to-image"` /
@@ -251,12 +255,16 @@ and work through these steps IN ORDER — a later step never overrides an
 earlier one:
 - STEP 1, is the work even local? `hardware` describes the machine THIS server
   runs on, and that is where MOST tools execute. A `comfy_target` block
-  carrying a `host` diverts only `run_workflow` and the queue/`jobs` tools;
-  `generate_image`, `run_template` and everything else still run HERE, so the
-  thresholds below keep governing them. Count the target as another machine
-  only when its `host` is neither a loopback address (anything in
-  `127.0.0.0/8`, `localhost`, or IPv6 `::1`) nor this host's own name or
-  address; an ERROR-shaped `comfy_target` (`{"error": …, "note": …}` from a
+  carrying a `host` diverts every tool that SUBMITS a job — `run_workflow`,
+  `generate_image`, `run_template` — along with the queue/`jobs` tools, while
+  discovery, templates, model downloads and the lifecycle tools still describe
+  and act on THIS machine. (`fetch_outputs` is neither: it forwards no host but
+  still collects a remote job's files, from the local state file the submit
+  wrote.) So against a genuine remote the thresholds below describe the wrong
+  machine: they govern generation only while the target is this one. Count the
+  target as another machine only when its `host` is neither a loopback address
+  (anything in `127.0.0.0/8`, `localhost`, or IPv6 `::1`) nor this host's own
+  name or address; an ERROR-shaped `comfy_target` (`{"error": …, "note": …}` from a
   malformed config) resolves no remote at all. Nothing this server returns
   carries the local hostname or interface addresses, so if the `host` is a name
   or LAN IP you cannot place, ASK the user which machine it is rather than
@@ -346,19 +354,51 @@ COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 DEFAULT_COMFYUI_PORT = 8188
 
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
-# run`` and every ``comfy jobs`` subcommand — the "run/queue" tools this ticket
-# scopes, and the pair comfy-cli's ``comfy_cli/host_port.py`` contractually
-# guarantees accept the options. Deliberately NOT forwarded (v1 scope):
+# run``, ``comfy run-template``, and every ``comfy jobs`` subcommand — every verb
+# that SUBMITS a job or reads one back, which is the set that has to agree on
+# which server it is talking to. ``run`` / ``jobs`` are the pair comfy-cli's
+# ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
+# options and resolves them through that module's own ``resolve_host_port``
+# (``comfy_cli/command/templates.py``), it is just missing from that docstring's
+# list.
+#
+# ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
+# It backs both ``run_template`` and ``generate_image``, and while it was absent
+# the submit-then-poll flow did not merely run on the wrong box, it could not
+# complete at all: the run executed locally, ``wait_for_job`` (a ``jobs`` verb,
+# forwarded) polled the configured remote, and the local ``prompt_id`` came back
+# ``prompt_not_found`` from a queue it was never submitted to. Adding a verb here
+# is only safe when comfy-cli actually accepts the flags on it — otherwise the
+# forward turns every call into "No such option". There is no such window for
+# this one: ``run-template`` shipped WITH both options, in the same comfy-cli
+# release (1.13.0) that introduced the verb — which is also the floor
+# ``_check_comfy_version`` enforces (``_MIN_COMFY_CLI``). A comfy-cli old enough
+# to reject ``--host`` here has no ``run-template`` at all, so it fails on the
+# verb before the flags are ever parsed. That argument is about RELEASED
+# comfy-cli, and the floor guard deliberately fails OPEN, so a fork or source
+# build carrying ``run-template`` with its options stripped would still get a
+# Click usage error rather than a graceful degrade. No probe is added for it
+# because the exposure is not this verb's: ``run`` and ``jobs`` have been
+# forwarded unprobed all along and would fail the same way. Probing (the
+# ``_comfy_run_takes_allow_spend`` shape) is the fix if that ever stops being
+# hypothetical — for ALL THREE verbs, not just this one.
+#
+# Deliberately NOT forwarded:
 #   * ``env`` / ``download`` / ``upload`` / ``templates`` / ``models`` /
 #     ``generate`` / the lifecycle verbs take NO ``--host`` / ``--port`` at all,
-#     so forwarding would error "No such option" — they stay local-only (a real
-#     comfy-cli limitation; e.g. ``download`` can't fetch a remote job's files).
+#     so forwarding would error "No such option" — they stay local-only. That is
+#     not always a functional limit: ``download`` still collects a REMOTE job's
+#     files, because it resolves the ``prompt_id`` from the state file this
+#     machine wrote at submit (which records absolute ``/view`` URLs on the
+#     remote) instead of asking a server — see ``fetch_outputs``.
 #   * ``nodes`` / ``validate`` DO accept ``--host`` / ``--port`` in current
-#     comfy-cli, but remoting live discovery/validation is out of this pass's
-#     "run/queue" scope; forwarding them is a clean follow-up.
+#     comfy-cli, but remoting live discovery/validation is out of scope here;
+#     forwarding them is a clean follow-up. Their local answers are advisory —
+#     ``run_workflow`` and ``run_template`` already submit to a remote whose node
+#     set a local check cannot see.
 # Forwarding is a no-op for the local default regardless, so unconfigured
 # behavior is unchanged for every tool.
-_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "jobs"})
+_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "run-template", "jobs"})
 
 # The envelope schema major version this server speaks. comfy-cli tags every
 # result with a ``schema`` like ``envelope/1``; the whole contract (result
@@ -1332,9 +1372,9 @@ def _comfy_target() -> tuple[str, int, str] | None:
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
-    The flags are injected into the SUBCOMMAND args (after the ``run`` / ``jobs``
-    verb), never into the global ``--json`` / ``--where`` prefix, since
-    ``--host`` / ``--port`` are ``comfy run`` / ``comfy jobs`` subcommand options.
+    The flags are injected into the SUBCOMMAND args (after the ``run`` /
+    ``run-template`` / ``jobs`` verb), never into the global ``--json`` /
+    ``--where`` prefix, since ``--host`` / ``--port`` are subcommand options.
     A no-op for the local default (``_comfy_target`` is None) and for any
     subcommand that doesn't accept the flags (see :data:`_TARGET_AWARE_SUBCOMMANDS`),
     so unconfigured behavior is byte-identical to today.
@@ -3204,12 +3244,12 @@ def server_info() -> Any:
 
     Remote target: when a remote ComfyUI is configured (``COMFYUI_URL`` or
     ``COMFYUI_HOST`` — see :func:`_comfy_target`), a ``comfy_target`` block is
-    attached reporting the ``host`` / ``port`` the run/queue tools drive, so an
+    attached reporting the ``host`` / ``port`` the submit/poll tools drive, so an
     agent knows they are NOT targeting localhost. NOTE: the ``comfy env`` fields
     (running / url / workspace / python) always describe the LOCAL comfy-cli
     install — ``comfy env`` takes no ``--host`` — and this server never opens an
     HTTP socket (AGENTS.md), so it does not live-probe the remote here;
-    reachability is confirmed by the first run/queue call, which targets the
+    reachability is confirmed by the first submit/poll call, which targets the
     same host.
     """
     envelope, stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
@@ -3235,8 +3275,9 @@ def server_info() -> Any:
         report["comfy_target"] = {
             "error": str(exc),
             "note": (
-                "COMFYUI_URL/COMFYUI_HOST is set but malformed; the run/queue "
-                "tools will raise this same error until it is fixed."
+                "COMFYUI_URL/COMFYUI_HOST is set but malformed; the submit/poll "
+                "tools (run_workflow, generate_image, run_template and the "
+                "jobs/queue tools) will raise this same error until it is fixed."
             ),
         }
     else:
@@ -3247,8 +3288,14 @@ def server_info() -> Any:
                 "port": port,
                 "source": source,
                 "note": (
-                    "run/queue tools target this remote ComfyUI via --host/--port; "
-                    "the env fields above describe the LOCAL comfy-cli install."
+                    "the submit/poll tools target this remote ComfyUI via "
+                    "--host/--port — run_workflow, generate_image, run_template "
+                    "and the jobs/queue tools; the lifecycle, discovery and "
+                    "catalog tools forward no host and describe THIS machine, "
+                    "and so do the env fields above, which are the LOCAL "
+                    "comfy-cli install. (fetch_outputs forwards no host either "
+                    "but still collects a remote job's files, from the local "
+                    "state file the submit wrote.)"
                 ),
             }
     return report
@@ -4003,12 +4050,18 @@ async def generate_image(
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
 ) -> Any:
-    """Generate an image from a text prompt on the LOCAL ComfyUI — the fast on-ramp.
+    """Generate an image from a text prompt — the fast on-ramp.
+
+    Runs on the ComfyUI this server targets: the one on this machine unless
+    ``COMFYUI_URL`` / ``COMFYUI_HOST`` points the run/job tools at another one
+    you control (see :func:`_comfy_target`) — this is one of the tools that
+    follows it, so the ``prompt_id`` it returns belongs to that same server and
+    ``job_status`` / ``wait_for_job`` / ``watch_job`` read it back there.
 
     A single call that turns a text prompt into an image, so an agent does not
     have to hand-assemble a workflow graph. It runs ComfyUI's default SD1.5
     text-to-image gallery template through ``comfy run-template <name>
-    --param=KEY=VALUE`` — the same verb (and the same local run path) as
+    --param=KEY=VALUE`` — the same verb (and the same run path) as
     ``run_template``, with the prompt filled into the template's positive
     CLIPTextEncode slot. Returns the same envelope shape as ``run_workflow``
     (``prompt_id`` + outputs).
@@ -4020,11 +4073,13 @@ async def generate_image(
     graph; the two must name DIFFERENT slots (one key for both is refused rather
     than silently dropping the prompt). Pass ``checkpoint`` to swap the
     template's checkpoint model (it must
-    already be installed locally — see ``search_models`` / ``download_model``);
-    omit it to use the template's own default. The default template is a free,
-    fully local OSS graph: nothing here spends Comfy credits, so no spend
-    consent is passed and none is needed. (For hosted PARTNER models, which do
-    spend, use ``partner_generate``.)
+    already be installed on the machine that RUNS the job — ``search_models`` /
+    ``download_model`` inspect and write to THIS machine's install, so with a
+    remote configured you have to put the checkpoint on that machine yourself);
+    omit it to use the template's own default. The default template is a free
+    OSS graph that runs on your own ComfyUI: nothing here spends Comfy credits,
+    so no spend consent is passed and none is needed. (For hosted PARTNER
+    models, which do spend, use ``partner_generate``.)
 
     With ``wait=True`` (default) this waits until the generation finishes and
     streams live progress as MCP progress notifications (per-node execution +
@@ -4039,8 +4094,9 @@ async def generate_image(
     template, editing its graph, or running a hand-authored workflow — use the
     ``search_templates`` -> ``fetch_template`` -> ``run_workflow`` chain instead.
 
-    Everything targets the LOCAL server (``--where local`` is injected by
-    ``_run_comfy``), so there is no cloud reachability here.
+    This never reaches Comfy Cloud (``--where local`` is injected by
+    ``_run_comfy``); a configured ``COMFYUI_URL`` is a ComfyUI YOU run
+    elsewhere, not a hosted one.
     """
     template, prompt_slot, checkpoint_slot = _t2i_config()
     if not template:
@@ -5341,8 +5397,9 @@ class TemplateSpendApproval(BaseModel):
         description=(
             "Yes lets the run proceed even if the template contains "
             "partner-API (paid) nodes, spending credits from the Comfy account "
-            "this machine is signed into. No cancels it and spends nothing; a "
-            "template with no paid nodes runs free either way."
+            "the machine that RUNS it is signed into — this one, or the remote "
+            "a COMFYUI_URL/COMFYUI_HOST names. No cancels it and spends "
+            "nothing; a template with no paid nodes runs free either way."
         ),
     )
 
@@ -5364,8 +5421,9 @@ class WorkflowSpendApproval(BaseModel):
         description=(
             "Yes lets the run proceed even if the workflow contains "
             "partner-API (paid) nodes, spending credits from the Comfy account "
-            "this machine is signed into. No cancels it and spends nothing; a "
-            "workflow with no paid nodes runs free either way."
+            "the machine that RUNS it is signed into — this one, or the remote "
+            "a COMFYUI_URL/COMFYUI_HOST names. No cancels it and spends "
+            "nothing; a workflow with no paid nodes runs free either way."
         ),
     )
 
@@ -5435,9 +5493,10 @@ async def _resolve_template_spend_consent(
         schema=TemplateSpendApproval,
         prompt=(
             f"Run the gallery template `{_display_model(name)}` with credit "
-            "spending ALLOWED? Most templates are free graphs that run on this "
-            "machine, but one containing partner-API nodes SPENDS Comfy credits "
-            "from the account this machine is signed into."
+            "spending ALLOWED? Most templates are free graphs that run on your "
+            "own ComfyUI, but one containing partner-API nodes SPENDS Comfy "
+            "credits from the account the machine RUNNING it is signed into — "
+            "this one, or the remote a COMFYUI_URL/COMFYUI_HOST names."
         ),
         declined=(
             f"spend not confirmed: the user declined to let the template "
@@ -5510,9 +5569,10 @@ async def _resolve_workflow_spend_consent(
         schema=WorkflowSpendApproval,
         prompt=(
             f"Run the workflow `{path_display}` with credit spending ALLOWED? "
-            "Most workflows run for free on this machine, but one containing "
-            "partner-API nodes SPENDS Comfy credits from the account this "
-            "machine is signed into."
+            "Most workflows run for free on your own ComfyUI, but one "
+            "containing partner-API nodes SPENDS Comfy credits from the account "
+            "the machine RUNNING it is signed into — this one, or the remote a "
+            "COMFYUI_URL/COMFYUI_HOST names."
         ),
         declined=(
             f"spend not confirmed: the user declined to let the workflow "
@@ -5634,11 +5694,17 @@ async def run_template(
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
 ) -> Any:
-    """Run a gallery template on the LOCAL ComfyUI — fetch, fill params, execute.
+    """Run a gallery template — fetch, fill params, execute.
+
+    Runs on the ComfyUI this server targets: the one on this machine unless
+    ``COMFYUI_URL`` / ``COMFYUI_HOST`` points the run/job tools at another one
+    you control (see :func:`_comfy_target`) — this is one of the tools that
+    follows it, so the ``prompt_id`` it returns belongs to that same server and
+    ``job_status`` / ``wait_for_job`` / ``watch_job`` read it back there.
 
     Thin passthrough to ``comfy run-template <name> [--param=KEY=VALUE]…`` (the
     engine fetches the template graph, fills its parameterized slots, and runs it
-    through the same local run path as ``run_workflow``). Named ``run_template``
+    through the same run path as ``run_workflow``). Named ``run_template``
     for contract parity with the cloud MCP's ``run_template(name, params)``; this
     is the one-command alternative to the manual ``search_templates`` →
     ``fetch_template`` → ``run_workflow`` chain.
@@ -5653,8 +5719,10 @@ async def run_template(
     engine expands ``definitions.subgraphs`` for you.
 
     SPEND CONSENT — most gallery templates are free OSS graphs that run entirely
-    on the user's own machine. SOME embed partner-API (paid) nodes, and running
-    one spends the user's Comfy credits. comfy-cli gates that path and this
+    on the user's own ComfyUI (this machine, or a configured remote). SOME embed
+    partner-API (paid) nodes, and running one spends the Comfy credits of the
+    account the machine RUNNING the job is signed into, which with a remote
+    configured is not necessarily this one. comfy-cli gates that path and this
     wrapper only passes consent through (see
     :func:`_resolve_template_spend_consent`):
 
@@ -5705,9 +5773,12 @@ async def run_template(
     immediately with a ``prompt_id`` to poll via ``job_status`` /
     ``wait_for_job`` / ``watch_job`` — use that for long (e.g. video) runs that
     may exceed your MCP client's tool timeout. OSS templates need their referenced
-    models installed locally; a missing model surfaces the run path's per-node
-    error (see ``search_models`` / ``download_model``). Everything targets the
-    LOCAL server (``--where local`` is injected by ``_run_comfy``).
+    models installed on the machine that runs the job; a missing model surfaces
+    the run path's per-node error (see ``search_models`` / ``download_model``,
+    which inspect and write to THIS machine's install even when the run itself
+    goes to a configured remote). This never reaches Comfy Cloud (``--where
+    local`` is injected by ``_run_comfy``); a configured ``COMFYUI_URL`` is a
+    ComfyUI YOU run elsewhere, not a hosted one.
     """
     if not name:
         raise ComfyCliError(
@@ -6389,7 +6460,7 @@ def fetch_outputs(
     url_only: bool = False,
     inline_images: bool = False,
 ) -> Any:
-    """Download a completed LOCAL job's output files into ``out_dir``.
+    """Download a completed job's output files into ``out_dir``.
 
     Thin passthrough to ``comfy download <prompt_id> --where local -o <out_dir>``:
     comfy-cli resolves the job's outputs and writes them into ``out_dir``, so
@@ -6397,6 +6468,17 @@ def fetch_outputs(
     supplied by :func:`_run_comfy` as a global flag.) Pass ``url_only=True`` to
     add ``--url-only`` — comfy-cli then emits the output URLs without downloading,
     handy for handing URLs to other tools instead of copying bytes.
+
+    That ``local`` means "not Comfy Cloud", NOT "not a remote ComfyUI". This verb
+    takes no ``--host`` / ``--port`` and none is forwarded (see
+    :data:`_TARGET_AWARE_SUBCOMMANDS`), yet it still collects a job that ran on a
+    configured remote — because it never asks a server which job that is. The
+    comfy-cli run that SUBMITTED the job wrote a state file on THIS machine keyed
+    by ``prompt_id``, and against a non-loopback target that file records each
+    output as an absolute ``http://<remote>:<port>/view?…`` URL, which comfy-cli
+    streams from the remote. Only a ``prompt_id`` this machine never submitted
+    has no such state file, and that falls back to the local default server as a
+    ``download_job_not_found`` — never a silently wrong file.
 
     Pass ``inline_images=True`` to ALSO return the copied images as inline MCP
     image content (base64) so the calling agent can see the result without a

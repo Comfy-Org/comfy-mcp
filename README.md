@@ -425,7 +425,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a ComfyUI on *another
   machine*).** Read by **this server**. By default every tool targets `127.0.0.1:8188`. Set
   `COMFYUI_URL` (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`,
-  default `8188`) pair — to point the **run / job** tools at a ComfyUI running elsewhere, e.g. a
+  default `8188`) pair — to point the **submit / job** tools at a ComfyUI running elsewhere, e.g. a
   GPU box reachable over a private network (Tailscale). See **[Driving a remote
   ComfyUI](#driving-a-remote-comfyui)** for what is and isn't remoted. Unset ⇒ nothing changes.
 - **`COMFY_LOCAL_URL` (optional — a ComfyUI on *this machine*, on a non-default port).** Read by
@@ -470,7 +470,7 @@ The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card o
 
 The instructions walk these as an ordered procedure, because several of the checks only make sense in sequence:
 
-1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts only `run_workflow` and the queue/`jobs` tools — `generate_image`, `run_template` and the rest stay local, so the thresholds still govern them. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
+1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts every tool that submits a job — `run_workflow`, `generate_image`, `run_template` — along with the queue/`jobs` tools, while discovery, templates, downloads, outputs and the lifecycle tools stay here; so against a genuine remote the thresholds below describe the wrong machine. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
 2. **Get a memory figure.** The sizes are bytes (`ram_bytes`, `gpu.vram_bytes`) and the divisor gives GiB, while drivers report under the advertised size — a consumer 24 GB card reads 23.99, an ECC/reserving datacenter card (A10, L4) about 22.3 — so a *small* shortfall, within ~10% of a nominal size, reads as that nominal capacity. A gap wider than that is not driver overhead and is taken at face value instead: on a MIG/vGPU partition the model string names the whole card while `vram_bytes` is the slice you actually get, and rounding a 6 GB A100 slice up into the ≥ 24 GB band would OOM the run. On Apple Silicon `gpu.vram_bytes` is `null` (with `gpu.unified_memory` true) and the figure is `ram_bytes` — an Apple-only substitution.
 3. **If the figure is missing, ask.** A `null` **or zero** `vram_bytes` on any **non-Apple** GPU (a discrete card comfy-cli can't size, but also a non-Apple unified part like a Jetson/Grace board or a Strix Halo APU), a missing `gpu` object, or a missing/zero `ram_bytes` on the Apple path all mean **unknown**, not "no GPU" — the agent asks rather than stranding a machine that has one. The "no GPU" verdict is reserved for a *confirmed* absence, and the only thing that confirms one is your own answer: no `hardware` payload encodes it, because a null or missing `gpu` is unknown by this same step. Nothing in this repo probes hardware, and the instructions tell the agent not to shell out either: a probe runs on a path this server can neither bound nor audit.
 4. **Route on the figure**, then **redirect rather than dead-end** when the answer is "not on this machine". A figure that came from your answer rather than the payload routes on whichever row fits the machine — the unified-memory row on an Apple Silicon Mac, the VRAM rows otherwise, which is what covers the non-Apple unified-memory boards that have no row of their own.
@@ -494,6 +494,9 @@ The recipe, in order:
    - **llama.cpp (`llama-server`)** — in [router mode](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) (started with no `-m`, or with `--models-dir`) `POST /models/unload` with `{"model": "<name>"}` unloads one model; `GET /models` lists what is currently loaded. Independently of router mode, `--sleep-idle-seconds N` makes the server unload the model and its KV cache after N idle seconds and reload it automatically on the next request — which handles both step 2 and step 5 with no orchestration at all. Only a classic single-model server started without either (`llama-server -m model.gguf`) has nothing to call: there, stopping and restarting the process is the reclaim.
 3. **Free ComfyUI's own models too** with `free_memory()`. ComfyUI applies it when its queue worker next iterates — immediate if idle, after the current job if busy — and it never interrupts a running job. Re-read `system_stats()` to confirm the VRAM actually came back before committing to a big run.
 4. **Run the job** — `run_workflow(...)` / `run_template(...)` / `generate_image(...)` — then collect with `fetch_outputs(...)`.
+   (This whole recipe is about **this machine's** VRAM: `system_stats` and `free_memory` are never
+   remoted, so with a `COMFYUI_URL` configured steps 1–3 measure and free the wrong box while step 4
+   submits to the remote. See [Driving a remote ComfyUI](#driving-a-remote-comfyui).)
 5. **The client reloads its LLM** afterwards, again through its own runtime. Ollama, LM Studio and a sleep-idle `llama-server` all reload on demand, so for those "reload" is just the next request; a single-model `llama-server` stopped in step 2 has to be started again.
 
 **Why steps 2 and 5 cannot live in this MCP server.** This server is a **stdio subprocess of your MCP client** — it holds no handle on whatever LLM runtime that client is using, is not told which one it is, and has no business reaching into a process it does not own. Reaching one anyway would also breach the [thin-wrapper rule](AGENTS.md): every tool here is a `comfy` passthrough, and there is no `comfy` subcommand for "unload someone else's model". The deeper reason is step 5: the *model* that was unloaded cannot ask for itself back, so something still running has to sequence unload → run → reload. Where the LLM's own runtime can do that (Ollama's on-demand load, LM Studio's JIT, `llama-server --sleep-idle-seconds`) it should — that is the least-coordination option and it needs nothing from this server. Otherwise the client, or the orchestrator driving it, is the only participant present throughout. Either way the split is structural rather than a missing feature: this server owns reading and freeing **ComfyUI's** memory, and the client owns its **own** model's lifecycle.
@@ -502,7 +505,7 @@ A note on scope: `free_memory()` asks ComfyUI to release *its* models. It does n
 
 **Read that signal against the lag, not instantly.** The free applies on the queue worker's next iteration, so on a *busy* server an immediate re-read legitimately shows no change while the VRAM is still ComfyUI's — the request simply has not been serviced yet. Before concluding the memory belongs to another process, either wait for the current job to finish (`get_queue()` shows whether one is running) or re-poll `system_stats()` a few times over a few seconds. Only a number that stays flat on an *idle* server means the holder is someone else.
 
-A second caveat: `system_stats()` and `free_memory()` are **not** redirected by `COMFYUI_URL` / `COMFYUI_HOST` — they always describe and act on whichever ComfyUI comfy-cli itself targets, because `comfy system-stats` and `comfy free` take no `--host` / `--port`. With a remote ComfyUI configured, `run_workflow` submits *there* while these two read and free the *local* install, so this recipe applies to a local-ComfyUI setup. Don't gate a remote run on it.
+A second caveat: `system_stats()` and `free_memory()` are **not** redirected by `COMFYUI_URL` / `COMFYUI_HOST` — they always describe and act on whichever ComfyUI comfy-cli itself targets, because `comfy system-stats` and `comfy free` take no `--host` / `--port`. With a remote ComfyUI configured, `run_workflow` / `generate_image` / `run_template` submit *there* while these two read and free the *local* install, so this recipe applies to a local-ComfyUI setup. Don't gate a remote run on it.
 
 ## Partner-API nodes
 
@@ -540,7 +543,7 @@ they bill through the workflow, below this server. `run_workflow` therefore carr
 That gate covers the partner-API nodes comfy-cli recognizes, which is not the same as every node
 that can bill something: an arbitrary custom node can still call a paid service of its own, with
 nothing to gate it. **Check what a workflow contains before running one you did not build.**
-`generate_image` needs no gate because it runs a free local template — though note it is
+`generate_image` needs no gate because it runs a free OSS template — though note it is
 [retargetable via `COMFY_T2I_TEMPLATE`](#prerequisites), and pointed at an `API`-tagged template it
 would spend with no prompt.
 
@@ -668,9 +671,14 @@ behavior is unchanged (`127.0.0.1:8188` on this machine). If what you actually h
 do I want?](#which-address-variable-do-i-want).
 
 When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
-accept them — `comfy run` and `comfy jobs …` — so the **run and job tools** target the remote:
-`run_workflow`, `job_status`, `wait_for_job`, `watch_job`, `cancel_job`, `get_queue`. `server_info`
-reports the configured target under a `comfy_target` block.
+accept them — `comfy run`, `comfy run-template` and `comfy jobs …` — so every tool that **submits a
+job or reads one back** targets the remote: `run_workflow`, `generate_image`, `run_template`,
+`job_status`, `wait_for_job`, `watch_job`, `cancel_job`, `get_queue`. `server_info` reports the
+configured target under a `comfy_target` block.
+
+That set is deliberately closed under submit-then-poll: a `prompt_id` only means something to the
+server that issued it, so a tool that submits and a tool that polls must never resolve to different
+machines.
 
 **Not remoted (this repo is a thin wrapper and never opens its own socket):**
 
@@ -678,15 +686,25 @@ reports the configured target under a `comfy_target` block.
   `switch_comfyui_version`, `get_logs`) — these manage a **local** ComfyUI process/install and stay
   local-only; they cannot start/stop, update, version-switch, or read logs from a remote box. Start
   and update ComfyUI on the remote host yourself.
-- **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
-  / `generate_image` / `run_template` / `partner_generate` — this server forwards **no**
-  `--host`/`--port` to these verbs (most of them accept none at all), so they run
-  against comfy-cli's local default. Against a remote target, prefer `run_workflow(wait=True)` /
-  `job_status` (which return the remote job's `/view` output URLs) to retrieve results.
-- **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`) — their comfy-cli
-  verbs *do* accept `--host`/`--port`, but this version forwards only to the run/job tools (the
-  ticket's scope), so they still target local. Remoting them is a planned follow-up; until then,
-  author/validate against a local ComfyUI matching the remote's node set.
+- **Catalog / partner verbs** — `search_templates` / `search_models` / `download_model` /
+  `partner_generate` — this server forwards **no** `--host`/`--port` to these verbs (they accept
+  none at all), so they run against comfy-cli's local default. In particular a model must be
+  installed on the machine that actually runs the job, which `download_model` cannot do for you:
+  put it on the remote host yourself.
+- **Output download** (`fetch_outputs` → `comfy download`) takes no `--host`/`--port` either, but it
+  still retrieves a **remote** job's files, because it never asks a server which job that is: the
+  same comfy-cli run that submitted the job wrote a state file **on this machine** keyed by
+  `prompt_id`, and for a non-loopback target that file records each output as an absolute
+  `http://<remote>:<port>/view?…` URL, which `comfy download` then streams from the remote. It falls
+  back to querying the local default server only when no such state file exists (an id this machine
+  never submitted). `run_workflow(wait=True)` / `job_status` return those same URLs if you would
+  rather hand them off than copy bytes.
+- **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`, and the
+  `local_check` block on `fetch_template` / `get_template`) — their comfy-cli verbs *do* accept
+  `--host`/`--port`, but this version forwards only to the submit/poll tools, so they still
+  describe the **local** install. Remoting them is a planned follow-up; until then a workflow or
+  template can pass a local check and still fail on a remote whose node set differs, so
+  author/validate against a local ComfyUI matching the remote's.
 - The remote ComfyUI must be reachable and **unauthenticated** on that network (the private network
   is the boundary); the server does not authenticate to it. `server_info` does not live-probe the
   remote — reachability surfaces on the first run/job call.
@@ -762,13 +780,13 @@ different layers. Pick by which one you need; the table is the whole answer.
 | **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never reads it |
 | **Means** | "a ComfyUI on **another machine** I control" | "the ComfyUI on **this machine** is not on `127.0.0.1:8188`" |
 | **How it acts** | this server forwards `--host` / `--port` to the verbs that accept them | comfy-cli resolves its own target from the environment it inherits |
-| **What it moves** | the **run / job** tools only — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
+| **What it moves** | the **submit / job** tools only (`run_workflow`, `generate_image`, `run_template`, and the `jobs` family) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
 | **Reported as** | a `comfy_target` block on `server_info` | the resolved `server` URL on `server_info` — **no** `comfy_target` block |
 | **Use it for** | a GPU box over Tailscale / a private network | a port clash, a second instance, a container publishing a different port |
 
 **Set one, not both.** They resolve independently, so together they *split* your tools rather than
 conflicting loudly: comfy-cli ranks an explicit `--host` / `--port` flag above `COMFY_LOCAL_URL`, so
-the run/job tools would follow `COMFYUI_URL` while every other verb followed `COMFY_LOCAL_URL` — two
+the submit/job tools would follow `COMFYUI_URL` while every other verb followed `COMFY_LOCAL_URL` — two
 different ComfyUIs, no error. For a non-default address on **this** machine prefer `COMFY_LOCAL_URL`
 alone, since it also reaches the verbs `COMFYUI_URL` cannot.
 
@@ -795,17 +813,17 @@ handle is `prompt_id`.
 | Tool | Wraps | What it does |
 |---|---|---|
 | `run_workflow(workflow_path, wait=True, timeout_seconds=110.0, confirm_spend=False)` | `comfy run --workflow <path> [--wait] [--allow-spend]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. Most workflows are free local graphs, but one embedding partner (paid) nodes spends credits: `confirm_spend=True` unlocks that, and on an elicitation-capable client asks **you** per call, same posture as `run_template`. On a comfy-cli whose `comfy run` carries the gate the default fails closed (`spend_consent_required`, naming the `partner_nodes`); no release has it yet, so today a paid graph still spends either way. See [Workflows that spend](#workflows-that-spend--run_workflow). |
-| `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy run-template default --param=6.text=<prompt> [--param=ckpt_name=<ckpt>]` | Text prompt → image in one call, with no hand-assembled workflow needed: it runs ComfyUI's own default SD1.5 text-to-image gallery template through the same verb (and the same local run path) as `run_template`. Free and fully local — nothing here spends credits. Retarget it with [`COMFY_T2I_TEMPLATE` and its slot-key companions](#prerequisites). Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
+| `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=600.0)` | `comfy run-template default --param=6.text=<prompt> [--param=ckpt_name=<ckpt>]` | Text prompt → image in one call, with no hand-assembled workflow needed: it runs ComfyUI's own default SD1.5 text-to-image gallery template through the same verb (and the same run path) as `run_template`. Free — nothing here spends credits. Runs on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)); the checkpoint has to be installed on *that* machine. Retarget the template with [`COMFY_T2I_TEMPLATE` and its slot-key companions](#prerequisites). Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. |
 | `partner_generate(model, params=None, confirm_spend=False, out_path=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--timeout=<s>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits** on every call, where the local `run_workflow` / `generate_image` paths spend only when the graph itself carries partner nodes. Every call confirms the spend with you first — see [Spending credits](#spending-credits-on-partner-models) below. Runs **entirely on the partner's infrastructure** — your local ComfyUI is never in the execution path; use `emit_partner_workflow` below for the path where it is. `params` are the model's own schema-driven inputs, forwarded verbatim — `list_partner_models()` gives you the `model` aliases and `partner_model_schema(model)` the parameter list, so neither needs a terminal. `out_path` becomes comfy-cli's `--download` and is a save-path *template*: a plain path names the file, `{request_id}` / `{index}` / `{ext}` are substituted per output, and a trailing slash means "a default filename in this directory". `timeout_seconds` becomes comfy-cli's own `--timeout` so the engine — not a parent kill — owns the deadline on a job the partner may already have charged for. The result carries comfy-cli's printed text as `message` and, when it named the files it wrote, the resolved paths as `saved_paths` — so a caller reads the destination as data instead of scraping prose that rich may have wrapped mid-filename. |
 | `emit_partner_workflow(model, out_path, params=None)` | `comfy generate <model> [--param=value…] --emit-workflow=<path>` | Write a runnable workflow JSON that drives the partner model's **API node** instead of calling the proxy, so **your own ComfyUI executes the partner model** (the other way there is an existing `API`-tagged gallery template via `search_templates` / `run_template`; this is the path from a model *alias*). Chain it: `emit_partner_workflow` → `run_workflow` → `fetch_outputs` (the three stay separate so the graph can be inspected, edited with `set_workflow_slot`, re-run, or embedded in a bigger pipeline). Calls no partner API, needs no API key, and **spends nothing**, so unlike `partner_generate` it has no `confirm_spend` argument and raises no confirmation prompt — *running* the emitted graph is what bills the partner node, so that `run_workflow` step is the one that needs `confirm_spend=True`. **Coverage is narrow:** comfy-cli maps only `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana` and `seedance` to a node class, a small subset of `list_partner_models()`; every other model reaches its partner through the proxy only, so send those to `partner_generate`. An unsupported model raises with comfy-cli's own `emit_workflow_failed` message, which names the supported set for the comfy-cli you actually have installed. Returns comfy-cli's envelope data — `{"out", "model", "nodes"}`. |
-| `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on local ComfyUI (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=True` (the default) streams the run's live progress as MCP progress notifications, the same way `run_workflow` / `watch_job` do, so a long template run is not a silent block; `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
+| `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=True` (the default) streams the run's live progress as MCP progress notifications, the same way `run_workflow` / `watch_job` do, so a long template run is not a silent block; `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job_status(prompt_id)` | `comfy jobs status <prompt_id>` | Poll a submitted job's status + outputs. |
 | `wait_for_job(prompt_id, timeout_seconds=25.0)` | `comfy jobs status <prompt_id>` (polled) | Bounded wait until a job reaches a terminal status; returns a `{"timed_out": True, …}` payload on expiry. Chain several. |
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
 | `get_execution_error(prompt_id)` | `comfy jobs status <prompt_id>` | Compact failure verdict for a failed run — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; returns `error: None` on a healthy prompt. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed); Comfy Cloud-tracked rows are filtered out, since this server never drives them. Follows a configured remote, like the other job tools. |
-| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
 
 ### Resource management
 
