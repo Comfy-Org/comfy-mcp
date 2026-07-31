@@ -88,8 +88,11 @@ This server drives a ComfyUI the user runs themselves through comfy-cli — by
 default the one on this machine (`127.0.0.1:8188`), never Comfy Cloud. Canonical
 flows:
 
-- Call `server_info` FIRST to confirm a local ComfyUI is running before anything
-  else.
+- Call `server_info` FIRST, before anything else. Its `comfy env` fields
+  (running / url / workspace) always describe the ComfyUI on THIS machine —
+  `comfy env` takes no `--host` — so with `COMFYUI_URL` set they confirm the
+  local install, not the remote: the `comfy_target` block names that remote,
+  and the first run/job call is what confirms it is reachable.
 - Long generations: submit non-blocking with `run_workflow(wait=False)` to get a
   `prompt_id`, poll `wait_for_job` (a short bounded wait — chain several) or
   `job_status` until it finishes, then collect files with `fetch_outputs`.
@@ -6091,7 +6094,11 @@ def get_queue() -> Any:
     ComfyUI the user runs themselves. Passing a cloud job's ``prompt_id`` to
     ``job_status`` / ``cancel_job`` would route to this server's own target
     regardless, so listing those ids here would only invite calls that cannot
-    work.
+    work. The filter is deliberately conservative: it drops rows POSITIVELY
+    marked ``"cloud"`` out of the ``{"jobs": [...]}`` shape comfy-cli returns
+    today and passes any other payload shape through untouched rather than
+    reshaping it — so read a row's ``where`` rather than assuming the listing
+    has already been cleaned.
     """
     return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
 
