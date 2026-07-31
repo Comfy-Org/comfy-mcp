@@ -410,6 +410,111 @@ def test_node_dependencies_different_verb_is_not_unsupported(patched_run):
         server.node_dependencies()
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"pack": "no such command 'deps'"},
+        {"registry_id": "no such command 'deps'"},
+    ],
+    ids=lambda kw: next(iter(kw)),
+)
+def test_node_dependencies_echoed_phrase_is_not_unsupported(patched_run, kwargs):
+    """A caller cannot forge the version gap through its own argument.
+
+    Click echoes an offending value verbatim in a usage error, on the same exit 2
+    with no envelope `_is_missing_verb_error` reads — the one route to a false
+    `unsupported` its two conditions cannot close. A real failure must stay a
+    real failure rather than becoming "your comfy-cli is just too old".
+    """
+    value = next(iter(kwargs.values()))
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy node deps [OPTIONS] [PACK]\n"
+            f"Error: Invalid value for '[PACK]': {value!r} is not an installed pack."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        server.node_dependencies(**kwargs)
+
+
+def test_node_dependencies_degrades_with_a_pack_argument(patched_run):
+    """The echoed-input check must not cost the genuine degrade.
+
+    Discounting the caller's own text is subtraction, not a veto: an ordinary
+    `pack` shares no wording with Click's message, so the parser's own phrase
+    survives and the version gap still reports as one.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr=("Usage: comfy node [OPTIONS] COMMAND\nError: No such command 'deps'."),
+    )
+
+    assert server.node_dependencies(pack="comfyui-impact-pack")["unsupported"] is True
+
+
+def test_node_dependencies_degrades_without_the_registry_option(patched_run):
+    """The OPTION half of the version gap, the way `download_model` covers it.
+
+    A comfy-cli that HAS `node deps` but not `--registry` never matches the verb
+    pattern, so without this it falls through as the raw usage dump the degrade
+    exists to replace.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy node deps [OPTIONS] [PACK]\n"
+            "Try 'comfy node deps --help' for help.\n"
+            "Error: No such option: --registry"
+        ),
+    )
+
+    result = server.node_dependencies(registry_id="comfyui-impact-pack")
+
+    assert result["unsupported"] is True
+    assert "--registry" in result["error"]
+    # Points at the half that still works rather than dead-ending.
+    assert "registry_id empty" in result["error"]
+    assert "No such option" not in result["error"]
+
+
+def test_node_dependencies_registry_option_gap_needs_the_argument(patched_run):
+    """With `registry_id` empty the flag is never on the command line.
+
+    So a "no such option: --registry" can only have been relayed from elsewhere,
+    and degrading on it would assert this call is fine when it is not.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr="Error: No such option: --registry",
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        server.node_dependencies(pack="comfyui-impact-pack")
+
+
+@pytest.mark.parametrize("label", ["pack", "registry_id"])
+def test_node_dependencies_rejects_an_oversized_id(patched_run, label):
+    """An id past `ARG_MAX` fails `execve`, not the lookup — refuse it first.
+
+    And the error must report the SIZE: `_reject_option_like` would otherwise
+    echo a megabyte-long value back through the response and the failure log.
+    """
+    calls = patched_run(envelope(data={"packs": []}))
+    oversized = "-" + "x" * server._MAX_NODE_PACK_ID_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds the") as excinfo:
+        server.node_dependencies(**{label: oversized})
+
+    assert oversized not in str(excinfo.value)
+    assert calls == []
+
+
 def test_search_models_query_uses_search(patched_run):
     # BE-2952: comfy-cli 1.12's `models search` takes the query as `--text`,
     # not a positional — a positional exits 2 ("returned no JSON (exit 2)").
