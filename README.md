@@ -4,10 +4,10 @@
 
 <h1>Comfy MCP</h1>
 
-**Drive your local [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any MCP-speaking AI agent — a local [MCP](https://modelcontextprotocol.io) server built on [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).**
+**Drive your own [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any MCP-speaking AI agent — an [MCP](https://modelcontextprotocol.io) server built on [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).**
 
 <p>
-  <a href="https://github.com/comfyanonymous/ComfyUI"><img src="https://img.shields.io/badge/ComfyUI-local-blue?style=for-the-badge" alt="ComfyUI local"></a>
+  <a href="https://github.com/comfyanonymous/ComfyUI"><img src="https://img.shields.io/badge/ComfyUI-self--hosted-blue?style=for-the-badge" alt="ComfyUI self-hosted"></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-Compatible-green?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiPjxwYXRoIGQ9Ik0xMiAyTDIgN2wxMCA1IDEwLTUtMTAtNXoiLz48cGF0aCBkPSJNMiAxN2wxMCA1IDEwLTUiLz48cGF0aCBkPSJNMiAxMmwxMCA1IDEwLTUiLz48L3N2Zz4=" alt="MCP"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-%E2%89%A5%203.10-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python"></a>
 </p>
@@ -168,6 +168,13 @@ the rename is **not** something `pip install .` finishes on its own, because `co
 All three clients speak the same MCP stdio contract: run the `comfy-mcp` command as a
 server. Pick your client.
 
+> The **server key** (`comfy-mcp` in every snippet below) is just the label your client files
+> these tools under — it is yours to choose, and the `"command"` (`comfy-mcp`) is the only part
+> that has to match the installed console script. Earlier versions of this README used
+> `comfy-local`, so **if your config already has a `comfy-local` entry, edit it rather than
+> pasting a second one** — two keys pointing at the same command register the server twice and
+> your client shows every tool twice. Keeping the old key is equally fine; nothing reads it.
+
 > The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
 > environment your client launches the server with; keep it (pointing at the absolute path) if
 > it isn't. `COMFY_API_KEY` is also shown, commented as optional — keep it only if you use
@@ -186,7 +193,7 @@ One command registers the server:
 ```bash
 # COMFY_API_KEY is optional — add it only if you use partner-API nodes
 # (see the Partner-API nodes section).
-claude mcp add comfy-local \
+claude mcp add comfy-mcp \
   -e COMFY_BIN=/path/to/venv/bin/comfy \
   -e COMFY_API_KEY=<your-comfy-api-key> \
   -- comfy-mcp
@@ -197,7 +204,7 @@ Or, to check it into a project, add a `.mcp.json` at the repo root:
 ```json
 {
   "mcpServers": {
-    "comfy-local": {
+    "comfy-mcp": {
       "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
@@ -217,7 +224,7 @@ restart Claude Desktop:
 ```json
 {
   "mcpServers": {
-    "comfy-local": {
+    "comfy-mcp": {
       "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
@@ -235,7 +242,7 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 ```json
 {
   "mcpServers": {
-    "comfy-local": {
+    "comfy-mcp": {
       "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
@@ -359,6 +366,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Templates your install can't run](#templates-your-install-cant-run)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
+- [Which address variable do I want?](#which-address-variable-do-i-want)
 - [Tools](#tools)
 - [Troubleshooting](#troubleshooting)
 - [Failure log (opt-in)](#failure-log-opt-in)
@@ -414,17 +422,19 @@ full cloud tool list, and the slash-command/prompt tables live.
   client registration `env` block. See **[Partner-API nodes](#partner-api-nodes)** below for the
   full precedence chain; every example in
   [Configure your AI client](#configure-your-ai-client) shows where it goes.
-- **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a *remote* ComfyUI).** By
-  default every tool targets the local `127.0.0.1:8188`. Set `COMFYUI_URL`
-  (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`, default `8188`)
-  pair — to point the **run / job** tools at a ComfyUI running elsewhere, e.g. a GPU box reachable
-  over a private network (Tailscale). See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)**
-  for what is and isn't remoted. Unset ⇒ local behavior is unchanged.
-- **`COMFY_LOCAL_URL` (optional — a local ComfyUI on a non-default port).** For a ComfyUI on
-  *this* machine that isn't on `127.0.0.1:8188` (e.g. `:8189` because Docker Desktop's ComfyUI
-  holds `:8188`). Read by comfy-cli, not by this server — it rides the environment passthrough,
-  so setting it in the client `env` block re-points every tool. See
-  **[Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)**.
+- **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a ComfyUI on *another
+  machine*).** Read by **this server**. By default every tool targets `127.0.0.1:8188`. Set
+  `COMFYUI_URL` (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`,
+  default `8188`) pair — to point the **run / job** tools at a ComfyUI running elsewhere, e.g. a
+  GPU box reachable over a private network (Tailscale). See **[Driving a remote
+  ComfyUI](#driving-a-remote-comfyui)** for what is and isn't remoted. Unset ⇒ nothing changes.
+- **`COMFY_LOCAL_URL` (optional — a ComfyUI on *this machine*, on a non-default port).** Read by
+  **comfy-cli**, never by this server — it rides the environment passthrough, so setting it in the
+  client `env` block re-points every tool. For a ComfyUI on this machine that isn't on
+  `127.0.0.1:8188` (e.g. `:8189` because Docker Desktop's ComfyUI holds `:8188`). See
+  **[Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)**, and
+  **[Which address variable do I want?](#which-address-variable-do-i-want)** for the difference
+  between the two.
 - **`COMFY_T2I_TEMPLATE` / `COMFY_T2I_PROMPT_SLOT` / `COMFY_T2I_CHECKPOINT_SLOT` (optional — retarget
   `generate_image`).** `generate_image(prompt)` runs the gallery's `default` template (ComfyUI's own
   basic SD1.5 text-to-image graph), filling its positive-prompt slot `6.text` and, when you pass
@@ -645,7 +655,9 @@ By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at 
   A port without a host (setting only `COMFYUI_PORT`) is rejected — set the host too.
 
 Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set,
-behavior is unchanged (local `127.0.0.1:8188`).
+behavior is unchanged (`127.0.0.1:8188` on this machine). If what you actually have is a ComfyUI on
+*this* machine on a different port, you want `COMFY_LOCAL_URL` instead — see [Which address variable
+do I want?](#which-address-variable-do-i-want).
 
 When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
 accept them — `comfy run` and `comfy jobs …` — so the **run and job tools** target the remote:
@@ -685,7 +697,7 @@ alongside `COMFY_BIN` in the client registration:
 ```json
 {
   "mcpServers": {
-    "comfy-local": {
+    "comfy-mcp": {
       "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
@@ -731,12 +743,34 @@ effect, rather than the version alone.
 **Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port` flag →
 `COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.
 
-> **Use this *or* `COMFYUI_URL`, not both.** [`COMFYUI_URL`/`COMFYUI_HOST`](#driving-a-remote-comfyui)
-> makes this server forward explicit `--host`/`--port` flags for `comfy run` / `comfy jobs`, and an
-> explicit flag **outranks** `COMFY_LOCAL_URL` — so with both set the run/job tools would follow
-> `COMFYUI_URL` while every other verb followed `COMFY_LOCAL_URL`. For a non-default address on
-> *this* machine prefer `COMFY_LOCAL_URL` alone: it also covers the verbs that accept no
-> `--host`/`--port` (`comfy env`, templates, models, download), which `COMFYUI_URL` cannot reach.
+## Which address variable do I want?
+
+Two variables point ComfyUI work at an address, their names are similar, and they are **not**
+alternative spellings of each other — they belong to **different programs** and are read at
+different layers. Pick by which one you need; the table is the whole answer.
+
+| | `COMFYUI_URL` (+ `COMFYUI_HOST` / `COMFYUI_PORT`) | `COMFY_LOCAL_URL` |
+| --- | --- | --- |
+| **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never reads it |
+| **Means** | "a ComfyUI on **another machine** I control" | "the ComfyUI on **this machine** is not on `127.0.0.1:8188`" |
+| **How it acts** | this server forwards `--host` / `--port` to the verbs that accept them | comfy-cli resolves its own target from the environment it inherits |
+| **What it moves** | the **run / job** tools only — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
+| **Reported as** | a `comfy_target` block on `server_info` | the resolved `server` URL on `server_info` — **no** `comfy_target` block |
+| **Use it for** | a GPU box over Tailscale / a private network | a port clash, a second instance, a container publishing a different port |
+
+**Set one, not both.** They resolve independently, so together they *split* your tools rather than
+conflicting loudly: comfy-cli ranks an explicit `--host` / `--port` flag above `COMFY_LOCAL_URL`, so
+the run/job tools would follow `COMFYUI_URL` while every other verb followed `COMFY_LOCAL_URL` — two
+different ComfyUIs, no error. For a non-default address on **this** machine prefer `COMFY_LOCAL_URL`
+alone, since it also reaches the verbs `COMFYUI_URL` cannot.
+
+**Neither name is changing, and neither is deprecated.** They look like a rename waiting to happen —
+they are not, because only one of them is ours. `COMFY_LOCAL_URL` is comfy-cli's own published
+variable: renaming it here would document a name nothing reads, and its "local" is a factual
+address-scope word (comfy-cli's *local* target, as opposed to its cloud one), not this project's
+branding. `COMFYUI_URL` is this server's, and already carries no "local" to strip. So there is no
+old spelling to accept and no deprecation period to sit through — if you have either variable in an
+MCP client config today, it keeps working unchanged.
 
 ## Tools
 
@@ -762,7 +796,7 @@ handle is `prompt_id`.
 | `watch_job(prompt_id, timeout_seconds=600.0)` | `comfy jobs watch <prompt_id>` (streamed) | Tail an async-submitted job's live execution, streaming progress notifications; bounded, returns a `{"timed_out": True, …}` payload on expiry. Streaming counterpart to `wait_for_job`. |
 | `get_execution_error(prompt_id)` | `comfy jobs status <prompt_id>` | Compact failure verdict for a failed run — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; returns `error: None` on a healthy prompt. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
-| `get_queue()` | `comfy jobs ls` | List known **local** jobs with status (pending/running/completed); cloud-tracked rows are filtered out. |
+| `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed); Comfy Cloud-tracked rows are filtered out, since this server never drives them. Follows a configured remote, like the other job tools. |
 | `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
 
 ### Resource management
