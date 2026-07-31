@@ -21,13 +21,15 @@
 <p>
   <a href="#quickstart"><strong>Quickstart</strong></a> ·
   <a href="#configure-your-ai-client">Configure your client</a> ·
+  <a href="#comfy-cloud-mcp">Comfy Cloud MCP</a> ·
   <a href="#tools">Tools</a> ·
   <a href="#contributing">Contributing</a>
 </p>
 
 </div>
 
-> Looking for the cloud-hosted version? See the [Comfy Cloud MCP docs](https://docs.comfy.org/agent-tools/mcp).
+> Looking for the cloud-hosted version? [Comfy Cloud MCP](#comfy-cloud-mcp) is set up below — install
+> it instead of this server, or alongside it.
 
 **What it does:**
 
@@ -46,9 +48,19 @@ the ComfyUI on **your** machine (`127.0.0.1:8188`).
 (Flux / Ideogram / Kling / …) entirely on partner infrastructure — no local ComfyUI in the
 execution path — and [partner-API nodes](#partner-api-nodes) let a locally-executed workflow call
 those same hosted models, while [`COMFYUI_URL`](#driving-a-remote-comfyui) points the run/job tools
-at a ComfyUI on another machine you control. What this server is **not** is a Comfy Cloud client:
-it shares no code with the Comfy Cloud MCP and implements none of its cloud-native feature set. If
-your workflows live in Comfy Cloud, use that MCP — alongside this one if you like.
+at a ComfyUI on another machine you control.
+
+**This server vs. [Comfy Cloud MCP](#comfy-cloud-mcp).** Two different servers, and running both is
+normal. This one is **stdio**: your client launches it as a subprocess on **your own machine**, and
+it drives the ComfyUI installed there (or one on another machine you control). Comfy Cloud MCP is a
+**remote HTTP** server at `https://cloud.comfy.org/mcp` that your client connects to over the
+network, and it executes workflows on **Comfy Cloud GPUs** — no local GPU, no ComfyUI install. Both
+authenticate: this one signs in to Comfy through comfy-cli ([`auth_login`](#partner-api-nodes) or
+`COMFY_API_KEY`), the cloud one through OAuth in your browser or a Comfy Cloud API key. Both can
+spend credits on **partner** models, so partner generation is not the dividing line — what this
+server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud queue, no
+cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
+want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
 > **Status:** beta. 49 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
@@ -182,10 +194,110 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 }
 ```
 
+## Comfy Cloud MCP
+
+Everything above sets up **this** server, which runs on your machine. Comfy also runs a **hosted**
+MCP server — **Comfy Cloud MCP** — and it is a good fit when the machine can't carry local
+diffusion, or when you'd rather not install ComfyUI at all. It lives at:
+
+```
+https://cloud.comfy.org/mcp
+```
+
+Your client connects to that URL over **remote HTTP** (no subprocess, nothing to `pip install`) and
+workflows execute on **Comfy Cloud GPUs**. You need a [Comfy Cloud](https://cloud.comfy.org)
+account — sign up first if you don't have one, since the sign-in below uses it.
+
+**Two ways to authenticate.** **OAuth** is the default: your client opens a browser, you pick a
+workspace, and tokens refresh themselves. For clients that don't speak MCP OAuth (Cursor today) and
+for headless/CI use, create a **Comfy Cloud API key** at
+[platform.comfy.org/profile/api-keys](https://platform.comfy.org/profile/api-keys) — it starts with
+`comfyui-` — and pass it as an `X-API-Key` header. Prefer your client's env interpolation
+(`${env:COMFY_API_KEY}`) over pasting a key into a file you might commit.
+
+Note that this is a **separate** credential path from the `COMFY_API_KEY` this server's own examples
+show: that one is read by comfy-cli on **this** machine for [partner-API
+nodes](#partner-api-nodes). The same key works for both, but each server is configured on its own.
+
+### Claude Code (cloud)
+
+Install the `comfy-cloud` plugin — it registers the MCP connection and adds `/comfy-cloud:*` slash
+commands in one step:
+
+```
+/plugin marketplace add Comfy-Org/comfy-skills
+/plugin install comfy-cloud@comfy-skills
+```
+
+Then run `/mcp`, select **comfy-cloud** → **Authenticate**, and finish the sign-in in your browser.
+
+Prefer just the connection, without the plugin? Add the server directly (`-s user` makes it
+available in every project):
+
+```bash
+claude mcp add --transport http comfy-cloud https://cloud.comfy.org/mcp
+```
+
+and authenticate the same way, via `/mcp`.
+
+### Claude Desktop (cloud)
+
+Claude Desktop adds it as a **custom connector** through its UI:
+
+1. Sidebar → **Customize** → **Connectors**.
+2. Click **+** in the Connectors header → **Add custom connector**.
+3. **Name** it (e.g. `Comfy Cloud MCP`), set **Remote MCP server URL** to
+   `https://cloud.comfy.org/mcp`, and click **Add**.
+4. A browser window opens: choose your workspace and click **Continue** to authorize.
+
+### Cursor (cloud)
+
+Cursor connects to remote MCP servers over HTTP but does **not** support MCP OAuth today, so use an
+API key. Add this to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project), with
+`COMFY_API_KEY` set in your shell or system environment:
+
+```json
+{
+  "mcpServers": {
+    "comfy-cloud": {
+      "url": "https://cloud.comfy.org/mcp",
+      "headers": {
+        "X-API-Key": "${env:COMFY_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+### Other clients (cloud)
+
+Any client with a **remote HTTP** MCP transport can connect to the same URL. Most use a JSON config
+with a `url` field (Windsurf uses `serverUrl` instead):
+
+```json
+{
+  "mcpServers": {
+    "comfy-cloud": {
+      "url": "https://cloud.comfy.org/mcp"
+    }
+  }
+}
+```
+
+Sign in through the browser if the client supports MCP OAuth; otherwise add the `X-API-Key` header
+shown above. Restart the client and you should see the cloud tools (`search_templates`,
+`submit_workflow`, `get_output`, …) registered under the **comfy-cloud** server.
+
+**Codex** and **OpenClaw** have first-class setup steps — including `codex mcp add comfy-cloud --url
+https://cloud.comfy.org/mcp` and `openclaw mcp set` / `openclaw mcp login` — in the [Comfy Cloud MCP
+docs](https://docs.comfy.org/agent-tools/mcp), which is also where the screenshot walkthroughs, the
+full cloud tool list, and the slash-command/prompt tables live.
+
 ## Table of contents
 
 - [Quickstart](#quickstart)
 - [Configure your AI client](#configure-your-ai-client)
+- [Comfy Cloud MCP](#comfy-cloud-mcp)
 - [Prerequisites](#prerequisites)
 - [When to use this server](#when-to-use-this-server)
 - [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
@@ -279,7 +391,7 @@ Local diffusion is only a good default on a machine that can actually carry it, 
 |---|---|
 | Discrete GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
 | Discrete GPU, **8 GB to under 24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
-| **< 8 GB** VRAM, or the user confirming there is no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the Comfy Cloud MCP if your client has it connected. |
+| **< 8 GB** VRAM, or the user confirming there is no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the [Comfy Cloud MCP](#comfy-cloud-mcp) if your client has it connected. |
 | **Apple Silicon**, **≥ 32 GB** unified memory | Images are OK. Video on the Apple GPU is not recommended — time estimates are unreliable and thermals suffer. |
 | **Apple Silicon**, under 32 GB unified memory | Same as the no-GPU row above — go partner/cloud rather than local. |
 
