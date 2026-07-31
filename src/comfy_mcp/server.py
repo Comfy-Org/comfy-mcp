@@ -741,6 +741,29 @@ _MIN_COMFY_CLI_STR = "1.13.0"
 _version_checked = False
 
 
+# How this server identifies itself to comfy-cli, via comfy-cli's documented
+# self-attribution hook (`comfy_cli/caller.py`: `COMFY_USER_AGENT` is the
+# highest-priority signal in `detect_caller`, ahead of `AI_AGENT` / `CLAUDECODE`
+# / the non-TTY fallback). It exists so partner-node usage that ORIGINATES here
+# is attributable rather than folded into the generic CLI bucket: every partner
+# call this server makes is a `comfy generate` / `comfy run` shelled out from
+# `_run_comfy`, so without a caller label the engine's telemetry and the
+# `Comfy-Usage-Source` attribution it sends upstream cannot tell an MCP-driven
+# partner call apart from a human typing the same command.
+#
+# The value is the distribution name (`pyproject.toml` `name`), bare and
+# unversioned: it is consumed as an identifier to match on, so a version suffix
+# would only defeat an exact-match lookup. Keep the two in sync.
+#
+# Setting it changes nothing about how comfy-cli BEHAVES for us. `detect_caller`
+# already classified this server as agentic through the non-TTY path (`kind`
+# "pipe"), and `agentic` — not `kind` — is what drives comfy-cli's output-mode
+# resolution; the only place `kind` itself is read is the bare-`comfy` welcome
+# screen, which this server never reaches because `_run_comfy` always passes a
+# subcommand. So this is an attribution label, not a behavior switch.
+_MCP_USER_AGENT = "comfy-mcp"
+
+
 def _comfy_env() -> dict[str, str]:
     """Child-process environment for every comfy-cli spawn.
 
@@ -755,6 +778,15 @@ def _comfy_env() -> dict[str, str]:
     - ``COMFY_WHERE=local`` — belt-and-suspenders pin so we never touch cloud.
     - ``COMFY_NO_WATCH=1`` — suppress comfy-cli's file watcher for agentic
       callers like this MCP; a harmless no-op on versions that lack the flag.
+    - ``COMFY_USER_AGENT=comfy-mcp`` — self-attribution, so usage that
+      originates here (partner-node calls above all: ``partner_generate`` ->
+      ``comfy generate``, and ``run_workflow`` over a graph carrying partner-API
+      nodes -> ``comfy run``) is attributable to this server rather than folded
+      into the generic CLI bucket. See :data:`_MCP_USER_AGENT`. It is INJECTED,
+      not defaulted — an inherited value (a stale one in the user's shell, or the
+      client's own label) would silently mis-attribute calls this server made,
+      which is the one thing the label exists to answer. A caller wanting to
+      record *which host drove the MCP* wants a second field, not this one.
     - ``PYTHONUTF8=1`` / ``PYTHONIOENCODING=utf-8`` — force UTF-8 on the child's
       console. Without them a default Windows (cp1252) console raises
       ``UnicodeEncodeError`` printing the UTF-8 catalog output and wedges, so the
@@ -809,6 +841,7 @@ def _comfy_env() -> dict[str, str]:
         **os.environ,
         "COMFY_WHERE": "local",
         "COMFY_NO_WATCH": "1",
+        "COMFY_USER_AGENT": _MCP_USER_AGENT,
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
         "GIT_TERMINAL_PROMPT": "0",
