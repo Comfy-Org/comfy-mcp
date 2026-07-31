@@ -8,6 +8,11 @@ drive a user's **local** ComfyUI by shelling out to
 By participating in this project you agree to abide by our
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Response times
+
+We review issues and pull requests on a best-effort basis and do not commit to a
+response-time SLA.
+
 ## The one architecture rule — thin wrapper only
 
 Before you write any code, read [`AGENTS.md`](AGENTS.md). The core rule:
@@ -68,6 +73,13 @@ ComfyUI; it **skips** cleanly when ComfyUI or the `comfy` binary is absent.
 1. Fork and branch off `main`.
 2. Make your change, with tests, and get the three checks above green.
 3. Open a PR and fill in [the template](.github/PULL_REQUEST_TEMPLATE.md).
+
+Two more things run against your work without you asking for them: a
+[TruffleHog scan](.github/workflows/secret-scanning.yml) of the pushed range,
+and GitHub push protection, which rejects a push carrying a recognized provider
+credential to this repository outright. If a push is rejected that way, rotate
+the credential and rewrite it out of your commits rather than bypassing the block —
+see [`SECURITY.md`](SECURITY.md#automated-security-tooling).
 
 ## Reporting bugs and requesting features
 

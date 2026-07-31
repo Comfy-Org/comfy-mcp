@@ -51,35 +51,40 @@ The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
 confirmation on the tools that can spend money, destroy local state, or expose
-the machine: `partner_generate`, `run_template`, `switch_comfyui_version`, and
-the `launch_comfyui` / `restart_comfyui` pair when `extra_args` would publish
-ComfyUI to the network. comfy-cli owns the credit-spend interlock and the
-durable "always proceed" (`comfy generate consent always`), and this server only
-raises the confirmation over MCP **elicitation** — the protocol's equivalent of
-the CLI's y/N prompt — then forwards the answer as `--yes` / `--allow-spend`,
-or (for the version switch and the launch flags, which the CLI does not gate at
-all) simply refuses to run the command. It stores no consent of its own. All of
-them share one fail-closed body, `_elicit_approval`; give a new gate its own
+the machine: `partner_generate`, `run_template`, `run_workflow`,
+`switch_comfyui_version`, and the `launch_comfyui` / `restart_comfyui` pair
+when `extra_args` would publish ComfyUI to the network. comfy-cli owns the
+credit-spend interlock and the durable "always proceed"
+(`comfy generate consent always`), and this server only raises the confirmation
+over MCP **elicitation** — the protocol's equivalent of the CLI's y/N prompt —
+then forwards the answer as `--yes` / `--allow-spend`, or (for the version
+switch and the launch flags, which the CLI does not gate at all) simply refuses
+to run the command. It stores no consent of its own. All of them share one
+fail-closed body, `_elicit_approval`; give a new gate its own
 `_ApprovalWording` rather than a second copy of that handling. Adding *product*
 behavior here is still a guardrail breach; adapting comfy-cli's contract to an
 MCP primitive is this repo's job.
 
-The two *spend* gates — `partner_generate` and `run_template` — differ where the
-engine's own shape differs, and those differences are load-bearing rather than
-incidental: `comfy generate` always spends so it always prompts and honors
-`spend.auto_confirm`, while `comfy run-template` is usually free and never reads
-that setting — so `run_template` prompts only when `confirm_spend=True` asks to
-unlock spending, and treats the generate-scoped always-proceed as granting
-nothing. `switch_comfyui_version` sits outside that axis entirely: it spends no
-credits and the CLI does not gate it at all, so its prompt is not a spend
-interlock but this server's only gate — raised on every call, with no
-always-proceed setting to read. The launch pair sits outside it too, and
-differs again in WHEN it fires: the argument is what is dangerous, not the
-verb, so the prompt is raised only for the `extra_args` that would publish an
-unauthenticated ComfyUI (`_network_exposing_args` — a non-loopback `--listen`,
-including its bare form, or `--enable-cors-header`) and an ordinary launch is
-untouched. Mirror the engine's contract per tool; do not generalize one tool's
-consent rules onto another.
+The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` —
+differ where the engine's own shape differs, and those differences are
+load-bearing: `comfy generate` always spends, so it always prompts and honors
+`spend.auto_confirm`, while `comfy run-template` and `comfy run` are usually
+free and never read that setting — so those two prompt only when
+`confirm_spend=True` asks to unlock spending, and treat the generate-scoped
+always-proceed as granting nothing. That shared opt-in policy is one body,
+`_resolve_optin_spend_consent`, whose per-verb wording is an argument the way
+`_ApprovalWording` is `_elicit_approval`'s. What still differs is the
+capability SIGNAL: `run_template` can trust the verb, `run_workflow` must PROBE
+`comfy run --help` for the flag — its docstring says why, and what an engine
+without it means. `switch_comfyui_version` sits outside that axis: it spends no
+credits and the CLI does not gate it at all, so its prompt is this server's
+only gate — raised on every call, with no always-proceed setting to read. The
+launch pair sits outside it too, and differs in WHEN it fires: the argument is
+what is dangerous, not the verb, so the prompt is raised only for `extra_args`
+that would publish an unauthenticated ComfyUI (`_network_exposing_args` — a
+non-loopback `--listen`, including its bare form, or `--enable-cors-header`);
+an ordinary launch is untouched. Mirror the engine's contract per tool; do not
+generalize one tool's consent rules onto another.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via
@@ -120,11 +125,9 @@ ruff format --check .     # format check (run `ruff format .` to fix)
 ```
 
 CI (`.github/workflows/ci.yml`) runs all three on Python 3.10 and 3.14 for every
-PR. Get them green locally before pushing. The workflow carries no path filter
-on `pull_request` — the `test (py3.10)` / `test (py3.14)` contexts are required
-by branch protection, so they have to report on every PR — and it decides
-internally whether to run the suite, no-opping when a PR changes only Markdown.
-Do not add a `paths` / `paths-ignore` filter to that trigger.
+PR; get them green locally first. Never add a `paths`/`paths-ignore` filter to its
+`pull_request` trigger — the required `test (py3.10)`/`test (py3.14)` contexts must
+report on every PR, and the workflow already no-ops on Markdown-only changes.
 
 ## Tests
 
@@ -186,7 +189,9 @@ This repository is **private but destined to go public.** Treat everything you
 write as if it were already public:
 
 - **No secrets** — API keys, tokens, or credentials in code, commits, tests,
-  fixtures, or PR text.
+  fixtures, or PR text. Credential-in-URL fixtures use `https://<user>:<pass>@host`:
+  a bare `user:pass@` fails the secret-scanning diff gate, and a fake scheme
+  documents behavior the scrubber lacks (`failure_log._URL_RE` needs `https?://`).
 - **No internal hostnames, IPs, or internal-only URLs** in code, comments, or
   commit messages.
 - **No internal-tracker references** in commits or PR titles/bodies — describe
