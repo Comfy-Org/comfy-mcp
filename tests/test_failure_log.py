@@ -1,4 +1,4 @@
-"""Tests for the opt-in local rotating failure log (``COMFY_LOCAL_MCP_DEBUG_LOG``).
+"""Tests for the opt-in local rotating failure log (``COMFY_MCP_DEBUG_LOG``).
 
 The log exists to give a tester a durable, zippable diagnostic trail for
 comfy-cli failures, so these tests hold its three defining properties:
@@ -27,7 +27,7 @@ import threading
 import pytest
 from conftest import _FakeProc
 
-from comfy_local_mcp import failure_log, server, tcc, textutil
+from comfy_mcp import failure_log, server, tcc, textutil
 
 # A failing envelope/1 result, the most common recorded failure.
 _ERROR_ENVELOPE = json.dumps(
@@ -103,9 +103,9 @@ def test_env_var_any_other_value_is_the_log_path(tmp_path):
 @pytest.mark.parametrize(
     ("platform", "expected"),
     [
-        ("darwin", ("Library", "Application Support", "comfy-local-mcp")),
-        ("win32", ("AppData", "Local", "comfy-local-mcp")),
-        ("linux", (".config", "comfy-local-mcp")),
+        ("darwin", ("Library", "Application Support", "comfy-mcp")),
+        ("win32", ("AppData", "Local", "comfy-mcp")),
+        ("linux", (".config", "comfy-mcp")),
     ],
 )
 def test_default_path_mirrors_comfy_cli_app_dirs(monkeypatch, platform, expected):
@@ -151,7 +151,7 @@ def test_disabled_by_default_writes_nothing_and_creates_no_dir(
 def test_enabled_path_from_env_var_value_is_written(
     monkeypatch, tmp_path, fake_comfy, capsys
 ):
-    """``COMFY_LOCAL_MCP_DEBUG_LOG=<path>`` writes to exactly that file."""
+    """``COMFY_MCP_DEBUG_LOG=<path>`` writes to exactly that file."""
     target = tmp_path / "nested" / "chosen.jsonl"
     monkeypatch.setattr(
         failure_log,

@@ -1,6 +1,6 @@
 """The opt-in local failure log.
 
-Leaf module over :mod:`comfy_local_mcp.textutil`: it owns the log's configuration,
+Leaf module over :mod:`comfy_mcp.textutil`: it owns the log's configuration,
 its module-level state (``_FAILURE_LOG_PATH`` and the lazily-opened rotating
 handler) and the single ``_log_failure`` entry point ``server`` calls before
 each raise. Nothing here imports ``server``.
@@ -30,7 +30,7 @@ from .textutil import _redact_url, _stream_tail
 _FAILURE_LOG_DIR_MODE = 0o700
 _FAILURE_LOG_FILE_MODE = 0o600
 
-# `COMFY_LOCAL_MCP_DEBUG_LOG` turns on a rotating, local-only JSONL record of
+# `COMFY_MCP_DEBUG_LOG` turns on a rotating, local-only JSONL record of
 # every comfy-cli failure this server surfaces, so a tester can zip up a durable
 # diagnostic trail instead of scraping an MCP client's transcript after the fact.
 # Failure-only (a successful call writes nothing), local-only (nothing is
@@ -40,7 +40,7 @@ _FAILURE_LOG_FILE_MODE = 0o600
 #   unset / "" / "0"  -> disabled (the default)
 #   "1"               -> enabled at the per-OS default path
 #   anything else     -> enabled, and the value IS the log file path
-_FAILURE_LOG_ENV = "COMFY_LOCAL_MCP_DEBUG_LOG"
+_FAILURE_LOG_ENV = "COMFY_MCP_DEBUG_LOG"
 
 # Chars kept per stream tail, deliberately far larger than the
 # `_MAX_ERROR_FIELD_CHARS` cap an error *message* carries: preserving more output
@@ -59,14 +59,14 @@ _FAILURE_LOG_BACKUPS = 2
 # A dedicated logger with `propagate = False`. Non-propagation is not cosmetic:
 # this is an MCP **stdio** server, so stdout is the protocol transport, and a
 # record reaching a default root handler could corrupt the session.
-_FAILURE_LOGGER_NAME = "comfy_local_mcp.failures"
+_FAILURE_LOGGER_NAME = "comfy_mcp.failures"
 
 
 def _default_failure_log_path() -> str:
     """Per-OS default path for the failure log. Creates nothing.
 
     Mirrors comfy-cli's own local-state convention (its ``constants.py``
-    ``DEFAULT_CONFIG``) with a ``comfy-local-mcp`` leaf, hand-rolled rather than
+    ``DEFAULT_CONFIG``) with a ``comfy-mcp`` leaf, hand-rolled rather than
     imported: comfy-cli is the *engine* this server shells out to, not a Python
     dependency of it (``mcp`` is the only one), so there is nothing to import.
 
@@ -81,11 +81,11 @@ def _default_failure_log_path() -> str:
         base = os.path.join(home, "AppData", "Local")
     else:
         base = os.path.join(home, ".config")
-    return os.path.join(base, "comfy-local-mcp", "failures.jsonl")
+    return os.path.join(base, "comfy-mcp", "failures.jsonl")
 
 
 def _resolve_failure_log_path(value: str | None) -> str | None:
-    """The log path ``COMFY_LOCAL_MCP_DEBUG_LOG=<value>`` selects, else ``None``."""
+    """The log path ``COMFY_MCP_DEBUG_LOG=<value>`` selects, else ``None``."""
     value = (value or "").strip()
     if not value or value == "0":
         return None
@@ -284,7 +284,7 @@ def _failure_logger(path: str) -> logging.Logger:
                         # live handlers would duplicate every line). Reported on
                         # the MODULE logger rather than swallowed: that is a
                         # different logger from the non-propagating
-                        # `comfy_local_mcp.failures` one being rebuilt here, so
+                        # `comfy_mcp.failures` one being rebuilt here, so
                         # this cannot recurse into the handler that just failed.
                         logging.getLogger(__name__).debug(
                             "failure-log handler close failed", exc_info=True
@@ -367,7 +367,7 @@ def _log_failure(
         # while writing nothing — a disabled log and a broken one would look
         # identical. So the drop is recorded on the module logger, which is a
         # different, PROPAGATING logger from the non-propagating
-        # `comfy_local_mcp.failures` one that just failed: it can neither recurse
+        # `comfy_mcp.failures` one that just failed: it can neither recurse
         # nor re-enter the broken handler. `debug` because this file is an opt-in
         # diagnostic, so its own faults belong at diagnostic level too.
         logging.getLogger(__name__).debug(

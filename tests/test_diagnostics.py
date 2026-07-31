@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 
 def test_get_execution_error_extracts_fields_and_caps_traceback(monkeypatch):

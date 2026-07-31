@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/Comfy-Org/comfy-local-mcp/security/advisories/new
+    url: https://github.com/Comfy-Org/comfy-mcp/security/advisories/new
     about: Please report security issues privately — do not open a public issue. See SECURITY.md.
   - name: Question or discussion
-    url: https://github.com/Comfy-Org/comfy-local-mcp/discussions
+    url: https://github.com/Comfy-Org/comfy-mcp/discussions
     about: For usage questions and open-ended discussion.

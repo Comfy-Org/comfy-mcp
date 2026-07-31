@@ -29,7 +29,7 @@ from pathlib import PurePosixPath
 import pytest
 from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope, stream_reader
 
-from comfy_local_mcp import failure_log, server, tcc, textutil
+from comfy_mcp import failure_log, server, tcc, textutil
 
 
 def _download_model(*args, **kwargs):

@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from comfy_local_mcp import server
+from comfy_mcp import server
 
 _needs_posix_exec = pytest.mark.skipif(
     sys.platform == "win32",

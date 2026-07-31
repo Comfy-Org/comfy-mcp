@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="Comfy" width="160"/>
 
-<h1>Comfy Local MCP</h1>
+<h1>Comfy MCP</h1>
 
 **Drive your local [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any MCP-speaking AI agent — a local [MCP](https://modelcontextprotocol.io) server built on [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).**
 
@@ -13,8 +13,8 @@
 </p>
 
 <p>
-  <a href="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml"><img src="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/Comfy-Org/comfy-local-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/Comfy-Org/comfy-local-mcp" alt="Release"></a>
+  <a href="https://github.com/Comfy-Org/comfy-mcp/actions/workflows/ci.yml"><img src="https://github.com/Comfy-Org/comfy-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Comfy-Org/comfy-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/Comfy-Org/comfy-mcp" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later%20OR%20Commercial-blue.svg" alt="License: AGPL-3.0-or-later OR Commercial"></a>
 </p>
 
@@ -63,11 +63,11 @@ Four steps take you from a fresh install to your first generated image.
    ```bash
    pip install "comfy-cli>=1.13.0"  # the engine (>= 1.13.0 required)
    comfy install                  # create a ComfyUI workspace (skip if you have one)
-   pip install .                  # this MCP server → the `comfy-local-mcp` command
+   pip install .                  # this MCP server → the `comfy-mcp` command
    ```
 
    Run that last one from a checkout of this repo (`pip install -e .` for a working copy).
-   `pip install .` puts a `comfy-local-mcp` console script on your `PATH`; that command is what you
+   `pip install .` puts a `comfy-mcp` console script on your `PATH`; that command is what you
    point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
 
@@ -101,7 +101,7 @@ the originals stay in the ComfyUI workspace.
 
 ## Configure your AI client
 
-All three clients speak the same MCP stdio contract: run the `comfy-local-mcp` command as a
+All three clients speak the same MCP stdio contract: run the `comfy-mcp` command as a
 server. Pick your client.
 
 > The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
@@ -125,7 +125,7 @@ One command registers the server:
 claude mcp add comfy-local \
   -e COMFY_BIN=/path/to/venv/bin/comfy \
   -e COMFY_API_KEY=<your-comfy-api-key> \
-  -- comfy-local-mcp
+  -- comfy-mcp
 ```
 
 Or, to check it into a project, add a `.mcp.json` at the repo root:
@@ -134,7 +134,7 @@ Or, to check it into a project, add a `.mcp.json` at the repo root:
 {
   "mcpServers": {
     "comfy-local": {
-      "command": "comfy-local-mcp",
+      "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
         "COMFY_API_KEY": "<your-comfy-api-key>"
@@ -154,7 +154,7 @@ restart Claude Desktop:
 {
   "mcpServers": {
     "comfy-local": {
-      "command": "comfy-local-mcp",
+      "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
         "COMFY_API_KEY": "<your-comfy-api-key>"
@@ -172,7 +172,7 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 {
   "mcpServers": {
     "comfy-local": {
-      "command": "comfy-local-mcp",
+      "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
         "COMFY_API_KEY": "<your-comfy-api-key>"
@@ -521,7 +521,7 @@ alongside `COMFY_BIN` in the client registration:
 {
   "mcpServers": {
     "comfy-local": {
-      "command": "comfy-local-mcp",
+      "command": "comfy-mcp",
       "env": {
         "COMFY_BIN": "/path/to/venv/bin/comfy",
         "COMFY_LOCAL_URL": "http://127.0.0.1:8189"
@@ -704,7 +704,7 @@ surfaces as the raw traceback in your client's MCP logs. Same fix.
 
 When you're diagnosing a flaky setup, an MCP client's transcript is a poor record: it scrolls, it
 truncates, and the interesting failures (a missing `comfy` binary, a crash before any JSON, a
-timeout) are exactly the ones that leave the least behind. Set **`COMFY_LOCAL_MCP_DEBUG_LOG`** and
+timeout) are exactly the ones that leave the least behind. Set **`COMFY_MCP_DEBUG_LOG`** and
 the server appends one JSON object per comfy-cli **failure** to a local file you can `jq`, grep, or
 zip up and attach to a bug report.
 
@@ -718,9 +718,9 @@ Default paths — the same per-OS local-state convention comfy-cli itself uses:
 
 | OS | Path |
 | --- | --- |
-| macOS | `~/Library/Application Support/comfy-local-mcp/failures.jsonl` |
-| Windows | `~/AppData/Local/comfy-local-mcp/failures.jsonl` |
-| Linux / other | `~/.config/comfy-local-mcp/failures.jsonl` |
+| macOS | `~/Library/Application Support/comfy-mcp/failures.jsonl` |
+| Windows | `~/AppData/Local/comfy-mcp/failures.jsonl` |
+| Linux / other | `~/.config/comfy-mcp/failures.jsonl` |
 
 Each line records the failure `kind` (`error_envelope`, `no_json`, `timeout`, `binary_missing`,
 `schema_mismatch`), a UTC `ts`, the comfy-cli `args`, its `exit_code` and the envelope's
@@ -728,9 +728,9 @@ Each line records the failure `kind` (`error_envelope`, `no_json`, `timeout`, `b
 `stderr_tail` — deliberately more output than an error message can carry:
 
 ```console
-$ COMFY_LOCAL_MCP_DEBUG_LOG=1 …            # in your MCP client config's env block
+$ COMFY_MCP_DEBUG_LOG=1 …            # in your MCP client config's env block
 $ jq -r 'select(.kind == "timeout") | .ts + "  " + (.args | join(" "))' \
-    ~/Library/Application\ Support/comfy-local-mcp/failures.jsonl
+    ~/Library/Application\ Support/comfy-mcp/failures.jsonl
 ```
 
 The file rotates itself: 1 MiB per file with two older generations kept (`failures.jsonl.1`,
