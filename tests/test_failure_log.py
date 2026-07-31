@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import stat
 import subprocess
 import sys
@@ -662,3 +663,27 @@ def test_rotation_produces_a_backup_file(monkeypatch, log_path, fake_comfy):
 
     assert log_path.exists()
     assert log_path.with_suffix(log_path.suffix + ".1").exists()
+
+
+def test_readme_migration_note_names_the_live_env_var_and_log_dir():
+    """The rename note is prose, so nothing else would notice it going stale.
+
+    ``Upgrading from comfy-local-mcp`` tells an existing installer that
+    ``COMFY_LOCAL_MCP_DEBUG_LOG`` is dead and that the log directory moved — the
+    one place a reader learns their still-set old variable is now writing
+    nothing. Rename either surface again without touching the note and it
+    quietly starts giving the wrong instruction, which is worse than no note at
+    all. Key the assertions on the values the code actually uses.
+    """
+    readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+    body = readme.read_text(encoding="utf-8")
+    assert "## Upgrading from" in body, "the rename note was removed from the README"
+    section = body.split("## Upgrading from", 1)[1].split("\n## ", 1)[0]
+
+    # The variable the server reads today, and the dead one it no longer reads.
+    assert failure_log._FAILURE_LOG_ENV in section
+    assert "COMFY_LOCAL_MCP_DEBUG_LOG" in section
+
+    # The directory leaf the default path lands in today, named as the "is now".
+    leaf = os.path.basename(os.path.dirname(failure_log._default_failure_log_path()))
+    assert f"`{leaf}/`" in section

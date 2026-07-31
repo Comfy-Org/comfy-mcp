@@ -71,6 +71,10 @@ Four steps take you from a fresh install to your first generated image.
    point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
 
+   > Installed this server back when it was called `comfy-local-mcp`? Do
+   > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — `pip install .`
+   > alone will **not** clean up after the old name.
+
 2. **Launch ComfyUI** and leave it running:
 
    ```bash
@@ -98,6 +102,54 @@ Four steps take you from a fresh install to your first generated image.
 `fetch_outputs(prompt_id, out_dir)` **copies** a finished job's outputs into any directory you
 name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
 the originals stay in the ComfyUI workspace.
+
+## Upgrading from `comfy-local-mcp`
+
+This server used to be called **`comfy-local-mcp`**. It was never published to PyPI under that
+name, so this only affects you if you installed it from a source checkout — but for those installs
+the rename is **not** something `pip install .` finishes on its own, because `comfy-mcp` is a
+*different distribution*, not a new version of the old one. Four things moved:
+
+| Was | Is now |
+| --- | --- |
+| distribution / import package `comfy-local-mcp` / `comfy_local_mcp` | `comfy-mcp` / `comfy_mcp` |
+| console script `comfy-local-mcp` (the `"command"` in your client config) | `comfy-mcp` |
+| env var `COMFY_LOCAL_MCP_DEBUG_LOG` | `COMFY_MCP_DEBUG_LOG` |
+| failure-log directory leaf `comfy-local-mcp/` | `comfy-mcp/` |
+
+1. **Uninstall the old distribution first.** Installing the new one leaves the old one in place,
+   and its `comfy-local-mcp` script stays on your `PATH` pointing at a package that no longer
+   exists — so an "upgraded" environment either keeps running the old code or fails with
+   `ModuleNotFoundError`:
+
+   ```bash
+   pip uninstall comfy-local-mcp   # then: pip install .   (or `pip install -e .`)
+   ```
+
+2. **Change `"command"` to `comfy-mcp`** in every MCP client config that starts this server
+   (`.mcp.json`, `claude_desktop_config.json`, `~/.cursor/mcp.json` — see
+   [Configure your AI client](#configure-your-ai-client)), then restart the client. The old
+   command name is gone; nothing aliases it.
+
+3. **Rename the failure-log env var if you set it.** `COMFY_LOCAL_MCP_DEBUG_LOG` is no longer
+   read, and an env block that still sets it logs **nothing** — a disabled log and a stale
+   variable look identical from the outside. Use `COMFY_MCP_DEBUG_LOG`; see
+   [Failure log (opt-in)](#failure-log-opt-in).
+
+4. **Move an existing failure log if you're mid-investigation.** The default path's directory leaf
+   changed with the package, so a fresh run starts an empty `failures.jsonl` rather than appending
+   to the trail you were collecting. Nothing reads the old directory any more — copy it across, or
+   delete it:
+
+   ```bash
+   # macOS; ~/AppData/Local on Windows, ~/.config on Linux
+   cd ~/Library/Application\ Support
+   mkdir -p comfy-mcp
+   mv comfy-local-mcp/failures.jsonl* comfy-mcp/ && rmdir comfy-local-mcp
+   ```
+
+   The glob carries the two rotations (`failures.jsonl.1`, `failures.jsonl.2`) along with the
+   live file, and `mkdir -p` first means this is also safe once the new directory exists.
 
 ## Configure your AI client
 
@@ -185,6 +237,7 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 ## Table of contents
 
 - [Quickstart](#quickstart)
+- [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
 - [Configure your AI client](#configure-your-ai-client)
 - [Prerequisites](#prerequisites)
 - [When to use this server](#when-to-use-this-server)
