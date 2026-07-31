@@ -84,10 +84,15 @@ from . import failure_log, tcc, textutil
 # Rides every client handshake — teach an agent the canonical flows up front so
 # it does not have to rediscover them tool-by-tool. Keep this short.
 INSTRUCTIONS = """\
-This server drives a LOCAL ComfyUI through comfy-cli. Canonical flows:
+This server drives a ComfyUI the user runs themselves through comfy-cli — by
+default the one on this machine (`127.0.0.1:8188`), never Comfy Cloud. Canonical
+flows:
 
-- Call `server_info` FIRST to confirm a local ComfyUI is running before anything
-  else.
+- Call `server_info` FIRST, before anything else. Its `comfy env` fields
+  (running / url / workspace) always describe the ComfyUI on THIS machine —
+  `comfy env` takes no `--host` — so with `COMFYUI_URL` set they confirm the
+  local install, not the remote: the `comfy_target` block names that remote,
+  and the first run/job call is what confirms it is reachable.
 - Long generations: submit non-blocking with `run_workflow(wait=False)` to get a
   `prompt_id`, poll `wait_for_job` (a short bounded wait — chain several) or
   `job_status` until it finishes, then collect files with `fetch_outputs`.
@@ -3716,7 +3721,11 @@ async def run_workflow(
     confirm_spend: bool = False,
     ctx: Context | None = None,
 ) -> Any:
-    """Run a ComfyUI workflow JSON on the LOCAL ComfyUI.
+    """Run a ComfyUI workflow JSON on the ComfyUI this server targets.
+
+    That is the ComfyUI on this machine unless ``COMFYUI_URL`` /
+    ``COMFYUI_HOST`` points the run/job tools at another one you control (see
+    :func:`_comfy_target`) — this is one of the tools that follows it.
 
     Accepts an API-format or UI-export workflow file — call it as
     ``run_workflow(workflow_path=...)``. Wraps ``comfy run --workflow <path>``.
@@ -3739,8 +3748,8 @@ async def run_workflow(
     CAUTION — a workflow whose nodes request a huge TOTAL allocation (e.g. an
     ``EmptyImage`` / ``EmptyLatentImage`` with a very large width x height x
     ``batch_size``) can pass ALL validation — every input is within its declared
-    range, and no layer estimates memory — and then crash the whole local
-    ComfyUI process mid-run when the OS kills it on the allocation. When that
+    range, and no layer estimates memory — and then crash the whole ComfyUI
+    process mid-run when the OS kills it on the allocation. When that
     happens there is no node-level error to fetch: this tool surfaces a
     connection-loss / timeout error, and subsequent ``job_status`` /
     ``get_execution_error`` calls report ``server_not_running`` (both query the
@@ -5915,7 +5924,7 @@ def _is_terminal(status: Any) -> bool:
 
 @mcp.tool()
 def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
-    """Wait (bounded) for a submitted LOCAL job to reach a terminal status.
+    """Wait (bounded) for a submitted job to reach a terminal status.
 
     Polls ``comfy jobs status <prompt_id>`` with a short sleep between polls
     until the job finishes (completed / error / cancelled) or
@@ -5998,7 +6007,7 @@ async def watch_job(
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
 ) -> Any:
-    """Tail a submitted LOCAL job's live execution, streaming progress.
+    """Tail a submitted job's live execution, streaming progress.
 
     Wraps ``comfy jobs watch <prompt_id>``, which follows a job's execution
     events (per-node execution + sampler step counts) and ends on the terminal
@@ -6028,7 +6037,7 @@ async def watch_job(
 
 @mcp.tool()
 def cancel_job(prompt_id: str) -> Any:
-    """Cancel a queued or running LOCAL job.
+    """Cancel a queued or running job.
 
     Wraps ``comfy jobs cancel <prompt_id>``. Use this to stop a job you
     submitted via ``run_workflow(wait=False)`` before it finishes; cancelling an
@@ -6073,18 +6082,23 @@ def _drop_cloud_jobs(data: Any) -> Any:
 
 @mcp.tool()
 def get_queue() -> Any:
-    """List known LOCAL jobs with their status (pending / running / completed).
+    """List known jobs with their status (pending / running / completed).
 
     Wraps ``comfy jobs ls``. comfy-cli merges its on-disk job state with the
     running ComfyUI server's queue, so this returns both jobs still in the queue
     and recently completed ones — call it to find a ``prompt_id`` to inspect with
     ``job_status`` or cancel with ``cancel_job``.
 
-    LOCAL ONLY: jobs comfy-cli tracks in its state store from a CLOUD run are
-    filtered out of the listing, because this server drives the user's local
-    ComfyUI and nothing else. Passing a cloud job's ``prompt_id`` to
-    ``job_status`` / ``cancel_job`` would route locally regardless, so listing
-    those ids here would only invite calls that cannot work.
+    NO COMFY CLOUD JOBS: jobs comfy-cli tracks in its state store from a CLOUD
+    run are filtered out of the listing, because this server only ever drives a
+    ComfyUI the user runs themselves. Passing a cloud job's ``prompt_id`` to
+    ``job_status`` / ``cancel_job`` would route to this server's own target
+    regardless, so listing those ids here would only invite calls that cannot
+    work. The filter is deliberately conservative: it drops rows POSITIVELY
+    marked ``"cloud"`` out of the ``{"jobs": [...]}`` shape comfy-cli returns
+    today and passes any other payload shape through untouched rather than
+    reshaping it — so read a row's ``where`` rather than assuming the listing
+    has already been cleaned.
     """
     return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
 
