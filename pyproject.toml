@@ -4,7 +4,11 @@ version = "0.4.0"
 description = "Local MCP server for ComfyUI — a thin wrapper over comfy-cli."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+# PEP 639 SPDX expression. `LicenseRef-Comfy-Commercial` is the SPDX form for a
+# custom licence that has no registered identifier — the terms live in LICENSE
+# and are obtained from licensing@comfy.org.
+license = "AGPL-3.0-or-later OR LicenseRef-Comfy-Commercial"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Comfy Org" }]
 dependencies = [
     # >= 2 because that is where `mcp.server.mcpserver` exists: the SDK's 2.0.0

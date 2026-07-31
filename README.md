@@ -15,7 +15,7 @@
 <p>
   <a href="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml"><img src="https://github.com/Comfy-Org/comfy-local-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Comfy-Org/comfy-local-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/Comfy-Org/comfy-local-mcp" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later%20OR%20Commercial-blue.svg" alt="License: AGPL-3.0-or-later OR Commercial"></a>
 </p>
 
 <p>
@@ -771,20 +771,31 @@ vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License
 
-Apache-2.0 (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)). It wraps the
-GPL-3.0 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) by shelling out to
-the `comfy` binary as a separate process — no GPL code is imported or linked.
-`comfy-cli` remains GPL-3.0-licensed and is distributed separately; how its
-copyleft applies depends on how the programs interact.
+Comfy MCP is dual-licensed (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)):
+
+- **[GNU Affero General Public License v3.0 or later](LICENSE)** — free for use
+  under the AGPL's terms, including the network-use source-disclosure
+  obligation in section 13.
+- **Commercial license** — for use in proprietary products or hosted services
+  without AGPL obligations. Contact
+  **[licensing@comfy.org](mailto:licensing@comfy.org)**.
+
+It wraps the GPL-3.0 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli) by
+shelling out to the `comfy` binary as a separate process — no GPL code is
+imported or linked. `comfy-cli` remains GPL-3.0-licensed and is distributed
+separately; how its copyleft applies depends on how the programs interact.
+
+© Comfy Org.
 
 ## Trademarks
 
 "Comfy," "ComfyUI," and the Comfy Org name and logos — including the mark in
-[`assets/logo.svg`](assets/logo.svg) — are trademarks of Comfy Org. Apache-2.0
-is a copyright and patent license; per [section 6 of the license](LICENSE) it
-grants **no** rights to use those names or logos. Forks and derivative works are
-welcome under the license, but must not be named or branded in a way that
-suggests they are official Comfy Org software or carry Comfy Org's endorsement.
+[`assets/logo.svg`](assets/logo.svg) — are trademarks of Comfy Org. The AGPL is
+a copyright license and grants **no** rights to use those names or logos; the
+commercial license grants none either unless it says so in writing. Forks and
+derivative works are welcome under the license, but must not be named or branded
+in a way that suggests they are official Comfy Org software or carry Comfy Org's
+endorsement.
 
 Accurate, descriptive references — tutorials, reviews, integrations — are
 welcome. See the [brand guidelines](https://www.comfy.org/brand) for the full
