@@ -3,15 +3,19 @@
 The run/queue tools normally target the implicit local 127.0.0.1:8188. Setting
 ``COMFYUI_URL`` — or the ``COMFYUI_HOST`` / ``COMFYUI_PORT`` pair — points them
 at a ComfyUI running elsewhere by forwarding ``--host`` / ``--port`` to the
-comfy-cli verbs that accept them (``comfy run`` and every ``comfy jobs``
-subcommand). These lock in:
+comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, and
+every ``comfy jobs`` subcommand). These lock in:
 
 1. ``_comfy_target`` env parsing (URL, host/port, defaults, malformed values).
 2. ``--host`` / ``--port`` forwarded into the SUBCOMMAND (not the global prefix)
-   for ``run`` / ``jobs``, and NOT for verbs that don't accept them (``env`` /
-   ``download`` / ``upload`` / …).
+   for ``run`` / ``run-template`` / ``jobs``, and NOT for verbs that don't accept
+   them (``env`` / ``download`` / ``upload`` / …).
 3. Byte-identical local behavior when nothing is configured.
 4. ``server_info`` surfacing the configured ``comfy_target``.
+5. Submit and poll agreeing on ONE server: a ``generate_image`` / ``run_template``
+   submission and the ``wait_for_job`` that follows it must carry the same
+   ``--host`` / ``--port``, or the ``prompt_id`` from one is meaningless to the
+   other.
 """
 
 from __future__ import annotations
@@ -221,6 +225,80 @@ def test_jobs_forwards_host_port_into_subcommand(patched_run, monkeypatch):
     ]
 
 
+def test_run_template_forwards_host_port_into_subcommand(patched_run, monkeypatch):
+    """`comfy run-template` accepts --host/--port, so a submit follows the remote.
+
+    Driven through the raw wrapper rather than a tool so this asserts the
+    allowlist entry itself; the two tool-level tests below cover the argv the
+    tools actually build.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+
+    server._run_comfy("run-template", "default", "--async")
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global prefix unchanged
+    assert cmd[4:] == [
+        "run-template",
+        "default",
+        "--async",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
+def test_generate_image_submit_forwards_host_port(patched_run, monkeypatch):
+    """`generate_image(wait=False)` submits to the remote, not to this machine.
+
+    The whole ticket in one assertion: this is the easiest text-to-image
+    on-ramp, it goes through `run-template`, and while that verb was off the
+    allowlist the run happened HERE while `wait_for_job` polled THERE.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+
+    result = asyncio.run(server.generate_image("a red fox in snow", wait=False))
+
+    assert result == {"prompt_id": "p1"}
+    assert calls[0]["cmd"][4:] == [
+        "run-template",
+        "default",
+        '--param=6.text="a red fox in snow"',
+        "--timeout=60",
+        "--async",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
+def test_run_template_tool_submit_forwards_host_port(patched_run, monkeypatch):
+    """`run_template(wait=False)` submits to the remote too — same verb, same fix."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+
+    asyncio.run(
+        server.run_template("image_flux2", params={"prompt": "a cat"}, wait=False)
+    )
+
+    assert calls[0]["cmd"][4:] == [
+        "run-template",
+        "image_flux2",
+        '--param=prompt="a cat"',
+        "--timeout=60",
+        "--async",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
 def test_env_is_not_forwarded_host_port(patched_run, monkeypatch):
     """`comfy env` takes no --host/--port; forwarding would error 'No such option'."""
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
@@ -250,6 +328,47 @@ def test_local_default_is_byte_identical(patched_run):
     server._run_comfy("run", "--workflow", "wf.json")
 
     assert calls[0]["cmd"][4:] == ["run", "--workflow", "wf.json"]  # no --host/--port
+
+
+def test_run_template_local_default_is_byte_identical(patched_run):
+    """Adding `run-template` to the allowlist changes NOTHING with no remote set.
+
+    The mirror of the assertion above for the newly-forwarded verb: forwarding is
+    conditional on a resolved target, so an unconfigured install must produce the
+    same argv it produced before this verb was ever allowlisted.
+    """
+    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+
+    asyncio.run(server.generate_image("a cat", wait=False))
+
+    assert calls[0]["cmd"][4:] == [
+        "run-template",
+        "default",
+        '--param=6.text="a cat"',
+        "--timeout=60",
+        "--async",
+    ]
+
+
+def test_run_template_malformed_config_fails_like_run_does(patched_run, monkeypatch):
+    """A malformed COMFYUI_URL breaks `run-template` no worse than it breaks `run`.
+
+    `_with_target` checks the VERB before it resolves the target, so a bad config
+    can only ever reach a verb that would have used it. For a target-aware verb
+    that means a named `ComfyCliError` and NO spawn — the same failure `run` has
+    always had, not a silent fall back to running on this machine, which is the
+    outcome the ticket is about. (Local-only verbs are unaffected; that is
+    `test_local_only_verb_survives_malformed_config` above.)
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        server._run_comfy("run", "--workflow", "wf.json")
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        asyncio.run(server.generate_image("a cat", wait=False))
+
+    assert calls == []  # neither verb ever spawned comfy-cli
 
 
 # --- forwarding into the streaming (--json-stream) path --------------------
@@ -294,6 +413,88 @@ def test_watch_job_stream_forwards_host_port(patched_stream, monkeypatch):
         "--port",
         "9001",
     ]
+
+
+def test_generate_image_stream_forwards_host_port(patched_stream, monkeypatch):
+    """`generate_image(wait=True)` streams from the remote, with the flags forwarded."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    procs = patched_stream(_OK_STREAM)
+
+    result = asyncio.run(server.generate_image("a cat"))
+
+    assert result == {"outputs": ["/x.png"]}
+    cmd = procs[0].cmd
+    assert cmd[1:4] == ["--json-stream", "--where", "local"]  # global prefix unchanged
+    assert cmd[4:] == [
+        "run-template",
+        "default",
+        '--param=6.text="a cat"',
+        "--timeout=120",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
+def test_run_template_stream_forwards_host_port(patched_stream, monkeypatch):
+    """`run_template(wait=True)` streams from the remote as well."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    procs = patched_stream(_OK_STREAM)
+
+    asyncio.run(server.run_template("image_flux2"))
+
+    assert procs[0].cmd[4:] == [
+        "run-template",
+        "image_flux2",
+        "--timeout=120",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
+# --- submit and poll must agree on ONE server ------------------------------
+
+
+def _target_flags(cmd: list[str]) -> list[str]:
+    """The `--host`/`--port` pair a spawned argv carries, or `[]` for none."""
+    if "--host" not in cmd:
+        return []
+    start = cmd.index("--host")
+    return cmd[start : start + 4]
+
+
+@pytest.mark.parametrize("submit_argv", ["generate_image", "run_template"])
+def test_submit_then_wait_for_job_hit_the_same_server(
+    patched_run, monkeypatch, submit_argv
+):
+    """The end-to-end break: submit and poll must land on the SAME ComfyUI.
+
+    This is the reported failure, not merely "the run happened on the wrong
+    machine". `wait_for_job` goes through the `jobs` verb, which was already
+    forwarded, while the submit went through `run-template`, which was not — so a
+    client got a `prompt_id` from a LOCAL run and then asked the REMOTE queue
+    about it, where it had never been submitted, and got `prompt_not_found`. The
+    invariant that has to hold is agreement, so assert the two argvs carry the
+    SAME target rather than re-asserting one tool's flags.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"prompt_id": "p1", "status": "completed"}))
+
+    if submit_argv == "generate_image":
+        submitted = asyncio.run(server.generate_image("a cat", wait=False))
+    else:
+        submitted = asyncio.run(server.run_template("image_flux2", wait=False))
+    polled = server.wait_for_job(submitted["prompt_id"])
+
+    assert polled["status"] == "completed"  # no `prompt_not_found`
+    assert calls[0]["cmd"][4] == "run-template"
+    assert calls[1]["cmd"][4:7] == ["jobs", "status", "p1"]
+    assert _target_flags(calls[0]["cmd"]) == ["--host", "gpu.example", "--port", "9001"]
+    assert _target_flags(calls[0]["cmd"]) == _target_flags(calls[1]["cmd"])
 
 
 # --- server_info surfaces the configured target ----------------------------

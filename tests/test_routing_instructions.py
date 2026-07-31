@@ -134,12 +134,10 @@ def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
     (surfaced as ``comfy_target``). Routing off local hardware would then reject
     a capable remote GPU, or pile work onto a weaker one.
 
-    The exemption has to be NARROW, though: only ``run`` and ``jobs`` are
-    target-aware (``_TARGET_AWARE_SUBCOMMANDS``), so ``generate_image`` and
-    friends still run locally and the thresholds still govern them; a loopback
-    host is this same machine; and a malformed config yields an error-shaped
-    block that resolves no remote at all. Treating any ``comfy_target`` as
-    "runs elsewhere" would switch routing off on all three.
+    The exemption still has to be NARROW, though: a loopback host is this same
+    machine, and a malformed config yields an error-shaped block that resolves no
+    remote at all. Treating any ``comfy_target`` as "runs elsewhere" would switch
+    routing off on both.
 
     Loopback is stated as a RANGE, not a pair of literals: ``_comfy_target``
     accepts a bracketed IPv6 host (``COMFYUI_URL=http://[::1]:8188``, see
@@ -149,10 +147,31 @@ def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
     producing the block at all.
     """
     assert "comfy_target" in routing
-    assert "generate_image" in routing  # named as still-local
     assert "ERROR-shaped" in routing
     assert "127.0.0.0/8" in routing and "::1" in routing
     assert "COMFY_LOCAL_URL" in routing
+
+
+def test_routing_names_every_submitting_tool_as_diverted(routing):
+    """All three job-SUBMITTING tools follow ``comfy_target`` — the block must say so.
+
+    ``_TARGET_AWARE_SUBCOMMANDS`` covers ``run``, ``run-template`` and ``jobs``,
+    so ``run_workflow``, ``generate_image`` and ``run_template`` all submit to a
+    configured remote. The block used to name the last two as *still local*,
+    which is the failure this guards against in both directions: an agent that
+    believes ``generate_image`` runs here will apply this machine's VRAM
+    thresholds to a job that lands elsewhere, and — worse — will read a
+    ``prompt_not_found`` from ``wait_for_job`` as a broken queue rather than as
+    the two calls having been pointed at different servers.
+
+    Scoped to the diversion SENTENCE, not the whole block: every one of these
+    names appears elsewhere in the routing prose, so a whole-block ``in`` check
+    would keep passing after the sentence had been rewritten to exclude them.
+    """
+    assert "diverts" in routing, "the routing block no longer states a diversion"
+    sentence = routing.split("diverts", 1)[1].split(". ", 1)[0]
+    for tool in ("run_workflow", "generate_image", "run_template"):
+        assert tool in sentence, f"{tool} is target-aware but not named as diverted"
 
 
 def test_routing_asks_when_it_cannot_place_the_target_host(routing):
