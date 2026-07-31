@@ -486,6 +486,9 @@ The recipe, in order:
    - **llama.cpp (`llama-server`)** — in [router mode](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) (started with no `-m`, or with `--models-dir`) `POST /models/unload` with `{"model": "<name>"}` unloads one model; `GET /models` lists what is currently loaded. Independently of router mode, `--sleep-idle-seconds N` makes the server unload the model and its KV cache after N idle seconds and reload it automatically on the next request — which handles both step 2 and step 5 with no orchestration at all. Only a classic single-model server started without either (`llama-server -m model.gguf`) has nothing to call: there, stopping and restarting the process is the reclaim.
 3. **Free ComfyUI's own models too** with `free_memory()`. ComfyUI applies it when its queue worker next iterates — immediate if idle, after the current job if busy — and it never interrupts a running job. Re-read `system_stats()` to confirm the VRAM actually came back before committing to a big run.
 4. **Run the job** — `run_workflow(...)` / `run_template(...)` / `generate_image(...)` — then collect with `fetch_outputs(...)`.
+   (This whole recipe is about **this machine's** VRAM: `system_stats` and `free_memory` are never
+   remoted, so with a `COMFYUI_URL` configured steps 1–3 measure and free the wrong box while step 4
+   submits to the remote. See [Driving a remote ComfyUI](#driving-a-remote-comfyui).)
 5. **The client reloads its LLM** afterwards, again through its own runtime. Ollama, LM Studio and a sleep-idle `llama-server` all reload on demand, so for those "reload" is just the next request; a single-model `llama-server` stopped in step 2 has to be started again.
 
 **Why steps 2 and 5 cannot live in this MCP server.** This server is a **stdio subprocess of your MCP client** — it holds no handle on whatever LLM runtime that client is using, is not told which one it is, and has no business reaching into a process it does not own. Reaching one anyway would also breach the [thin-wrapper rule](AGENTS.md): every tool here is a `comfy` passthrough, and there is no `comfy` subcommand for "unload someone else's model". The deeper reason is step 5: the *model* that was unloaded cannot ask for itself back, so something still running has to sequence unload → run → reload. Where the LLM's own runtime can do that (Ollama's on-demand load, LM Studio's JIT, `llama-server --sleep-idle-seconds`) it should — that is the least-coordination option and it needs nothing from this server. Otherwise the client, or the orchestrator driving it, is the only participant present throughout. Either way the split is structural rather than a missing feature: this server owns reading and freeing **ComfyUI's** memory, and the client owns its **own** model's lifecycle.
@@ -675,12 +678,19 @@ machines.
   `switch_comfyui_version`, `get_logs`) — these manage a **local** ComfyUI process/install and stay
   local-only; they cannot start/stop, update, version-switch, or read logs from a remote box. Start
   and update ComfyUI on the remote host yourself.
-- **Output download** (`fetch_outputs` → `comfy download`) and `search_templates` / `search_models`
-  / `download_model` / `partner_generate` — this server forwards **no** `--host`/`--port` to these
-  verbs (they accept none at all), so they run against comfy-cli's local default. Against a remote
-  target, prefer `run_workflow(wait=True)` / `job_status` (which return the remote job's `/view`
-  output URLs) to retrieve results — and note that a model must be installed on the machine that
-  actually runs the job, which `download_model` cannot do for you.
+- **Catalog / partner verbs** — `search_templates` / `search_models` / `download_model` /
+  `partner_generate` — this server forwards **no** `--host`/`--port` to these verbs (they accept
+  none at all), so they run against comfy-cli's local default. In particular a model must be
+  installed on the machine that actually runs the job, which `download_model` cannot do for you:
+  put it on the remote host yourself.
+- **Output download** (`fetch_outputs` → `comfy download`) takes no `--host`/`--port` either, but it
+  still retrieves a **remote** job's files, because it never asks a server which job that is: the
+  same comfy-cli run that submitted the job wrote a state file **on this machine** keyed by
+  `prompt_id`, and for a non-loopback target that file records each output as an absolute
+  `http://<remote>:<port>/view?…` URL, which `comfy download` then streams from the remote. It falls
+  back to querying the local default server only when no such state file exists (an id this machine
+  never submitted). `run_workflow(wait=True)` / `job_status` return those same URLs if you would
+  rather hand them off than copy bytes.
 - **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`, and the
   `local_check` block on `fetch_template` / `get_template`) — their comfy-cli verbs *do* accept
   `--host`/`--port`, but this version forwards only to the submit/poll tools, so they still
@@ -805,7 +815,7 @@ handle is `prompt_id`.
 | `get_execution_error(prompt_id)` | `comfy jobs status <prompt_id>` | Compact failure verdict for a failed run — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; returns `error: None` on a healthy prompt. |
 | `cancel_job(prompt_id)` | `comfy jobs cancel <prompt_id>` | Cancel a queued or running job. |
 | `get_queue()` | `comfy jobs ls` | List known jobs with status (pending/running/completed); Comfy Cloud-tracked rows are filtered out, since this server never drives them. Follows a configured remote, like the other job tools. |
-| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished local job's outputs into `out_dir`; `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
 
 ### Resource management
 

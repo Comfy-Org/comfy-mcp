@@ -321,6 +321,49 @@ def test_download_and_upload_not_forwarded(patched_run, monkeypatch):
     assert calls[1]["cmd"][4:] == ["upload", "a.png"]
 
 
+def test_fetch_outputs_docs_do_not_deny_remote_retrieval():
+    """Not-forwarded must not be documented as not-working, for this one verb.
+
+    ``download`` takes no ``--host`` / ``--port`` (asserted above) and the
+    obvious reading — that ``fetch_outputs`` therefore cannot collect a job that
+    ran on the configured remote — is wrong, which is why this is a tripwire
+    rather than a comment. comfy-cli's ``download`` resolves the ``prompt_id``
+    from the state file the SUBMITTING run wrote on THIS machine, and for a
+    non-loopback target that file records each output as an absolute
+    ``http://<remote>:<port>/view?…`` URL it then streams from the remote (the
+    on-disk shortcut in ``run.execution.format_image_path`` is gated on a
+    loopback host, so it cannot fire for a remote job). Only an id this machine
+    never submitted has no such file.
+
+    Two review passes read the non-forwarding as a broken chain and asked for
+    the denial to be written into the docstrings; documenting it would have
+    talked users out of a path that works. Keyed on the load-bearing MECHANISM
+    (the state file) plus the absence of a denial, so the prose can be rewritten
+    without churn.
+    """
+    doc = server.fetch_outputs.__doc__ or ""
+    assert "state file" in doc, (
+        "fetch_outputs no longer explains WHY it reaches a remote job's outputs "
+        "— the state file is the whole mechanism"
+    )
+    assert "_TARGET_AWARE_SUBCOMMANDS" in doc, (
+        "the docstring no longer ties its behavior to the forwarding allowlist"
+    )
+    # The denial this guards against, in the spellings a rewrite would reach for.
+    lowered = " ".join(doc.split()).lower()
+    for denial in (
+        "cannot collect",
+        "can't collect",
+        "cannot fetch a remote",
+        "can't fetch a remote",
+        "unreachable for these jobs",
+    ):
+        assert denial not in lowered, (
+            f"fetch_outputs' docstring now denies remote retrieval ({denial!r}); "
+            "comfy-cli resolves the prompt_id from the local state file, so it works"
+        )
+
+
 def test_local_default_is_byte_identical(patched_run):
     """With nothing configured the argv is exactly today's — no --host appended."""
     calls = patched_run(envelope())
