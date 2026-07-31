@@ -67,17 +67,32 @@ jobs:
       # 'actions: read', but is only allowed 'actions: none'") — it does not
       # quietly degrade to running every tick. The agent jobs need nothing
       # beyond contents: read: they invoke the Claude CLI directly and mint no
-      # GitHub token, so `id-token: write` is not required at this SHA (verified
-      # against ece4c3e — grep finds no `id-token` outside a comment).
+      # GitHub token, so `id-token: write` is not required at this SHA.
+      #
+      # Re-derived against 02fe484 (the SHA pinned below), not inherited from the
+      # previous pin: the reusable's own `groom.yml` is BYTE-IDENTICAL between
+      # ece4c3e and 02fe484 — that bump touches only the groom assets loaded via
+      # `workflows_ref` (ledger.py, verifier.md, README) plus an unrelated
+      # workflow — so the union below is unchanged by construction. Union of the
+      # nested jobs' declared scopes at 02fe484: `gate` contents+actions+issues+
+      # pull-requests: read; `build_select` contents+issues+pull-requests: read;
+      # `file` contents: read + issues: write; every agent job (audit_find,
+      # audit_verify, build, build_pr) contents: read only. No job-level `uses:`,
+      # so there is no further nesting to union in, and `id-token` appears
+      # nowhere outside a comment.
+      #
+      # When you bump the SHA, redo this derivation rather than copying the
+      # comment forward — diff the reusable's `groom.yml` across the two SHAs;
+      # if it changed, re-grep its `permissions:` blocks.
       contents: read
       issues: write
       pull-requests: read
       actions: read
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e # github-workflows main (ece4c3e)
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@02fe484c0424b0bf767a49e910805c065dddfb5c # github-workflows main (02fe484)
     with:
       # Keep the assets ref (finder/verifier briefs, interval gate, dedup ledger)
       # in lock-step with the `uses:` SHA above. Bump both together.
-      workflows_ref: ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e
+      workflows_ref: 02fe484c0424b0bf767a49e910805c065dddfb5c
       # File as cloud-code-bot so groom's issues are a distinct, queryable actor
       # rather than github-actions[bot]. Unset -> reusable falls back gracefully.
       bot_app_id: ${{ vars.APP_ID }}
