@@ -402,7 +402,7 @@ full cloud tool list, and the slash-command/prompt tables live.
   `server_info`. Nothing here starts ComfyUI implicitly.
 
 <details>
-<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_LOCAL_URL</code>, <code>COMFY_T2I_TEMPLATE</code>)</summary>
+<summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_LOCAL_URL</code>, <code>COMFY_T2I_TEMPLATE</code>; plus <code>COMFY_USER_AGENT</code>, which the server sets itself)</summary>
 
 <br>
 
@@ -435,6 +435,14 @@ full cloud tool list, and the slash-command/prompt tables live.
   **[Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)**, and
   **[Which address variable do I want?](#which-address-variable-do-i-want)** for the difference
   between the two.
+- **`COMFY_USER_AGENT` (set by the server — not yours to configure).** Every comfy-cli call this
+  server makes is labelled `comfy-mcp`, which is how comfy-cli tells work that came from this MCP
+  apart from a human typing the same command — most usefully on the partner-API calls that spend
+  credits. A value you set is **overridden**, on purpose: it would otherwise file this server's
+  calls under someone else's name. The label is a caller identity, not content — nothing about
+  your prompts, workflows, or outputs travels with it, and comfy-cli's own telemetry stays subject
+  to comfy-cli's consent settings (`comfy tracking disable`, or the `DO_NOT_TRACK` /
+  `COMFY_NO_TELEMETRY` environment variables, both of which this server passes straight through).
 - **`COMFY_T2I_TEMPLATE` / `COMFY_T2I_PROMPT_SLOT` / `COMFY_T2I_CHECKPOINT_SLOT` (optional — retarget
   `generate_image`).** `generate_image(prompt)` runs the gallery's `default` template (ComfyUI's own
   basic SD1.5 text-to-image graph), filling its positive-prompt slot `6.text` and, when you pass

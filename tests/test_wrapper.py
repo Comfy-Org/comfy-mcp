@@ -18,6 +18,8 @@ import asyncio
 import enum
 import json
 import os
+import pathlib
+import re
 import shutil
 import signal
 import subprocess
@@ -137,6 +139,51 @@ def test_run_comfy_sets_no_watch_env(patched_run):
     server._run_comfy("jobs", "status", "abc")
 
     assert calls[0]["env"]["COMFY_NO_WATCH"] == "1"
+
+
+def test_run_comfy_self_attributes_via_user_agent_env(patched_run):
+    """Every spawn labels itself `comfy-mcp` through comfy-cli's caller hook.
+
+    The attribution the engine needs to tell usage that originated in THIS
+    server apart from a human running the same subcommand — partner-node calls
+    above all, since those are the ones that cost money.
+    """
+    calls = patched_run(envelope(data={"x": 1}))
+
+    server._run_comfy("jobs", "status", "abc")
+
+    assert calls[0]["env"]["COMFY_USER_AGENT"] == "comfy-mcp"
+
+
+def test_comfy_env_user_agent_wins_over_an_inherited_value(monkeypatch):
+    """An inherited `COMFY_USER_AGENT` is overwritten, not deferred to.
+
+    `_comfy_env` forwards `os.environ` wholesale, so a value in the user's shell
+    or the MCP client's `env` block reaches the child — and comfy-cli reads
+    `COMFY_USER_AGENT` ahead of every other caller signal. Deferring to it would
+    file calls this server made under someone else's label, which is exactly the
+    question the label exists to answer.
+    """
+    monkeypatch.setenv("COMFY_USER_AGENT", "some-other-harness")
+
+    assert server._comfy_env()["COMFY_USER_AGENT"] == "comfy-mcp"
+
+
+def test_mcp_user_agent_matches_the_distribution_name():
+    """The label is the distribution name, bare — it is matched on exactly.
+
+    A tripwire for the rename half of the sync note on `_MCP_USER_AGENT`: the
+    value is consumed downstream as an identifier, so a package rename that left
+    this behind would silently strand every attributed call under a name nothing
+    matches (and a version suffix would defeat the match outright).
+    """
+    pyproject = (
+        pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+    ).read_text(encoding="utf-8")
+    name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', pyproject)
+
+    assert name is not None, "pyproject.toml has no [project] name"
+    assert server._MCP_USER_AGENT == name.group(1)
 
 
 def test_run_comfy_forces_utf8_env(patched_run):
@@ -4167,6 +4214,21 @@ def test_run_workflow_stream_sets_no_watch_env(patched_stream):
 
     assert procs[0].env["COMFY_WHERE"] == "local"
     assert procs[0].env["COMFY_NO_WATCH"] == "1"
+
+
+def test_run_workflow_stream_self_attributes_via_user_agent_env(patched_stream):
+    """The streaming spawn carries the caller label too.
+
+    `run_workflow` is the second partner-node path — a graph with partner-API
+    nodes bills them wherever it runs — and `wait=True` takes the streaming
+    spawn, a different site from `_run_comfy`. Both read `_comfy_env`; this is
+    the guard that keeps them from drifting apart on the attribution.
+    """
+    procs = patched_stream(_OK_STREAM)
+
+    asyncio.run(server.run_workflow("wf.json", wait=True))
+
+    assert procs[0].env["COMFY_USER_AGENT"] == "comfy-mcp"
 
 
 def test_run_workflow_stream_forces_utf8_env(patched_stream):

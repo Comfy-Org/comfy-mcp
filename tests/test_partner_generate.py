@@ -95,6 +95,22 @@ def test_partner_generate_argv_is_a_local_json_passthrough(patched_plain_run):
     assert calls[0]["env"]["COMFY_WHERE"] == "local"  # belt-and-suspenders pin
 
 
+def test_partner_generate_is_attributed_to_this_server(patched_plain_run):
+    """The paid partner call carries this server's caller label.
+
+    `comfy generate` is the spend path, so it is the one whose origin the
+    engine's usage attribution most needs to record: without the label an
+    MCP-driven partner generation is indistinguishable from a human running the
+    same command. `_comfy_env` sets it for every spawn; this pins it on the
+    partner one specifically, since that is the reason it is set at all.
+    """
+    calls = patched_plain_run(0, stdout="Saved image to /tmp/out.png")
+
+    _generate("flux-pro", params={"prompt": "a red fox"})
+
+    assert calls[0]["env"]["COMFY_USER_AGENT"] == "comfy-mcp"
+
+
 def test_partner_generate_marshals_param_types(patched_plain_run):
     """Params render in the spellings comfy-cli's schema parser accepts."""
     calls = patched_plain_run(0, stdout="done")
