@@ -198,6 +198,218 @@ def test_nodes_categories_argv(patched_run):
     assert calls[0]["cmd"][4:] == ["nodes", "categories"]
 
 
+def test_node_dependencies_bare_argv(patched_run):
+    """No arguments -> a bare `node deps`, which reports every installed pack."""
+    data = {"workspace": "/ws", "python": "/ws/.venv/bin/python", "packs": []}
+    calls = patched_run(envelope(data=data))
+    assert server.node_dependencies() == data
+    # `node` (pack-level), NOT the `nodes` class-introspection family
+    assert calls[0]["cmd"][4:] == ["node", "deps"]
+    assert calls[0]["timeout"] == 60.0
+
+
+def test_node_dependencies_pack_is_a_positional(patched_run):
+    calls = patched_run(envelope(data={"packs": []}))
+    server.node_dependencies(pack="comfyui-impact-pack")
+    assert calls[0]["cmd"][4:] == ["node", "deps", "comfyui-impact-pack"]
+
+
+def test_node_dependencies_registry_id_uses_the_flag(patched_run):
+    calls = patched_run(envelope(data={"packs": []}))
+    server.node_dependencies(registry_id="comfyui-impact-pack")
+    assert calls[0]["cmd"][4:] == ["node", "deps", "--registry", "comfyui-impact-pack"]
+
+
+def test_node_dependencies_both_are_additive(patched_run):
+    """The two are not exclusive — comfy-cli emits a row for each.
+
+    Naming the same id both ways is the deliberate "installed vs published"
+    comparison, so the positional must stay ahead of the option rather than
+    either one replacing the other.
+    """
+    calls = patched_run(envelope(data={"packs": []}))
+    server.node_dependencies(pack="was-suite", registry_id="was-suite")
+    assert calls[0]["cmd"][4:] == [
+        "node",
+        "deps",
+        "was-suite",
+        "--registry",
+        "was-suite",
+    ]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"pack": "--help"}, {"pack": "-p"}, {"registry_id": "--registry"}],
+    ids=["pack-long", "pack-short", "registry_id"],
+)
+def test_node_dependencies_rejects_leading_dash(patched_run, kwargs):
+    """Both values are refused before the spawn, `get_node`/`list_nodes`-style."""
+    calls = patched_run(envelope(data={"packs": []}))
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.node_dependencies(**kwargs)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"pack": "was\0suite"}, {"registry_id": "was\0suite"}],
+    ids=lambda kw: next(iter(kw)),
+)
+def test_node_dependencies_rejects_embedded_nul(patched_run, kwargs):
+    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data={"packs": []}))
+    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
+        server.node_dependencies(**kwargs)
+    assert calls == []
+
+
+def test_node_dependencies_returns_the_envelope_payload(patched_run):
+    """Thin passthrough: comfy-cli's `data` is returned verbatim, unreshaped."""
+    data = {
+        "workspace": "/ws",
+        "python": "/ws/.venv/bin/python",
+        "compiled_lock": {"present": False, "path": None},
+        "packs": [
+            {
+                "pack": "demo-pack",
+                "path": "custom_nodes/demo-pack",
+                "status": "installed",
+                "requirement_files": ["requirements.txt"],
+                "requirements": [
+                    {
+                        "raw": "numpy==1.26.4",
+                        "name": "numpy",
+                        "specifier": "==1.26.4",
+                        "installed": None,
+                        "status": "missing",
+                        "source": "requirements.txt",
+                    }
+                ],
+                "summary": {
+                    "satisfied": 0,
+                    "mismatch": 0,
+                    "missing": 1,
+                    "unparseable": 0,
+                    "unknown": 0,
+                },
+            }
+        ],
+        "warnings": [],
+    }
+    patched_run(envelope(data=data))
+    assert server.node_dependencies() == data
+
+
+def test_node_dependencies_degrades_without_the_verb(patched_run):
+    """A comfy-cli predating `comfy node deps` reads as a version gap, not a break.
+
+    The verb ships in releases AFTER the `_MIN_COMFY_CLI` floor, so an install
+    that satisfies the version guard can still lack it — the common path today.
+    Verified against the released 1.13.0: a missing SUBcommand of `node` exits 2
+    with no envelope and Click's `No such command 'deps'.` on stderr, exactly the
+    shape `_is_missing_verb_error` already matches for a top-level verb.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr="Usage: comfy node [OPTIONS] COMMAND\nNo such command 'deps'.",
+    )
+
+    result = server.node_dependencies()
+
+    assert result["unsupported"] is True
+    assert "node_dependencies unavailable" in result["error"]
+    assert "comfy node deps" in result["error"]
+    # None of the raw wrapper/CLI text leaks through.
+    assert "No such command" not in result["error"]
+    assert "Usage: comfy" not in result["error"]
+    assert "returned no JSON" not in result["error"]
+
+
+def test_node_dependencies_degrades_through_a_rich_panel(patched_run):
+    """Typer wraps the same error in a bordered, width-wrapped rich panel.
+
+    `_normalize_cli_text` folds the box glyphs and the wrap away, so the degrade
+    must not depend on the terminal width the child happened to render at. This
+    is the stderr the real 1.13.0 emits, box characters and all.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy node [OPTIONS] COMMAND [ARGS]...\n"
+            "Try 'comfy node --help' for help.\n"
+            "╭─ Error ─────────────────────╮\n"
+            "│ No such command\n"
+            "│ 'deps'.                     │\n"
+            "╰─────────────────────────────╯\n"
+        ),
+    )
+
+    assert server.node_dependencies()["unsupported"] is True
+
+
+def test_node_dependencies_keeps_a_real_error_raw(patched_run):
+    """A verb comfy-cli DID dispatch must never be waved through as a gap.
+
+    No workspace is the case that matters: comfy-cli answers with an
+    `not_in_workspace` envelope, and the agent has to see it to know the fix is
+    `comfy install`, not a comfy-cli upgrade.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "not_in_workspace",
+                "message": "ComfyUI workspace not found.",
+            },
+        )
+    )
+
+    with pytest.raises(server.ComfyCliError, match="not_in_workspace"):
+        server.node_dependencies()
+
+
+def test_node_dependencies_relayed_phrase_is_not_unsupported(patched_run):
+    """A failure that merely QUOTES the phrase, inside an envelope, stays raw.
+
+    `_is_missing_verb_error` requires the no-envelope + usage-exit pair exactly
+    so a nested error relaying "No such command 'deps'" from somewhere else — a
+    pack's own build hook, a pip/git call comfy-cli shelled out to — cannot be
+    mistaken for the verb itself being absent.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "pack_scan_failed",
+                "message": "a pack hook failed: No such command 'deps'.",
+            },
+        ),
+        returncode=2,
+    )
+
+    with pytest.raises(server.ComfyCliError, match="pack_scan_failed"):
+        server.node_dependencies()
+
+
+def test_node_dependencies_different_verb_is_not_unsupported(patched_run):
+    """A "no such command" naming a DIFFERENT verb is not this tool's gap.
+
+    A CLI new enough to have `node deps` can still reject something the verb
+    shells out to; degrading on that would assert nothing is broken.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr="Error: No such command 'deps-in-workflow'.",
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        server.node_dependencies()
+
+
 def test_search_models_query_uses_search(patched_run):
     # BE-2952: comfy-cli 1.12's `models search` takes the query as `--text`,
     # not a positional — a positional exits 2 ("returned no JSON (exit 2)").
