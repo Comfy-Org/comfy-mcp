@@ -8735,6 +8735,212 @@ def nodes_categories() -> Any:
     return _run_comfy("nodes", "categories", timeout=60.0)
 
 
+# Ceiling on `node_dependencies`' two id-shaped arguments, set the way
+# :data:`_MAX_DOWNLOAD_ID_LEN` is. A pack id is a registry slug — tens of
+# characters — and an oversized one is not a lookup that misses but a value that
+# never reaches comfy-cli at all: past the platform's `ARG_MAX`, `execve` fails
+# with an `OSError` no caller here converts to a `ComfyCliError`. Checked FIRST,
+# ahead of `_reject_option_like`, so the error reports a size rather than echoing
+# a megabyte-long "pack name" back through the tool response and the failure log.
+_MAX_NODE_PACK_ID_LEN = 128
+
+
+# The missing-verb/-option matchers are deliberately strict because their
+# degrade asserts NOTHING IS BROKEN (see `_is_missing_verb_error`), and their
+# `no_envelope` condition exists to keep a RELAYED "no such command" out. This
+# closes the one door that condition cannot: text the CALLER put on the command
+# line. `node deps` is the only degrade site whose argv carries caller-controlled
+# values — `outdated` / `notes` / `download-status` take none — and Click echoes
+# an offending value verbatim in its usage error (`Invalid value for '[PACK]':
+# …`), which lands on the same exit 2 with no envelope the matchers read. So a
+# caller passing `pack="no such command 'deps'"` could otherwise forge the
+# parser's own message about `deps` and convert a genuine usage failure into
+# "your comfy-cli is just too old". Local to this call site rather than folded
+# into the matchers, which have no way to know what their caller passed.
+def _phrase_is_only_the_caller_s(
+    exc: ComfyCliError, pattern: str, *values: str
+) -> bool:
+    """Does *pattern* match only text the CALLER supplied, not comfy-cli's own?
+
+    Removes every non-empty entry of *values* from the normalized message and
+    re-runs *pattern*. No match afterwards means the sole occurrence came from an
+    echoed argument, and the degrade must not fire.
+
+    A value that is itself a substring of comfy-cli's genuine message deletes
+    that occurrence too, so a caller who passes the parser's exact wording gets
+    the raw passthrough instead of the degrade. That is the same one-directional
+    trade :func:`_is_missing_verb_error` documents — noisy but honest beats a
+    false "nothing is broken" — and here it is also the only self-inflicted way
+    to reach it.
+
+    Matching is on the echo being VERBATIM (modulo the normalization both sides
+    get), which is what Click's ``repr`` of an offending value gives for the
+    shapes that can carry the phrase at all — the value needs a quote, and
+    ``repr`` answers a single-quoted value with double quotes rather than
+    backslashes. A value carrying BOTH quote styles would come back re-escaped
+    and survive this subtraction. That residual is left as-is: the caller would
+    be deceiving only itself, since the degrade it forges is returned to the
+    same caller that crafted the argument.
+    """
+    normalized = _normalize_cli_text(str(exc))
+    for value in values:
+        if value:
+            normalized = normalized.replace(_normalize_cli_text(value), " ")
+    return re.search(pattern, normalized, re.IGNORECASE) is None
+
+
+@mcp.tool()
+def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
+    """Report a custom node pack's Python dependency requirements vs the versions
+    installed in the workspace venv (read-only).
+
+    Wraps ``comfy node deps``. With ``pack`` empty, reports every installed pack.
+    ``pack`` names an INSTALLED pack (as shown by ``list_nodes``'s pack filter);
+    ``registry_id`` names a NOT-yet-installed registry pack to pre-check before
+    install (latest published version only). Each requirement carries a status —
+    satisfied / mismatch / missing / unparseable / unknown — computed against the
+    live venv, which is what an agent needs to assess dependency-conflict risk or
+    diagnose a pack's missing imports. Reporting only: nothing is installed or
+    changed.
+
+    Deliberately NOT part of ``get_node`` / ``search_nodes``: those introspect
+    node CLASSES over the running ComfyUI's live ``object_info``, while this reads
+    the workspace filesystem and its venv (``pip list``) — folding it in would put
+    a pip-list subprocess behind every schema lookup.
+
+    The two arguments are additive rather than exclusive, and each yields its own
+    row, so ``pack`` and ``registry_id`` may name the same id to compare an
+    installed pack against what the registry publishes. Rows are keyed by
+    (``pack``, ``registry``), not by ``pack`` alone.
+
+    Pass ``pack`` when you are diagnosing ONE pack: the bare call carries every
+    installed pack's every requirement row, so on a workspace with dozens of
+    packs it is a much larger payload than you need to answer "why do this
+    pack's nodes not load".
+
+    May return ``{"error": ..., "unsupported": True}`` INSTEAD of the payload,
+    on a comfy-cli that predates the verb — which today is every released one,
+    so a caller must check for that key before indexing ``["packs"]``. A missing
+    ``--registry`` reports the same shape, naming that half only. Any other
+    failure raises, as everywhere else.
+
+    Freshness: LIVE for the installed half — the pack's declared requirements are
+    re-read off disk and diffed against the venv on every call. The
+    ``registry_id`` half reflects the registry's LATEST published version, which
+    is not necessarily what an install would resolve to.
+    """
+    args = ["node", "deps"]
+    # `pack` is a bare positional and `registry_id` is `--registry`'s value, so
+    # the same guarded pattern `get_node` / `list_nodes` use applies to both: a
+    # dash-leading positional is read as an option (argument injection), a
+    # dash-leading option value is a caller mistake worth naming, and a NUL would
+    # otherwise escape as `subprocess`' bare ValueError instead of a
+    # `ComfyCliError`. Empty values are omitted entirely — a bare `node deps`
+    # reports every installed pack.
+    for label, value in (("pack", pack), ("registry_id", registry_id)):
+        if value and len(value) > _MAX_NODE_PACK_ID_LEN:
+            # Report the length, not the value — see `_MAX_NODE_PACK_ID_LEN`.
+            raise ComfyCliError(
+                f"invalid {label}: {len(value)} characters exceeds the "
+                f"{_MAX_NODE_PACK_ID_LEN}-character maximum."
+            )
+    if pack:
+        _reject_option_like(
+            "pack", pack, expected="an installed pack name (e.g. 'comfyui-impact-pack')"
+        )
+        _reject_nul("pack", pack)
+        args.append(pack)
+    if registry_id:
+        _reject_option_like(
+            "registry_id",
+            registry_id,
+            expected="a registry node id (e.g. 'comfyui-impact-pack')",
+        )
+        _reject_nul("registry_id", registry_id)
+        args += ["--registry", registry_id]
+    try:
+        # 60s, the tier the other node tools use — not `_freshness_report`'s 15s:
+        # the verb runs `pip list` in the workspace venv, and `--registry` adds a
+        # registry lookup on top.
+        return _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        # `comfy node deps` ships in comfy-cli releases AFTER 1.13.0, which is
+        # also this server's floor (`_MIN_COMFY_CLI`) — so every comfy-cli that
+        # currently satisfies the version guard still lacks the verb, making this
+        # the COMMON path today rather than an edge one. Verified against the
+        # released 1.13.0: `comfy --json --where local node deps` exits 2 with no
+        # envelope and Click's `No such command 'deps'.` on stderr, inside a rich
+        # panel — i.e. a missing SUBcommand of `node` produces exactly the message
+        # shape `_is_missing_verb_error` already matches for a missing TOP-LEVEL
+        # verb, so no widening of the matcher was needed. Same shape and same
+        # strictness as `_freshness_report` / `_download_verb_unsupported` /
+        # `list_workflow_notes`: the no-envelope + Click-usage-exit pair is
+        # required, so a real failure from a verb comfy-cli DID dispatch (no
+        # workspace, an unknown pack name, an unreachable registry) keeps the raw
+        # raise instead of being waved through as a capability gap. On top of
+        # that pair, `_phrase_is_only_the_caller_s` discounts a phrase Click
+        # merely echoed back out of `pack` / `registry_id` — the one route to a
+        # false `unsupported` those two conditions leave open here, and the
+        # reason this call site needs a check the other degrade sites do not.
+        caller_values = (pack, registry_id)
+        if _is_missing_verb_error(exc, "deps") and not _phrase_is_only_the_caller_s(
+            exc,
+            _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape("deps")),
+            *caller_values,
+        ):
+            return {
+                "error": (
+                    "node_dependencies unavailable: the installed comfy-cli does "
+                    "not support 'comfy node deps' (the verb ships in releases "
+                    # "1.13.0" is written out rather than interpolated from
+                    # `_MIN_COMFY_CLI_STR`: that constant is this server's version
+                    # FLOOR, and raising the floor to a release that HAS the verb
+                    # would turn this sentence into a contradiction. The release
+                    # the verb landed in is a fact about comfy-cli, so it is
+                    # spelled out — the same way `_download_verb_unsupported`
+                    # spells out its own.
+                    "after 1.13.0). Nothing else is affected. Update comfy-cli "
+                    "to use this tool."
+                ),
+                "unsupported": True,
+            }
+        # The OPTION-shaped half of the same version gap, the way `download_model`
+        # covers `--background` alongside the `model download-status` verb: a
+        # comfy-cli with `node deps` but without `--registry` raises Click's
+        # `No such option: --registry` — exit 2, no envelope, and no match for
+        # the verb pattern above — which would otherwise fall through as the raw
+        # usage dump this degrade exists to replace. Forward cover rather than a
+        # gap that exists today: on comfy-cli main the option and the verb are
+        # one commit (`comfy_cli/command/node_deps.py`), and neither is in any
+        # release yet — which is precisely the window in which the option could
+        # still be renamed before it ships. `download_model` carries the same
+        # both-halves cover over a verb group its own docstring calls
+        # all-or-nothing. Gated on `registry_id` because with it empty the flag
+        # is never on the command line, so any such phrase can only have been
+        # echoed from somewhere else.
+        if (
+            registry_id
+            and _is_missing_option_error(exc, "--registry")
+            and not _phrase_is_only_the_caller_s(
+                exc,
+                _MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--registry")),
+                *caller_values,
+            )
+        ):
+            return {
+                "error": (
+                    "node_dependencies registry_id unavailable: the installed "
+                    "comfy-cli's 'comfy node deps' does not support '--registry' "
+                    "(it ships with the verb, in releases after 1.13.0). The "
+                    "installed-pack half still works — call again with "
+                    "registry_id empty — or update comfy-cli to pre-check a pack "
+                    "before installing it."
+                ),
+                "unsupported": True,
+            }
+        raise
+
+
 @mcp.tool()
 def search_models(query: str = "", folder: str = "") -> Any:
     """Search / list model files available to the LOCAL ComfyUI install.
