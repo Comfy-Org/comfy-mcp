@@ -715,7 +715,12 @@ def _guard_download_id(download_id: str) -> str:
     ARGUMENT. Whether it names a real download is comfy-cli's answer to give
     (``download_not_found``), not this wrapper's to guess.
     """
-    if not download_id or download_id.startswith("-"):
+    # `strip()`, not just falsiness: a whitespace-only id is the same caller
+    # mistake as an empty one — comfy-cli's store resolves `[A-Za-z0-9_-]{1,64}`,
+    # so a blank can never name a real download — but it is truthy, and letting
+    # it through forwards `comfy model download-status " "` and hands
+    # `_phrase_is_only_the_caller_s` a value that normalizes to `""`.
+    if not download_id.strip() or download_id.startswith("-"):
         raise ComfyCliError(
             f"invalid download_id: {download_id!r} (empty or leading '-')"
         )
@@ -9367,7 +9372,8 @@ _MAX_NODE_PACK_ID_LEN = 128
 # usage failure into "your comfy-cli is just too old".
 #
 # The degrade sites, by what their argv carries — the VERB-shaped ones first:
-# `outdated` (`_freshness_report`) takes no caller text at all; `notes`
+# `outdated` (`_freshness_report`) and `system-stats` / `free`
+# (`_resource_verb_upgrade_error`) take no caller text at all; `notes`
 # (`list_workflow_notes`) carries `workflow_path`; `download-status` /
 # `download-cancel` (`_download_verb_unsupported`) carry `download_id`; `node
 # deps` carries `pack` and `registry_id`. Then the OPTION-shaped siblings, which
@@ -9408,42 +9414,62 @@ def _phrase_is_only_the_caller_s(
     false "nothing is broken" — and here it is also the only self-inflicted way
     to reach it.
 
+    Only a value that MATCHES *pattern* on its own is subtracted, which is the
+    load-bearing half of this function. ``str.replace`` is global, so
+    subtracting unconditionally would delete a caller's value from comfy-cli's
+    OWN phrase whenever the value happened to be a substring of it — and the
+    values that collide are ordinary, not crafted: ``filename="background"``
+    erases the flag out of ``No such option: --background``,
+    ``workflow_path="notes"`` and ``download_status("a")`` do the same to
+    ``No such command 'notes'`` and ``'download-status'``. A value that does not
+    contain the phrase cannot have forged the phrase, so there is nothing to
+    discount and it is left alone. The cost of getting this wrong is not
+    symmetric: at the verb sites an over-subtraction only costs the friendly
+    message, but at ``download_model``'s ``--background`` the suppressed degrade
+    is the only path that PERFORMS the transfer, so a benign ``filename`` would
+    have turned a working legacy-CLI download into an outright failure.
+
     Matching is on the echo being VERBATIM (modulo the normalization both sides
     get), which is what Click's ``repr`` of an offending value gives for the
     shapes that can carry the phrase at all — the value needs a quote, and
     ``repr`` answers a single-quoted value with double quotes rather than
-    backslashes. Three ways the echo can fail to be verbatim are known and left
-    as-is, for one shared reason: each is SELF-inflicted, because the degrade a
-    caller forges is returned to the same caller that crafted the argument.
+    backslashes. Three ways the echo can fail to be verbatim are known and
+    accepted; in each the subtraction is a no-op, so the result is exactly the
+    behaviour that site had BEFORE this discount existed, and reaching it at all
+    is self-inflicted — the degrade a caller forges is returned to the same
+    caller that crafted the argument.
 
     - A value carrying BOTH quote styles comes back re-escaped, so the raw value
       is no longer a substring of the message.
     - Click does not always echo the value byte-for-byte. The retype this is
       forward cover for is exactly where that shows: a Typer
       ``Path(..., resolve_path=True)`` echoes the RESOLVED path, and ``repr``
-      doubles a backslash. Either way the subtraction is a no-op and the forged
-      phrase survives.
+      doubles a backslash.
     - The message this reads is a bounded ``textutil._tail`` (500 chars), so a
-      value longer than the tail arrives clipped and the whole-value replace
-      matches nothing. The id-shaped values are already capped well under that
-      bound (``_MAX_DOWNLOAD_ID_LEN``, ``_MAX_NODE_PACK_ID_LEN``);
-      ``workflow_path`` and ``download_model``'s ``url`` / ``relative_path`` /
-      ``filename`` are not, and are left uncapped deliberately — a cap tight
-      enough to close the gap would have to sit under 500 characters, and would
-      start refusing legitimately deep paths and long CivitAI/HuggingFace URLs
-      to buy nothing but protection from a caller's own crafted argument.
+      value longer than the tail arrives clipped. The id-shaped values are
+      already capped well under that bound (``_MAX_DOWNLOAD_ID_LEN``,
+      ``_MAX_NODE_PACK_ID_LEN``); ``workflow_path`` and ``download_model``'s
+      ``url`` / ``relative_path`` / ``filename`` are not, and are left uncapped
+      deliberately — a cap tight enough to close the gap would have to sit under
+      500 characters, and would start refusing legitimately deep paths and long
+      CivitAI/HuggingFace URLs to buy nothing but protection from a caller's own
+      crafted argument.
+
+    One residual runs the other way and is also accepted: the phrase could in
+    principle be assembled ACROSS the boundary, half from Click's template and
+    half from the echoed value, in which case neither the value nor this check
+    sees it whole. That needs Click's fixed wording to end mid-phrase exactly
+    where it interpolates the value, which none of its usage templates do.
     """
     normalized = _normalize_cli_text(str(exc))
     for value in values:
-        # Emptiness is tested on the NORMALIZED value, not the raw one. A value
-        # that is only whitespace or panel glyphs — `" "`, which
-        # `_guard_download_id` accepts and `list_workflow_notes` does not
-        # reject — is truthy but normalizes to `""`, and `str.replace("", " ")`
-        # interleaves a space between EVERY character of the message. That
-        # shreds comfy-cli's own phrase and would suppress the GENUINE degrade,
-        # handing the caller Click's raw usage dump instead.
         echoed = _normalize_cli_text(value)
-        if echoed:
+        # A value that does not carry the phrase itself could not have forged
+        # it — see above. This also disposes of the empty-normalization case
+        # (`" "`, which normalizes to `""`): `str.replace("", " ")` would
+        # interleave a space between EVERY character of the message, and an
+        # empty string never matches *pattern*, so it is skipped here.
+        if echoed and re.search(pattern, echoed, re.IGNORECASE):
             normalized = normalized.replace(echoed, " ")
     return re.search(pattern, normalized, re.IGNORECASE) is None
 

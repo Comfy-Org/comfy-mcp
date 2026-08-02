@@ -1339,15 +1339,18 @@ def test_download_companions_echoed_phrase_is_not_unsupported(patched_run, tool,
         ("cancel_download", "download-cancel"),
     ],
 )
-def test_download_companions_degrade_with_a_blank_download_id(patched_run, tool, verb):
-    """A whitespace-only id must not cost the genuine degrade.
+def test_download_companions_degrade_with_a_colliding_download_id(
+    patched_run, tool, verb
+):
+    """A short id that COLLIDES with Click's phrase must not cost the degrade.
 
-    `_guard_download_id` accepts `" "` (it is truthy, dash-free and NUL-free),
-    and `_normalize_cli_text` folds it to `""`. Subtracting an empty string is
-    `str.replace("", " ")`, which interleaves a space between EVERY character of
-    comfy-cli's message — shredding the parser's own phrase and suppressing the
-    version gap. `_phrase_is_only_the_caller_s` skips a value whose NORMALIZED
-    form is empty for exactly that reason.
+    The subtraction is a global `str.replace`, so discounting a value that is
+    merely a substring of comfy-cli's own message would shred the parser's
+    phrase and suppress the genuine version gap. `"a"` is an id
+    `_guard_download_id` accepts and comfy-cli's `[A-Za-z0-9_-]{1,64}` store
+    resolves, and it appears in both `download-status` and `download-cancel`.
+    `_phrase_is_only_the_caller_s` only subtracts a value that matches the
+    pattern ITSELF — one that cannot carry the phrase cannot have forged it.
     """
     patched_run(
         "",
@@ -1355,7 +1358,19 @@ def test_download_companions_degrade_with_a_blank_download_id(patched_run, tool,
         stderr=f"Usage: comfy model [OPTIONS] COMMAND\nNo such command '{verb}'.",
     )
 
-    assert getattr(server, tool)(" ")["unsupported"] is True
+    assert getattr(server, tool)("a")["unsupported"] is True
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t\n"])
+def test_download_companions_reject_a_blank_download_id(blank):
+    """A whitespace-only id is the same caller mistake as an empty one.
+
+    `_guard_download_id`'s docstring says an empty id can only be a caller
+    mistake, but `" "` is truthy — so it took a `strip()` to refuse it rather
+    than forward `comfy model download-status " "`.
+    """
+    with pytest.raises(server.ComfyCliError, match="invalid download_id"):
+        server.download_status(blank)
 
 
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
@@ -1515,6 +1530,29 @@ def test_download_model_echoed_phrase_does_not_reach_the_fallback(
 
     with pytest.raises(server.ComfyCliError):
         _download_model(url)
+
+
+def test_download_model_falls_back_with_a_colliding_filename(
+    patched_async_run, legacy_comfy_cli
+):
+    """A benign `filename` that COLLIDES with Click's phrase keeps the fallback.
+
+    The regression this pins is the sharpest consequence of an unbounded
+    subtraction: `filename="background"` is an ordinary bare name, but it is
+    also a substring of `No such option: --background`, so discounting it
+    unconditionally would erase the flag out of comfy-cli's OWN message, make
+    `_phrase_is_only_the_caller_s` report a forgery, and `raise` past
+    `_legacy_foreground_download` — turning a download that works on a
+    pre-`--background` comfy-cli into an outright failure. Unlike the verb
+    sites, where an over-subtraction costs only the friendly message, here the
+    suppressed degrade is the only path that performs the transfer.
+    """
+    patched_async_run(stderr="Done in 9.1s. Saved to /models/background")
+
+    result = _download_model("https://hf.co/background", filename="background")
+
+    assert result["ok"] is True
+    assert result["background_unsupported"] is True
 
 
 def test_download_model_synthesizes_success_on_plain_exit(
