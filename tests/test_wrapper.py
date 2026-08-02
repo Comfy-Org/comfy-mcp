@@ -4888,6 +4888,41 @@ def test_timeout_failure_returns_the_error_instead_of_raising_it(monkeypatch):
     ]
 
 
+def test_timeout_failure_takes_the_bytes_and_none_captures_too(monkeypatch):
+    """The shared body handles what `_drain_timed_out` actually hands it.
+
+    `_run_comfy_raw` passes that function's result through verbatim, and on POSIX
+    a `TimeoutExpired` carries the partial read as raw *bytes* — or as `None` when
+    the child wrote nothing before it was killed. Both reach the shared body, so
+    pin them here rather than only the decoded-`str` case above: a future edit
+    doing string-only work on these parameters has to fail this test instead of
+    failing at a user's POSIX timeout.
+    """
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        failure_log,
+        "_log_failure",
+        lambda kind, args, **kwargs: logged.append(
+            {"kind": kind, "args": args, **kwargs}
+        ),
+    )
+
+    error = server._timeout_failure(
+        [server.COMFY_BIN, "--json", "--where", "local", "discover"],
+        ("discover",),
+        60.0,
+        b"partial stdout bytes",
+        None,
+    )
+
+    message = str(error)
+    assert "stdout tail: partial stdout bytes" in message
+    # Nothing on stderr renders as the `<empty>` marker, not as a bare `None`.
+    assert "stderr tail: <empty>" in message
+    assert logged[0]["stdout"] == b"partial stdout bytes"
+    assert logged[0]["stderr"] is None
+
+
 def test_plain_spawn_leads_its_own_process_group(patched_run):
     """The plain path spawns with `start_new_session=True`, like the streaming one.
 

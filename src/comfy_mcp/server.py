@@ -1547,8 +1547,8 @@ def _timeout_failure(
     cmd: list[str],
     args: tuple[str, ...],
     timeout: float | None,
-    stdout: str,
-    stderr: str,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
 ) -> ComfyCliError:
     """Format + log a runner timeout, and RETURN the error for the caller to raise.
 
@@ -1560,6 +1560,16 @@ def _timeout_failure(
     starts there rather than inside a formatting helper, and the explicit
     ``from exc`` chaining to the originating ``TimeoutExpired`` /
     ``asyncio.TimeoutError`` stays where that exception is actually bound.
+
+    The stream parameters are typed as widely as what the callers can hand over,
+    not as narrowly as the common case: :func:`_run_comfy_async` always decodes to
+    ``str`` first, but :func:`_drain_timed_out` can return ``None`` (nothing
+    written) or ``bytes`` (POSIX attaches the undecoded partial read to
+    ``TimeoutExpired``), and :func:`_run_comfy_raw` passes that through verbatim.
+    Both consumers below — :func:`textutil._tail` and
+    :func:`failure_log._log_failure` — already declare that same union, so
+    narrowing it here would only mislead a later edit into string-only work that
+    blows up on exactly the POSIX timeout path.
 
     Not shared with :func:`_run_comfy_streaming`, whose timeout is deliberately a
     different report — it adds the progress snapshot and the poll-instead advice,
