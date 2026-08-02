@@ -1300,6 +1300,37 @@ def test_download_companions_keep_a_real_error_raw(patched_run, tool):
         getattr(server, tool)("a1b2c3d4e5f6")
 
 
+@pytest.mark.parametrize(
+    "tool, verb",
+    [
+        ("download_status", "download-status"),
+        ("wait_for_download", "download-status"),
+        ("cancel_download", "download-cancel"),
+    ],
+)
+def test_download_companions_echoed_phrase_is_not_unsupported(patched_run, tool, verb):
+    """A caller cannot forge the version gap through its own `download_id`.
+
+    The id is a bare positional and `_guard_download_id` deliberately permits
+    any characters, so Click echoing an offending value verbatim lands on the
+    same exit 2 with no envelope `_is_missing_verb_error` reads — the one route
+    to a false `unsupported` its two conditions cannot close. Subtracting the
+    caller's own text keeps a real failure a real failure.
+    """
+    download_id = f"no such command {verb!r}"
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            f"Usage: comfy model {verb} [OPTIONS] DOWNLOAD_ID\n"
+            f"Error: Invalid value for 'DOWNLOAD_ID': {download_id!r} does not exist."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        getattr(server, tool)(download_id)
+
+
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
     """wait_for_download polls until terminal and returns that final payload."""
     calls = _sequenced(monkeypatch, [_status("downloading"), _status("completed")])

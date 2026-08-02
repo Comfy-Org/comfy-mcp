@@ -9168,14 +9168,27 @@ _MAX_NODE_PACK_ID_LEN = 128
 # degrade asserts NOTHING IS BROKEN (see `_is_missing_verb_error`), and their
 # `no_envelope` condition exists to keep a RELAYED "no such command" out. This
 # closes the one door that condition cannot: text the CALLER put on the command
-# line. `node deps` is the only degrade site whose argv carries caller-controlled
-# values — `outdated` / `notes` / `download-status` take none — and Click echoes
-# an offending value verbatim in its usage error (`Invalid value for '[PACK]':
-# …`), which lands on the same exit 2 with no envelope the matchers read. So a
-# caller passing `pack="no such command 'deps'"` could otherwise forge the
-# parser's own message about `deps` and convert a genuine usage failure into
-# "your comfy-cli is just too old". Local to this call site rather than folded
-# into the matchers, which have no way to know what their caller passed.
+# line. Click echoes an offending value verbatim in its usage error (`Invalid
+# value for '[PACK]': …`), which lands on the same exit 2 with no envelope the
+# matchers read — so a caller passing `pack="no such command 'deps'"` could
+# otherwise forge the parser's own message about `deps` and convert a genuine
+# usage failure into "your comfy-cli is just too old".
+#
+# The degrade sites, by what their argv carries: `outdated`
+# (`_freshness_report`) takes no caller text at all and needs no subtraction;
+# `notes` (`list_workflow_notes`) carries `workflow_path`; `download-status` /
+# `download-cancel` (`_download_verb_unsupported`) carry `download_id`; `node
+# deps` carries `pack` and `registry_id`. EVERY site whose argv carries caller
+# text applies this subtraction, passing its own values — the matchers see only
+# the exception and have no way to know what their caller put on the command
+# line, which is why the values are a per-site argument rather than folded in.
+#
+# For `notes` and the download verbs this is forward cover rather than a live
+# hole: on comfy-cli main those parameters are plain `str` Typer params
+# validated in the command body, so the failure is an enveloped exit 1 and Click
+# never echoes them at parse time. Retyping one to a parse-time-validated type
+# (`Path`, a `Choice`) is a one-line comfy-cli change that needs no coordination
+# with this repo — which is exactly the change that would open the door here.
 def _phrase_is_only_the_caller_s(
     exc: ComfyCliError, pattern: str, *values: str
 ) -> bool:
@@ -9298,9 +9311,9 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
         # workspace, an unknown pack name, an unreachable registry) keeps the raw
         # raise instead of being waved through as a capability gap. On top of
         # that pair, `_phrase_is_only_the_caller_s` discounts a phrase Click
-        # merely echoed back out of `pack` / `registry_id` — the one route to a
-        # false `unsupported` those two conditions leave open here, and the
-        # reason this call site needs a check the other degrade sites do not.
+        # merely echoed back out of `pack` / `registry_id` — the same echoed-argv
+        # route every degrade site with caller text in its argv closes, here for
+        # this site's own two values.
         caller_values = (pack, registry_id)
         if _is_missing_verb_error(exc, "deps") and not _phrase_is_only_the_caller_s(
             exc,
@@ -9694,7 +9707,9 @@ async def _legacy_foreground_download(
     return legacy
 
 
-def _download_verb_unsupported(exc: ComfyCliError, verb: str) -> dict[str, Any] | None:
+def _download_verb_unsupported(
+    exc: ComfyCliError, verb: str, download_id: str
+) -> dict[str, Any] | None:
     """The capability-gap degrade for a ``model <verb>`` this comfy-cli lacks.
 
     Returns the ``{"error": ..., "unsupported": True}`` shape
@@ -9720,9 +9735,20 @@ def _download_verb_unsupported(exc: ComfyCliError, verb: str) -> dict[str, Any] 
     for the reason documented there: this shape asserts nothing is broken, so a
     failure that merely RELAYS a "no such command" — or any real error from a
     verb comfy-cli did dispatch, an unknown id included — must keep the raw
-    passthrough instead of being waved through as a capability gap.
+    passthrough instead of being waved through as a capability gap. On top of
+    that, the caller's own *download_id* is discounted the way
+    ``node_dependencies`` discounts ``pack`` / ``registry_id``: every verb here
+    takes the id as a bare positional and :func:`_guard_download_id`
+    deliberately permits any characters, so a Click usage error echoing it back
+    could otherwise carry the parser's own phrase. *download_id* is a required
+    argument rather than a defaulted one so a fourth caller cannot silently skip
+    the subtraction.
     """
-    if not _is_missing_verb_error(exc, verb):
+    if not _is_missing_verb_error(exc, verb) or _phrase_is_only_the_caller_s(
+        exc,
+        _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape(verb)),
+        download_id,
+    ):
         return None
     return {
         "error": (
@@ -10201,7 +10227,7 @@ def download_status(download_id: str) -> Any:
     try:
         return _run_comfy("model", "download-status", download_id, timeout=60.0)
     except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-status")
+        degraded = _download_verb_unsupported(exc, "download-status", download_id)
         if degraded is None:
             raise
         return degraded
@@ -10237,7 +10263,7 @@ def wait_for_download(download_id: str, timeout_seconds: float = 25.0) -> Any:
     try:
         return _poll_download(download_id, timeout_seconds)
     except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-status")
+        degraded = _download_verb_unsupported(exc, "download-status", download_id)
         if degraded is None:
             raise
         return degraded
@@ -10261,7 +10287,7 @@ def cancel_download(download_id: str) -> Any:
     try:
         return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
     except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-cancel")
+        degraded = _download_verb_unsupported(exc, "download-cancel", download_id)
         if degraded is None:
             raise
         return degraded
@@ -10452,8 +10478,16 @@ def list_workflow_notes(workflow_path: str) -> Any:
         # `_download_verb_unsupported`: `_is_missing_verb_error` requires the
         # no-envelope + Click-usage-exit pair, so a real failure from a verb
         # comfy-cli DID dispatch (a missing file, an API-format export) keeps
-        # the raw raise instead of being waved through as a capability gap.
-        if not _is_missing_verb_error(exc, "notes"):
+        # the raw raise instead of being waved through as a capability gap. On
+        # top of that pair, `_phrase_is_only_the_caller_s` subtracts the one
+        # thing this argv carries from the caller — `workflow_path`, a bare
+        # positional — so a path Click merely echoed back in a usage error
+        # cannot forge the phrase and turn a real failure into a version gap.
+        if not _is_missing_verb_error(exc, "notes") or _phrase_is_only_the_caller_s(
+            exc,
+            _MISSING_VERB_RE_TEMPLATE.format(verb=re.escape("notes")),
+            workflow_path,
+        ):
             raise
         # The degrade names the path that still works rather than dead-ending:
         # the notes are IN the frontend-format file `fetch_template` already

@@ -15,7 +15,9 @@ that same template carries. The behaviors they own on top of the passthrough:
    here instead of failing opaquely (or behind a server-connection error) later.
 4. ``list_workflow_notes`` degrades to the ``unsupported`` shape on a comfy-cli
    that predates the ``workflow notes`` verb, instead of relaying Click's raw
-   usage dump — the common case while the verb is newer than the version floor.
+   usage dump — the common case while the verb is newer than the version floor
+   — and refuses to fire that degrade for a phrase Click merely echoed back out
+   of the caller's own ``workflow_path``.
 """
 
 from __future__ import annotations
@@ -161,6 +163,45 @@ def test_list_workflow_notes_relayed_phrase_is_not_unsupported(patched_run):
 
     with pytest.raises(server.ComfyCliError, match="workflow_read_failed"):
         server.list_workflow_notes("/tmp/flux.json")
+
+
+def test_list_workflow_notes_echoed_phrase_is_not_unsupported(patched_run):
+    """A caller cannot forge the version gap through its own `workflow_path`.
+
+    The path is a bare positional, and Click echoes an offending value verbatim
+    in a usage error — the same exit 2 with no envelope `_is_missing_verb_error`
+    reads, which is the one route to a false `unsupported` its two conditions
+    cannot close. `_phrase_is_only_the_caller_s` subtracts the caller's own text
+    so a real failure stays a real failure.
+    """
+    path = "no such command 'notes'"
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy workflow notes [OPTIONS] FILE\n"
+            f"Error: Invalid value for 'FILE': {path!r} does not exist."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        server.list_workflow_notes(workflow_path=path)
+
+
+def test_list_workflow_notes_degrades_with_an_ordinary_path(patched_run):
+    """The echoed-input check must not cost the genuine degrade.
+
+    Discounting the caller's own text is subtraction, not a veto: an ordinary
+    `workflow_path` shares no wording with Click's message, so the parser's own
+    phrase survives and the version gap still reports as one.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr="Usage: comfy workflow [OPTIONS] COMMAND\nNo such command 'notes'.",
+    )
+
+    assert server.list_workflow_notes("workflow.json")["unsupported"] is True
 
 
 def test_set_workflow_slot_argv_default_stdout(patched_run):
