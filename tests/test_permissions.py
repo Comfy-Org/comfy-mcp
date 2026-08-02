@@ -271,6 +271,29 @@ def test_version_guard_translates_the_fatal_startup_error(on_macos, monkeypatch)
     assert server._version_checked is False
 
 
+def test_version_guard_masks_a_credential_in_the_quoted_stderr(on_macos, monkeypatch):
+    """`Original error:` quotes a captured stream, so it is scrubbed like the rest.
+
+    The probe is only `comfy --version` and carries no caller URL of its own, but
+    comfy-cli reads its config at startup — a warning naming a configured server
+    URL can land on this stderr. The guidance beside it is left alone: it renders
+    a filesystem path, not a stream.
+    """
+    url = "https://<user>:<pw>@gpu.example:8188/api?token=SECRETTOKEN"
+    _patch_version_probe(monkeypatch, 1, f"{_FATAL_STDERR}\nconfigured server: {url}")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._check_comfy_version()
+
+    message = str(excinfo.value)
+    assert "SECRETTOKEN" not in message
+    assert "<user>:<pw>" not in message
+    # Masked, not dropped — and the actual diagnosis still survives beside it.
+    assert "configured server: https://***@gpu.example:8188/api" in message
+    assert "init_import_site" in message
+    _assert_actionable(message)
+
+
 def test_version_guard_translates_a_denied_spawn(on_macos, monkeypatch):
     """The probe can be denied at exec time, never reaching a returncode.
 

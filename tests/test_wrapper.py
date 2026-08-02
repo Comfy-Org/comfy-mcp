@@ -2414,6 +2414,126 @@ def test_error_envelope_stderr_fallback_keeps_its_tail():
     assert "[x]: ..." in msg
 
 
+# The credential-in-URL fixtures below use the `https://<user>:<pass>@host` shape
+# the repo's destined-public hygiene mandates: a bare `user:pass@` trips the
+# secret-scanning diff gate, and `failure_log._URL_RE` needs the `https?://`
+# scheme to match at all.
+_CREDENTIALED_URL = (
+    "https://<user>:<pw>@civitai.example/api/download/models/1?token=SECRETTOKEN"
+)
+_MASKED_URL = "https://***@civitai.example/api/download/models/1"
+
+
+def test_error_envelope_masks_the_credential_in_its_echoed_argv():
+    """`ok: false` echoes the argv — a signed model URL must not ride along.
+
+    The failure log has always scrubbed this on its way to disk; the message the
+    MCP client renders carries the same bytes, so it gets the same masking.
+    Masked, not dropped: which call failed is still legible.
+    """
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": "http_error", "message": "403 from the CDN"},
+    }
+    args = ("model", "download", "--url", _CREDENTIALED_URL)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, args, 1, "")
+
+    msg = str(excinfo.value)
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    assert f"comfy model download --url {_MASKED_URL} failed [http_error]" in msg
+    assert "403 from the CDN" in msg  # the diagnosis itself is untouched
+
+
+def test_error_envelope_stderr_fallback_masks_a_credentialed_url():
+    """An empty `error.message` falls back to stderr — comfy-cli echoes URLs there."""
+    envelope = {"type": "envelope", "ok": False, "error": {"code": "x", "message": ""}}
+    stderr = f"downloading {_CREDENTIALED_URL}\nrequest failed"
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("model", "download"), 1, stderr)
+
+    msg = str(excinfo.value)
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    assert _MASKED_URL in msg  # masked, not dropped
+    assert "request failed" in msg
+
+
+def test_error_envelope_masks_its_own_message_hint_and_details():
+    """comfy-cli's own envelope fields are scrubbed too — the version is only floor-checked.
+
+    A newer comfy-cli scrubs these itself, but this server does not pin the child's
+    exact version, so the client path cannot assume that. Scrub-before-cap is what
+    makes it work at the boundary: capping first can bisect a URL so its `https://`
+    is gone and `failure_log._URL_RE` can no longer see the remainder.
+    """
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {
+            "code": "x",
+            "message": f"could not fetch {_CREDENTIALED_URL}",
+            "hint": f"retry with {_CREDENTIALED_URL}",
+            "details": {"partner_nodes": [f"node fetching {_CREDENTIALED_URL}"]},
+        },
+    }
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+
+    msg = str(excinfo.value)
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    # All three fields still render, masked rather than dropped.
+    assert f"could not fetch {_MASKED_URL}" in msg
+    assert f"hint: retry with {_MASKED_URL}" in msg
+    assert f"partner_nodes: node fetching {_MASKED_URL}" in msg
+
+
+def test_no_envelope_error_masks_credentials_on_both_streams(patched_plain_run):
+    """The no-JSON path renders both raw streams — both need the same masking."""
+    patched_plain_run(
+        1,
+        stdout=f"fetching {_CREDENTIALED_URL}",
+        stderr=f"curl: (22) on {_CREDENTIALED_URL}",
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._run_comfy("model", "download")
+
+    msg = str(excinfo.value)
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    # Both sections still render, each masked rather than emptied.
+    assert f"stderr: curl: (22) on {_MASKED_URL}" in msg
+    assert f"stdout: fetching {_MASKED_URL}" in msg
+
+
+def test_tcc_denial_message_masks_the_credential_in_its_original_error(monkeypatch):
+    """The TCC branch quotes stderr verbatim as `Original error:` — scrub that too.
+
+    `tcc._tcc_guidance` is deliberately left alone: it renders a filesystem path,
+    not a captured stream.
+    """
+    monkeypatch.setattr(tcc, "_looks_like_tcc_denial", lambda _: True)
+    stderr = f"PermissionError: /Users/x/Documents while fetching {_CREDENTIALED_URL}"
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(None, ("model", "download"), 1, stderr)
+
+    msg = str(excinfo.value)
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    assert (
+        f"Original error: PermissionError: /Users/x/Documents while fetching {_MASKED_URL}"
+        in msg
+    )
+
+
 def test_streaming_no_envelope_error_includes_both_stream_tails(monkeypatch):
     """The streaming EOF path produces the same enriched message as `_run_comfy`."""
     procs: list[_FakeProc] = []
@@ -3265,6 +3385,107 @@ def test_timeout_failure_takes_the_bytes_and_none_captures_too(monkeypatch):
     assert "stderr tail: <empty>" in message
     assert logged[0]["stdout"] == b"partial stdout bytes"
     assert logged[0]["stderr"] is None
+
+
+def test_timeout_failure_masks_credentials_in_both_stream_tails(monkeypatch):
+    """comfy-cli echoes the URL it is fetching — the timeout tails must mask it.
+
+    The disk record and the client message are built from the same captures, so
+    the tails go through `failure_log._scrubbed_stream_tail` rather than
+    `textutil._tail`. The log call is unchanged and re-scrubs its own inputs,
+    which is idempotent.
+    """
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        failure_log,
+        "_log_failure",
+        lambda kind, args, **kwargs: logged.append(
+            {"kind": kind, "args": args, **kwargs}
+        ),
+    )
+
+    error = server._timeout_failure(
+        [server.COMFY_BIN, "--json", "--where", "local", "model", "download"],
+        ("model", "download"),
+        60.0,
+        f"resolving {_CREDENTIALED_URL}",
+        f"stalled on {_CREDENTIALED_URL}",
+    )
+
+    message = str(error)
+    assert "comfy-cli timed out after 60.0s" in message  # existing wording, unchanged
+    assert "SECRETTOKEN" not in message
+    assert "<user>:<pw>" not in message
+    assert f"stderr tail: stalled on {_MASKED_URL}" in message
+    assert f"stdout tail: resolving {_MASKED_URL}" in message
+    # The log still receives the RAW captures — `_log_failure` owns scrubbing on
+    # its own side, and the disk record deliberately keeps a longer slice.
+    assert logged[0]["stderr"] == f"stalled on {_CREDENTIALED_URL}"
+
+
+def test_sync_timeout_masks_a_credential_in_a_bytes_stderr_capture(patched_run):
+    """POSIX hands the tails over as bytes — the scrub has to reach that shape too."""
+    patched_run(
+        raises=_timeout(
+            stderr=f"curl: (22) on {_CREDENTIALED_URL}".encode(),
+            stdout=b"partial stdout",
+        )
+    )
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server._run_comfy("model", "download", timeout=60.0)
+
+    msg = str(exc.value)
+    assert "comfy-cli timed out after 60.0s" in msg
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    assert f"stderr tail: curl: (22) on {_MASKED_URL}" in msg
+
+
+def test_cmd_for_message_bounds_a_huge_argv_from_the_head():
+    """`run_workflow`'s `--param` values are caller-supplied and otherwise unbounded.
+
+    The slice takes the HEAD because the identifying
+    `comfy --json --where local <subcommand>` prefix sits at the front — and
+    everything it can cut has already been scrubbed, so a bisected URL has no
+    userinfo or query left to leak.
+    """
+    cmd = [
+        server.COMFY_BIN,
+        "--json",
+        "--where",
+        "local",
+        "run",
+        "--workflow",
+        "wf.json",
+        "--param",
+        "prompt=" + "x" * 2000,
+    ]
+
+    rendered = server._cmd_for_message(cmd)
+
+    assert len(rendered) == server._MAX_ERROR_FIELD_CHARS
+    assert rendered.startswith(
+        f"{server.COMFY_BIN} --json --where local run --workflow"
+    )
+
+
+def test_timeout_message_stays_bounded_on_a_huge_argv(monkeypatch):
+    """The whole timeout sentence is bounded now that its last raw field is capped."""
+    monkeypatch.setattr(failure_log, "_log_failure", lambda *a, **k: None)
+
+    error = server._timeout_failure(
+        [server.COMFY_BIN, "--json", "--where", "local", "run", "p=" + "x" * 5000],
+        ("run",),
+        60.0,
+        "y" * 5000,
+        "z" * 5000,
+    )
+
+    message = str(error)
+    # cmd + both tails, each capped, plus the fixed prose around them.
+    assert len(message) < 4 * server._MAX_ERROR_FIELD_CHARS
+    assert f"{server.COMFY_BIN} --json --where local run" in message  # head survives
 
 
 def test_plain_spawn_leads_its_own_process_group(patched_run):
