@@ -109,7 +109,9 @@ flows:
   `cancel_download(download_id)` stops one. The file is written straight to its
   final path while it downloads, so a `search_models` / filesystem check
   mid-flight sees a present-but-incomplete file: `download_status` is the only
-  proof a model is usable.
+  proof a model is usable. The download always lands on THIS machine, so with a
+  remote configured (`COMFYUI_URL`/`COMFYUI_HOST`) `download_model` refuses
+  outright — see the note below.
 - Start from a template: `search_templates(query=...)` to find one (free-text
   search, paged 25 at a time via `limit`/`offset`; narrow with `tag`/`type`/
   `model`/`provider`, or `exclude_api=True` for templates that run without a
@@ -174,7 +176,14 @@ flows:
   targets and are NOT redirected by `COMFYUI_URL`/`COMFYUI_HOST` — so when those
   are set, they report and free the LOCAL install while `run_workflow`,
   `generate_image` and `run_template` all submit to the remote one. Do not
-  sequence them against a remote run.
+  sequence them against a remote run. `download_model` is local-only for the
+  same reason but does NOT quietly go local: with a remote configured it FAILS,
+  because a model written to this machine's models dir is invisible to the
+  remote that has to load it. Install the model on the remote host itself; only
+  if this machine's models dir IS the remote's (shared NFS / tailnet mount) set
+  `COMFY_MCP_REMOTE_SHARED_MODELS=1` to allow it. `download_status`,
+  `wait_for_download` and `cancel_download` are unaffected — they manage
+  downloads already submitted here.
 - Before running a workflow whose nodes call partner APIs (Seedream / Veo /
   Kling / Gemini / …), call `auth_status` to check Comfy Cloud credentials.
   Treat credentials as GOOD if `signed_in` is true OR
@@ -352,6 +361,27 @@ COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 # ``--port`` to the comfy-cli verbs that accept them (see ``_comfy_target`` /
 # ``_with_target`` and ``_TARGET_AWARE_SUBCOMMANDS`` below).
 DEFAULT_COMFYUI_PORT = 8188
+
+# Escape hatch for the one tool that REFUSES to run against a configured remote:
+# ``download_model``. ``comfy model download`` has no target concept at all — it
+# writes into the workspace of the machine running this MCP server — so with a
+# remote configured it would land the checkpoint on the wrong disk and the run
+# that needed it would still fail on a missing model. That combination is
+# refused (see ``_reject_remote_model_download``).
+#
+# The one deployment where today's behavior is CORRECT is shared storage: an NFS
+# / tailnet mount where this machine's workspace models dir IS the remote's. No
+# environment check can tell that apart from the wrong-disk case, and this
+# server may not probe the remote to find out (AGENTS.md: comfy-cli owns all
+# I/O), so it is an explicit operator assertion rather than a detection. Set it
+# to ``1`` to skip the guard.
+#
+# Read at CALL time, never cached, so it tracks the environment the same way
+# ``COMFYUI_URL`` / ``COMFYUI_HOST`` do. Only the spellings below count: an
+# unrecognized value leaves the guard ARMED (fail closed), and the guard's own
+# message names the value to set.
+REMOTE_SHARED_MODELS_ENV = "COMFY_MCP_REMOTE_SHARED_MODELS"
+_REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
 # run``, ``comfy run-template``, and every ``comfy jobs`` subcommand — every verb
@@ -1391,6 +1421,67 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
         return args
     host, port, _source = target
     return (*args, "--host", host, "--port", str(port))
+
+
+def _remote_shared_models_optin() -> bool:
+    """True when the operator asserted this workspace IS the remote's models dir.
+
+    See :data:`REMOTE_SHARED_MODELS_ENV`. Fails CLOSED: anything outside the
+    recognized truthy spellings — including an empty value, ``0`` and ``false``
+    — leaves :func:`_reject_remote_model_download`'s guard armed.
+    """
+    return (
+        os.environ.get(REMOTE_SHARED_MODELS_ENV, "").strip().lower()
+        in _REMOTE_SHARED_MODELS_TRUE
+    )
+
+
+def _reject_remote_model_download() -> None:
+    """Refuse a model download while a REMOTE ComfyUI target is configured.
+
+    ``comfy model download`` is not in :data:`_TARGET_AWARE_SUBCOMMANDS` and has
+    no ``--host`` / ``--port`` to be added to it: comfy-cli resolves the
+    destination from ``get_workspace()``, i.e. the models directory of the
+    machine running THIS server. So with ``COMFYUI_URL`` / ``COMFYUI_HOST``
+    pointing elsewhere, a download "succeeds" onto the wrong disk — the remote
+    never sees the file, and the ``run_workflow`` that needed it still fails on a
+    missing model. Refuse early instead: a clear failure beats a silent success
+    on the wrong machine.
+
+    There is no remote-download mode to fall back to. Nothing in comfy-cli
+    accepts a target for this verb, and ComfyUI's own HTTP surface has no
+    endpoint that writes into the models directory (its uploads land in
+    ``input``), so this cannot be implemented here without an upstream change —
+    which is also why the guard names the ways AROUND it rather than a flag that
+    would make it work.
+
+    Deliberately NOT folded into :func:`_with_target`: that helper checks the
+    verb before resolving the target precisely so a malformed ``COMFYUI_URL``
+    cannot brick local-only verbs (BE-3869). Here the opposite is wanted — the
+    caller has opted into a remote, so a malformed value should fail loudly
+    rather than be ignored, and the raise comes straight out of
+    :func:`_comfy_target`.
+    """
+    if _remote_shared_models_optin():
+        return
+    target = _comfy_target()
+    if target is None:
+        return
+    host, port, source = target
+    raise ComfyCliError(
+        "download_model is LOCAL-ONLY, but a remote ComfyUI is configured "
+        f"({source} -> {host}:{port}). `comfy model download` takes no "
+        "--host/--port: it writes into the models directory of the machine "
+        "running this MCP server, so that remote would never see the file and a "
+        "run there would still fail on a missing model. Either (1) run the "
+        "download on the remote host itself (its own comfy-cli / MCP server), "
+        "or (2) if this machine's workspace models directory IS the remote's "
+        "(shared storage — an NFS / tailnet mount), set "
+        f"{REMOTE_SHARED_MODELS_ENV}=1 to allow the download, or (3) unset "
+        "COMFYUI_URL/COMFYUI_HOST to work entirely locally. Already-submitted "
+        "downloads are unaffected: download_status, wait_for_download and "
+        "cancel_download keep working."
+    )
 
 
 def _cmd_for_message(cmd: list[str]) -> str:
@@ -4073,9 +4164,10 @@ async def generate_image(
     graph; the two must name DIFFERENT slots (one key for both is refused rather
     than silently dropping the prompt). Pass ``checkpoint`` to swap the
     template's checkpoint model (it must
-    already be installed on the machine that RUNS the job — ``search_models`` /
-    ``download_model`` inspect and write to THIS machine's install, so with a
-    remote configured you have to put the checkpoint on that machine yourself);
+    already be installed on the machine that RUNS the job — ``search_models``
+    reads and ``download_model`` writes THIS machine's install, so with a remote
+    configured you have to put the checkpoint on that machine yourself, and
+    ``download_model`` refuses rather than fetching it to the wrong one);
     omit it to use the template's own default. The default template is a free
     OSS graph that runs on your own ComfyUI: nothing here spends Comfy credits,
     so no spend consent is passed and none is needed. (For hosted PARTNER
@@ -9103,7 +9195,11 @@ def search_models(query: str = "", folder: str = "") -> Any:
       telling the user anything, since acting on this reading triggers a
       redundant multi-GB download of a file they already have.
     - genuinely "not downloaded here" — ``download_model`` is the way to add one,
-      and the hosted partner catalog is ``list_partner_models``.
+      and the hosted partner catalog is ``list_partner_models``. Both this
+      listing and that download are about THIS machine, so with a remote ComfyUI
+      configured (``COMFYUI_URL`` / ``COMFYUI_HOST``) they answer for the wrong
+      install — which is why ``download_model`` refuses there rather than
+      fetching to a disk the remote cannot read.
     """
     # The guards sit INSIDE their branch so an empty value keeps meaning "mode
     # not selected" (the precedence above) rather than becoming an error.
@@ -9392,6 +9488,22 @@ async def download_model(
     is the only source of truth for completeness: treat the model as usable only
     once its status is ``completed``.
 
+    LOCAL-ONLY, ENFORCED: with ``COMFYUI_URL`` / ``COMFYUI_HOST`` pointing at a
+    remote ComfyUI, this REFUSES rather than downloading. ``comfy model
+    download`` has no target concept — it always writes into the models
+    directory of the machine running this server — so on a remote setup it would
+    "succeed" onto the wrong disk and the run that needed the model would still
+    fail on a missing file. The error names the ways around it: download on the
+    remote host itself, or unset those variables. The one exception is SHARED
+    STORAGE, where this machine's workspace models dir IS the remote's (an NFS /
+    tailnet mount): that cannot be detected from the environment and this server
+    may not probe the remote to find out, so assert it by setting
+    ``COMFY_MCP_REMOTE_SHARED_MODELS=1``, which skips the guard and restores the
+    plain local behavior. The guard covers ``wait`` either way, since it runs
+    before anything is submitted. ``download_status`` / ``wait_for_download`` /
+    ``cancel_download`` are NOT guarded — they manage downloads that were already
+    submitted here, which stay local and valid.
+
     ``relative_path`` is resolved from the WORKSPACE ROOT, so it must name the
     models dir or a subfolder of it — its first segment has to be ``models``
     (``models``, ``models/loras``, ``models/checkpoints``). A bare folder name
@@ -9445,6 +9557,13 @@ async def download_model(
     that full cap; the default 110s budget exists for the modern path, where the
     transfer outlives the request.
     """
+    # FIRST, before argument validation and before anything is spawned: a
+    # configured remote makes this whole call the wrong operation, not a call
+    # with a bad argument, and refusing here is what covers `wait` both ways and
+    # the legacy no-`--background` fallback alike (they all sit downstream of the
+    # submit below). See `_reject_remote_model_download` for why it cannot be
+    # made to work instead.
+    _reject_remote_model_download()
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
     _reject_option_like("url", url)
