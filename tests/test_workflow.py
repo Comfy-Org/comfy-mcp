@@ -227,6 +227,16 @@ def test_workflow_path_positional_rejects_option_like(no_spawn):
         server.vary_workflow("--out-dir", ["3.seed=[1,2]"])
 
 
+def test_workflow_path_guard_message_tracks_format_requirement(no_spawn):
+    """Frontend-only tools name the frontend format; dual-format tools do not."""
+    with pytest.raises(server.ComfyCliError, match="frontend-format"):
+        server.list_workflow_slots("--stdout")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.validate_workflow("--stdout")
+    assert "frontend-format" not in str(excinfo.value)
+
+
 def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     """The documented escape hatch actually works: `./-flux.json` is not refused."""
     calls = patched_run(envelope(data={"modified": True}))
