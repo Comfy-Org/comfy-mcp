@@ -24,6 +24,7 @@ every ``comfy jobs`` subcommand). These lock in:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from conftest import _OK_STREAM, envelope
@@ -787,10 +788,46 @@ def test_system_stats_annotates_configured_remote(patched_run, monkeypatch):
     assert note["host"] == "gpu.example"
     assert note["port"] == server.DEFAULT_COMFYUI_PORT
     assert note["source"] == "COMFYUI_HOST"
-    assert "NOT the remote" in note["note"]
+    assert "NOT necessarily the host/port above" in note["note"]
     # Annotation only — comfy-cli's own payload is passed through untouched.
     assert result["devices"] == _STATS["devices"]
     assert result["system"] == _STATS["system"]
+
+
+def test_target_note_does_not_adjudicate_same_machine(patched_run, monkeypatch):
+    """A loopback target is annotated too, and the note asserts no verdict.
+
+    The note REPORTS the divergence rather than resolving it: a configured host
+    may well be this box, and this server cannot tell (no local hostname or
+    interface addresses, and a loopback host can be a tunnel to a remote GPU).
+    Suppressing the key for loopback would trade a false alarm for a silent
+    miss, so it stays — carrying the host/port for the caller to judge, and
+    never claiming the numbers are "the local machine's".
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "127.0.0.1")
+    monkeypatch.setenv("COMFYUI_PORT", "8189")
+    patched_run(envelope(data=_STATS))
+
+    note = server.system_stats()["comfy_target_note"]
+
+    assert (note["host"], note["port"]) == ("127.0.0.1", 8189)
+    assert "same machine when that host resolves to THIS box" in note["note"]
+
+
+def test_target_note_masks_credentials_in_the_host(patched_run, monkeypatch):
+    """`COMFYUI_HOST` is taken verbatim, so userinfo must not reach the payload.
+
+    Only the `COMFYUI_URL` path runs through `urlparse().hostname`, which drops
+    userinfo on its own; a URL-style `COMFYUI_HOST` carries it straight into the
+    resolved tuple. Every place that echoes the host back masks it.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "<user>:<token>@gpu.example")
+    patched_run(envelope(data=_STATS))
+
+    note = server.system_stats()["comfy_target_note"]
+
+    assert note["host"] == "***@gpu.example"
+    assert "<token>" not in json.dumps(note)
 
 
 def test_free_memory_annotates_configured_remote(patched_run, monkeypatch):
@@ -818,21 +855,41 @@ def test_resource_tools_unconfigured_are_byte_identical(patched_run):
     assert server.free_memory() == ack
 
 
-def test_resource_tools_survive_malformed_target(patched_run, monkeypatch):
-    """A malformed remote config must not break these local-only tools.
+def test_resource_tools_report_a_malformed_target(patched_run, monkeypatch):
+    """A malformed remote config is reported in the note, never raised.
 
-    Same contract `_with_target` honors for the local-only verbs: the caller
-    never asked these two to reach the remote, so an unparseable `COMFYUI_URL`
-    costs the annotation, not the call.
+    Two contracts at once. The call must still succeed — same one `_with_target`
+    honors for the local-only verbs: the caller never asked these two to reach
+    the remote. But the key must not simply VANISH either, because "no key" is
+    defined to mean "nothing configured", and a typo is the one thing that
+    reading must never be confused with. So it takes the error shape
+    `server_info` uses for the same breakage.
     """
     monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
 
     patched_run(envelope(data=_STATS))
-    assert server.system_stats() == _STATS
+    stats = server.system_stats()
+
+    note = stats["comfy_target_note"]
+    assert "scheme 'https' is not supported" in note["error"]
+    assert "malformed" in note["note"]
+    assert "host" not in note  # nothing resolved, so nothing to name
+    assert {k: v for k, v in stats.items() if k != "comfy_target_note"} == _STATS
 
     ack = {"requested": {"unload_models": True}}
     patched_run(envelope(data=ack))
-    assert server.free_memory() == ack
+    assert "error" in server.free_memory()["comfy_target_note"]
+
+
+def test_malformed_target_note_masks_credentials(patched_run, monkeypatch):
+    """The error text echoes the offending value, so it is masked there too."""
+    monkeypatch.setenv("COMFYUI_URL", "https://<user>:<token>@gpu.example")
+    patched_run(envelope(data=_STATS))
+
+    note = server.system_stats()["comfy_target_note"]
+
+    assert "***@gpu.example" in note["error"]
+    assert "<token>" not in json.dumps(note)
 
 
 def test_resource_tools_pass_through_foreign_payload_shapes(patched_run, monkeypatch):
