@@ -1323,6 +1323,32 @@ def _strip_brackets(host: str) -> str:
     return host
 
 
+def _redact_config_url(url: str) -> str:
+    """:func:`textutil._redact_url`, plus the query/fragment a secret also hides in.
+
+    :func:`_comfy_target`'s errors echo the offending ``COMFYUI_URL`` back, and
+    that text is quoted onward — into ``server_info``'s ``comfy_target`` block,
+    into :func:`_malformed_target_note`, and into the message
+    :func:`_target_provenance_suffix` appends to a raised error — so it reaches
+    the model's context and any transcript of it. Userinfo is not the only place
+    a credential rides in: an auth-proxied ComfyUI is routinely addressed as
+    ``https://host/?token=…``, and a value written that way is echoed back the
+    moment ANY of the checks below rejects it — the ``https`` scheme most of
+    all, which is what such a proxy is usually reached over.
+
+    The query and fragment are replaced WHOLESALE rather than parsed for
+    key names: what makes the value diagnosable is the scheme, host and port, so
+    nothing in either part is worth echoing — and a placeholder still tells the
+    user they wrote one, which "silently dropped" would not.
+    """
+    masked = textutil._redact_url(url)
+    cuts = [i for i in (masked.find("?"), masked.find("#")) if i != -1]
+    if not cuts:
+        return masked
+    cut = min(cuts)
+    return f"{masked[: cut + 1]}<redacted>"
+
+
 def _comfy_target() -> tuple[str, int, str] | None:
     """Resolve the configured ComfyUI ``(host, port, source)``, or None for local.
 
@@ -1350,31 +1376,31 @@ def _comfy_target() -> tuple[str, int, str] | None:
             host, port = parsed.hostname, parsed.port
         except ValueError as exc:  # bad port, or malformed URL (IPv6 brackets)
             raise ComfyCliError(
-                f"COMFYUI_URL is malformed: {textutil._redact_url(url)!r} ({exc})."
+                f"COMFYUI_URL is malformed: {_redact_config_url(url)!r} ({exc})."
             ) from exc
         if parsed.scheme and parsed.scheme != "http":
             raise ComfyCliError(
                 f"COMFYUI_URL scheme {parsed.scheme!r} is not supported "
-                f"({textutil._redact_url(url)!r}): comfy-cli's --host/--port speak plain "
+                f"({_redact_config_url(url)!r}): comfy-cli's --host/--port speak plain "
                 "http only, so an https:// target would be silently downgraded. "
                 "Use http://<host>:<port>."
             )
         if parsed.path not in ("", "/"):
             raise ComfyCliError(
-                f"COMFYUI_URL must not include a path ({textutil._redact_url(url)!r}): "
+                f"COMFYUI_URL must not include a path ({_redact_config_url(url)!r}): "
                 "comfy-cli forwards only host/port, so a reverse-proxy base path "
                 "would be dropped. Point COMFYUI_URL at the bare host:port."
             )
         if not host:
             raise ComfyCliError(
-                f"COMFYUI_URL is set but names no host: {textutil._redact_url(url)!r}. "
+                f"COMFYUI_URL is set but names no host: {_redact_config_url(url)!r}. "
                 "Use e.g. http://<host>:8188 (or set COMFYUI_HOST/COMFYUI_PORT)."
             )
         # `port or DEFAULT` alone would treat an explicit :0 as absent and
         # silently target 8188; reject it to match the COMFYUI_PORT path.
         if port == 0:
             raise ComfyCliError(
-                f"COMFYUI_URL port is out of range (1-65535): {textutil._redact_url(url)!r}."
+                f"COMFYUI_URL port is out of range (1-65535): {_redact_config_url(url)!r}."
             )
         return _strip_brackets(host), port or DEFAULT_COMFYUI_PORT, "COMFYUI_URL"
 
@@ -1410,11 +1436,34 @@ def _redact_target_host(host: str) -> str:
     drops userinfo — but ``COMFYUI_HOST`` is taken VERBATIM, so a value written
     URL-style (``<user>:<token>@host``) is carried into the tuple as-is and would
     otherwise reach the model's context, and any transcript of it, unmasked. The
-    same masking :func:`_comfy_target`'s own error messages already apply to the
+    same userinfo masking :func:`_comfy_target`'s own error messages apply to the
     raw value; a host with no ``@`` is returned unchanged, which is every real
     one.
+
+    Masked HERE rather than by delegating to :func:`textutil._redact_url`: that
+    helper stops inspecting at the first ``/``, ``?`` or ``#`` because it is
+    reading a URL, whose PATH may hold a stray ``@`` that is not userinfo. This
+    is a bare host, where there is no path for an ``@`` to belong to — so any
+    ``@`` is userinfo, and a token that happens to contain one of those
+    delimiters (base64 routinely contains ``/``) would otherwise fall outside
+    the inspected slice and be returned in full.
     """
-    return textutil._redact_url(host)
+    if "@" not in host:
+        return host
+    return f"***@{host.rsplit('@', 1)[1]}"
+
+
+def _format_target_endpoint(host: str, port: int) -> str:
+    """``host:port`` as ONE token, re-bracketing an IPv6 host so the port reads.
+
+    :func:`_strip_brackets` normalizes ``[2001:db8::1]`` to the bare form every
+    other consumer wants (comfy-cli re-brackets it when it builds a URL, and the
+    payload note keeps ``host`` and ``port`` as separate keys). Joined with a
+    colon for prose, though, that bare form renders ``2001:db8::1:8188``, where
+    the port is indistinguishable from a final hextet — so the brackets go back
+    on for the one caller that has to write the two as a single string.
+    """
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
@@ -6540,6 +6589,119 @@ def _annotate_comfy_target(payload: Any) -> Any:
     }
 
 
+def _target_provenance_suffix() -> str:
+    """The same divergence :func:`_annotate_comfy_target` carries, for a FAILURE.
+
+    The note above only ever reaches a caller on the SUCCESS path, and the
+    common case with a remote configured is the failing one: ``comfy
+    system-stats`` / ``comfy free`` take no ``--host`` / ``--port``, so with no
+    local ComfyUI running they raise comfy-cli's bare ``server_not_running``
+    while the configured remote is up and serving the run/job tools perfectly
+    well. An agent reading that error alone concludes the remote is down and
+    abandons a ``run_workflow`` that would have worked — the provenance is
+    exactly as load-bearing on the error as it is on the payload.
+
+    Returns a suffix to append to the raised message, or ``""`` when nothing is
+    configured — in which case the caller must re-raise the original objects
+    untouched, so the local default stays byte-identical.
+
+    Fail-soft on a malformed config for the same reason
+    :func:`_annotate_comfy_target` is: these two tools never touch the remote,
+    so a bad ``COMFYUI_URL`` must not make them fail differently. But it does
+    not vanish either — a typo must not read as "nothing configured" — so it
+    becomes its own short suffix carrying :func:`_comfy_target`'s own
+    (already userinfo-masked) message, the same rationale as
+    :func:`_malformed_target_note`.
+
+    It does not ADJUDICATE, exactly as the success-path note does not: the two
+    ends are the same machine whenever the configured host resolves to this box
+    and this server cannot tell whether it does. What it rules out is the one
+    wrong inference — that this error is a verdict on the configured target.
+    """
+    try:
+        target = _comfy_target()
+    except ComfyCliError as exc:
+        # Names all three knobs rather than the two that resolve a host: a lone
+        # `COMFYUI_PORT` raises out of `_comfy_target` too, and blaming
+        # `COMFYUI_URL`/`COMFYUI_HOST` for it points at variables that are not
+        # even set. The embedded message says which one it actually was.
+        return (
+            " (note: the remote-target config (COMFYUI_URL / COMFYUI_HOST / "
+            "COMFYUI_PORT) is set but invalid, so no remote is resolved and this "
+            "error is comfy-cli's own, about whichever ComfyUI it itself targets; "
+            f"the config error is: {exc})"
+        )
+    if target is None:
+        return ""
+    host, port, source = target
+    endpoint = _format_target_endpoint(_redact_target_host(host), port)
+    # "not AIMED at it", not "did not REACH it": the absence of --host/--port is
+    # a fact about what this invocation asked for, whereas whether it reached
+    # that endpoint anyway is exactly what this server cannot know (the host may
+    # resolve to this box, `COMFY_LOCAL_URL` may point comfy-cli straight at it).
+    # Claiming non-reach would misclassify a genuine failure OF the target as
+    # unrelated to it — the same over-reach the closing clause avoids by saying
+    # this failure is not evidence either way rather than that the remote is up.
+    return (
+        f" (note: {source} is set to {endpoint}, but this probe was NOT aimed at "
+        "it — `comfy system-stats` / `comfy free` take no --host/--port, so this "
+        "error is about whichever ComfyUI comfy-cli itself targets. That may or "
+        "may not be the same machine, and this server does not verify which, so "
+        "do not read this as a verdict on the configured target: that is where "
+        "the run/job tools submit, and this failure is no evidence about it.)"
+    )
+
+
+def _comfy_cli_ran(err: ComfyCliError) -> bool:
+    """True when *err* is a verdict from a comfy-cli child that actually RAN.
+
+    ``returncode`` is set wherever :func:`_unwrap_envelope` read a child's exit
+    status (the error-envelope path and the no-envelope path alike), and
+    ``timed_out`` marks the child we killed at our own deadline; neither can be
+    set unless comfy-cli was spawned.
+
+    The failures that leave both at their defaults are the ones raised about
+    this machine's INSTALL rather than about any ComfyUI —
+    :func:`_require_comfy_bin`'s missing binary and its macOS TCC denial,
+    :func:`_check_comfy_version`'s version floor, :func:`_unwrap_envelope`'s
+    refusal of an incompatible envelope schema. :func:`_target_provenance_suffix`
+    must not be appended to those: it says this failure is not a verdict on the
+    configured target, implying the submit tools are unaffected, and every one of
+    them breaks ``run_workflow`` in exactly the same way — there is no binary for
+    it to shell out to either.
+    """
+    return err.returncode is not None or err.timed_out
+
+
+def _with_target_provenance(err: ComfyCliError) -> ComfyCliError:
+    """*err* with :func:`_target_provenance_suffix` appended, or *err* itself.
+
+    Returning the SAME object when no remote is configured is the contract: the
+    unconfigured path must re-raise exactly what it raises today, message and
+    identity included. Every attribute is carried across rather than only the
+    two :func:`_resource_verb_upgrade_error` needs — a timeout here really can
+    set ``timed_out`` (both tools pass a ``timeout=``), and a message rewrite is
+    no reason for the structured provenance to decay.
+
+    A failure comfy-cli never got to run is returned the same untouched way, for
+    the reason :func:`_comfy_cli_ran` gives: the note is about which ComfyUI a
+    dispatched verb spoke to, and a missing or unusable comfy-cli spoke to none.
+    """
+    if not _comfy_cli_ran(err):
+        return err
+    suffix = _target_provenance_suffix()
+    if not suffix:
+        return err
+    return ComfyCliError(
+        f"{err}{suffix}",
+        code=err.code,
+        no_envelope=err.no_envelope,
+        returncode=err.returncode,
+        timed_out=err.timed_out,
+        data=err.data,
+    )
+
+
 @mcp.tool()
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
@@ -6583,14 +6745,21 @@ def system_stats() -> Any:
     error-shaped note (``error`` / ``note``) instead — the same shape
     ``server_info`` reports that breakage in — so an absent key means one thing
     only: no remote is configured. Nothing else about the payload changes.
+    ERRORS carry that provenance too: with a remote configured, a failure here
+    (``server_not_running`` above all, the common shape when nothing is running
+    locally) is appended with the same note, so it is not mistaken for a verdict
+    on the target the run/job tools submit to. Only a failure comfy-cli actually
+    ran, though — a missing or too-old comfy-cli breaks every tool alike and is
+    about no ComfyUI at all, so it is raised untouched.
     """
     try:
         data = _run_comfy("system-stats", timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "system-stats", "system_stats")
-        if hinted is not None:
-            raise hinted from exc
-        raise
+        annotated = _with_target_provenance(exc if hinted is None else hinted)
+        if annotated is exc:
+            raise
+        raise annotated from exc
     return _annotate_comfy_target(data)
 
 
@@ -6639,7 +6808,10 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
     target and leaving the same-machine judgment to the caller exactly as
     ``system_stats`` does (a malformed value gives the error-shaped ``error`` /
     ``note`` form). With no remote configured the key is absent and the payload
-    is unchanged.
+    is unchanged. ERRORS carry the same provenance note appended to their
+    message, so a failure to reach the LOCAL ComfyUI is not read as the
+    configured remote being down — with the same carve-out ``system_stats``
+    documents for a comfy-cli that never ran at all.
     """
     if free_memory is None:
         # Mirror `unload_models` so the default call asks for both and
@@ -6661,9 +6833,10 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
         data = _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "free", "free_memory")
-        if hinted is not None:
-            raise hinted from exc
-        raise
+        annotated = _with_target_provenance(exc if hinted is None else hinted)
+        if annotated is exc:
+            raise
+        raise annotated from exc
     return _annotate_comfy_target(data)
 
 
