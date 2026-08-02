@@ -7,9 +7,10 @@ groups alongside the genuine wrapper core. This file is the
 background flow, the companions, and the legacy synchronous fallback for a
 comfy-cli that predates ``model download --background``.
 
-``_NO_SUCH_OPTION_STDERR`` stays in ``test_wrapper.py`` — the
-``_is_missing_option_error`` tests there use it too — and is imported from
-there rather than duplicated.
+``NO_SUCH_OPTION_STDERR`` is shared with ``test_wrapper.py`` — the
+``_is_missing_option_error`` tests there use it too — so it lives in
+``conftest.py`` with the other shared helpers rather than being duplicated or
+cross-imported between two test modules.
 """
 
 from __future__ import annotations
@@ -19,8 +20,7 @@ import time
 from pathlib import PurePosixPath
 
 import pytest
-from conftest import envelope
-from test_wrapper import _NO_SUCH_OPTION_STDERR
+from conftest import NO_SUCH_OPTION_STDERR, envelope
 
 from comfy_mcp import failure_log, server
 
@@ -40,7 +40,7 @@ def _download_model(*args, **kwargs):
 def _missing_background_error() -> server.ComfyCliError:
     """The `ComfyCliError` an old comfy-cli's `--background` rejection produces."""
     return server.ComfyCliError(
-        f"comfy-cli returned no JSON (exit 2). stderr: {_NO_SUCH_OPTION_STDERR} "
+        f"comfy-cli returned no JSON (exit 2). stderr: {NO_SUCH_OPTION_STDERR} "
         "| stdout: <empty>",
         no_envelope=True,
         returncode=2,
@@ -175,43 +175,63 @@ def test_download_model_omits_absent_optionals(patched_run):
     assert "--filename" not in cmd
 
 
-def test_download_model_rejects_option_like_url():
+def test_download_model_rejects_option_like_url(patched_run):
     """A leading-dash url is refused so comfy-cli can't parse it as a flag."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="invalid url"):
         _download_model("--config")
 
+    assert calls == []
 
-def test_download_model_rejects_option_like_relative_path():
+
+def test_download_model_rejects_option_like_relative_path(patched_run):
     """A leading-dash relative_path is refused (argument injection guard)."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model("https://hf.co/x.safetensors", relative_path="-rf")
 
+    assert calls == []
 
-def test_download_model_rejects_option_like_filename():
+
+def test_download_model_rejects_option_like_filename(patched_run):
     """A leading-dash filename is refused (argument injection guard)."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         _download_model("https://hf.co/x.safetensors", filename="--evil")
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
     "bad_url", ["file:///etc/passwd", "ftp://host/x", "/etc/passwd"]
 )
-def test_download_model_rejects_non_http_scheme(bad_url):
+def test_download_model_rejects_non_http_scheme(bad_url, patched_run):
     """Only http(s) URLs are allowed; file://, ftp:// and bare paths are refused."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="invalid url"):
         _download_model(bad_url)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
     "bad_path",
     ["../../etc", "models/../../etc", "/abs/models", "..\\..\\etc", "C:evil"],
 )
-def test_download_model_rejects_traversal_relative_path(bad_path):
+def test_download_model_rejects_traversal_relative_path(bad_path, patched_run):
     """relative_path must stay within the models dir: no `..`, absolute paths,
     or a drive prefix (``C:evil`` has no separator but is drive-relative on
     Windows)."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
 
 
 # --- Windows-shaped escapes are refused on EVERY host, including Linux CI ----
@@ -497,12 +517,16 @@ def test_download_model_accepts_dotted_but_ordinary_filename(good_name, patched_
 @pytest.mark.parametrize(
     "bad_name", ["../evil", "sub/dir.safetensors", "..", "a\\b", "C:evil.dll"]
 )
-def test_download_model_rejects_pathy_filename(bad_name):
+def test_download_model_rejects_pathy_filename(bad_name, patched_run):
     """filename must be a bare name: no separators, `..`, or a drive prefix to
     escape the dir (``C:evil.dll`` has no separator but is drive-relative on
     Windows)."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
         _download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -544,20 +568,32 @@ def test_download_model_still_accepts_ordinary_path_and_name(patched_run):
     assert "--filename" in cmd and cmd[cmd.index("--filename") + 1] == "x.safetensors"
 
 
-def test_download_model_rejects_embedded_nul_url():
+def test_download_model_rejects_embedded_nul_url(patched_run):
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
         _download_model("https://hf.co/x\0.safetensors")
 
+    assert calls == []
 
-def test_download_model_rejects_embedded_nul_relative_path():
+
+def test_download_model_rejects_embedded_nul_relative_path(patched_run):
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
         _download_model("https://hf.co/x.safetensors", relative_path="models/\0")
 
+    assert calls == []
 
-def test_download_model_rejects_embedded_nul_filename():
+
+def test_download_model_rejects_embedded_nul_filename(patched_run):
+    calls = patched_run(envelope(data=_submit()))
+
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
         _download_model("https://hf.co/x.safetensors", filename="x\0.safetensors")
+
+    assert calls == []
 
 
 def test_download_model_omits_empty_string_optionals(patched_run):
@@ -607,26 +643,95 @@ def _status(status: str, **extra) -> dict:
     }
 
 
-def _sequenced(monkeypatch, replies: list) -> list[tuple]:
+class _FakeClock:
+    """A ``time``-shaped stand-in that only ``server`` sees.
+
+    The download family is a deadline machine — every branch below turns on how
+    much of `timeout_seconds` is left — so these tests have to drive the clock.
+    Patching ``server.time.monotonic`` would do it by mutating the STDLIB module
+    (``server.time`` *is* ``time``), freezing it process-wide including for the
+    asyncio loop these tests run under, whose ``BaseEventLoop.time()`` is
+    ``time.monotonic()``. Replacing ``server``'s own ``time`` BINDING keeps the
+    fake where it belongs, and lets the tests stop racing wall time.
+
+    ``sleep`` is a no-op rather than a clock advance: only an explicit
+    `advance()` moves time, so a poll loop's own pacing never eats the budget
+    the test is measuring.
+    """
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self._now = start
+        self._per_read = 0.0
+
+    def monotonic(self) -> float:
+        now = self._now
+        self._now += self._per_read
+        return now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+    def reset(self, start: float) -> None:
+        self._now = start
+        self._per_read = 0.0
+
+    def tick_per_read(self, step: float) -> None:
+        """Advance `step` on every READ of the clock.
+
+        The bounded poll loop consults the clock rather than sleeping through
+        the budget, so a per-read tick is how a test drains a deadline without
+        waiting for one.
+        """
+        self._per_read = step
+
+    def sleep(self, _seconds: float) -> None:
+        pass
+
+    def __getattr__(self, name):  # anything else still comes from the real module
+        return getattr(time, name)
+
+
+def _install_clock(monkeypatch, start: float = 1_000.0) -> _FakeClock:
+    """Give `server` a controllable clock for the duration of one test.
+
+    Idempotent: `_sequenced` installs one for every test that uses it, so a
+    second call RESETS that clock rather than orphaning it behind a new one —
+    otherwise a test could end up advancing a clock `server` no longer reads.
+    """
+    clock = getattr(server, "time", None)
+    if isinstance(clock, _FakeClock):
+        clock.reset(start)
+        return clock
+    clock = _FakeClock(start)
+    monkeypatch.setattr(server, "time", clock)
+    return clock
+
+
+def _sequenced(monkeypatch, replies: list, *, seconds_per_call: float = 0.0) -> list:
     """Answer successive `_run_comfy` calls from `replies`; record their argv.
 
     The conftest fakes hand back ONE canned reply per fixture, and a submit
     followed by N polls needs a different answer each time — the multi-call case
     AGENTS.md leaves to a local stub. An exhausted iterator fails loudly rather
     than looping forever.
+
+    Installs the fake clock too: the poll loop between replies is `time.sleep`,
+    which must not really wait. `seconds_per_call` charges each spawn that much
+    simulated time, for the tests about a deadline draining as the loop runs.
     """
     calls: list[tuple] = []
     pending = iter(replies)
+    clock = _install_clock(monkeypatch)
 
     def fake_run(*args, **kwargs):
         calls.append(args)
+        clock.advance(seconds_per_call)
         try:
             return next(pending)
         except StopIteration:
             raise AssertionError(f"unexpected extra comfy-cli call: {args}") from None
 
     monkeypatch.setattr(server, "_run_comfy", fake_run)
-    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
     return calls
 
 
@@ -654,7 +759,11 @@ def test_download_model_returns_a_timed_out_envelope_rather_than_raising(monkeyp
     deadline fire on a download that was succeeding, leaving no handle to verify
     it with. A bound that expires must never look like a failure.
     """
-    calls = _sequenced(monkeypatch, [_submit(), _status("downloading")])
+    # Each spawn burns a simulated second, so the 1e-9 bound is long gone by the
+    # time the first poll returns — deterministically, not by racing the wall.
+    calls = _sequenced(
+        monkeypatch, [_submit(), _status("downloading")], seconds_per_call=1.0
+    )
 
     result = _download_model("https://hf.co/x.safetensors", timeout_seconds=1e-9)
 
@@ -760,12 +869,12 @@ def test_download_model_spends_one_end_to_end_budget(monkeypatch):
     """
     seen: dict[str, float] = {}
     elapsed = 4.0
+    clock = _install_clock(monkeypatch)
 
     def fake_run(*args, **kwargs):
         seen["submit_timeout"] = kwargs["timeout"]
         # Simulate a submit that spent `elapsed` seconds resolving metadata.
-        base = time.monotonic()
-        monkeypatch.setattr(server.time, "monotonic", lambda: base + elapsed)
+        clock.advance(elapsed)
         return _submit()
 
     def fake_poll(download_id, timeout_seconds):
@@ -779,8 +888,10 @@ def test_download_model_spends_one_end_to_end_budget(monkeypatch):
 
     # The submit is capped to the caller's bound as well as its own...
     assert seen["submit_timeout"] == 30.0
-    # ...and the poll gets only what the submit left of it.
-    assert seen["poll_bound"] == pytest.approx(30.0 - elapsed, abs=0.5)
+    # ...and the poll gets only what the submit left of it. The clock is a fake,
+    # so this is exact: a tolerance wide enough to swallow `elapsed` would pass
+    # just as happily on a poll handed the caller's WHOLE budget.
+    assert seen["poll_bound"] == pytest.approx(30.0 - elapsed)
 
 
 def test_download_model_wait_false_keeps_the_full_submit_budget(monkeypatch):
@@ -888,10 +999,14 @@ def test_download_model_legacy_wait_true_spends_what_the_submit_left(monkeypatch
     only the cap on it.
     """
     seen: dict[str, float] = {}
-    elapsed = 0.2
+    elapsed = 4.0
+    clock = _install_clock(monkeypatch)
 
     def fake_run(*args, **kwargs):
-        time.sleep(elapsed)  # the submit burns part of the deadline before failing
+        # The submit burns part of the deadline before failing. Charged to the
+        # fake clock, not slept on the wall: a real sleep both slows the suite
+        # and makes the assertion a race with the runner's scheduling.
+        clock.advance(elapsed)
         raise _missing_background_error()
 
     async def fake_async(*args, timeout=None, **kwargs):
@@ -903,7 +1018,7 @@ def test_download_model_legacy_wait_true_spends_what_the_submit_left(monkeypatch
 
     _download_model("https://hf.co/x.safetensors", timeout_seconds=30.0)
 
-    assert seen["bound"] == pytest.approx(30.0 - elapsed, abs=0.5)
+    assert seen["bound"] == pytest.approx(30.0 - elapsed)
 
 
 def test_download_model_legacy_wait_true_is_capped_by_the_sync_ceiling(monkeypatch):
@@ -934,9 +1049,10 @@ def test_download_model_legacy_refuses_an_exhausted_remainder(monkeypatch):
     takes the same position on a bound too small to resolve the download at all.
     """
     spawned: list[float | None] = []
+    clock = _install_clock(monkeypatch)
 
     def fake_run(*args, **kwargs):
-        time.sleep(1.2)  # overspends the caller's whole 1s budget
+        clock.advance(1.2)  # overspends the caller's whole 1s budget
         raise _missing_background_error()
 
     async def fake_async(*args, timeout=None, **kwargs):
@@ -1212,14 +1328,7 @@ def test_wait_for_download_times_out_cleanly(monkeypatch):
     _sequenced(monkeypatch, [_status("downloading")] * 10)
 
     # A monotonic clock that jumps 10s per read, so the 25s bound expires.
-    clock = {"t": 0.0}
-
-    def fake_monotonic():
-        now = clock["t"]
-        clock["t"] += 10.0
-        return now
-
-    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+    _install_clock(monkeypatch, start=0.0).tick_per_read(10.0)
 
     assert server.wait_for_download("a1b2c3d4e5f6") == {
         "timed_out": True,
@@ -1237,16 +1346,8 @@ def test_wait_for_download_caps_each_poll_to_the_remaining_bound(monkeypatch):
         return _status("downloading")
 
     monkeypatch.setattr(server, "_run_comfy", fake_run)
-    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
-
-    clock = {"t": 0.0}
-
-    def fake_monotonic():
-        now = clock["t"]
-        clock["t"] += 1.0
-        return now
-
-    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+    clock = _install_clock(monkeypatch, start=0.0)
+    clock.tick_per_read(1.0)  # the bound drains as the loop consults the clock
 
     result = server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=5.0)
 
@@ -1267,7 +1368,8 @@ def test_wait_for_download_clamps_an_oversized_timeout(monkeypatch, oversized):
         except StopIteration:
             pytest.fail("wait_for_download kept polling past the clamped ceiling")
 
-    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+    # On the fake clock object, not on the stdlib module `server` imported.
+    monkeypatch.setattr(_install_clock(monkeypatch), "monotonic", fake_monotonic)
 
     assert server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=oversized)[
         "timed_out"
@@ -1483,6 +1585,12 @@ def test_download_model_legacy_timeout_kills_the_transfer_and_guides_the_caller(
     # big enough to spawn under: `_DOWNLOAD_SYNC_TIMEOUT` has to stay real so the
     # retry guidance quotes the number a caller would actually pass.
     monkeypatch.setattr(server, "_MIN_LEGACY_DOWNLOAD_TIMEOUT", 0.05)
+    # `server`'s deadline arithmetic runs on the fake clock, so the rejected
+    # submit hands the transfer the WHOLE sub-second budget however long the
+    # thread-pool hop really took — a slow runner can no longer divert this into
+    # the exhausted-remainder refusal. The bound itself is still real wall time:
+    # `_run_comfy_async` spends it in `asyncio.wait_for`, on the loop's own clock.
+    _install_clock(monkeypatch)
     logged: list[dict] = []
     monkeypatch.setattr(
         failure_log,
@@ -1529,6 +1637,12 @@ def test_download_model_legacy_timeout_names_the_folder_without_a_filename(
     file — worse than reporting the folder the partial is somewhere inside.
     """
     monkeypatch.setattr(server, "_MIN_LEGACY_DOWNLOAD_TIMEOUT", 0.05)
+    # `server`'s deadline arithmetic runs on the fake clock, so the rejected
+    # submit hands the transfer the WHOLE sub-second budget however long the
+    # thread-pool hop really took — a slow runner can no longer divert this into
+    # the exhausted-remainder refusal. The bound itself is still real wall time:
+    # `_run_comfy_async` spends it in `asyncio.wait_for`, on the loop's own clock.
+    _install_clock(monkeypatch)
     patched_async_run(hang=True)
 
     with pytest.raises(server.ComfyCliError) as excinfo:

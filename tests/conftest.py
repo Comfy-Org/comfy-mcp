@@ -170,6 +170,24 @@ def _clear_t2i_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+# What Click prints when a comfy-cli that predates the background download is
+# handed `--background`: `NoSuchOption`, i.e. a `UsageError` (exit 2) raised
+# while PARSING, so no envelope is ever emitted. The message body is Click's own
+# `format_message()` verbatim; the borders, colour, and the mid-phrase wrap are
+# the rich panel Typer renders it inside — every part `_normalize_cli_text`
+# exists to fold away. Wrapped the way `_unwrap_envelope` wraps it.
+#
+# It lives here rather than in either test module because two of them need it:
+# `test_wrapper.py` (the `_is_missing_option_error` unit tests) and
+# `test_downloads.py` (the legacy-fallback flow). A cross-import between two
+# test modules would make collecting one execute the other.
+NO_SUCH_OPTION_STDERR = (
+    "\x1b[31m╭─\x1b[0m Error \x1b[31m─╮\x1b[0m\n"
+    "│ No such option    │\n"
+    "│ '--background'.   │\n"
+    "╰───────────────────╯"
+)
+
 _UNSET = object()
 
 

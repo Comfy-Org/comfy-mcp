@@ -28,7 +28,14 @@ import threading
 import time
 
 import pytest
-from conftest import _OK_STREAM, _FakeProc, _RecordingCtx, envelope, stream_reader
+from conftest import (
+    _OK_STREAM,
+    NO_SUCH_OPTION_STDERR,
+    _FakeProc,
+    _RecordingCtx,
+    envelope,
+    stream_reader,
+)
 
 from comfy_mcp import server, tcc, textutil
 
@@ -47,20 +54,6 @@ def _launch(*args, **kwargs):
 def _restart(*args, **kwargs):
     """Drive the async ``restart_comfyui`` from these synchronous tests."""
     return asyncio.run(server.restart_comfyui(*args, **kwargs))
-
-
-# What Click prints when a comfy-cli that predates the background download is
-# handed `--background`: `NoSuchOption`, i.e. a `UsageError` (exit 2) raised
-# while PARSING, so no envelope is ever emitted. The message body is Click's own
-# `format_message()` verbatim; the borders, colour, and the mid-phrase wrap are
-# the rich panel Typer renders it inside — every part `_normalize_cli_text`
-# exists to fold away. Wrapped the way `_unwrap_envelope` wraps it.
-_NO_SUCH_OPTION_STDERR = (
-    "\x1b[31m╭─\x1b[0m Error \x1b[31m─╮\x1b[0m\n"
-    "│ No such option    │\n"
-    "│ '--background'.   │\n"
-    "╰───────────────────╯"
-)
 
 
 def test_global_flags_precede_subcommand(patched_run):
@@ -1422,7 +1415,7 @@ def test_upload_file_rejects_embedded_nul_path():
         "Error: No such option: --background",
         # ...and the colourized rich panel Typer wraps it in, which can break the
         # phrase across lines. `_normalize_cli_text` folds all of that away.
-        _NO_SUCH_OPTION_STDERR,
+        NO_SUCH_OPTION_STDERR,
     ],
 )
 def test_is_missing_option_error_matches_clicks_usage_error(rendered):
@@ -1443,7 +1436,7 @@ def test_is_missing_option_error_requires_no_envelope():
     message) could quote the phrase and trigger a second, blocking download.
     """
     exc = server.ComfyCliError(
-        f"stderr: {_NO_SUCH_OPTION_STDERR}", no_envelope=False, returncode=2
+        f"stderr: {NO_SUCH_OPTION_STDERR}", no_envelope=False, returncode=2
     )
 
     assert server._is_missing_option_error(exc, "--background") is False
@@ -1452,7 +1445,7 @@ def test_is_missing_option_error_requires_no_envelope():
 def test_is_missing_option_error_requires_the_usage_exit_status():
     """Exit 2 is Click's `UsageError` status: nothing was ever dispatched."""
     exc = server.ComfyCliError(
-        f"stderr: {_NO_SUCH_OPTION_STDERR}", no_envelope=True, returncode=1
+        f"stderr: {NO_SUCH_OPTION_STDERR}", no_envelope=True, returncode=1
     )
 
     assert server._is_missing_option_error(exc, "--background") is False
