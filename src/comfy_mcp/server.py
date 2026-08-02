@@ -1399,6 +1399,43 @@ def _comfy_target() -> tuple[str, int, str] | None:
     return _strip_brackets(host), port, "COMFYUI_HOST"
 
 
+def _redact_target_host(host: str) -> str:
+    """Mask any ``user:pass@`` before a resolved target host is echoed back.
+
+    ``COMFYUI_URL`` is parsed with :func:`urlparse`, whose ``.hostname`` already
+    drops userinfo — but ``COMFYUI_HOST`` is taken VERBATIM, so a value written
+    URL-style (``<user>:<token>@host``) is carried into the tuple as-is and would
+    otherwise reach the model's context, and any transcript of it, unmasked. The
+    same masking :func:`_comfy_target`'s own error messages already apply to the
+    raw value; a host with no ``@`` is returned unchanged, which is every real
+    one.
+    """
+    return textutil._redact_url(host)
+
+
+def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
+    """The error-shaped remote-target block for a malformed ``COMFYUI_URL``/``_HOST``.
+
+    Shared by ``server_info`` and :func:`_annotate_comfy_target` so a broken
+    config reads the same wherever it surfaces: a diagnostic FIELD rather than a
+    raise, since the tools carrying it either never touch the remote
+    (``system_stats`` / ``free_memory``) or exist to explain the environment
+    (``server_info``). What it must not do is look like "nothing configured" —
+    no remote resolves either way, but only one of the two is a typo the user
+    wants to hear about. The message is :func:`_comfy_target`'s, already
+    userinfo-masked.
+    """
+    return {
+        "error": str(exc),
+        "note": (
+            "COMFYUI_URL/COMFYUI_HOST is set but malformed, so no remote is "
+            "resolved; the submit/poll tools (run_workflow, generate_image, "
+            "run_template and the jobs/queue tools) will raise this same error "
+            "until it is fixed."
+        ),
+    }
+
+
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
@@ -3363,19 +3400,12 @@ def server_info() -> Any:
     try:
         target = _comfy_target()
     except ComfyCliError as exc:
-        report["comfy_target"] = {
-            "error": str(exc),
-            "note": (
-                "COMFYUI_URL/COMFYUI_HOST is set but malformed; the submit/poll "
-                "tools (run_workflow, generate_image, run_template and the "
-                "jobs/queue tools) will raise this same error until it is fixed."
-            ),
-        }
+        report["comfy_target"] = _malformed_target_note(exc)
     else:
         if target is not None:
             host, port, source = target
             report["comfy_target"] = {
-                "host": host,
+                "host": _redact_target_host(host),
                 "port": port,
                 "source": source,
                 "note": (
@@ -6346,15 +6376,100 @@ def _resource_verb_upgrade_error(
     )
 
 
+_COMFY_TARGET_NOTE_KEY = "comfy_target_note"
+
+
+def _annotate_comfy_target(payload: Any) -> Any:
+    """Return *payload* tagged with the configured remote, for a LOCAL-only tool.
+
+    ``comfy system-stats`` and ``comfy free`` take no ``--host`` / ``--port``
+    (only ``--where``), so they read and act on whichever ComfyUI comfy-cli
+    itself targets — while ``run_workflow`` submits to the ``COMFYUI_URL`` /
+    ``COMFYUI_HOST`` remote. Both docstrings say so, but an agent that skipped
+    them sees numbers with no provenance and gates a remote run on local VRAM.
+    So the divergence is carried IN the payload: a ``comfy_target_note`` key
+    naming the configured target and stating that this payload need not be
+    about it.
+
+    A WARNING, deliberately not an error: freeing local VRAM while submitting a
+    remote run is a legitimate pattern (the local-LLM coexistence recipe in the
+    README keeps it), so the call still succeeds and the payload still carries
+    everything comfy-cli returned.
+
+    The note reports the divergence, it does not ADJUDICATE it — the two ends
+    are the same machine whenever the configured host resolves to this box, and
+    this server cannot tell whether it does. It carries no local hostname or
+    interface addresses, a loopback host can be an SSH tunnel to a remote GPU,
+    and ``COMFY_LOCAL_URL`` can repoint comfy-cli off-box with no target
+    configured here at all — the same reason the routing rule at the top of this
+    module tells the agent to ASK about a host it cannot place. So the note
+    hands over the host/port and says what is and is not verified, exactly as
+    ``server_info``'s ``comfy_target`` block does; suppressing it for a loopback
+    host would trade a false alarm for a silent one on the tunnel case.
+
+    Conservative on all three axes:
+
+    * **Nothing configured** (:func:`_comfy_target` is ``None``) → the payload is
+      returned unchanged, the same object, so the local default stays
+      byte-identical.
+    * **Malformed config** → reported, never raised. A bad ``COMFYUI_URL`` raises
+      out of :func:`_comfy_target`, and these two tools never touch the remote,
+      so it must not break them — the same "local behavior unchanged" contract
+      :func:`_with_target` honors (BE-3869). But swallowing it outright would
+      make a typo look like "nothing configured", which is the one reading this
+      key exists to rule out, so it becomes an ERROR-SHAPED note (``error`` /
+      ``note``) the way ``server_info`` reports the same breakage. Absence of the
+      key then means exactly one thing: no remote is configured.
+    * **Foreign payload shape** (not a ``dict``) → returned untouched rather than
+      reshaped, mirroring :func:`_drop_cloud_jobs`.
+
+    The key cannot realistically collide — ComfyUI's ``/system_stats`` has only
+    ``system`` and ``devices`` at the top level, and ``comfy free`` returns
+    comfy-cli's own ``{"requested": ..., "note": ...}`` — but if one ever
+    appeared, the existing value wins: annotation must never clobber engine data.
+    """
+    if not isinstance(payload, dict) or _COMFY_TARGET_NOTE_KEY in payload:
+        return payload
+    try:
+        target = _comfy_target()
+    except ComfyCliError as exc:
+        return {**payload, _COMFY_TARGET_NOTE_KEY: _malformed_target_note(exc)}
+    if target is None:
+        return payload
+    host, port, source = target
+    # Shallow copy rather than an in-place insert: reshaping comfy-cli's parsed
+    # payload under the caller is not this helper's call (see _drop_cloud_jobs).
+    return {
+        **payload,
+        _COMFY_TARGET_NOTE_KEY: {
+            "host": _redact_target_host(host),
+            "port": port,
+            "source": source,
+            "note": (
+                "this payload describes whichever ComfyUI comfy-cli itself "
+                "targets — `comfy system-stats` / `comfy free` take no "
+                "--host/--port — and NOT necessarily the host/port above, which "
+                "is where the run/job tools submit. The two are the same machine "
+                "when that host resolves to THIS box and different machines "
+                "otherwise; this server does not verify which, so compare them "
+                "before gating a run on these numbers, and ask the user when the "
+                "host is one you cannot place (a loopback host can be a tunnel "
+                "to a remote GPU)."
+            ),
+        },
+    }
+
+
 @mcp.tool()
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
 
     Wraps ``comfy system-stats`` (ComfyUI's own ``GET /system_stats``, also served
     at ``/api/system_stats``, reached by comfy-cli — no HTTP from here). The whole
-    payload is forwarded UNMODIFIED, so treat it as a passthrough rather than a
-    fixed schema: a ``devices`` list plus a ``system`` dict, whose keys are
-    whatever the ComfyUI on the other end reports. The fields this server's
+    payload is forwarded unmodified except for a ``comfy_target_note`` key added
+    when a remote target is configured (below), so treat it as a passthrough
+    rather than a fixed schema: a ``devices`` list plus a ``system`` dict, whose
+    keys are whatever the ComfyUI on the other end reports. The fields this server's
     guidance actually reads are per-device ``vram_free`` / ``vram_total`` (byte
     counts, alongside e.g. ``name`` / ``type`` / ``index`` / ``torch_vram_free``)
     and ``system.ram_free`` / ``ram_total`` / ``comfyui_version`` — examples, not
@@ -6378,15 +6493,25 @@ def system_stats() -> Any:
     reporting zeros. Unlike the run/job tools this is NOT diverted by
     ``COMFYUI_URL`` / ``COMFYUI_HOST`` (``comfy system-stats`` takes no
     ``--host`` / ``--port``), so it describes whichever ComfyUI comfy-cli itself
-    targets.
+    targets. When one of those IS set, a top-level ``comfy_target_note``
+    (``host`` / ``port`` / ``source`` / ``note``) is added to the payload saying
+    exactly that and naming the target — so before gating a run on these numbers,
+    settle whether the host it names is THIS machine, by the routing rule at the
+    top of this module (loopback or this host's own name/address = same box; a
+    host you cannot place = ASK). If it is another box, these figures describe
+    the wrong one. A malformed ``COMFYUI_URL`` / ``COMFYUI_HOST`` yields an
+    error-shaped note (``error`` / ``note``) instead — the same shape
+    ``server_info`` reports that breakage in — so an absent key means one thing
+    only: no remote is configured. Nothing else about the payload changes.
     """
     try:
-        return _run_comfy("system-stats", timeout=60.0)
+        data = _run_comfy("system-stats", timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "system-stats", "system_stats")
         if hinted is not None:
             raise hinted from exc
         raise
+    return _annotate_comfy_target(data)
 
 
 @mcp.tool()
@@ -6427,8 +6552,14 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 
     Like ``system_stats``, and unlike the run/job tools, this is NOT diverted by
     ``COMFYUI_URL`` / ``COMFYUI_HOST`` — it frees memory on whichever ComfyUI
-    comfy-cli itself targets, which with a remote URL configured is NOT the server
-    the run tools submit to.
+    comfy-cli itself targets, which with one of those configured need NOT be the
+    server the run tools submit to. comfy-cli's acknowledgement is therefore
+    forwarded unmodified except for a top-level ``comfy_target_note`` (``host`` /
+    ``port`` / ``source`` / ``note``) added when one of them IS set, naming the
+    target and leaving the same-machine judgment to the caller exactly as
+    ``system_stats`` does (a malformed value gives the error-shaped ``error`` /
+    ``note`` form). With no remote configured the key is absent and the payload
+    is unchanged.
     """
     if free_memory is None:
         # Mirror `unload_models` so the default call asks for both and
@@ -6447,12 +6578,13 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
         # `--no-free-memory` counterpart), so "off" is expressed by omitting it.
         args.append("--free-memory")
     try:
-        return _run_comfy(*args, timeout=60.0)
+        data = _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "free", "free_memory")
         if hinted is not None:
             raise hinted from exc
         raise
+    return _annotate_comfy_target(data)
 
 
 # Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
