@@ -479,6 +479,30 @@ def test_run_template_wait_false_submits_async(patched_run, monkeypatch):
     )
 
 
+def test_run_template_wait_false_still_forwards_consent(patched_run):
+    """A submit carries BOTH the consent flag and `--async`.
+
+    The two are appended by different owners — consent by the tool (before it
+    knows which branch will run), `--async` by the shared dispatch — and this is
+    the one call that exercises them together, so it pins that neither owner
+    drops the other's flag.
+    """
+    calls = patched_run(envelope(data={"prompt_id": "p9"}))
+
+    _run_template(
+        "api_seedance", params={"prompt": "x"}, confirm_spend=True, wait=False
+    )
+
+    assert calls[0]["cmd"][4:] == [
+        "run-template",
+        "api_seedance",
+        '--param=prompt="x"',
+        "--timeout=60",
+        "--allow-spend",
+        "--async",
+    ]
+
+
 class _BlockingProc:
     """A child fake that emits ``first_lines`` and then never yields an envelope.
 
