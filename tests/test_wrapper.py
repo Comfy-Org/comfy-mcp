@@ -5252,3 +5252,64 @@ def test_run_and_validate_workflow_reject_embedded_nul(monkeypatch):
     for wait in (True, False):
         with pytest.raises(server.ComfyCliError, match="embedded NUL"):
             asyncio.run(server.run_workflow("/tmp/w\0f.json", wait=wait))
+
+
+# `download_model`'s two path-containment guards, exercised DIRECTLY. The dense
+# adversarial corpus for what they permit and refuse lives at the tool level in
+# tests/test_downloads.py — these pin only the helpers' own contract (return the
+# value unchanged vs raise `ComfyCliError`), which is what lets a future
+# adversarial case be added here without any conftest plumbing.
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "models",
+        "models/loras",
+        # Doubled and trailing separators are ordinary spellings of the same
+        # subfolder — the guard skips empty segments rather than rejecting them.
+        "models/loras/",
+        "models//loras",
+    ],
+)
+def test_guard_model_relative_path_returns_accepted_values_unchanged(value):
+    """An accepted value is forwarded VERBATIM — the guard never rewrites it."""
+    assert server._guard_model_relative_path(value) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # One representative per diagnosis; the order the three checks run in is
+        # pinned at the tool level (`test_download_model_traversal_still_reports
+        # _as_traversal`, `test_download_model_backslash_check_is_ordered_last`).
+        ("../evil", r"path traversal"),
+        ("custom_nodes/pwn", r"must be the models dir or a subfolder of it"),
+        ("models\\loras", r"use '/' as the path separator"),
+    ],
+)
+def test_guard_model_relative_path_rejects(value, match):
+    """A refused value raises `ComfyCliError` with its diagnosis-specific text."""
+    with pytest.raises(server.ComfyCliError, match=match):
+        server._guard_model_relative_path(value)
+
+
+def test_guard_model_filename_returns_accepted_values_unchanged():
+    """A bare filename is forwarded VERBATIM, like the guard above."""
+    assert server._guard_model_filename("model.safetensors") == "model.safetensors"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # dot run, pathy, and the drive-prefix colon — one per refusal in the
+        # single four-term predicate.
+        "..",
+        "sub/model.safetensors",
+        "C:evil.dll",
+    ],
+)
+def test_guard_model_filename_rejects(value):
+    """A refused value raises `ComfyCliError` naming the bare-filename rule."""
+    with pytest.raises(server.ComfyCliError, match=r"must be a bare filename"):
+        server._guard_model_filename(value)

@@ -10075,6 +10075,192 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     )
 
 
+def _guard_model_relative_path(relative_path: str) -> str:
+    """Reject a ``relative_path`` that would write outside the models tree.
+
+    ``download_model``'s destination guard, lifted out of the tool so the
+    policy sits under a name like the module's other ``_guard_*`` helpers.
+    Three refusals, in the order they run: a value that can climb OUT of the
+    workspace (an absolute or root-relative path, a Windows drive prefix, a
+    ``..``-shaped dot-run component), a value that stays in the workspace but
+    lands outside the models tree anyway (``custom_nodes/pwn`` +
+    ``__init__.py`` is code ComfyUI executes on its next start), and the
+    backslash separator spelling that those checks read as ``/`` while the
+    forwarded value would not. That order is load-bearing, and the moved
+    comments below say why — along with the guard's KNOWN LIMITATION, that it
+    is a lexical check on the string and so cannot see a symlink already
+    planted inside the models tree.
+
+    Raises :class:`ComfyCliError` on any of the three; otherwise returns the
+    value UNCHANGED — this guard never rewrites an untrusted argument, for the
+    reason the bare-``loras`` comment gives.
+    """
+    _reject_option_like("relative_path", relative_path)
+    _reject_nul("relative_path", relative_path)
+    # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`), enforced
+    # in two stages. FIRST, below: keep the value inside the WORKSPACE by
+    # rejecting absolute paths, `..`, and a Windows drive prefix (`C:evil`
+    # has no separator but is drive-relative on that platform, same escape as
+    # the bare `filename` case below). That is a containment check, not a
+    # destination check — it says where the value cannot go, not where it
+    # must land — so a SECOND stage after it confines the write to the models
+    # tree itself (and refuses the `\` spelling that would let the forwarded
+    # value miss that tree anyway); see those checks for why both are needed.
+    #
+    # Decide this the same way on every host rather than deferring to
+    # `os.path.isabs`: the guard runs wherever the MCP server runs, but the
+    # write happens wherever comfy-cli runs, so a Windows-shaped escape has
+    # to be refused from a POSIX server too (`os.path` is `posixpath` there
+    # and sees `\\server\share` as an ordinary directory name).
+    #
+    # An empty leading segment means the value opened with `/` or `\` — an
+    # absolute POSIX path, a UNC root, or a Windows root-relative path like
+    # `\evil` (which lands at the root of the *current drive*, outside the
+    # models dir). Testing the split segment rather than `ntpath.isabs` also
+    # keeps the answer stable across Python versions: 3.13 stopped reporting
+    # single-separator paths as absolute, so `ntpath.isabs("\\evil")` is True
+    # on 3.10 and False on 3.14 — and CI runs both.
+    #
+    # `splitdrive` then covers what no separator reveals: a drive-relative
+    # `C:evil` resolves against drive C:'s own working directory.
+    #
+    # Segments are matched as a DOT RUN rather than by `seg == ".."`, because
+    # Windows strips trailing spaces and periods from every path component at
+    # syscall time (`normpath` does not — it leaves them in place, which is
+    # exactly why the string check has to). So `".. "` and `"..."` reach the
+    # filesystem as `..` and traverse out of the models dir while comparing
+    # unequal to it. `strip(" .")` leaves something behind for any real name
+    # — `".hidden"`, `"v1.5"`, `"loras"` — so only those disguised forms fall
+    # out empty. Empty segments are skipped so a doubled or trailing slash
+    # (`models//loras`, `models/loras/`) keeps working as before; a LEADING
+    # empty segment is the separator case `parts[0] == ""` already catches.
+    #
+    # This deliberately sweeps in a bare `.` component too (`./models`), one
+    # step wider than the escape strictly requires. Drawing the line exactly
+    # where Windows' stripping lands would mean modelling how many trailing
+    # dots survive per component — precisely the reasoning you do not want
+    # load-bearing in a traversal guard — and a `.` segment carries no
+    # meaning here that plain `models/loras` does not, so the caller loses
+    # nothing but a spelling.
+    parts = relative_path.replace("\\", "/").split("/")
+    if (
+        parts[0] == ""
+        or ntpath.splitdrive(relative_path)[0] != ""
+        or any(seg and not seg.strip(" .") for seg in parts)
+        or ":" in relative_path
+    ):
+        raise ComfyCliError(
+            f"invalid relative_path: {relative_path!r} (path traversal)"
+        )
+    # The checks above only prove the value cannot climb OUT of the
+    # workspace — they never required it to land in the models tree.
+    # comfy-cli joins `--relative-path` to the WORKSPACE ROOT, not to the
+    # models dir (`local_filepath = get_workspace() / relative_path /
+    # local_filename`, defaulting to `DEFAULT_COMFY_MODEL_PATH = "models"`),
+    # which is why the documented shape is `models/loras` and not a bare
+    # `loras`. So a value that is perfectly traversal-clean can still write
+    # anywhere in the workspace: `custom_nodes/pwn` + `__init__.py` puts
+    # attacker-controlled code on ComfyUI's import path, which it executes on
+    # the next start. Require the first segment to be `models` so the write
+    # lands where the tool says it does.
+    #
+    # Ordered AFTER the traversal checks so a traversal string still reports
+    # as traversal, and safe to state as a plain segment comparison only
+    # because those checks have already run: by here the value has no leading
+    # separator, no drive prefix, and no dot-run component, so the first
+    # non-empty segment really is the first directory the write enters.
+    #
+    # Empty segments are dropped for the same reason they are skipped above —
+    # `models/loras/` and `models//loras` are ordinary spellings of a real
+    # subfolder. Matched exactly, not case-folded: a case-insensitive match
+    # would only ever LOOSEN a security guard, and the error text names the
+    # shape to use, so the caller loses nothing but a spelling.
+    #
+    # A bare `loras` is REJECTED rather than normalized to `models/loras`.
+    # Normalizing would have to rewrite an untrusted argument, and it would
+    # quietly turn the sibling-dir names this check exists to refuse into
+    # accepted-but-nonsense paths (`input` -> `models/input`) instead of an
+    # error the caller can act on.
+    #
+    # KNOWN LIMITATION, stated rather than silently trusted: this is a
+    # LEXICAL check on the string, so it cannot see a symlink or junction
+    # that already exists inside the models tree. If `models/link` is already
+    # a link to `custom_nodes`, then `models/link/pwn` passes here and the
+    # write follows it out. Resolving the path for real is deliberately NOT
+    # done: the guard runs wherever the MCP server runs while the write
+    # happens wherever comfy-cli runs, so resolution would consult the wrong
+    # filesystem (the same host-independence the traversal checks above are
+    # built around). Planting that link already requires write access inside
+    # the models tree, which is the thing this tool is allowed to grant.
+    segs = [seg for seg in parts if seg]
+    if not segs or segs[0] != "models":
+        raise ComfyCliError(
+            f"invalid relative_path: {relative_path!r} "
+            "(must be the models dir or a subfolder of it, e.g. 'models/loras')"
+        )
+    # Every check above reads `\` as a separator (`parts` splits on it), but
+    # the value is forwarded VERBATIM — so on a POSIX host the check and the
+    # write disagree. `models\loras` validates as segments `models` + `loras`,
+    # then pathlib treats the backslash as an ordinary character and writes to
+    # a workspace-root directory literally NAMED `models\loras` — a sibling of
+    # the models dir, outside the tree the check just claimed to enforce.
+    # (Only the guard's invariant breaks, not containment: the literal name is
+    # forced to start with `models`, and a `models\..\custom_nodes` escape is
+    # already dead because the same `\`->`/` split turns it into a `..` the
+    # traversal check rejects.)
+    #
+    # Refuse the separator rather than rewrite the argument, matching both the
+    # bare-`loras` reasoning above and `filename` below, which rejects `\` too.
+    # It costs no capability on any host: pathlib on Windows resolves
+    # `models/loras` and `models\loras` to the same directory, so a Windows
+    # caller loses a spelling, not a destination — and the message names the
+    # spelling to use. Ordered LAST so the security-meaningful diagnoses win:
+    # `models\..\evil` still reports as traversal and `custom_nodes\pwn` still
+    # reports as outside the models tree.
+    if "\\" in relative_path:
+        raise ComfyCliError(
+            f"invalid relative_path: {relative_path!r} "
+            "(use '/' as the path separator, e.g. 'models/loras')"
+        )
+    return relative_path
+
+
+def _guard_model_filename(filename: str) -> str:
+    """Reject a ``filename`` that is a path rather than a bare output name.
+
+    The :func:`_guard_model_relative_path` treatment for the value that names
+    the file itself: separators in either spelling, a Windows drive prefix, and
+    the ``.``/``..`` dot runs — each of which would redirect the write out of
+    the directory ``relative_path`` was just made to pin down. Why a bare name
+    needs no separate ``ntpath.splitdrive`` test, and why the dot case is
+    matched as a run rather than compared to ``..``, are in the moved comment
+    below.
+
+    Raises :class:`ComfyCliError` when the value is anything but a bare
+    filename; otherwise returns it UNCHANGED, like the guard above.
+    """
+    _reject_option_like("filename", filename)
+    _reject_nul("filename", filename)
+    # filename is a single output name, not a path; reject separators, `..`,
+    # and `:` (a Windows drive prefix like `C:evil.dll` has no separator but
+    # still escapes the models dir via `os.path.join` on that platform) so it
+    # can't redirect the write out of the target directory. These already
+    # subsume an `ntpath.splitdrive` test — every string it reports a drive
+    # for is either `X:…` (caught by `:`) or a UNC `\\host\share…` (caught by
+    # `\`) — so a bare name needs no separate drive check. The `.`/`..` case
+    # is matched as a dot run for the same reason as `relative_path` above:
+    # Windows strips a component's trailing spaces and periods at syscall
+    # time, so `".. "` and `"..."` arrive as `..` yet compare unequal to it.
+    if (
+        not filename.strip(" .")
+        or "/" in filename
+        or "\\" in filename
+        or ":" in filename
+    ):
+        raise ComfyCliError(f"invalid filename: {filename!r} (must be a bare filename)")
+    return filename
+
+
 @mcp.tool()
 async def download_model(
     url: str,
@@ -10219,155 +10405,9 @@ async def download_model(
     # Optional args are treated as unset when falsy (None or ""), so an explicit
     # empty string is omitted rather than forwarded as `--relative-path ""`.
     if relative_path:
-        _reject_option_like("relative_path", relative_path)
-        _reject_nul("relative_path", relative_path)
-        # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`), enforced
-        # in two stages. FIRST, below: keep the value inside the WORKSPACE by
-        # rejecting absolute paths, `..`, and a Windows drive prefix (`C:evil`
-        # has no separator but is drive-relative on that platform, same escape as
-        # the bare `filename` case below). That is a containment check, not a
-        # destination check — it says where the value cannot go, not where it
-        # must land — so a SECOND stage after it confines the write to the models
-        # tree itself (and refuses the `\` spelling that would let the forwarded
-        # value miss that tree anyway); see those checks for why both are needed.
-        #
-        # Decide this the same way on every host rather than deferring to
-        # `os.path.isabs`: the guard runs wherever the MCP server runs, but the
-        # write happens wherever comfy-cli runs, so a Windows-shaped escape has
-        # to be refused from a POSIX server too (`os.path` is `posixpath` there
-        # and sees `\\server\share` as an ordinary directory name).
-        #
-        # An empty leading segment means the value opened with `/` or `\` — an
-        # absolute POSIX path, a UNC root, or a Windows root-relative path like
-        # `\evil` (which lands at the root of the *current drive*, outside the
-        # models dir). Testing the split segment rather than `ntpath.isabs` also
-        # keeps the answer stable across Python versions: 3.13 stopped reporting
-        # single-separator paths as absolute, so `ntpath.isabs("\\evil")` is True
-        # on 3.10 and False on 3.14 — and CI runs both.
-        #
-        # `splitdrive` then covers what no separator reveals: a drive-relative
-        # `C:evil` resolves against drive C:'s own working directory.
-        #
-        # Segments are matched as a DOT RUN rather than by `seg == ".."`, because
-        # Windows strips trailing spaces and periods from every path component at
-        # syscall time (`normpath` does not — it leaves them in place, which is
-        # exactly why the string check has to). So `".. "` and `"..."` reach the
-        # filesystem as `..` and traverse out of the models dir while comparing
-        # unequal to it. `strip(" .")` leaves something behind for any real name
-        # — `".hidden"`, `"v1.5"`, `"loras"` — so only those disguised forms fall
-        # out empty. Empty segments are skipped so a doubled or trailing slash
-        # (`models//loras`, `models/loras/`) keeps working as before; a LEADING
-        # empty segment is the separator case `parts[0] == ""` already catches.
-        #
-        # This deliberately sweeps in a bare `.` component too (`./models`), one
-        # step wider than the escape strictly requires. Drawing the line exactly
-        # where Windows' stripping lands would mean modelling how many trailing
-        # dots survive per component — precisely the reasoning you do not want
-        # load-bearing in a traversal guard — and a `.` segment carries no
-        # meaning here that plain `models/loras` does not, so the caller loses
-        # nothing but a spelling.
-        parts = relative_path.replace("\\", "/").split("/")
-        if (
-            parts[0] == ""
-            or ntpath.splitdrive(relative_path)[0] != ""
-            or any(seg and not seg.strip(" .") for seg in parts)
-            or ":" in relative_path
-        ):
-            raise ComfyCliError(
-                f"invalid relative_path: {relative_path!r} (path traversal)"
-            )
-        # The checks above only prove the value cannot climb OUT of the
-        # workspace — they never required it to land in the models tree.
-        # comfy-cli joins `--relative-path` to the WORKSPACE ROOT, not to the
-        # models dir (`local_filepath = get_workspace() / relative_path /
-        # local_filename`, defaulting to `DEFAULT_COMFY_MODEL_PATH = "models"`),
-        # which is why the documented shape is `models/loras` and not a bare
-        # `loras`. So a value that is perfectly traversal-clean can still write
-        # anywhere in the workspace: `custom_nodes/pwn` + `__init__.py` puts
-        # attacker-controlled code on ComfyUI's import path, which it executes on
-        # the next start. Require the first segment to be `models` so the write
-        # lands where the tool says it does.
-        #
-        # Ordered AFTER the traversal checks so a traversal string still reports
-        # as traversal, and safe to state as a plain segment comparison only
-        # because those checks have already run: by here the value has no leading
-        # separator, no drive prefix, and no dot-run component, so the first
-        # non-empty segment really is the first directory the write enters.
-        #
-        # Empty segments are dropped for the same reason they are skipped above —
-        # `models/loras/` and `models//loras` are ordinary spellings of a real
-        # subfolder. Matched exactly, not case-folded: a case-insensitive match
-        # would only ever LOOSEN a security guard, and the error text names the
-        # shape to use, so the caller loses nothing but a spelling.
-        #
-        # A bare `loras` is REJECTED rather than normalized to `models/loras`.
-        # Normalizing would have to rewrite an untrusted argument, and it would
-        # quietly turn the sibling-dir names this check exists to refuse into
-        # accepted-but-nonsense paths (`input` -> `models/input`) instead of an
-        # error the caller can act on.
-        #
-        # KNOWN LIMITATION, stated rather than silently trusted: this is a
-        # LEXICAL check on the string, so it cannot see a symlink or junction
-        # that already exists inside the models tree. If `models/link` is already
-        # a link to `custom_nodes`, then `models/link/pwn` passes here and the
-        # write follows it out. Resolving the path for real is deliberately NOT
-        # done: the guard runs wherever the MCP server runs while the write
-        # happens wherever comfy-cli runs, so resolution would consult the wrong
-        # filesystem (the same host-independence the traversal checks above are
-        # built around). Planting that link already requires write access inside
-        # the models tree, which is the thing this tool is allowed to grant.
-        segs = [seg for seg in parts if seg]
-        if not segs or segs[0] != "models":
-            raise ComfyCliError(
-                f"invalid relative_path: {relative_path!r} "
-                "(must be the models dir or a subfolder of it, e.g. 'models/loras')"
-            )
-        # Every check above reads `\` as a separator (`parts` splits on it), but
-        # the value is forwarded VERBATIM — so on a POSIX host the check and the
-        # write disagree. `models\loras` validates as segments `models` + `loras`,
-        # then pathlib treats the backslash as an ordinary character and writes to
-        # a workspace-root directory literally NAMED `models\loras` — a sibling of
-        # the models dir, outside the tree the check just claimed to enforce.
-        # (Only the guard's invariant breaks, not containment: the literal name is
-        # forced to start with `models`, and a `models\..\custom_nodes` escape is
-        # already dead because the same `\`->`/` split turns it into a `..` the
-        # traversal check rejects.)
-        #
-        # Refuse the separator rather than rewrite the argument, matching both the
-        # bare-`loras` reasoning above and `filename` below, which rejects `\` too.
-        # It costs no capability on any host: pathlib on Windows resolves
-        # `models/loras` and `models\loras` to the same directory, so a Windows
-        # caller loses a spelling, not a destination — and the message names the
-        # spelling to use. Ordered LAST so the security-meaningful diagnoses win:
-        # `models\..\evil` still reports as traversal and `custom_nodes\pwn` still
-        # reports as outside the models tree.
-        if "\\" in relative_path:
-            raise ComfyCliError(
-                f"invalid relative_path: {relative_path!r} "
-                "(use '/' as the path separator, e.g. 'models/loras')"
-            )
+        relative_path = _guard_model_relative_path(relative_path)
     if filename:
-        _reject_option_like("filename", filename)
-        _reject_nul("filename", filename)
-        # filename is a single output name, not a path; reject separators, `..`,
-        # and `:` (a Windows drive prefix like `C:evil.dll` has no separator but
-        # still escapes the models dir via `os.path.join` on that platform) so it
-        # can't redirect the write out of the target directory. These already
-        # subsume an `ntpath.splitdrive` test — every string it reports a drive
-        # for is either `X:…` (caught by `:`) or a UNC `\\host\share…` (caught by
-        # `\`) — so a bare name needs no separate drive check. The `.`/`..` case
-        # is matched as a dot run for the same reason as `relative_path` above:
-        # Windows strips a component's trailing spaces and periods at syscall
-        # time, so `".. "` and `"..."` arrive as `..` yet compare unequal to it.
-        if (
-            not filename.strip(" .")
-            or "/" in filename
-            or "\\" in filename
-            or ":" in filename
-        ):
-            raise ComfyCliError(
-                f"invalid filename: {filename!r} (must be a bare filename)"
-            )
+        filename = _guard_model_filename(filename)
     args = ["model", "download", "--url", url]
     if relative_path:
         args += ["--relative-path", relative_path]
