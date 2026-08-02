@@ -1331,6 +1331,33 @@ def test_download_companions_echoed_phrase_is_not_unsupported(patched_run, tool,
         getattr(server, tool)(download_id)
 
 
+@pytest.mark.parametrize(
+    "tool, verb",
+    [
+        ("download_status", "download-status"),
+        ("wait_for_download", "download-status"),
+        ("cancel_download", "download-cancel"),
+    ],
+)
+def test_download_companions_degrade_with_a_blank_download_id(patched_run, tool, verb):
+    """A whitespace-only id must not cost the genuine degrade.
+
+    `_guard_download_id` accepts `" "` (it is truthy, dash-free and NUL-free),
+    and `_normalize_cli_text` folds it to `""`. Subtracting an empty string is
+    `str.replace("", " ")`, which interleaves a space between EVERY character of
+    comfy-cli's message — shredding the parser's own phrase and suppressing the
+    version gap. `_phrase_is_only_the_caller_s` skips a value whose NORMALIZED
+    form is empty for exactly that reason.
+    """
+    patched_run(
+        "",
+        returncode=2,
+        stderr=f"Usage: comfy model [OPTIONS] COMMAND\nNo such command '{verb}'.",
+    )
+
+    assert getattr(server, tool)(" ")["unsupported"] is True
+
+
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
     """wait_for_download polls until terminal and returns that final payload."""
     calls = _sequenced(monkeypatch, [_status("downloading"), _status("completed")])
@@ -1456,6 +1483,38 @@ def test_download_model_guards_the_id_comfy_cli_hands_back(monkeypatch):
 # no-envelope handling below — which is now scoped to it alone, since a
 # `--background` submit returns a real envelope. `legacy_comfy_cli` is what
 # makes the installed CLI look that old.
+
+
+def test_download_model_echoed_phrase_does_not_reach_the_fallback(
+    patched_run, monkeypatch
+):
+    """A caller cannot forge the version gap through its own `url`.
+
+    The stake here is the highest of the echoed-argv group: the degrade is not a
+    label but a re-run, so a false `--background` gap would silently repeat a
+    multi-GB transfer the failed submit may already have started. `url` /
+    `relative_path` / `filename` are the caller's, and Click echoing one back in
+    a usage error lands on the same exit 2 with no envelope
+    `_is_missing_option_error` reads — so the subtraction has to run before the
+    fallback does.
+    """
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("the legacy foreground fallback must not run")
+
+    monkeypatch.setattr(server, "_run_comfy_async", _never)
+    url = "https://hf.co/x.safetensors?q=No such option: --background"
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy model download [OPTIONS]\n"
+            f"Error: Invalid value for '--url': {url!r} is not reachable."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError):
+        _download_model(url)
 
 
 def test_download_model_synthesizes_success_on_plain_exit(
