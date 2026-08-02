@@ -3122,6 +3122,70 @@ def test_the_shared_poll_puts_its_extra_keys_before_the_status(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("key", ["timed_out", "status"])
+def test_the_shared_poll_rejects_an_extra_that_shadows_its_own_keys(monkeypatch, key):
+    """An extra key may not redefine the two keys every caller branches on.
+
+    The extras are unpacked AFTER the `timed_out` literal, so a colliding key
+    would win — `download_model` reads `result.get("timed_out")` to tell an
+    expiry from a real result, and a shadowed `True` would send a timeout down
+    the `_download_failed` path instead.
+    """
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
+
+    with pytest.raises(ValueError, match=f"reserved keys: \\['{key}'\\]"):
+        server._poll_until_terminal(
+            "model",
+            "download-status",
+            "a1b2c3d4e5f6",
+            timeout_seconds=25.0,
+            is_terminal=server._is_download_terminal,
+            timed_out_extra={key: "shadowed"},
+        )
+
+
+@pytest.mark.parametrize("timeout_seconds", [float("inf"), float("nan")])
+def test_the_shared_poll_rejects_an_unbounded_timeout(monkeypatch, timeout_seconds):
+    """The bound the loop needs is enforced here, not just documented.
+
+    Extracting the loop moved `_bounded_timeout` away from the code it protects:
+    with `inf` every `remaining <= 0` stays False forever, and with NaN every
+    comparison is False and `min(_POLL_INTERVAL, nan)` yields 2.0 — either way a
+    caller that forgot to clamp re-spawns `comfy` on a worker thread until the
+    client gives up. Refuse before the first spawn instead.
+    """
+    spawned: list[tuple] = []
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: spawned.append(a))
+
+    with pytest.raises(server.ComfyCliError, match="invalid timeout_seconds"):
+        server._poll_until_terminal(
+            "jobs",
+            "status",
+            "pid",
+            timeout_seconds=timeout_seconds,
+            is_terminal=server._is_terminal,
+        )
+    assert spawned == []
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.0, -1.0])
+def test_the_shared_poll_still_takes_an_expired_bound(monkeypatch, timeout_seconds):
+    """A bound at or below zero is legal and hits the one-poll minimum.
+
+    `download_model` spends what its submit left (`deadline - monotonic()`),
+    which legitimately lands at or under zero on a slow submit, and still wants
+    a real status payload rather than a contentless `{"status": None}`. The
+    finiteness guard above must not swallow that documented path.
+    """
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
+
+    assert server._poll_download("a1b2c3d4e5f6", timeout_seconds) == {
+        "timed_out": True,
+        "download_id": "a1b2c3d4e5f6",
+        "status": {"status": "running"},
+    }
+
+
 def test_run_comfy_marks_a_subprocess_timeout(patched_run):
     """The `timed_out` flag is set only where the child was killed at our budget.
 

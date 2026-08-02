@@ -6175,9 +6175,30 @@ def _poll_until_terminal(
     ``timeout_seconds`` must already be bounded by the caller (see
     :func:`_bounded_timeout`): left raw, ``inf`` keeps ``remaining`` positive
     forever and NaN makes every comparison False, either of which re-spawns
-    comfy-cli until the client gives up.
+    comfy-cli until the client gives up. Extracting the loop moved that clamp
+    away from the code it protects, so the precondition is CHECKED here rather
+    than merely documented — a third caller that forgets ``_bounded_timeout``
+    gets a raise, not an unbounded spawn loop. The ceiling itself stays the
+    caller's (each tool has its own), so this is only the finiteness half —
+    and only that half: a bound at or below zero is legal here and reaches the
+    one-poll minimum on purpose (``download_model`` spends what its submit left,
+    which can land at or under zero, and still wants a real status back).
     """
+    if not math.isfinite(timeout_seconds):
+        raise ComfyCliError(
+            f"invalid timeout_seconds: {timeout_seconds!r} — expected a finite "
+            "number of seconds (clamp with `_bounded_timeout` first)."
+        )
+    # `timed_out` and `status` are the loop's OWN keys: `download_model` reads
+    # `result.get("timed_out")` to tell an expiry from a real result, and the
+    # unpack below sits after the `timed_out` literal — so an extra carrying
+    # either key would win, silently turning a timeout into a payload that falls
+    # through to `_download_failed`. No caller passes one; reject rather than let
+    # dict-unpack order quietly decide the envelope's meaning.
     extra = timed_out_extra or {}
+    reserved = sorted(extra.keys() & {"timed_out", "status"})
+    if reserved:
+        raise ValueError(f"timed_out_extra may not carry reserved keys: {reserved}")
     deadline = time.monotonic() + timeout_seconds
     last: Any = None
     while True:
