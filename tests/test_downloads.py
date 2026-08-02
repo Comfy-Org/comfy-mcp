@@ -1373,6 +1373,48 @@ def test_download_companions_reject_a_blank_download_id(blank):
         server.download_status(blank)
 
 
+@pytest.mark.parametrize("dash_led", [" -x", "\t--help"])
+def test_download_companions_reject_a_padded_dash_led_id(dash_led):
+    """Both shape tests read the STRIPPED value, so they cannot disagree.
+
+    The guard's docstring says a dash-led id stays out of argv. Testing that on
+    the raw string while testing emptiness on the stripped one let `" -x"`
+    through — defused today only by accident, because Click keys option
+    detection on the first character.
+    """
+    with pytest.raises(server.ComfyCliError, match="invalid download_id"):
+        server.download_status(dash_led)
+
+
+def test_guard_download_id_reports_a_size_not_an_oversized_value():
+    """The length check runs BEFORE the shape checks, which echo the value.
+
+    The shape branch interpolates `{download_id!r}` in full, so an oversized
+    blank would otherwise be mirrored back verbatim through the tool response
+    and the failure log — defeating the "report the length, not the value" rule
+    the cap exists to enforce.
+    """
+    oversized_blank = " " * (server._MAX_DOWNLOAD_ID_LEN + 50)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._guard_download_id(oversized_blank)
+
+    assert "exceeds the" in str(excinfo.value)
+    assert oversized_blank not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", [None, 12, ["a1b2c3"]])
+def test_guard_download_id_rejects_a_non_string(bad):
+    """The guard's contract is total: a non-string raises ComfyCliError.
+
+    Every check in the guard is a `str` method, so testing shape before type
+    would leave a bare `AttributeError` for an in-process caller instead of the
+    error every other bad input produces.
+    """
+    with pytest.raises(server.ComfyCliError, match="expected a string"):
+        server._guard_download_id(bad)
+
+
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
     """wait_for_download polls until terminal and returns that final payload."""
     calls = _sequenced(monkeypatch, [_status("downloading"), _status("completed")])

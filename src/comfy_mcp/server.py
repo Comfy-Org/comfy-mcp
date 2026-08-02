@@ -715,20 +715,37 @@ def _guard_download_id(download_id: str) -> str:
     ARGUMENT. Whether it names a real download is comfy-cli's answer to give
     (``download_not_found``), not this wrapper's to guess.
     """
-    # `strip()`, not just falsiness: a whitespace-only id is the same caller
-    # mistake as an empty one — comfy-cli's store resolves `[A-Za-z0-9_-]{1,64}`,
-    # so a blank can never name a real download — but it is truthy, and letting
-    # it through forwards `comfy model download-status " "` and hands
-    # `_phrase_is_only_the_caller_s` a value that normalizes to `""`.
-    if not download_id.strip() or download_id.startswith("-"):
+    # Type FIRST, the way `_guard_version` does it: every test below is a `str`
+    # method, so a non-string would leave as a bare `AttributeError` rather than
+    # the `ComfyCliError` this guard exists to produce. MCP-level validation
+    # keeps that off the tool paths, but the guard's contract is total for
+    # in-process callers.
+    if not isinstance(download_id, str):
         raise ComfyCliError(
-            f"invalid download_id: {download_id!r} (empty or leading '-')"
+            f"invalid download_id: expected a string, got {type(download_id).__name__}."
         )
+    # LENGTH first among the value checks, so the error reports a size instead of
+    # echoing an oversized value back through the tool response and the failure
+    # log — see `_guard_prompt_id`. Ordered ahead of the shape checks because
+    # those interpolate `{download_id!r}` in full, so a multi-megabyte blank
+    # would otherwise be mirrored back verbatim by the branch below.
     if len(download_id) > _MAX_DOWNLOAD_ID_LEN:
-        # Report the length, not the value — see `_guard_prompt_id`.
         raise ComfyCliError(
             f"invalid download_id: {len(download_id)} characters exceeds the "
             f"{_MAX_DOWNLOAD_ID_LEN}-character maximum."
+        )
+    # Both shape tests read the STRIPPED value, so they cannot disagree about
+    # what the id is. `strip()` rather than falsiness because a whitespace-only
+    # id is the same caller mistake as an empty one — comfy-cli's store resolves
+    # `[A-Za-z0-9_-]{1,64}`, so a blank can never name a real download — and
+    # applying it to the dash test too keeps the docstring's invariant true for
+    # `" -x"`, which Click only defuses by accident (it keys option detection on
+    # the first character). The ORIGINAL value is what gets forwarded and
+    # returned: this guard refuses input, it does not rewrite it.
+    stripped = download_id.strip()
+    if not stripped or stripped.startswith("-"):
+        raise ComfyCliError(
+            f"invalid download_id: {download_id!r} (empty or leading '-')"
         )
     return _reject_nul("download_id", download_id)
 
@@ -9403,9 +9420,11 @@ def _phrase_is_only_the_caller_s(
 ) -> bool:
     """Does *pattern* match only text the CALLER supplied, not comfy-cli's own?
 
-    Removes every non-empty entry of *values* from the normalized message and
+    Removes every qualifying entry of *values* from the normalized message and
     re-runs *pattern*. No match afterwards means the sole occurrence came from an
-    echoed argument, and the degrade must not fire.
+    echoed argument, and the degrade must not fire. Only entries that match
+    *pattern* THEMSELVES are subtracted — see below for why that qualifier is
+    the load-bearing part rather than an optimization.
 
     A value that is itself a substring of comfy-cli's genuine message deletes
     that occurrence too, so a caller who passes the parser's exact wording gets
@@ -9455,11 +9474,25 @@ def _phrase_is_only_the_caller_s(
       CivitAI/HuggingFace URLs to buy nothing but protection from a caller's own
       crafted argument.
 
-    One residual runs the other way and is also accepted: the phrase could in
-    principle be assembled ACROSS the boundary, half from Click's template and
-    half from the echoed value, in which case neither the value nor this check
-    sees it whole. That needs Click's fixed wording to end mid-phrase exactly
-    where it interpolates the value, which none of its usage templates do.
+    One residual runs the other way and is also accepted: requiring the value to
+    carry the phrase whole means a value holding only a FRAGMENT is never
+    discounted, so the phrase could be assembled ACROSS a join that neither the
+    value nor this check sees whole. Three joins exist and none is reachable
+    today:
+
+    - Click's own template, if its fixed wording ended mid-phrase exactly where
+      it interpolates the value. None of its usage templates do.
+    - Two caller values landing adjacently in one message. Click echoes only the
+      ONE value it rejected, so the sites passing two (``pack`` /
+      ``registry_id``, and ``download_model``'s three) never get both echoed.
+    - The wrapper's own ``"stderr: … | stdout: …"`` framing, whose ``" | "``
+      :func:`_normalize_cli_text` folds to a single space. Splitting the phrase
+      there needs a fragment at the very END of the stderr tail and its
+      completion at the very START of stdout — and the caller supplies argv, not
+      the child's stdout, so it does not control both sides.
+
+    All three would need the retype this is forward cover for to have happened
+    first, since without it Click never echoes these values at parse time at all.
     """
     normalized = _normalize_cli_text(str(exc))
     for value in values:
