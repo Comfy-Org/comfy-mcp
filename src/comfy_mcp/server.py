@@ -6346,15 +6346,79 @@ def _resource_verb_upgrade_error(
     )
 
 
+_COMFY_TARGET_NOTE_KEY = "comfy_target_note"
+
+
+def _annotate_comfy_target(payload: Any) -> Any:
+    """Return *payload* tagged with the configured remote, for a LOCAL-only tool.
+
+    ``comfy system-stats`` and ``comfy free`` take no ``--host`` / ``--port``
+    (only ``--where``), so they read and act on whichever ComfyUI comfy-cli
+    itself targets — while ``run_workflow`` submits to the ``COMFYUI_URL`` /
+    ``COMFYUI_HOST`` remote. Both docstrings say so, but an agent that skipped
+    them sees numbers with no provenance and gates a remote run on local VRAM.
+    So the divergence is carried IN the payload: a ``comfy_target_note`` key
+    naming the remote the run tools use and stating that this payload is not
+    about it.
+
+    A WARNING, deliberately not an error: freeing local VRAM while submitting a
+    remote run is a legitimate pattern (the local-LLM coexistence recipe in the
+    README keeps it), so the call still succeeds and the payload still carries
+    everything comfy-cli returned.
+
+    Conservative on all three axes:
+
+    * **Nothing configured** (:func:`_comfy_target` is ``None``) → the payload is
+      returned unchanged, the same object, so the local default stays
+      byte-identical.
+    * **Malformed config** → swallowed. A bad ``COMFYUI_URL`` raises out of
+      :func:`_comfy_target`, and these two tools never touch the remote, so it
+      must not break them — the same "local behavior unchanged" contract
+      :func:`_with_target` honors (BE-3869). ``server_info`` is where a malformed
+      value is surfaced as a diagnostic.
+    * **Foreign payload shape** (not a ``dict``) → returned untouched rather than
+      reshaped, mirroring :func:`_drop_cloud_jobs`.
+
+    The key cannot realistically collide — ComfyUI's ``/system_stats`` has only
+    ``system`` and ``devices`` at the top level, and ``comfy free`` returns
+    comfy-cli's own ``{"requested": ..., "note": ...}`` — but if one ever
+    appeared, the existing value wins: annotation must never clobber engine data.
+    """
+    if not isinstance(payload, dict) or _COMFY_TARGET_NOTE_KEY in payload:
+        return payload
+    try:
+        target = _comfy_target()
+    except ComfyCliError:
+        return payload
+    if target is None:
+        return payload
+    host, port, source = target
+    # Shallow copy rather than an in-place insert: reshaping comfy-cli's parsed
+    # payload under the caller is not this helper's call (see _drop_cloud_jobs).
+    return {
+        **payload,
+        _COMFY_TARGET_NOTE_KEY: {
+            "host": host,
+            "port": port,
+            "source": source,
+            "note": (
+                "this payload describes the ComfyUI comfy-cli targets locally, "
+                "NOT the remote the run/job tools submit to"
+            ),
+        },
+    }
+
+
 @mcp.tool()
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
 
     Wraps ``comfy system-stats`` (ComfyUI's own ``GET /system_stats``, also served
     at ``/api/system_stats``, reached by comfy-cli — no HTTP from here). The whole
-    payload is forwarded UNMODIFIED, so treat it as a passthrough rather than a
-    fixed schema: a ``devices`` list plus a ``system`` dict, whose keys are
-    whatever the ComfyUI on the other end reports. The fields this server's
+    payload is forwarded unmodified except for a ``comfy_target_note`` key added
+    when a remote target is configured (below), so treat it as a passthrough
+    rather than a fixed schema: a ``devices`` list plus a ``system`` dict, whose
+    keys are whatever the ComfyUI on the other end reports. The fields this server's
     guidance actually reads are per-device ``vram_free`` / ``vram_total`` (byte
     counts, alongside e.g. ``name`` / ``type`` / ``index`` / ``torch_vram_free``)
     and ``system.ram_free`` / ``ram_total`` / ``comfyui_version`` — examples, not
@@ -6378,15 +6442,20 @@ def system_stats() -> Any:
     reporting zeros. Unlike the run/job tools this is NOT diverted by
     ``COMFYUI_URL`` / ``COMFYUI_HOST`` (``comfy system-stats`` takes no
     ``--host`` / ``--port``), so it describes whichever ComfyUI comfy-cli itself
-    targets.
+    targets. When one of those IS set, a top-level ``comfy_target_note``
+    (``host`` / ``port`` / ``source`` / ``note``) is added to the payload saying
+    exactly that — so do NOT gate a run on these numbers when it is present: the
+    VRAM is the local machine's, the run goes to the remote it names. Nothing
+    else changes, and with no remote configured the key is absent entirely.
     """
     try:
-        return _run_comfy("system-stats", timeout=60.0)
+        data = _run_comfy("system-stats", timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "system-stats", "system_stats")
         if hinted is not None:
             raise hinted from exc
         raise
+    return _annotate_comfy_target(data)
 
 
 @mcp.tool()
@@ -6428,7 +6497,11 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
     Like ``system_stats``, and unlike the run/job tools, this is NOT diverted by
     ``COMFYUI_URL`` / ``COMFYUI_HOST`` — it frees memory on whichever ComfyUI
     comfy-cli itself targets, which with a remote URL configured is NOT the server
-    the run tools submit to.
+    the run tools submit to. comfy-cli's acknowledgement is therefore forwarded
+    unmodified except for a top-level ``comfy_target_note`` (``host`` / ``port``
+    / ``source`` / ``note``) added when one of those IS set, naming the remote
+    this call did NOT free. With no remote configured the key is absent and the
+    payload is unchanged.
     """
     if free_memory is None:
         # Mirror `unload_models` so the default call asks for both and
@@ -6447,12 +6520,13 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
         # `--no-free-memory` counterpart), so "off" is expressed by omitting it.
         args.append("--free-memory")
     try:
-        return _run_comfy(*args, timeout=60.0)
+        data = _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "free", "free_memory")
         if hinted is not None:
             raise hinted from exc
         raise
+    return _annotate_comfy_target(data)
 
 
 # Image suffixes we return inline from ``fetch_outputs`` — kept to the formats

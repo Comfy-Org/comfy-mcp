@@ -16,6 +16,9 @@ every ``comfy jobs`` subcommand). These lock in:
    submission and the ``wait_for_job`` that follows it must carry the same
    ``--host`` / ``--port``, or the ``prompt_id`` from one is meaningless to the
    other.
+6. The tools that CANNOT be diverted saying so themselves: ``download_model``
+   refusing outright, and ``system_stats`` / ``free_memory`` annotating their
+   payload with a ``comfy_target_note``.
 """
 
 from __future__ import annotations
@@ -756,3 +759,101 @@ def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
         ["model", "download-status"],
         ["model", "download-cancel"],
     ]
+
+
+# --- system_stats / free_memory annotate a configured remote ---------------
+#
+# `comfy system-stats` and `comfy free` take no `--host` / `--port` (only
+# `--where`), so they read and free whichever ComfyUI comfy-cli itself targets
+# while `run_workflow` submits to the configured remote. That divergence is a
+# WARNING, not an error — freeing local VRAM while running remote is legitimate
+# (the local-LLM coexistence recipe) — so the payload gains a `comfy_target_note`
+# rather than the call failing.
+
+_STATS = {
+    "devices": [{"name": "cuda:0", "vram_free": 11_000_000_000}],
+    "system": {"ram_free": 30_000_000_000, "comfyui_version": "0.3.0"},
+}
+
+
+def test_system_stats_annotates_configured_remote(patched_run, monkeypatch):
+    """The note names the remote the RUN tools use; the stats themselves are intact."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    patched_run(envelope(data=_STATS))
+
+    result = server.system_stats()
+
+    note = result["comfy_target_note"]
+    assert note["host"] == "gpu.example"
+    assert note["port"] == server.DEFAULT_COMFYUI_PORT
+    assert note["source"] == "COMFYUI_HOST"
+    assert "NOT the remote" in note["note"]
+    # Annotation only — comfy-cli's own payload is passed through untouched.
+    assert result["devices"] == _STATS["devices"]
+    assert result["system"] == _STATS["system"]
+
+
+def test_free_memory_annotates_configured_remote(patched_run, monkeypatch):
+    """`free` gets the same note alongside comfy-cli's `requested` acknowledgement."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    ack = {"requested": {"unload_models": True}, "note": "queued"}
+    patched_run(envelope(data=ack))
+
+    result = server.free_memory()
+
+    assert result["comfy_target_note"]["host"] == "gpu.example"
+    assert result["comfy_target_note"]["port"] == 9001
+    assert result["comfy_target_note"]["source"] == "COMFYUI_URL"
+    assert result["requested"] == ack["requested"]
+    assert result["note"] == "queued"  # comfy-cli's own `note` is not overwritten
+
+
+def test_resource_tools_unconfigured_are_byte_identical(patched_run):
+    """No remote configured -> no key, and the payload is exactly what comfy-cli sent."""
+    patched_run(envelope(data=_STATS))
+    assert server.system_stats() == _STATS
+
+    ack = {"requested": {"unload_models": True}}
+    patched_run(envelope(data=ack))
+    assert server.free_memory() == ack
+
+
+def test_resource_tools_survive_malformed_target(patched_run, monkeypatch):
+    """A malformed remote config must not break these local-only tools.
+
+    Same contract `_with_target` honors for the local-only verbs: the caller
+    never asked these two to reach the remote, so an unparseable `COMFYUI_URL`
+    costs the annotation, not the call.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+
+    patched_run(envelope(data=_STATS))
+    assert server.system_stats() == _STATS
+
+    ack = {"requested": {"unload_models": True}}
+    patched_run(envelope(data=ack))
+    assert server.free_memory() == ack
+
+
+def test_resource_tools_pass_through_foreign_payload_shapes(patched_run, monkeypatch):
+    """A payload that isn't a dict is returned untouched, not reshaped.
+
+    Mirrors `_drop_cloud_jobs`: a comfy-cli that answers with some other shape is
+    handed to the caller as-is rather than wrapped to make room for the note.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+
+    patched_run(envelope(data=["not", "a", "dict"]))
+    assert server.system_stats() == ["not", "a", "dict"]
+
+    patched_run(envelope(data="ok"))
+    assert server.free_memory() == "ok"
+
+
+def test_resource_tools_do_not_clobber_a_colliding_key(patched_run, monkeypatch):
+    """If comfy-cli ever emitted the key itself, ITS value wins — never overwritten."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    payload = {"devices": [], "comfy_target_note": "comfy-cli's own"}
+    patched_run(envelope(data=payload))
+
+    assert server.system_stats() == payload
