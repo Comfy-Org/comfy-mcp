@@ -18,13 +18,16 @@ every ``comfy jobs`` subcommand). These lock in:
    other.
 6. The tools that CANNOT be diverted saying so themselves: ``download_model``
    refusing outright, and ``system_stats`` / ``free_memory`` annotating their
-   payload with a ``comfy_target_note``.
+   payload with a ``comfy_target_note`` — and, since a probe that cannot reach
+   the remote usually FAILS when one is configured, appending that same
+   provenance to the error they raise.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 
 import pytest
 from conftest import _OK_STREAM, envelope
@@ -914,3 +917,282 @@ def test_resource_tools_do_not_clobber_a_colliding_key(patched_run, monkeypatch)
     patched_run(envelope(data=payload))
 
     assert server.system_stats() == payload
+
+
+# --- ...and the ERROR path carries the same provenance ----------------------
+#
+# The note above only reaches a caller when the call SUCCEEDS, and with a remote
+# configured the failing case is the common one: neither verb takes
+# `--host`/`--port`, so with no local ComfyUI running they raise comfy-cli's bare
+# `server_not_running` while the configured remote is up and serving the run/job
+# tools fine. Unannotated, that reads as "the remote is down" and an agent
+# abandons a `run_workflow` that would have worked.
+
+# Hand-built rather than `envelope(ok=False, error=…)`: that builder carries
+# EITHER an error or a `data` payload, and the shape needed here is the one
+# `ComfyCliError.data` exists for — a failed envelope that still has a payload —
+# so the structured-field test below has a non-default `data` to prove survives.
+_FAILED_ENVELOPE = {
+    "type": "envelope",
+    "ok": False,
+    "error": {"code": "server_not_running", "message": "ComfyUI not running"},
+    "data": {"probe": "partial"},
+}
+
+_NO_VERB_REPLY = {
+    "system_stats": (
+        2,
+        "",
+        "Usage: comfy [OPTIONS] COMMAND\nNo such command 'system-stats'.",
+    ),
+    "free_memory": (2, "", "Usage: comfy [OPTIONS] COMMAND\nNo such command 'free'."),
+}
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_errors_name_the_configured_target(
+    patched_run, monkeypatch, tool
+):
+    """A raised error says WHICH ComfyUI it is (not) about, and keeps its own text."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    patched_run(_FAILED_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    # comfy-cli's own verdict is still the primary text — the note is additive.
+    assert "server_not_running" in message
+    assert "gpu.example:9001" in message
+    assert "COMFYUI_HOST" in message
+    # "not AIMED at" is the claim this server can actually make — see the note
+    # in `_target_provenance_suffix`; asserting it here keeps a future reword
+    # from quietly upgrading it back into a claim about reachability.
+    assert "was NOT aimed at it" in message
+    # ...and it does not adjudicate, exactly as the success-path note does not.
+    assert "may or may not be the same machine" in message
+    assert "no evidence about it" in message
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_missing_verb_error_also_carries_the_target(
+    patched_run, monkeypatch, tool
+):
+    """The upgrade hint and the provenance note coexist — neither replaces the other.
+
+    A comfy-cli too old for the verb AND a configured remote are independent
+    facts, and the caller needs both: the one-command fix, and the fact that
+    fixing it still would not have probed the remote.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    returncode, stdout, stderr = _NO_VERB_REPLY[tool]
+    patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert "pip install -U comfy-cli" in message  # the hint survived
+    assert "gpu.example:9001" in message  # ...and gained the provenance
+    assert "COMFYUI_URL" in message
+    # The raw Click usage dump the hint replaces still must not leak through.
+    assert "No such command" not in message
+
+
+@pytest.mark.parametrize(
+    "tool, argv",
+    [
+        ("system_stats", "system-stats"),
+        ("free_memory", "free --unload-models --free-memory"),
+    ],
+)
+def test_resource_tool_errors_unconfigured_are_byte_identical(patched_run, tool, argv):
+    """Nothing configured -> the message is exactly what it was before this note.
+
+    The empty-suffix path must re-raise the SAME error object, so the local
+    default is untouched: full equality, not a substring.
+    """
+    patched_run(_FAILED_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    assert str(excinfo.value) == (
+        f"comfy {argv} failed [server_not_running]: ComfyUI not running"
+    )
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_errors_report_a_malformed_target(patched_run, monkeypatch, tool):
+    """A broken config annotates the error; it never REPLACES comfy-cli's own.
+
+    Same fail-soft rule the success-path note follows: these two verbs never
+    touch the remote, so a typo in `COMFYUI_URL` must not change what they fail
+    with — only add that a target is configured-but-unreadable, which "no note
+    at all" would have read as "nothing configured".
+    """
+    monkeypatch.setenv("COMFYUI_URL", "::/bad")
+    patched_run(_FAILED_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert message.startswith("comfy ")
+    assert "[server_not_running]: ComfyUI not running" in message
+    assert "COMFYUI_PORT) is set but invalid" in message
+    # `_comfy_target`'s OWN message is interpolated, not just the static note —
+    # it is the only part that says which variable and what is wrong with it.
+    assert "COMFYUI_URL is malformed: '::/bad'" in message
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_errors_mask_credentials_in_the_host(
+    patched_run, monkeypatch, tool
+):
+    """`COMFYUI_HOST` is verbatim, so userinfo must not ride out on the error either.
+
+    Mirrors `test_target_note_masks_credentials_in_the_host`: the error message
+    reaches the model's context (and any transcript of it) exactly as the
+    payload note does.
+
+    The token carries a `/` on purpose. `_redact_target_host` used to defer to
+    `textutil._redact_url`, which stops inspecting at the first `/` because in a
+    URL that is where the path starts — so a base64-ish token (they routinely
+    contain `/`) put the `@` outside the inspected slice and came back in full.
+    A bare host has no path, so every `@` in it is userinfo.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "<user>:<tok/en>@gpu.example")
+    patched_run(_FAILED_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert "***@gpu.example" in message
+    assert "<tok/en>" not in message
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_errors_keep_their_structured_fields(
+    patched_run, monkeypatch, tool
+):
+    """Rewriting the message must not decay the error's structured provenance.
+
+    `code` / `no_envelope` / `returncode` are what callers branch on instead of
+    string-matching, so the annotated error carries the originals rather than a
+    fresh set of defaults. The fixture's failed envelope carries a `data`
+    payload so that attribute is compared at a NON-default value — equality
+    against a `None` both sides share would hold even if the rewrite dropped it.
+    (`timed_out` gets the same treatment in the timeout test below, which is the
+    only path that can set it.)
+    """
+    patched_run(_FAILED_ENVELOPE)
+    with pytest.raises(server.ComfyCliError) as bare:
+        getattr(server, tool)()
+
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    patched_run(_FAILED_ENVELOPE)
+    with pytest.raises(server.ComfyCliError) as annotated:
+        getattr(server, tool)()
+
+    for attr in ("code", "no_envelope", "returncode", "timed_out", "data"):
+        assert getattr(annotated.value, attr) == getattr(bare.value, attr)
+    assert annotated.value.code == "server_not_running"
+    assert annotated.value.data == {"probe": "partial"}  # not a shared default
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_timeout_keeps_the_note_and_its_timed_out_flag(
+    patched_run, monkeypatch, tool
+):
+    """A timeout is a verdict from a child that ran, so it is annotated too.
+
+    And `timed_out` — the one attribute the envelope fixtures leave at its
+    default on both sides — has to survive the rewrite: `wait_for_job` branches
+    on it instead of matching the message.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    patched_run(
+        "", raises=subprocess.TimeoutExpired(cmd=[server.COMFY_BIN], timeout=60.0)
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    assert excinfo.value.timed_out is True
+    assert "gpu.example:8188" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_errors_skip_the_note_when_comfy_cli_never_ran(
+    patched_run, monkeypatch, tool
+):
+    """A missing comfy-cli is about no ComfyUI at all, so it is raised untouched.
+
+    The note tells the caller not to read the failure as a verdict on the
+    configured target, which implies the submit tools are unaffected. That is
+    true of a dispatched verb's failure and false of every failure raised before
+    a verb ran: `run_workflow` shells out to the same absent binary and dies the
+    same way. Appending it there would send an agent to retry against a remote
+    it equally cannot reach.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    patched_run(_FAILED_ENVELOPE)
+    # After `patched_run`, so it overrides the fixture's resolvable stub.
+    monkeypatch.setattr(server.shutil, "which", lambda _: None)
+    # Keep the message the PATH one on every runner: on macOS `_require_comfy_bin`
+    # would otherwise probe for a TCC denial, which depends on the real PATH.
+    monkeypatch.setattr(server.tcc, "_is_macos", lambda: False)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert "not found on PATH" in message
+    assert "gpu.example" not in message
+    assert "note:" not in message
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_error_note_brackets_an_ipv6_target(
+    patched_run, monkeypatch, tool
+):
+    """An IPv6 target is re-bracketed so the port is not read as a final hextet.
+
+    `_comfy_target` hands back the bracket-free host every other consumer wants
+    (the payload note keeps host and port as separate keys), but this note joins
+    the two into one string — where `2001:db8::1:8188` is ambiguous.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "[2001:db8::1]")
+    monkeypatch.setenv("COMFYUI_PORT", "8188")
+    patched_run(_FAILED_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    assert "[2001:db8::1]:8188" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("tool", ["system_stats", "free_memory"])
+def test_resource_tool_malformed_target_error_redacts_a_query_secret(
+    patched_run, monkeypatch, tool
+):
+    """A token in the query string is masked, not just `user:pass@` userinfo.
+
+    An auth-proxied ComfyUI is routinely addressed as `https://host/?token=…`,
+    and a value written that way is echoed back the moment `_comfy_target`
+    rejects it — here for the `https` scheme, which is how such a proxy is
+    usually reached. The host is the whole diagnostic, so the query goes out as
+    a placeholder.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example:8188/?token=<sekret>")
+    patched_run(_FAILED_ENVELOPE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        getattr(server, tool)()
+
+    message = str(excinfo.value)
+    assert "<sekret>" not in message
+    assert "?<redacted>" in message  # ...but the user still sees they wrote one
