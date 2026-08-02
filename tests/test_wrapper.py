@@ -37,7 +37,7 @@ from conftest import (
     stream_reader,
 )
 
-from comfy_mcp import server, tcc, textutil
+from comfy_mcp import failure_log, server, tcc, textutil
 
 
 def _launch(*args, **kwargs):
