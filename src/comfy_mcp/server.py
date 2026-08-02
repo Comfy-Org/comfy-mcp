@@ -6540,6 +6540,79 @@ def _annotate_comfy_target(payload: Any) -> Any:
     }
 
 
+def _target_provenance_suffix() -> str:
+    """The same divergence :func:`_annotate_comfy_target` carries, for a FAILURE.
+
+    The note above only ever reaches a caller on the SUCCESS path, and the
+    common case with a remote configured is the failing one: ``comfy
+    system-stats`` / ``comfy free`` take no ``--host`` / ``--port``, so with no
+    local ComfyUI running they raise comfy-cli's bare ``server_not_running``
+    while the configured remote is up and serving the run/job tools perfectly
+    well. An agent reading that error alone concludes the remote is down and
+    abandons a ``run_workflow`` that would have worked — the provenance is
+    exactly as load-bearing on the error as it is on the payload.
+
+    Returns a suffix to append to the raised message, or ``""`` when nothing is
+    configured — in which case the caller must re-raise the original objects
+    untouched, so the local default stays byte-identical.
+
+    Fail-soft on a malformed config for the same reason
+    :func:`_annotate_comfy_target` is: these two tools never touch the remote,
+    so a bad ``COMFYUI_URL`` must not make them fail differently. But it does
+    not vanish either — a typo must not read as "nothing configured" — so it
+    becomes its own short suffix carrying :func:`_comfy_target`'s own
+    (already userinfo-masked) message, the same rationale as
+    :func:`_malformed_target_note`.
+
+    It does not ADJUDICATE, exactly as the success-path note does not: the two
+    ends are the same machine whenever the configured host resolves to this box
+    and this server cannot tell whether it does. What it rules out is the one
+    wrong inference — that this error is a verdict on the configured target.
+    """
+    try:
+        target = _comfy_target()
+    except ComfyCliError as exc:
+        return (
+            " (note: COMFYUI_URL/COMFYUI_HOST is set but malformed, so no remote "
+            "is resolved and this error is comfy-cli's own, about whichever "
+            f"ComfyUI it itself targets; the config error is: {exc})"
+        )
+    if target is None:
+        return ""
+    host, port, source = target
+    return (
+        f" (note: {source} is set to {_redact_target_host(host)}:{port}, but this "
+        "probe did NOT reach it — `comfy system-stats` / `comfy free` take no "
+        "--host/--port, so this error is about whichever ComfyUI comfy-cli itself "
+        "targets. That may or may not be the same machine, and this server does "
+        "not verify which, so do not read this as the configured target being "
+        "down: the run/job tools do submit there.)"
+    )
+
+
+def _with_target_provenance(err: ComfyCliError) -> ComfyCliError:
+    """*err* with :func:`_target_provenance_suffix` appended, or *err* itself.
+
+    Returning the SAME object when no remote is configured is the contract: the
+    unconfigured path must re-raise exactly what it raises today, message and
+    identity included. Every attribute is carried across rather than only the
+    two :func:`_resource_verb_upgrade_error` needs — a timeout here really can
+    set ``timed_out`` (both tools pass a ``timeout=``), and a message rewrite is
+    no reason for the structured provenance to decay.
+    """
+    suffix = _target_provenance_suffix()
+    if not suffix:
+        return err
+    return ComfyCliError(
+        f"{err}{suffix}",
+        code=err.code,
+        no_envelope=err.no_envelope,
+        returncode=err.returncode,
+        timed_out=err.timed_out,
+        data=err.data,
+    )
+
+
 @mcp.tool()
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
@@ -6583,14 +6656,19 @@ def system_stats() -> Any:
     error-shaped note (``error`` / ``note``) instead — the same shape
     ``server_info`` reports that breakage in — so an absent key means one thing
     only: no remote is configured. Nothing else about the payload changes.
+    ERRORS carry that provenance too: with a remote configured, a failure here
+    (``server_not_running`` above all, the common shape when nothing is running
+    locally) is appended with the same note, so it is not mistaken for a verdict
+    on the target the run/job tools submit to.
     """
     try:
         data = _run_comfy("system-stats", timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "system-stats", "system_stats")
-        if hinted is not None:
-            raise hinted from exc
-        raise
+        annotated = _with_target_provenance(exc if hinted is None else hinted)
+        if annotated is exc:
+            raise
+        raise annotated from exc
     return _annotate_comfy_target(data)
 
 
@@ -6639,7 +6717,9 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
     target and leaving the same-machine judgment to the caller exactly as
     ``system_stats`` does (a malformed value gives the error-shaped ``error`` /
     ``note`` form). With no remote configured the key is absent and the payload
-    is unchanged.
+    is unchanged. ERRORS carry the same provenance note appended to their
+    message, so a failure to reach the LOCAL ComfyUI is not read as the
+    configured remote being down.
     """
     if free_memory is None:
         # Mirror `unload_models` so the default call asks for both and
@@ -6661,9 +6741,10 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
         data = _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
         hinted = _resource_verb_upgrade_error(exc, "free", "free_memory")
-        if hinted is not None:
-            raise hinted from exc
-        raise
+        annotated = _with_target_provenance(exc if hinted is None else hinted)
+        if annotated is exc:
+            raise
+        raise annotated from exc
     return _annotate_comfy_target(data)
 
 
