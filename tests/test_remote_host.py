@@ -580,3 +580,179 @@ def test_server_info_reports_malformed_target_as_data(monkeypatch, patched_run):
 
     assert "error" in result["comfy_target"]
     assert result["running"] is False  # local `comfy env` data still returned
+
+
+# --- download_model refuses a configured remote ----------------------------
+#
+# `comfy model download` is not target-aware and never can be from here: it has
+# no `--host` / `--port`, it resolves its destination from the workspace of the
+# machine running THIS server, and ComfyUI's HTTP surface has no endpoint that
+# writes into a models directory. So with a remote configured the download would
+# "succeed" onto a disk the remote cannot read, and the run that needed the model
+# would fail later on a missing file. It is refused up front instead.
+
+
+def _download(**kwargs):
+    """Drive the async ``download_model`` from these synchronous tests."""
+    return asyncio.run(server.download_model("https://hf.co/x.safetensors", **kwargs))
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_download_model_refuses_configured_url_target(patched_run, monkeypatch, wait):
+    """A COMFYUI_URL remote fails the call, and spawns NOTHING — either `wait`."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download(wait=wait)
+
+    message = str(excinfo.value)
+    assert "gpu.example:9001" in message  # names the remote that would miss it
+    assert "COMFYUI_URL" in message  # ... and which knob selected it
+    assert server.REMOTE_SHARED_MODELS_ENV in message  # ... and the way out
+    # The guard is only worth anything if it lands BEFORE the submit: a started
+    # transfer writes to the wrong disk whatever this call then returns.
+    assert calls == []
+
+
+def test_download_model_refuses_configured_host_target(patched_run, monkeypatch):
+    """The COMFYUI_HOST spelling is guarded too, with its default port named."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download(wait=False)
+
+    message = str(excinfo.value)
+    assert f"gpu.example:{server.DEFAULT_COMFYUI_PORT}" in message
+    assert "COMFYUI_HOST" in message
+    assert server.REMOTE_SHARED_MODELS_ENV in message
+    assert calls == []
+
+
+def test_download_model_raises_on_malformed_url_target(patched_run, monkeypatch):
+    """A malformed remote config fails LOUDLY here, unlike the local-only verbs.
+
+    ``_with_target`` deliberately ignores a malformed ``COMFYUI_URL`` for verbs
+    that never touch the remote, so a bad value cannot brick them. This tool is
+    the opposite case: the caller asked for a remote, and the whole question the
+    guard answers is *which* one — so an unparseable answer is an error, not
+    something to shrug off and download locally.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
+
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        _download(wait=False)
+
+    assert calls == []
+
+
+def test_download_model_shared_models_optin_downloads_unchanged(
+    patched_run, monkeypatch
+):
+    """The shared-storage opt-in restores TODAY's argv exactly — no target flags.
+
+    `model` is still not target-aware, so the escape hatch must not start
+    forwarding `--host` / `--port` to it; it only says "this workspace IS the
+    remote's models volume, proceed."
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, "1")
+    submit = {"download_id": "a1b2c3d4e5f6", "dest": "/models/x.safetensors"}
+    calls = patched_run(envelope(data=submit))
+
+    assert _download(wait=False) == submit
+
+    assert calls[0]["cmd"][4:] == [
+        "model",
+        "download",
+        "--url",
+        "https://hf.co/x.safetensors",
+        "--background",
+    ]
+
+
+def test_download_model_shared_models_optin_ignores_malformed_target(
+    patched_run, monkeypatch
+):
+    """Opted in, the target is never resolved — so a malformed one cannot raise.
+
+    The opt-in means "behave exactly as an unconfigured install does", and an
+    unconfigured `download_model` ignores `COMFYUI_URL` entirely.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, "1")
+    calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
+
+    _download(wait=False)
+
+    assert calls[0]["cmd"][4] == "model"
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "maybe", " "])
+def test_download_model_shared_models_optin_fails_closed(
+    patched_run, monkeypatch, value
+):
+    """Anything but a recognized truthy value leaves the guard ARMED.
+
+    A typo'd opt-in must not silently land a multi-GB checkpoint on the wrong
+    machine — the failure names the value to set.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, value)
+    calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
+
+    with pytest.raises(server.ComfyCliError, match="LOCAL-ONLY"):
+        _download(wait=False)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
+def test_download_model_shared_models_optin_spellings(patched_run, monkeypatch, value):
+    """The documented `1` plus the obvious synonyms, case- and space-insensitive."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, value)
+    calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
+
+    _download(wait=False)
+
+    assert calls[0]["cmd"][4] == "model"
+
+
+def test_download_model_unconfigured_is_unchanged(patched_run):
+    """No remote configured -> byte-identical to today (the guard is a no-op)."""
+    submit = {"download_id": "a1b2c3d4e5f6", "dest": "/models/x.safetensors"}
+    calls = patched_run(envelope(data=submit))
+
+    assert _download(wait=False) == submit
+
+    assert calls[0]["cmd"][4:] == [
+        "model",
+        "download",
+        "--url",
+        "https://hf.co/x.safetensors",
+        "--background",
+    ]
+
+
+def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
+    """status / wait / cancel manage an ALREADY-submitted local download.
+
+    Those ids only exist because a download was submitted on this machine while
+    it was allowed to be, so guarding them would strand a transfer mid-flight —
+    unpollable and uncancellable — the moment a remote was configured.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"status": "completed"}))
+
+    server.download_status("a1b2c3d4e5f6")
+    server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=1.0)
+    server.cancel_download("a1b2c3d4e5f6")
+
+    assert [call["cmd"][4:6] for call in calls] == [
+        ["model", "download-status"],
+        ["model", "download-status"],
+        ["model", "download-cancel"],
+    ]

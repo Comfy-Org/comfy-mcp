@@ -100,8 +100,19 @@ def _clear_comfyui_target_env(monkeypatch):
     ``COMFYUI_HOST`` is set (see ``server._comfy_target``). A stray value in the
     ambient environment would perturb the exact-argv assertions across the suite,
     so clear all three here; the remote-targeting tests set them explicitly.
+
+    ``COMFY_MCP_REMOTE_SHARED_MODELS`` rides along because it only ever means
+    something in company with those three: it is the operator's assertion that
+    this machine's models dir IS the configured remote's, and an ambient ``1``
+    would silently disarm ``download_model``'s remote guard in the very tests
+    that exist to prove it fires.
     """
-    for var in ("COMFYUI_URL", "COMFYUI_HOST", "COMFYUI_PORT"):
+    for var in (
+        "COMFYUI_URL",
+        "COMFYUI_HOST",
+        "COMFYUI_PORT",
+        server.REMOTE_SHARED_MODELS_ENV,
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
