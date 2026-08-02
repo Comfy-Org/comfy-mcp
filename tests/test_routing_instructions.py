@@ -155,8 +155,8 @@ def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
 def test_routing_names_every_submitting_tool_as_diverted(routing):
     """All three job-SUBMITTING tools follow ``comfy_target`` — the block must say so.
 
-    ``_TARGET_AWARE_SUBCOMMANDS`` covers ``run``, ``run-template`` and ``jobs``,
-    so ``run_workflow``, ``generate_image`` and ``run_template`` all submit to a
+    ``_TARGET_AWARE`` covers ``run``, ``run-template`` and ``jobs``, so
+    ``run_workflow``, ``generate_image`` and ``run_template`` all submit to a
     configured remote. The block used to name the last two as *still local*,
     which is the failure this guards against in both directions: an agent that
     believes ``generate_image`` runs here will apply this machine's VRAM

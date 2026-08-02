@@ -1,21 +1,28 @@
 """Tests for driving a configurable (remote/tailnet) ComfyUI host.
 
-The run/queue tools normally target the implicit local 127.0.0.1:8188. Setting
+The tools normally target the implicit local 127.0.0.1:8188. Setting
 ``COMFYUI_URL`` — or the ``COMFYUI_HOST`` / ``COMFYUI_PORT`` pair — points them
 at a ComfyUI running elsewhere by forwarding ``--host`` / ``--port`` to the
-comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, and
-every ``comfy jobs`` subcommand). These lock in:
+comfy-cli calls that accept them (``comfy run``, ``comfy run-template``, every
+``comfy jobs`` and ``comfy nodes`` subcommand, ``comfy validate``, and
+``comfy workflow slots`` / ``set-slot`` / ``vary``). These lock in:
 
 1. ``_comfy_target`` env parsing (URL, host/port, defaults, malformed values).
 2. ``--host`` / ``--port`` forwarded into the SUBCOMMAND (not the global prefix)
-   for ``run`` / ``run-template`` / ``jobs``, and NOT for verbs that don't accept
-   them (``env`` / ``download`` / ``upload`` / …).
+   for every entry in ``_TARGET_AWARE``, and NOT for calls that don't accept
+   them (``env`` / ``download`` / ``upload`` / ``workflow notes`` / …).
 3. Byte-identical local behavior when nothing is configured.
 4. ``server_info`` surfacing the configured ``comfy_target``.
 5. Submit and poll agreeing on ONE server: a ``generate_image`` / ``run_template``
    submission and the ``wait_for_job`` that follows it must carry the same
    ``--host`` / ``--port``, or the ``prompt_id`` from one is meaningless to the
    other.
+
+``_TARGET_AWARE`` is a (verb, subcommand) table rather than a verb allowlist
+because ``comfy workflow`` is a MIXED group — ``slots`` / ``set-slot`` / ``vary``
+resolve a live ``object_info`` and take the flags, ``notes`` is an offline file
+read and takes neither — so the negative assertion for ``workflow notes`` is the
+one that keeps the granularity from quietly collapsing back to a verb check.
 """
 
 from __future__ import annotations
@@ -299,6 +306,198 @@ def test_run_template_tool_submit_forwards_host_port(patched_run, monkeypatch):
     ]
 
 
+# --- discovery / validation / workflow authoring follow the target too --------
+#
+# These verbs do not submit a job, so nothing here can produce the
+# `prompt_not_found` the run-template gap did. What they produce is a confident
+# WRONG ANSWER: `validate_workflow` clearing a graph against this machine's node
+# set while `run_workflow` submits to a remote whose set differs, or
+# `list_workflow_slots` reporting slots the target install does not expose. The
+# fix is the same one — ask the machine the job will actually run on.
+
+_TARGET_FLAGS = ["--host", "gpu.example", "--port", "9001"]
+
+# (id, call, the leading argv tokens that call must build). The tail is asserted
+# separately as `_TARGET_FLAGS`, so a change to how the MIDDLE of an argv renders
+# (slot encoding, a new default flag) does not drag these assertions with it.
+_TARGET_AWARE_TOOL_CALLS = [
+    (
+        "validate_workflow",
+        lambda: server.validate_workflow("wf.json"),
+        ["validate", "--workflow", "wf.json"],
+    ),
+    (
+        "search_nodes",
+        lambda: server.search_nodes("KSampler"),
+        ["nodes", "search", "KSampler"],
+    ),
+    ("get_node", lambda: server.get_node("KSampler"), ["nodes", "show", "KSampler"]),
+    (
+        "list_nodes",
+        lambda: server.list_nodes(produces="IMAGE"),
+        ["nodes", "ls", "--produces", "IMAGE"],
+    ),
+    (
+        "nodes_upstream",
+        lambda: server.nodes_upstream("KSampler"),
+        ["nodes", "upstream", "KSampler"],
+    ),
+    (
+        "nodes_downstream",
+        lambda: server.nodes_downstream("KSampler"),
+        ["nodes", "downstream", "KSampler"],
+    ),
+    (
+        "nodes_path",
+        lambda: server.nodes_path("MODEL", "IMAGE"),
+        ["nodes", "path", "MODEL", "IMAGE"],
+    ),
+    ("nodes_types", lambda: server.nodes_types(), ["nodes", "types"]),
+    ("nodes_categories", lambda: server.nodes_categories(), ["nodes", "categories"]),
+    (
+        "list_workflow_slots",
+        lambda: server.list_workflow_slots("wf.json"),
+        ["workflow", "slots", "wf.json"],
+    ),
+    (
+        "set_workflow_slot",
+        lambda: server.set_workflow_slot(
+            "wf.json", [{"address": "6.text", "value": "a cat"}]
+        ),
+        ["workflow", "set-slot", "wf.json"],
+    ),
+    (
+        "vary_workflow",
+        lambda: server.vary_workflow(
+            "wf.json", [{"address": "3.seed", "values": [1, 2]}]
+        ),
+        ["workflow", "vary", "wf.json"],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("call", "head"),
+    [(call, head) for _id, call, head in _TARGET_AWARE_TOOL_CALLS],
+    ids=[tool_id for tool_id, _call, _head in _TARGET_AWARE_TOOL_CALLS],
+)
+def test_target_aware_tool_forwards_host_port(patched_run, monkeypatch, call, head):
+    """Each newly remoted tool appends the flags AFTER its subcommand args."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"ok": True}))
+
+    call()
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global prefix unchanged
+    assert cmd[4 : 4 + len(head)] == head
+    assert cmd[-4:] == _TARGET_FLAGS
+
+
+@pytest.mark.parametrize(
+    ("call", "head"),
+    [(call, head) for _id, call, head in _TARGET_AWARE_TOOL_CALLS],
+    ids=[tool_id for tool_id, _call, _head in _TARGET_AWARE_TOOL_CALLS],
+)
+def test_target_aware_tool_local_default_is_byte_identical(patched_run, call, head):
+    """...and with nothing configured each one builds exactly today's argv."""
+    calls = patched_run(envelope(data={"ok": True}))
+
+    call()
+
+    cmd = calls[0]["cmd"]
+    assert cmd[4 : 4 + len(head)] == head
+    assert "--host" not in cmd and "--port" not in cmd
+
+
+def test_workflow_notes_is_not_forwarded(patched_run, monkeypatch):
+    """`comfy workflow` is a MIXED group: `notes` declares no --host/--port.
+
+    This is the whole reason the allowlist is keyed on (verb, subcommand). Under
+    the old verb-level check, remoting `workflow slots` would have handed `notes`
+    an option typer has never heard of, turning a working offline read into a
+    Click usage error the envelope parser cannot even interpret.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"workflow": "wf.json", "count": 0, "notes": []}))
+
+    server.list_workflow_notes("wf.json")
+
+    assert calls[0]["cmd"][4:] == ["workflow", "notes", "wf.json"]
+
+
+def test_workflow_notes_survives_malformed_config(patched_run, monkeypatch):
+    """The BE-3869 ordering contract, at (verb, subcommand) granularity.
+
+    `_with_target` decides from the ARGV alone before it resolves the target, so
+    a malformed `COMFYUI_URL` cannot brick a call that would never have used it —
+    and that now has to hold for a non-target subcommand of a target-aware VERB,
+    not just for a wholly unlisted verb.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_run(envelope(data={"workflow": "wf.json", "count": 0, "notes": []}))
+
+    server.list_workflow_notes("wf.json")
+
+    assert calls[0]["cmd"][4:] == ["workflow", "notes", "wf.json"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("workflow",),  # bare verb, no subcommand to check
+        ("workflow", "notes", "wf.json"),
+        ("workflow", "list"),  # a subcommand the table does not name
+    ],
+)
+def test_unlisted_workflow_subcommands_pass_through(patched_run, monkeypatch, args):
+    """Anything outside the frozenset passes through exactly as an unlisted verb.
+
+    Including a subcommand comfy-cli may grow later: the table names what is
+    KNOWN to accept the flags, and everything else is left alone rather than
+    guessed at.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope())
+
+    server._run_comfy(*args)
+
+    assert calls[0]["cmd"][4:] == list(args)
+
+
+def test_validate_forwards_host_port_into_subcommand(patched_run, monkeypatch):
+    """The allowlist entry itself, driven through the raw wrapper.
+
+    `validate` is also reached from `_local_template_check` (the `local_check`
+    block on `fetch_template` / `get_template`), which builds the same argv.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    calls = patched_run(envelope(data={"valid": True}))
+
+    server._run_comfy("validate", "--workflow", "wf.json")
+
+    assert calls[0]["cmd"][4:] == ["validate", "--workflow", "wf.json", *_TARGET_FLAGS]
+
+
+def test_fetch_template_local_check_forwards_host_port(patched_run, monkeypatch):
+    """`local_check` compares against the install the run will land on.
+
+    The blind spot this closes: the check cleared a template against THIS
+    machine's node set while `run_workflow` submitted to the remote, so a
+    template could pass the mandatory gate and still fail there on a missing node.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"valid": True, "errors": [], "warnings": []}))
+
+    server.fetch_template("image_flux2", "/tmp/wf.json")
+
+    assert calls[0]["cmd"][4:6] == ["templates", "fetch"]
+    assert "--host" not in calls[0]["cmd"]  # `templates` takes no target
+    assert calls[1]["cmd"][4] == "validate"
+    assert calls[1]["cmd"][-4:] == _TARGET_FLAGS
+
+
 def test_env_is_not_forwarded_host_port(patched_run, monkeypatch):
     """`comfy env` takes no --host/--port; forwarding would error 'No such option'."""
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
@@ -346,7 +545,7 @@ def test_fetch_outputs_docs_do_not_deny_remote_retrieval():
         "fetch_outputs no longer explains WHY it reaches a remote job's outputs "
         "— the state file is the whole mechanism"
     )
-    assert "_TARGET_AWARE_SUBCOMMANDS" in doc, (
+    assert "_TARGET_AWARE" in doc, (
         "the docstring no longer ties its behavior to the forwarding allowlist"
     )
     # The denial this guards against, in the spellings a rewrite would reach for.

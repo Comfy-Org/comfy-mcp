@@ -476,7 +476,7 @@ The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card o
 
 The instructions walk these as an ordered procedure, because several of the checks only make sense in sequence:
 
-1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts every tool that submits a job — `run_workflow`, `generate_image`, `run_template` — along with the queue/`jobs` tools, while discovery, templates, downloads, outputs and the lifecycle tools stay here; so against a genuine remote the thresholds below describe the wrong machine. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
+1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts every tool that submits a job — `run_workflow`, `generate_image`, `run_template` — along with the queue/`jobs` tools and every tool that reads a live node catalog (`validate_workflow`, the `search_nodes` / `nodes_*` family, `list_workflow_slots` / `set_workflow_slot` / `vary_workflow`), while templates, model downloads, outputs, `system_stats`/`free_memory` and the lifecycle tools stay here; so against a genuine remote the thresholds below describe the wrong machine. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
 2. **Get a memory figure.** The sizes are bytes (`ram_bytes`, `gpu.vram_bytes`) and the divisor gives GiB, while drivers report under the advertised size — a consumer 24 GB card reads 23.99, an ECC/reserving datacenter card (A10, L4) about 22.3 — so a *small* shortfall, within ~10% of a nominal size, reads as that nominal capacity. A gap wider than that is not driver overhead and is taken at face value instead: on a MIG/vGPU partition the model string names the whole card while `vram_bytes` is the slice you actually get, and rounding a 6 GB A100 slice up into the ≥ 24 GB band would OOM the run. On Apple Silicon `gpu.vram_bytes` is `null` (with `gpu.unified_memory` true) and the figure is `ram_bytes` — an Apple-only substitution.
 3. **If the figure is missing, ask.** A `null` **or zero** `vram_bytes` on any **non-Apple** GPU (a discrete card comfy-cli can't size, but also a non-Apple unified part like a Jetson/Grace board or a Strix Halo APU), a missing `gpu` object, or a missing/zero `ram_bytes` on the Apple path all mean **unknown**, not "no GPU" — the agent asks rather than stranding a machine that has one. The "no GPU" verdict is reserved for a *confirmed* absence, and the only thing that confirms one is your own answer: no `hardware` payload encodes it, because a null or missing `gpu` is unknown by this same step. Nothing in this repo probes hardware, and the instructions tell the agent not to shell out either: a probe runs on a path this server can neither bound nor audit.
 4. **Route on the figure**, then **redirect rather than dead-end** when the answer is "not on this machine". A figure that came from your answer rather than the payload routes on whichever row fits the machine — the unified-memory row on an Apple Silicon Mac, the VRAM rows otherwise, which is what covers the non-Apple unified-memory boards that have no row of their own.
@@ -676,15 +676,31 @@ behavior is unchanged (`127.0.0.1:8188` on this machine). If what you actually h
 *this* machine on a different port, you want `COMFY_LOCAL_URL` instead — see [Which address variable
 do I want?](#which-address-variable-do-i-want).
 
-When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
-accept them — `comfy run`, `comfy run-template` and `comfy jobs …` — so every tool that **submits a
-job or reads one back** targets the remote: `run_workflow`, `generate_image`, `run_template`,
-`job_status`, `wait_for_job`, `watch_job`, `cancel_job`, `get_queue`. `server_info` reports the
-configured target under a `comfy_target` block.
+When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the calls that
+accept them, which is every tool that **submits a job or reads one back** —
 
-That set is deliberately closed under submit-then-poll: a `prompt_id` only means something to the
-server that issued it, so a tool that submits and a tool that polls must never resolve to different
-machines.
+- `comfy run`, `comfy run-template`, `comfy jobs …` → `run_workflow`, `generate_image`,
+  `run_template`, `job_status`, `wait_for_job`, `watch_job`, `cancel_job`, `get_queue`.
+
+— and every tool that **reads a live node catalog**, so discovery, validation and workflow authoring
+all describe the machine the job will actually run on:
+
+- `comfy validate` → `validate_workflow`, and the `local_check` block on `fetch_template` /
+  `get_template`.
+- `comfy nodes …` → `search_nodes`, `get_node`, `list_nodes`, `nodes_upstream`, `nodes_downstream`,
+  `nodes_path`, `nodes_types`, `nodes_categories`.
+- `comfy workflow slots` / `set-slot` / `vary` → `list_workflow_slots`, `set_workflow_slot`,
+  `vary_workflow`. (`list_workflow_notes` is **not** in this group — `comfy workflow notes` is an
+  offline read of the file on disk and takes no `--host` / `--port` at all.)
+
+`server_info` reports the configured target under a `comfy_target` block.
+
+The first set is deliberately closed under submit-then-poll: a `prompt_id` only means something to
+the server that issued it, so a tool that submits and a tool that polls must never resolve to
+different machines. The second set answers the matching question for authoring: a workflow that
+passes a node check *here* can still fail *there*, so the check is asked of the same install the run
+will land on. Both sets read comfy-cli's live `object_info`, so the answers still reflect whatever
+that install actually has, staleness included.
 
 **Not remoted (this repo is a thin wrapper and never opens its own socket):**
 
@@ -692,9 +708,12 @@ machines.
   `switch_comfyui_version`, `get_logs`) — these manage a **local** ComfyUI process/install and stay
   local-only; they cannot start/stop, update, version-switch, or read logs from a remote box. Start
   and update ComfyUI on the remote host yourself.
-- **Catalog / partner verbs** — `search_templates` / `search_models` / `download_model` /
-  `partner_generate` — this server forwards **no** `--host`/`--port` to these verbs (they accept
-  none at all), so they run against comfy-cli's local default. A model must be installed on the
+- **Model catalog / partner verbs** — `search_models` / `download_model` / `partner_generate` —
+  this server forwards **no** `--host`/`--port` to these verbs (they accept
+  none at all, only `--where local|cloud`; giving them a target is comfy-cli work, not this repo's),
+  so they run against comfy-cli's local default. `search_models` therefore answers about *this*
+  machine's models even with a remote configured — unlike the node tools next to it, which do
+  follow the target. A model must be installed on the
   machine that actually runs the job, and `download_model` cannot do that for you — so rather than
   writing the checkpoint to the wrong disk and letting the run fail later on a missing model, it
   **refuses** while `COMFYUI_URL`/`COMFYUI_HOST` is set, naming the remote it would have missed.
@@ -712,12 +731,15 @@ machines.
   back to querying the local default server only when no such state file exists (an id this machine
   never submitted). `run_workflow(wait=True)` / `job_status` return those same URLs if you would
   rather hand them off than copy bytes.
-- **Discovery / validation** (`search_nodes`, `get_node`, `validate_workflow`, and the
-  `local_check` block on `fetch_template` / `get_template`) — their comfy-cli verbs *do* accept
-  `--host`/`--port`, but this version forwards only to the submit/poll tools, so they still
-  describe the **local** install. Remoting them is a planned follow-up; until then a workflow or
-  template can pass a local check and still fail on a remote whose node set differs, so
-  author/validate against a local ComfyUI matching the remote's.
+- **Template gallery** (`search_templates`, `fetch_template`, `get_template`) — `comfy templates`
+  takes no `--host`/`--port`, and needs none: the gallery is comfy-cli's own cached index of
+  `Comfy-Org/workflow_templates`, not something either ComfyUI serves. The template JSON is written
+  **here**, which is where `run_workflow` reads it from; only the `local_check` verdict attached to
+  it is remoted (it goes through `comfy validate`, above).
+- **Workflow notes** (`list_workflow_notes`) — `comfy workflow notes` reads the file on disk and
+  never contacts a server, so there is nothing to point elsewhere. Its sibling
+  `list_workflow_slots` *is* remoted, which is why the forwarding allowlist is keyed on
+  (verb, subcommand) rather than on the verb alone.
 - The remote ComfyUI must be reachable and **unauthenticated** on that network (the private network
   is the boundary); the server does not authenticate to it. `server_info` does not live-probe the
   remote — reachability surfaces on the first run/job call.
@@ -793,7 +815,7 @@ different layers. Pick by which one you need; the table is the whole answer.
 | **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never reads it |
 | **Means** | "a ComfyUI on **another machine** I control" | "the ComfyUI on **this machine** is not on `127.0.0.1:8188`" |
 | **How it acts** | this server forwards `--host` / `--port` to the verbs that accept them | comfy-cli resolves its own target from the environment it inherits |
-| **What it moves** | the **submit / job** tools only (`run_workflow`, `generate_image`, `run_template`, and the `jobs` family) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
+| **What it moves** | the **submit / job** tools (`run_workflow`, `generate_image`, `run_template`, the `jobs` family) **and the live-catalog tools** (`validate_workflow`, the `search_nodes` / `nodes_*` discovery family, `list_workflow_slots` / `set_workflow_slot` / `vary_workflow`) — but nothing whose comfy-cli verb takes no `--host` / `--port`, see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
 | **Reported as** | a `comfy_target` block on `server_info` | the resolved `server` URL on `server_info` — **no** `comfy_target` block |
 | **Use it for** | a GPU box over Tailscale / a private network | a port clash, a second instance, a container publishing a different port |
 
@@ -858,6 +880,8 @@ handle is `prompt_id`.
 
 ### Workflow building
 
+Everything here except `list_workflow_notes` resolves against a live `object_info`, so it follows `COMFYUI_URL`/`COMFYUI_HOST` and answers for the ComfyUI the run will land on ([Driving a remote ComfyUI](#driving-a-remote-comfyui)). `list_workflow_notes` is an offline read of the file on disk and takes no target.
+
 | Tool | Wraps | What it does |
 |---|---|---|
 | `validate_workflow(workflow_path)` | `comfy validate --workflow <path>` | Pre-flight a workflow against the live `object_info` before a slow run; surfaces the structured error code on failure. |
@@ -873,7 +897,7 @@ handle is `prompt_id`.
 | `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type}]}`. |
 | `get_template(name, check_local=True)` | `comfy templates show <name>` (+ `comfy validate`) | Show one template's details/schema before fetching it, plus a `local_check` block cross-checking its graph against the live `object_info` of your install — see [Templates your install can't run](#templates-your-install-cant-run). `check_local=False` skips the check (metadata only, one call). |
 | `fetch_template(name, out_path, check_local=True)` | `comfy templates fetch <name> --out <path>` (+ `comfy validate`) | Write a template's runnable workflow JSON to `out_path`; returns `{path, local_check}` — `path` is the absolute path for `run_workflow`, `local_check` is the same cross-check run on the file just written. The file is written either way. |
-| `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live local** `object_info` (includes installed custom nodes). |
+| `search_nodes(query)` | `comfy nodes search <query>` | Find node classes in the **live** `object_info` (includes installed custom nodes). The whole `nodes` family follows `COMFYUI_URL`/`COMFYUI_HOST`, so it describes the ComfyUI a run would land on ([Driving a remote ComfyUI](#driving-a-remote-comfyui)); the template rows below do not — the gallery is comfy-cli's own cache — but their `local_check` does. |
 | `get_node(name)` | `comfy nodes show <ClassName>` | Full input/output schema for one node class — what you need to author/repair a graph. |
 | `list_nodes(produces="", accepts="", category="", pack="", label="")` | `comfy nodes ls [--produces/--accepts/--category/--pack/--label …]` | List node classes, filtered by output/input type, category, pack, or label; bare call lists all. Reads the **live install**. |
 | `nodes_upstream(name, limit=None)` | `comfy nodes upstream <name> [--limit N]` | Nodes whose outputs can feed `<name>`'s inputs ("what wires INTO this?"). Reads the **live install**. |

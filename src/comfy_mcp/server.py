@@ -118,7 +118,8 @@ flows:
   hosted-API key), `fetch_template` to save its workflow JSON, then — only once
   the check below has CLEARED — `run_workflow` on `result["path"]`.
   `fetch_template` and `get_template` return a `local_check` block comparing the
-  template against the live node catalog of the installed ComfyUI. The gallery
+  template against the live node catalog of the ComfyUI it would run on — this
+  machine, or the remote a `comfy_target` names. The gallery
   catalog is CACHED by comfy-cli and maintained independently of the install (it
   is not read from it at all), so a template can need a node or model option this
   install does not have yet — clearing `local_check` is MANDATORY, not advisory,
@@ -265,9 +266,14 @@ earlier one:
 - STEP 1, is the work even local? `hardware` describes the machine THIS server
   runs on, and that is where MOST tools execute. A `comfy_target` block
   carrying a `host` diverts every tool that SUBMITS a job — `run_workflow`,
-  `generate_image`, `run_template` — along with the queue/`jobs` tools, while
-  discovery, templates, model downloads and the lifecycle tools still describe
-  and act on THIS machine. (`fetch_outputs` is neither: it forwards no host but
+  `generate_image`, `run_template` — along with the queue/`jobs` tools and every
+  tool that reads a live node catalog (`search_nodes`, `get_node`, `list_nodes`,
+  the `nodes_*` family, `validate_workflow`, the `local_check` block, and
+  `list_workflow_slots` / `set_workflow_slot` / `vary_workflow`), so discovery
+  and validation answer for the machine the job will land on; templates, model
+  downloads, `system_stats` / `free_memory`, the offline `list_workflow_notes`
+  and the lifecycle tools still describe and act on THIS machine.
+  (`fetch_outputs` is neither: it forwards no host but
   still collects a remote job's files, from the local state file the submit
   wrote.) So against a genuine remote the thresholds below describe the wrong
   machine: they govern generation only while the target is this one. Count the
@@ -359,7 +365,7 @@ COMFY_BIN = os.environ.get("COMFY_BIN", "comfy")
 # pair. When UNSET the tools behave byte-identically to the local-only default
 # (no ``--host`` forwarded); when set, ``_with_target`` forwards ``--host`` /
 # ``--port`` to the comfy-cli verbs that accept them (see ``_comfy_target`` /
-# ``_with_target`` and ``_TARGET_AWARE_SUBCOMMANDS`` below).
+# ``_with_target`` and ``_TARGET_AWARE`` below).
 DEFAULT_COMFYUI_PORT = 8188
 
 # Escape hatch for the one tool that REFUSES to run against a configured remote:
@@ -383,52 +389,100 @@ DEFAULT_COMFYUI_PORT = 8188
 REMOTE_SHARED_MODELS_ENV = "COMFY_MCP_REMOTE_SHARED_MODELS"
 _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 
-# The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
-# run``, ``comfy run-template``, and every ``comfy jobs`` subcommand — every verb
-# that SUBMITS a job or reads one back, which is the set that has to agree on
-# which server it is talking to. ``run`` / ``jobs`` are the pair comfy-cli's
-# ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
-# options and resolves them through that module's own ``resolve_host_port``
-# (``comfy_cli/command/templates.py``), it is just missing from that docstring's
-# list.
+# Which comfy-cli calls this server forwards ``--host`` / ``--port`` to, keyed by
+# VERB and — where the verb is not uniform — by subcommand:
 #
-# ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
-# It backs both ``run_template`` and ``generate_image``, and while it was absent
-# the submit-then-poll flow did not merely run on the wrong box, it could not
-# complete at all: the run executed locally, ``wait_for_job`` (a ``jobs`` verb,
-# forwarded) polled the configured remote, and the local ``prompt_id`` came back
-# ``prompt_not_found`` from a queue it was never submitted to. Adding a verb here
-# is only safe when comfy-cli actually accepts the flags on it — otherwise the
-# forward turns every call into "No such option". There is no such window for
-# this one: ``run-template`` shipped WITH both options, in the same comfy-cli
-# release (1.13.0) that introduced the verb — which is also the floor
-# ``_check_comfy_version`` enforces (``_MIN_COMFY_CLI``). A comfy-cli old enough
-# to reject ``--host`` here has no ``run-template`` at all, so it fails on the
-# verb before the flags are ever parsed. That argument is about RELEASED
-# comfy-cli, and the floor guard deliberately fails OPEN, so a fork or source
-# build carrying ``run-template`` with its options stripped would still get a
-# Click usage error rather than a graceful degrade. No probe is added for it
-# because the exposure is not this verb's: ``run`` and ``jobs`` have been
+#   * value ``None``  → every subcommand of that verb (and its bare form).
+#   * a ``frozenset`` → only those subcommands; anything else passes through
+#     untouched, exactly as an unlisted verb does.
+#
+# The granularity is not decoration: ``comfy workflow`` is a MIXED group. Its
+# graph-shaped subcommands resolve ``object_info`` from a server and declare both
+# options, while ``workflow notes`` is an offline read of the file on disk and
+# declares NEITHER (``comfy_cli/command/workflow.py``) — so a verb-level
+# allowlist would hand ``notes`` an option typer has never heard of and turn a
+# working local call into a usage error. Any new mixed group belongs here as a
+# frozenset for the same reason; only a group that is uniform gets ``None``.
+#
+# ⚠️ BLOCKED UPSTREAM — the ``validate`` / ``nodes`` / ``workflow`` entries below
+# are NOT SAFE TO SHIP against today's comfy-cli. Declaring ``--host`` is only
+# half of accepting one: everything that resolves ``object_info`` goes through
+# ``comfy_cli.cql.engine._load_from_target``, which REFUSES a non-loopback host
+# in ``--where local`` mode ("Refusing to fetch object_info from non-loopback
+# host … (potential SSRF). Use --where cloud for remote targets") at BOTH the
+# v1.13.0 floor and ``main``. So forwarding a real remote to them turns calls
+# that work today into a hard ``cql_no_graph`` error. ``run`` / ``jobs`` /
+# ``run-template`` are unaffected — they reach the server through
+# ``host_port.resolve_host_port``, not through that loader. Lifting the guard for
+# an EXPLICIT ``--host`` (the way ``run`` already trusts one) is a comfy-cli
+# change; until it lands, this table must keep only the three run/job verbs.
+#
+# What is forwarded, and why each is safe (verified against comfy-cli v1.13.0 —
+# the floor ``_check_comfy_version`` enforces — and against its ``main``):
+#
+#   * ``run`` / ``jobs`` — the submit-and-poll pair comfy-cli's
+#     ``comfy_cli/host_port.py`` documents. A ``prompt_id`` only means something
+#     to the server that issued it, so these two must never disagree.
+#   * ``run-template`` — declares the same two options and resolves them through
+#     that module's own ``resolve_host_port`` (``comfy_cli/command/templates.py``),
+#     it is just missing from that docstring's list. It is here because SUBMIT and
+#     POLL must land on the SAME server: it backs both ``run_template`` and
+#     ``generate_image``, and while it was absent the flow did not merely run on
+#     the wrong box, it could not complete at all — the run executed locally,
+#     ``wait_for_job`` (a ``jobs`` verb, forwarded) polled the configured remote,
+#     and the local ``prompt_id`` came back ``prompt_not_found`` from a queue it
+#     was never submitted to.
+#   * ``validate`` — ``comfy validate`` reads the live ``object_info`` it checks a
+#     graph against from a server, and takes ``--host`` / ``--port`` to say which
+#     (``comfy_cli/cmdline.py``). Without them the verdict described THIS machine
+#     while ``run_workflow`` / ``run_template`` submitted elsewhere, so a workflow
+#     could pass the check here and fail there on a node the remote lacks — the
+#     advisory was answering about the wrong install.
+#   * ``nodes`` — every subcommand this server calls (``ls`` / ``show`` /
+#     ``search`` / ``upstream`` / ``downstream`` / ``path`` / ``types`` /
+#     ``categories``) is host-annotated in ``comfy_cli/command/nodes.py``; they all
+#     read the same live ``object_info``, so they answer about whichever install
+#     the graph will actually run on. (``nodes refresh`` takes no host, but this
+#     server does not wrap it — if it ever does, ``nodes`` becomes a frozenset.)
+#   * ``workflow slots`` / ``set-slot`` / ``vary`` — these resolve a workflow's
+#     slots against ``object_info`` too, so the slots they report and write are
+#     the ones the target install actually exposes.
+#
+# Adding a verb here is only safe when comfy-cli actually accepts the flags on it
+# — otherwise the forward turns every call into "No such option". Every entry
+# above is present at the enforced floor (v1.13.0), with one deliberate
+# exception: ``run-template`` shipped WITH both options in that same release, so
+# a comfy-cli old enough to reject ``--host`` here has no ``run-template`` at all
+# and fails on the verb before the flags are ever parsed. That argument is about
+# RELEASED comfy-cli, and the floor guard deliberately fails OPEN, so a fork or
+# source build carrying one of these verbs with its options stripped would still
+# get a Click usage error rather than a graceful degrade. No probe is added for
+# it because the exposure is not any one verb's: ``run`` and ``jobs`` have been
 # forwarded unprobed all along and would fail the same way. Probing (the
 # ``_comfy_run_takes_allow_spend`` shape) is the fix if that ever stops being
-# hypothetical — for ALL THREE verbs, not just this one.
+# hypothetical — for the whole table, not for one entry.
 #
 # Deliberately NOT forwarded:
-#   * ``env`` / ``download`` / ``upload`` / ``templates`` / ``models`` /
-#     ``generate`` / the lifecycle verbs take NO ``--host`` / ``--port`` at all,
-#     so forwarding would error "No such option" — they stay local-only. That is
-#     not always a functional limit: ``download`` still collects a REMOTE job's
-#     files, because it resolves the ``prompt_id`` from the state file this
-#     machine wrote at submit (which records absolute ``/view`` URLs on the
-#     remote) instead of asking a server — see ``fetch_outputs``.
-#   * ``nodes`` / ``validate`` DO accept ``--host`` / ``--port`` in current
-#     comfy-cli, but remoting live discovery/validation is out of scope here;
-#     forwarding them is a clean follow-up. Their local answers are advisory —
-#     ``run_workflow`` and ``run_template`` already submit to a remote whose node
-#     set a local check cannot see.
+#   * ``env`` / ``download`` / ``upload`` / ``templates`` / ``models`` / ``model``
+#     / ``generate`` / ``system-stats`` / ``free`` / ``which`` / the lifecycle
+#     verbs take NO ``--host`` / ``--port`` at all (only ``--where``), so
+#     forwarding would error "No such option" — they stay local-only. Giving them
+#     a target is comfy-cli work, not this repo's. That is not always a functional
+#     limit: ``download`` still collects a REMOTE job's files, because it resolves
+#     the ``prompt_id`` from the state file this machine wrote at submit (which
+#     records absolute ``/view`` URLs on the remote) instead of asking a server —
+#     see ``fetch_outputs``.
+#   * ``workflow notes`` — see the mixed-group note above.
 # Forwarding is a no-op for the local default regardless, so unconfigured
 # behavior is unchanged for every tool.
-_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "run-template", "jobs"})
+_TARGET_AWARE: dict[str, frozenset[str] | None] = {
+    "run": None,
+    "jobs": None,
+    "run-template": None,
+    "validate": None,
+    "nodes": None,
+    "workflow": frozenset({"slots", "set-slot", "vary"}),
+}
 
 # The envelope schema major version this server speaks. comfy-cli tags every
 # result with a ``schema`` like ``envelope/1``; the whole contract (result
@@ -1400,21 +1454,31 @@ def _comfy_target() -> tuple[str, int, str] | None:
 
 
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
-    """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
+    """Append ``--host`` / ``--port`` to a target-aware call, if configured.
 
     The flags are injected into the SUBCOMMAND args (after the ``run`` /
-    ``run-template`` / ``jobs`` verb), never into the global ``--json`` /
-    ``--where`` prefix, since ``--host`` / ``--port`` are subcommand options.
-    A no-op for the local default (``_comfy_target`` is None) and for any
-    subcommand that doesn't accept the flags (see :data:`_TARGET_AWARE_SUBCOMMANDS`),
-    so unconfigured behavior is byte-identical to today.
+    ``nodes show`` / … verb), never into the global ``--json`` / ``--where``
+    prefix, since ``--host`` / ``--port`` are subcommand options. A no-op for the
+    local default (``_comfy_target`` is None) and for any call that doesn't
+    accept the flags (see :data:`_TARGET_AWARE`), so unconfigured behavior is
+    byte-identical to today.
+
+    The lookup is (verb, subcommand), not verb alone, because ``comfy workflow``
+    is a mixed group — see :data:`_TARGET_AWARE`.
     """
-    # Check the verb FIRST, then resolve the target. A malformed
-    # COMFYUI_URL/PORT must not brick local-only verbs (server_info's `env`,
-    # download, the stop/logs lifecycle) that never touch the remote — they'd
-    # otherwise raise ComfyCliError here despite ignoring the target entirely,
-    # breaking the "local behavior unchanged" contract (BE-3869 review).
-    if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
+    # Decide from the ARGV alone first, and only then resolve the target. A
+    # malformed COMFYUI_URL/PORT must not brick calls that never touch the remote
+    # (server_info's `env`, download, `workflow notes`, the stop/logs lifecycle)
+    # — they'd otherwise raise ComfyCliError here despite ignoring the target
+    # entirely, breaking the "local behavior unchanged" contract (BE-3869
+    # review). `test_remote_host.py` pins both halves of that ordering.
+    if not args or args[0] not in _TARGET_AWARE:
+        return args
+    subcommands = _TARGET_AWARE[args[0]]
+    if subcommands is not None and (len(args) < 2 or args[1] not in subcommands):
+        # A subcommand of a mixed group that takes no target (or a bare verb, or
+        # one comfy-cli grew since this table was written): pass through exactly
+        # as an unlisted verb does, rather than guessing it accepts the flags.
         return args
     target = _comfy_target()
     if target is None:
@@ -1439,7 +1503,7 @@ def _remote_shared_models_optin() -> bool:
 def _reject_remote_model_download() -> None:
     """Refuse a model download while a REMOTE ComfyUI target is configured.
 
-    ``comfy model download`` is not in :data:`_TARGET_AWARE_SUBCOMMANDS` and has
+    ``comfy model download`` is not in :data:`_TARGET_AWARE` and has
     no ``--host`` / ``--port`` to be added to it: comfy-cli resolves the
     destination from ``get_workspace()``, i.e. the models directory of the
     machine running THIS server. So with ``COMFYUI_URL`` / ``COMFYUI_HOST``
@@ -6563,7 +6627,7 @@ def fetch_outputs(
 
     That ``local`` means "not Comfy Cloud", NOT "not a remote ComfyUI". This verb
     takes no ``--host`` / ``--port`` and none is forwarded (see
-    :data:`_TARGET_AWARE_SUBCOMMANDS`), yet it still collects a job that ran on a
+    :data:`_TARGET_AWARE`), yet it still collects a job that ran on a
     configured remote — because it never asks a server which job that is. The
     comfy-cli run that SUBMITTED the job wrote a state file on THIS machine keyed
     by ``prompt_id``, and against a non-loopback target that file records each
@@ -8420,17 +8484,22 @@ def _unchecked(summary: str, reason: str) -> dict:
 
 
 def _local_template_check(workflow_path: str) -> dict:
-    """Cross-check a fetched template against the LOCAL install's ``object_info``.
+    """Cross-check a fetched template against the target install's ``object_info``.
 
     The gallery is served fresh from ``Comfy-Org/workflow_templates`` while the
     user's ComfyUI is whatever they installed, so a template can legitimately
     reference a node class — or an input option inside one, e.g. a partner
-    model key added in a later release — that this install does not expose yet.
+    model key added in a later release — that the install does not expose yet.
     Discovery then succeeds and the RUN fails, which is a bad place to find out.
     This runs ``comfy validate --workflow <path>`` (the same engine
     ``validate_workflow`` exposes: class_types, input shapes, enum values, edge
     wiring, all read from the running server's live ``object_info``) and turns
     its report into a block the agent can relay.
+
+    "Local" in the name is historical: ``validate`` is target-aware
+    (:data:`_TARGET_AWARE`), so with ``COMFYUI_URL`` / ``COMFYUI_HOST`` set the
+    comparison is made against the REMOTE the run will land on rather than this
+    machine — which is what makes the verdict worth relaying at all.
 
     Advisory only, and deliberately fail-OPEN: the template is already written
     and every caller still gets its path, a negative verdict is comfy-cli's own
@@ -8452,7 +8521,10 @@ def _local_template_check(workflow_path: str) -> dict:
                 "(the live node catalog was unreachable — the server may not be "
                 "running). The template was still written. Start ComfyUI with "
                 "`launch_comfyui`, then re-check with "
-                "`validate_workflow(workflow_path=...)`. "
+                "`validate_workflow(workflow_path=...)`. If a remote target is "
+                "configured (`server_info` reports it as `comfy_target`), the "
+                "check was aimed THERE — start or reach that machine instead; "
+                "`launch_comfyui` only starts the local one. "
                 f"Details: {str(exc)[:_MAX_ERROR_FIELD_CHARS]}",
                 "check_unavailable",
             )
@@ -8724,16 +8796,21 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
 
 @mcp.tool()
 def search_nodes(query: str) -> Any:
-    """Search node classes in the LOCAL ComfyUI's live ``object_info``.
+    """Search node classes in the targeted ComfyUI's live ``object_info``.
 
-    Wraps ``comfy nodes search <query>``. Because the catalog is read from the
-    user's running install, results include their INSTALLED custom nodes — not a
+    Wraps ``comfy nodes search <query>``. Because the catalog is read from a
+    running install, results include its INSTALLED custom nodes — not a
     static/bundled catalog. Use this to find the class name of a node (e.g.
     "KSampler", "load image") before authoring or repairing a workflow graph;
     pass the returned name to ``get_node`` for its full schema.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the catalog comes
+    from that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     # Bare positional: a leading-dash query is read as an option, not a search
@@ -8747,16 +8824,21 @@ def search_nodes(query: str) -> Any:
 
 @mcp.tool()
 def get_node(name: str) -> Any:
-    """Return one node class's full input/output schema from the live local catalog.
+    """Return one node class's full input/output schema from the live catalog.
 
     Wraps ``comfy nodes show <ClassName>``. ``name`` is the node's class name
     (as returned by ``search_nodes``). The schema — required/optional inputs,
     their types and defaults, and outputs — is what an agent needs to author or
-    repair a workflow graph. Reflects the user's live install, so it resolves
-    custom-node classes too (not just built-ins).
+    repair a workflow graph. Reflects a live install, so it resolves custom-node
+    classes too (not just built-ins).
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the schema comes
+    from that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     # Bare positional: a leading-dash name is read as an option rather than the
@@ -8774,7 +8856,7 @@ def list_nodes(
     pack: str = "",
     label: str = "",
 ) -> Any:
-    """List node classes from the live local ``object_info``, with optional filters.
+    """List node classes from the live ``object_info``, with optional filters.
 
     Wraps ``comfy nodes ls``. Each argument, when non-empty, adds the matching
     filter flag (empty ones are omitted, so a bare call lists everything):
@@ -8794,11 +8876,16 @@ def list_nodes(
       comfy-cli annotates (a purely local custom node carries none). This is not
       a display-name search; use ``search_nodes`` for that.
 
-    Reads the user's live install, so results include installed custom nodes —
-    the broad "what nodes can do X?" companion to ``search_nodes``' name search.
+    Reads a live install, so results include its installed custom nodes — the
+    broad "what nodes can do X?" companion to ``search_nodes``' name search.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the catalog comes
+    from that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     args = ["nodes", "ls"]
@@ -8828,11 +8915,16 @@ def nodes_upstream(name: str, limit: int | None = None) -> Any:
 
     Wraps ``comfy nodes upstream <name> [--limit N]``. Answers "what can I wire
     INTO this node?" — the candidates that produce the types ``name`` accepts,
-    computed against the live local ``object_info`` (custom nodes included). Pass
+    computed against the live ``object_info`` (custom nodes included). Pass
     ``limit`` to cap the number of results; omit it for the full set.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the graph comes from
+    that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     # Bare positional, and it sits beside this command's own `--limit`: a
@@ -8851,12 +8943,16 @@ def nodes_downstream(name: str, limit: int | None = None) -> Any:
 
     Wraps ``comfy nodes downstream <name> [--limit N]``. Answers "what can I wire
     this node INTO?" — the candidates whose inputs accept the types ``name``
-    produces, computed against the live local ``object_info`` (custom nodes
-    included). Pass ``limit`` to cap the number of results; omit it for the full
-    set.
+    produces, computed against the live ``object_info`` (custom nodes included).
+    Pass ``limit`` to cap the number of results; omit it for the full set.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the graph comes from
+    that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     # Bare positional, and it sits beside this command's own `--limit`: a
@@ -8878,11 +8974,16 @@ def nodes_path(
     Wraps ``comfy nodes path <FROM> <TO> --max-depth N --max-paths N``. Given two
     connection types (e.g. ``MODEL`` → ``IMAGE``), returns sequences of nodes
     whose wiring carries a value from ``from_type`` to ``to_type`` over the live
-    local ``object_info`` graph. ``max_depth`` bounds the chain length and
+    ``object_info`` graph. ``max_depth`` bounds the chain length and
     ``max_paths`` caps how many routes are returned.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the graph comes from
+    that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     # Two bare positionals ahead of `--max-depth` / `--max-paths`: a leading-dash
@@ -8912,15 +9013,20 @@ def nodes_path(
 
 @mcp.tool()
 def nodes_types() -> Any:
-    """List every connection type in the live local graph, ranked by connectivity.
+    """List every connection type in the live graph, ranked by connectivity.
 
     Wraps ``comfy nodes types``. Returns the set of edge types (``MODEL``,
-    ``IMAGE``, ``LATENT``, ``CONDITIONING``, …) present across the user's
-    installed nodes, ordered by how connective each is — the vocabulary you wire
+    ``IMAGE``, ``LATENT``, ``CONDITIONING``, …) present across the targeted
+    install's nodes, ordered by how connective each is — the vocabulary you wire
     with. Reflects custom nodes, so install-specific types show up too.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the types come from
+    that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     return _run_comfy("nodes", "types", timeout=60.0)
@@ -8928,15 +9034,20 @@ def nodes_types() -> Any:
 
 @mcp.tool()
 def nodes_categories() -> Any:
-    """Return the node category tree from the live local ``object_info``.
+    """Return the node category tree from the live ``object_info``.
 
     Wraps ``comfy nodes categories``. Gives the menu-category hierarchy the
-    user's installed nodes fall under — a map for browsing what is available by
+    targeted install's nodes fall under — a map for browsing what is available by
     area (loaders, sampling, image, …) rather than by name. Reflects the live
     install, so custom-node categories appear too.
 
-    Freshness: LIVE — read from the running ComfyUI's ``object_info`` on every
-    call; reflects exactly what THIS install has (including its staleness: an
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the tree comes from
+    that REMOTE ComfyUI, the same machine ``run_workflow`` / ``run_template``
+    submit to. Unconfigured, it reads this machine's.
+
+    Freshness: LIVE — read from the targeted ComfyUI's ``object_info`` on every
+    call; reflects exactly what THAT install has (including its staleness: an
     outdated install lists outdated nodes).
     """
     return _run_comfy("nodes", "categories", timeout=60.0)
@@ -10065,7 +10176,7 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
 
 @mcp.tool()
 def validate_workflow(workflow_path: str) -> Any:
-    """Pre-flight a workflow against the live local ComfyUI before running it.
+    """Pre-flight a workflow against the live ComfyUI before running it.
 
     Wraps ``comfy validate --workflow <path>``; call it as
     ``validate_workflow(workflow_path=...)``. Checks the workflow's
@@ -10075,6 +10186,13 @@ def validate_workflow(workflow_path: str) -> Any:
     raises :class:`ComfyCliError` carrying comfy-cli's structured error code
     (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
     missing-model problem stays actionable instead of failing deep inside a run.
+
+    Target: follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`)
+    — with one set, ``--host`` / ``--port`` are forwarded and the workflow is
+    checked against that REMOTE ComfyUI's catalog, i.e. the same install
+    ``run_workflow`` / ``run_template`` will actually run it on. That is the point
+    of forwarding here: a check answered by this machine could pass while the run
+    failed there on a node the remote lacks.
 
     Known blind spots (upstream comfy-cli, fixes in progress): a passing result
     does NOT currently guarantee the server will accept the workflow.
@@ -10140,6 +10258,14 @@ def list_workflow_slots(workflow_path: str) -> Any:
     Slots are tweakable PARAMETERS only. Note/MarkdownNote documentation text is
     not a slot — use ``list_workflow_notes`` to read what the template's author
     wrote (trigger words, model links, usage instructions).
+
+    Target: comfy-cli resolves a workflow's slots against a live ``object_info``,
+    so this follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see
+    :func:`_comfy_target`) — with one set, ``--host`` / ``--port`` are forwarded
+    and the slots reported are the ones the REMOTE install exposes, i.e. the
+    machine ``run_workflow`` / ``run_template`` submit to. ``list_workflow_notes``
+    is the exception in this group: it is an offline file read that takes no
+    target at all.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
@@ -10430,6 +10556,12 @@ def set_workflow_slot(
         ]
         modified = set_workflow_slot(path, overrides)
         # write `modified` to disk (or call with stdout=False), then run_workflow
+
+    Target: comfy-cli resolves the addresses against a live ``object_info``, so
+    this follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`) —
+    with one set, ``--host`` / ``--port`` are forwarded and the edit is resolved
+    against the REMOTE install the run will land on. The file it reads and writes
+    is always the local ``workflow_path``; only the slot resolution is remoted.
     """
     # `workflow_path` and each override are splatted in as bare positionals, so
     # a leading-dash entry is read by comfy-cli as a flag — e.g. `"--stdout"`
@@ -10692,6 +10824,12 @@ def vary_workflow(
     stdout; set ``out_dir`` to instead write ``<stem>_<N>.json`` files there (and
     forward ``--out-dir``). Run each variant with ``run_workflow`` to sweep a
     parameter grid.
+
+    Target: comfy-cli resolves the addresses against a live ``object_info``, so
+    this follows ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see :func:`_comfy_target`) —
+    with one set, ``--host`` / ``--port`` are forwarded and the variants are
+    resolved against the REMOTE install the runs will land on. The files are
+    still read and written here; only the slot resolution is remoted.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path. `slots` and `out_dir` ride behind `--slot`

@@ -117,20 +117,26 @@ def test_section_warns_against_setting_both(section: str):
 
 
 def test_target_aware_tools_do_not_claim_to_be_local_only():
-    """The run/job tools FOLLOW ``COMFYUI_URL``; their summaries must not deny it.
+    """Every target-aware tool FOLLOWS ``COMFYUI_URL``; no summary may deny it.
 
-    ``_TARGET_AWARE_SUBCOMMANDS`` is ``{"run", "run-template", "jobs"}``, so
-    exactly these tools are diverted to a configured remote. Their one-line
-    summaries used to open with "LOCAL", which is the one place the local/remote
-    distinction is load-bearing and was simply wrong. The tools that genuinely
-    stay on this machine (lifecycle, ``fetch_outputs``, discovery, …) keep saying
-    so, and are deliberately not covered here.
+    ``_TARGET_AWARE`` covers ``run`` / ``run-template`` / ``jobs`` (submit and
+    poll) plus ``validate`` / ``nodes`` / ``workflow slots``-``set-slot``-``vary``
+    (everything that reads a live node catalog), so exactly these tools are
+    diverted to a configured remote. Their one-line summaries used to open with
+    "LOCAL", which is the one place the local/remote distinction is load-bearing
+    and was simply wrong. The tools that genuinely stay on this machine
+    (lifecycle, ``fetch_outputs``, ``system_stats`` / ``free_memory``,
+    ``download_model``, the offline ``list_workflow_notes``, …) keep saying so,
+    and are deliberately not covered here.
 
     ``generate_image`` and ``run_template`` are the ``run-template`` pair: they
     were the tools whose summaries said LOCAL *while* their submissions really
     did stay local, and both halves moved together — forwarding the flags without
     correcting the summary would leave the one sentence a caller reads before
     deciding which machine a job lands on saying the opposite of what happens.
+    The discovery/validation block below is the same pairing one step later: a
+    summary that still says the answer describes the LOCAL install is the single
+    sentence an agent reads before trusting a node lookup or a pre-flight verdict.
     """
     for tool in (
         server.run_workflow,
@@ -141,6 +147,18 @@ def test_target_aware_tools_do_not_claim_to_be_local_only():
         server.watch_job,
         server.cancel_job,
         server.get_queue,
+        server.validate_workflow,
+        server.search_nodes,
+        server.get_node,
+        server.list_nodes,
+        server.nodes_upstream,
+        server.nodes_downstream,
+        server.nodes_path,
+        server.nodes_types,
+        server.nodes_categories,
+        server.list_workflow_slots,
+        server.set_workflow_slot,
+        server.vary_workflow,
     ):
         lines = (tool.__doc__ or "").strip().splitlines()
         # Report a missing docstring as itself: under `python -OO` (or if one is
