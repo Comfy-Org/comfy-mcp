@@ -71,6 +71,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple, TypeVar
 from urllib.parse import urlparse
@@ -494,18 +495,21 @@ _DOWNLOAD_SYNC_TIMEOUT = 1800.0
 # rather than one status poll.
 _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 
-# Sleep between `model download-status` polls. Matches `wait_for_job`'s cadence:
-# a download's state file is rewritten at most once a second, so polling faster
-# buys nothing.
-_DOWNLOAD_POLL_INTERVAL = 2.0
+# Sleep between polls in the shared bounded-poll loop (`_poll_until_terminal`) —
+# `wait_for_job`'s `jobs status` polls and `_poll_download`'s
+# `model download-status` polls run on the same cadence: a job's queue state and
+# a download's state file are each rewritten at most once a second, so polling
+# faster buys nothing. One named constant rather than two identical 2.0s that
+# would only ever drift apart.
+_POLL_INTERVAL = 2.0
 
-# Per-poll subprocess budget for `wait_for_job`'s `comfy jobs status` calls, and
-# the smallest slice worth spawning one for. `wait_for_job` caps each poll to
-# whatever is left of the caller's own bound, so a wedged status call can't hold
-# a one-second wait open for the full budget; the floor keeps a sliver of
-# remaining time from spawning a poll that is guaranteed to hit its own deadline.
-# `_poll_download` polls `comfy model download-status` on the same terms and
-# shares these two rather than minting a second pair that would only ever drift.
+# Per-poll subprocess budget for the shared bounded-poll loop's calls
+# (`wait_for_job`'s `comfy jobs status`, `_poll_download`'s
+# `comfy model download-status`), and the smallest slice worth spawning one for.
+# Each poll is capped to whatever is left of the caller's own bound, so a wedged
+# status call can't hold a one-second wait open for the full budget; the floor
+# keeps a sliver of remaining time from spawning a poll that is guaranteed to hit
+# its own deadline.
 _JOB_STATUS_POLL_TIMEOUT = 60.0
 _MIN_JOB_STATUS_POLL_TIMEOUT = 1.0
 
@@ -6157,6 +6161,104 @@ def _is_terminal(status: Any) -> bool:
     return False
 
 
+def _poll_until_terminal(
+    *args: str,
+    timeout_seconds: float,
+    is_terminal: Callable[[Any], bool],
+    timed_out_extra: dict[str, Any] | None = None,
+) -> Any:
+    """Poll ``comfy <args>`` until ``is_terminal`` or ``timeout_seconds`` expires.
+
+    The one bounded-poll loop behind :func:`wait_for_job` (``jobs status``) and
+    :func:`_poll_download` (``model download-status``). Those two ran
+    statement-for-statement identical loops and differ only in argv, in the
+    terminal predicate, and in the extra keys their timed-out payload carries —
+    so the timing rules below hold identically for both, and cannot drift apart.
+
+    Returns the first payload ``is_terminal`` accepts, or ``{"timed_out": True,
+    **timed_out_extra, "status": <last payload>}`` on expiry (the extras go in
+    FRONT of ``status``, preserving the key order each caller already returned).
+    A terminal FAILURE payload is returned like any other terminal one; deciding
+    whether that is an error is the caller's job.
+
+    ``timeout_seconds`` must already be bounded by the caller (see
+    :func:`_bounded_timeout`): left raw, ``inf`` keeps ``remaining`` positive
+    forever and NaN makes every comparison False, either of which re-spawns
+    comfy-cli until the client gives up. Extracting the loop moved that clamp
+    away from the code it protects, so the precondition is CHECKED here rather
+    than merely documented — a third caller that forgets ``_bounded_timeout``
+    gets a raise, not an unbounded spawn loop. The ceiling itself stays the
+    caller's (each tool has its own), so this is only the finiteness half —
+    and only that half: a bound at or below zero is legal here and reaches the
+    one-poll minimum on purpose (``download_model`` spends what its submit left,
+    which can land at or under zero, and still wants a real status back).
+    """
+    if not math.isfinite(timeout_seconds):
+        raise ComfyCliError(
+            f"invalid timeout_seconds: {timeout_seconds!r} — expected a finite "
+            "number of seconds (clamp with `_bounded_timeout` first)."
+        )
+    # `timed_out` and `status` are the loop's OWN keys: `download_model` reads
+    # `result.get("timed_out")` to tell an expiry from a real result, and the
+    # unpack below sits after the `timed_out` literal — so an extra carrying
+    # either key would win, silently turning a timeout into a payload that falls
+    # through to `_download_failed`. No caller passes one; reject rather than let
+    # dict-unpack order quietly decide the envelope's meaning.
+    extra = timed_out_extra or {}
+    reserved = sorted(extra.keys() & {"timed_out", "status"})
+    if reserved:
+        raise ComfyCliError(
+            f"timed_out_extra may not carry reserved keys: {reserved} — they are "
+            "the poll loop's own."
+        )
+    deadline = time.monotonic() + timeout_seconds
+    last: Any = None
+    while True:
+        # `last is not None` keeps the one-poll minimum: a bound small enough to
+        # expire before the first poll (`timeout_seconds=1e-9`) must still report
+        # a real status rather than the degenerate `{"status": None}`.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and last is not None:
+            return {"timed_out": True, **extra, "status": last}
+        # Cap each poll's own subprocess budget to what is left of the caller's
+        # bound. With a fixed 60s per poll the overall wait was only bounded
+        # between polls, so a wedged poll could hold a `timeout_seconds=1` call
+        # open for a full minute. The floor keeps a sliver of remaining time from
+        # spawning a poll that is guaranteed to hit its own deadline (and raise)
+        # instead of returning `timed_out`; it overshoots the caller's bound by
+        # at most that floor, never by 60s.
+        try:
+            last = _run_comfy(
+                *args,
+                timeout=min(
+                    _JOB_STATUS_POLL_TIMEOUT,
+                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
+                ),
+            )
+        except ComfyCliError as exc:
+            # Capping the poll to the time left means its deadline now doubles as
+            # the CALLER's: a slow-but-healthy poll (cold start plus imports)
+            # near the bound is killed where the old fixed 60s budget would have
+            # let it finish. That is this call expiring, not comfy-cli failing,
+            # so honor the documented envelope — and keep the last real status
+            # instead of discarding it with the exception. Two timeouts still
+            # raise, because neither is the caller's bound expiring: one with
+            # time left on that bound (the poll burned the full
+            # `_JOB_STATUS_POLL_TIMEOUT` — comfy-cli is genuinely wedged, which
+            # raised before this cap existed too), and one with no status yet
+            # read, where `{"status": None}` would bury a real failure under a
+            # contentless envelope.
+            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
+                raise
+            return {"timed_out": True, **extra, "status": last}
+        if is_terminal(last):
+            return last
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"timed_out": True, **extra, "status": last}
+        time.sleep(min(_POLL_INTERVAL, remaining))
+
+
 @mcp.tool()
 def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     """Wait (bounded) for a submitted job to reach a terminal status.
@@ -6181,59 +6283,17 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     prompt_id = _guard_prompt_id(prompt_id)
     # "Bounded by design" only holds if the bound itself is bounded. Left raw,
     # `inf` keeps `remaining` positive forever and NaN makes every comparison
-    # False (so `remaining <= 0` never fires and `min(2.0, nan)` yields 2.0) —
-    # either way the poll loop re-spawns `comfy jobs status` until the client
-    # gives up. See `_bounded_timeout`.
+    # False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
+    # yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
+    # `comfy jobs status` until the client gives up. See `_bounded_timeout`.
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
-    deadline = time.monotonic() + timeout_seconds
-    poll_interval = 2.0
-    last: Any = None
-    while True:
-        # `last is not None` keeps the one-poll minimum: a bound small enough to
-        # expire before the first poll (`timeout_seconds=1e-9`) must still report
-        # a real status rather than the degenerate `{"status": None}`.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 and last is not None:
-            return {"timed_out": True, "status": last}
-        # Cap each poll's own subprocess budget to what is left of the caller's
-        # bound. With a fixed 60s per poll the overall wait was only bounded
-        # between polls, so a wedged `comfy jobs status` could hold a
-        # `timeout_seconds=1` call open for a full minute. The floor keeps a
-        # sliver of remaining time from spawning a poll that is guaranteed to
-        # hit its own deadline (and raise) instead of returning `timed_out`; it
-        # overshoots the caller's bound by at most that floor, never by 60s.
-        try:
-            last = _run_comfy(
-                "jobs",
-                "status",
-                prompt_id,
-                timeout=min(
-                    _JOB_STATUS_POLL_TIMEOUT,
-                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
-                ),
-            )
-        except ComfyCliError as exc:
-            # Capping the poll to the time left means its deadline now doubles as
-            # the CALLER's: a slow-but-healthy `comfy jobs status` (cold start
-            # plus imports) near the bound is killed where the old fixed 60s
-            # budget would have let it finish. That is this call expiring, not
-            # comfy-cli failing, so honor the documented envelope — and keep the
-            # last real status instead of discarding it with the exception.
-            # Two timeouts still raise, because neither is the caller's bound
-            # expiring: one with time left on that bound (the poll burned the
-            # full `_JOB_STATUS_POLL_TIMEOUT` — comfy-cli is genuinely wedged,
-            # which raised before this cap existed too), and one with no status
-            # yet read, where `{"status": None}` would bury a real failure under
-            # a contentless envelope.
-            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
-                raise
-            return {"timed_out": True, "status": last}
-        if _is_terminal(last):
-            return last
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return {"timed_out": True, "status": last}
-        time.sleep(min(poll_interval, remaining))
+    return _poll_until_terminal(
+        "jobs",
+        "status",
+        prompt_id,
+        timeout_seconds=timeout_seconds,
+        is_terminal=_is_terminal,
+    )
 
 
 @mcp.tool()
@@ -9481,6 +9541,148 @@ def _legacy_download_way_out(at_cap: bool) -> str:
     )
 
 
+async def _legacy_foreground_download(
+    args: list[str],
+    *,
+    deadline: float | None,
+    relative_path: str | None,
+    filename: str | None,
+    submit_exc: ComfyCliError,
+) -> Any:
+    """Run ``download_model``'s transfer the OLD way, in the foreground.
+
+    The fallback for a comfy-cli that predates ``model download --background``
+    and rejected it at parse time. ``download_model`` calls this from the submit's
+    own ``except`` block once :func:`_is_missing_option_error` has confirmed that
+    is what happened; *submit_exc* is that rejection, kept so the failures raised
+    here still chain from it.
+
+    It lives out here rather than inline because it is VESTIGIAL: it is the whole
+    of the pre-``--background`` contract — its own deadline arithmetic, its own
+    pre-spawn refusal, its own timeout wrapping, its own payload marker — and once
+    this repo's comfy-cli floor rises past that release the fallback is deletable
+    as one function rather than excavated out of the middle of the tool.
+
+    *args* is the already-built ``model download …`` argv (WITHOUT
+    ``--background``); *deadline* is the waiting caller's end-to-end
+    ``time.monotonic()`` budget, or ``None`` for ``wait=False``, which keeps the
+    full cap. *relative_path* / *filename* are the caller's own, needed only to
+    name where an incomplete file may sit — no ``download_id`` is ever minted on
+    this path, so the messages have to say it themselves.
+
+    Returns the payload ``download_model`` returns (the marker already applied),
+    or raises :class:`ComfyCliError`.
+    """
+    # Bound the foreground transfer by the caller's OWN budget rather than a
+    # silent 30 minutes. `deadline` is set only on the waiting path, and the
+    # submit attempt already spent part of it, so spend the remainder — the same
+    # two-phase spend the `--background` path does with its poll — capped by
+    # `_DOWNLOAD_SYNC_TIMEOUT`, which is this path's ceiling and no longer its
+    # flat bound.
+    #
+    # `wait=False` keeps the full cap: that caller explicitly decoupled from
+    # waiting (the docstring documents that `wait` cannot be honored here at
+    # all), so tightening the bound would only truncate a transfer they never
+    # asked to be quick. What they gain from this runner is the `finally`
+    # reaping on cancellation, not a shorter deadline.
+    if deadline is None:
+        legacy_timeout = _DOWNLOAD_SYNC_TIMEOUT
+    else:
+        remaining = deadline - time.monotonic()
+        if remaining < _MIN_LEGACY_DOWNLOAD_TIMEOUT:
+            # Out of budget: REFUSE without spawning, the same position the
+            # `--background` path takes on a bound too small to resolve the
+            # download at all. Starting a transfer here would be worse than
+            # useless — `comfy model download` writes straight to the final
+            # path, so a child killed a moment after it opened the destination
+            # leaves a truncated file where a complete model may have been,
+            # and the caller would have bought that with a bound that could
+            # never have finished anyway. `timed_out=True` because this IS the
+            # caller's deadline expiring, just detected before the spend
+            # rather than after it.
+            raise ComfyCliError(
+                "the installed comfy-cli predates `model download "
+                "--background`, so the transfer has to run in the FOREGROUND "
+                "inside this call — and the rejected submit left only "
+                f"{max(remaining, 0.0):.1f}s of `timeout_seconds`, under the "
+                f"{_MIN_LEGACY_DOWNLOAD_TIMEOUT:.0f}s minimum a foreground "
+                "transfer is started for. NOTHING was downloaded and nothing "
+                "on disk was touched: comfy-cli writes straight to the final "
+                "path, so starting a transfer only to kill it moments later "
+                f"would truncate {_legacy_download_partial(relative_path, filename)}"
+                f". {_legacy_download_way_out(at_cap=False)}",
+                timed_out=True,
+            ) from submit_exc
+        legacy_timeout = min(_DOWNLOAD_SYNC_TIMEOUT, remaining)
+    # plain_ok=True: `comfy model download` exits 0 with human progress text
+    # and no envelope, so treat a clean exit as success instead of raising
+    # the "returned no JSON" false negative on a download that actually
+    # landed (BE-3345). A real error envelope or a non-zero exit still raises.
+    #
+    # `_run_comfy_async`, NOT `to_thread(_run_comfy, …)`: this is the one
+    # plain-JSON call that runs for the whole length of a multi-GB transfer,
+    # and a thread-offloaded `Popen` cannot be cancelled — a client that gave
+    # up (or a session being torn down) left the `comfy model download` worker
+    # and its partial file orphaned, killable only by pid. The async spawn's
+    # `finally` reaps the tree on cancellation as well as on timeout.
+    try:
+        legacy = await _run_comfy_async(*args, timeout=legacy_timeout, plain_ok=True)
+    # Bound to `legacy_exc`, distinct from the `submit_exc` parameter: this
+    # handler's failure and the rejected submit are two different errors, and the
+    # message below reads both — the CLI's own diagnosis from one, the chain back
+    # to the version gap from the other.
+    except ComfyCliError as legacy_exc:
+        if not legacy_exc.timed_out:
+            raise
+        # A timeout HERE means the bytes were being moved by this very call,
+        # so the kill stopped a real transfer — unlike the `--background`
+        # path, where a timeout leaves a detached worker still going. Say so,
+        # and say where the incomplete file is: the caller cannot check
+        # `download_status` (no id exists) and a partial model on disk looks
+        # exactly like a complete one to `search_models`. APPEND to the
+        # original message so the stderr/stdout tails survive.
+        #
+        # Not deleted for them: the exact path is only fully known when
+        # `filename` was passed, so removing a file guessed from the URL could
+        # delete the wrong one. Reporting it is v1 (see BE-3428 for the
+        # adjacent trust-the-engine's-own-answer theme).
+        #
+        # The way out is keyed on whether the bound that just expired WAS the
+        # cap, not on `wait`: "raise `timeout_seconds`" is dead advice for
+        # `wait=False` (which never reads it here) AND for a waiting caller who
+        # already passed a value at or above the cap.
+        raise ComfyCliError(
+            f"{legacy_exc} (the installed comfy-cli predates `model download "
+            "--background`, so the transfer ran in the FOREGROUND and was "
+            "KILLED at that bound rather than continuing in the background. "
+            "An INCOMPLETE file may remain under "
+            f"{_legacy_download_partial(relative_path, filename)} — no "
+            "`download_id` exists to check it with, so verify or remove it "
+            "yourself. "
+            f"{_legacy_download_way_out(at_cap=legacy_timeout >= _DOWNLOAD_SYNC_TIMEOUT)})",
+            code=legacy_exc.code,
+            no_envelope=legacy_exc.no_envelope,
+            returncode=legacy_exc.returncode,
+            timed_out=True,
+            data=legacy_exc.data,
+        ) from legacy_exc
+    # Mark the legacy path in the payload on BOTH branches rather than only
+    # in the docstring. `wait=False` could not be honored at all here — with
+    # no `--background` there was nothing to detach and no `download_id` to
+    # hand back, so the whole transfer ran inside this call — but a `wait=True`
+    # caller is equally entitled to SEE that it ran on the old path and that
+    # the download family has no id to poll, instead of inferring that from a
+    # missing key. A fast small-file success is exactly the case where the
+    # absence of an id is otherwise invisible.
+    #
+    # Deliberately NOT an error. Refusing here would remove the only way to
+    # download a model on a comfy-cli that predates `--background`, which is
+    # the entire reason this fallback exists; the file did land.
+    if isinstance(legacy, dict):
+        return {**legacy, "background_unsupported": True}
+    return legacy
+
+
 def _download_verb_unsupported(exc: ComfyCliError, verb: str) -> dict[str, Any] | None:
     """The capability-gap degrade for a ``model <verb>`` this comfy-cli lacks.
 
@@ -9529,10 +9731,10 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 
     The blocking half of ``wait_for_download`` and of ``download_model``'s wait
     path, shared so the two can never disagree about what a bound expiring means.
-    Structurally identical to ``wait_for_job``'s loop, including its per-poll
-    subprocess-budget capping — see that tool for why each poll is capped to the
-    time left on the caller's bound, why the floor exists, and why a poll killed
-    at that cap yields the ``timed_out`` payload instead of an error.
+    Runs on ``_poll_until_terminal``, the same bounded-poll loop ``wait_for_job``
+    uses — see it for why each poll is capped to the time left on the caller's
+    bound, why the floor exists, and why a poll killed at that cap yields the
+    ``timed_out`` payload instead of an error.
 
     Returns the terminal status payload, or ``{"timed_out": True, "download_id":
     ..., "status": <last payload>}`` on expiry. A ``failed`` / ``cancelled``
@@ -9540,37 +9742,14 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     turns that into a raise, matching ``wait_for_job``, which likewise hands back
     a failed job's status rather than raising on it.
     """
-    deadline = time.monotonic() + timeout_seconds
-    last: Any = None
-    while True:
-        # `last is not None` keeps the one-poll minimum: a bound small enough to
-        # expire before the first poll must still report a real status.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 and last is not None:
-            return {"timed_out": True, "download_id": download_id, "status": last}
-        try:
-            last = _run_comfy(
-                "model",
-                "download-status",
-                download_id,
-                timeout=min(
-                    _JOB_STATUS_POLL_TIMEOUT,
-                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
-                ),
-            )
-        except ComfyCliError as exc:
-            # This call's bound expiring, not comfy-cli failing — honor the
-            # documented envelope and keep the last real status. See
-            # `wait_for_job` for the two timeouts that still raise.
-            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
-                raise
-            return {"timed_out": True, "download_id": download_id, "status": last}
-        if _is_download_terminal(last):
-            return last
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return {"timed_out": True, "download_id": download_id, "status": last}
-        time.sleep(min(_DOWNLOAD_POLL_INTERVAL, remaining))
+    return _poll_until_terminal(
+        "model",
+        "download-status",
+        download_id,
+        timeout_seconds=timeout_seconds,
+        is_terminal=_is_download_terminal,
+        timed_out_extra={"download_id": download_id},
+    )
 
 
 @mcp.tool()
@@ -9918,116 +10097,18 @@ async def download_model(
         # download the same file twice.
         if not _is_missing_option_error(exc, "--background"):
             raise
-        # Bound the foreground transfer by the caller's OWN budget rather than a
-        # silent 30 minutes. `deadline` is set only on the waiting path, and the
-        # submit attempt above already spent part of it, so spend the remainder —
-        # the same two-phase spend the `--background` path does with its poll —
-        # capped by `_DOWNLOAD_SYNC_TIMEOUT`, which is this path's ceiling and no
-        # longer its flat bound.
-        #
-        # `wait=False` keeps the full cap: that caller explicitly decoupled from
-        # waiting (the docstring documents that `wait` cannot be honored here at
-        # all), so tightening the bound would only truncate a transfer they never
-        # asked to be quick. What they gain from this runner is the `finally`
-        # reaping on cancellation, not a shorter deadline.
-        if deadline is None:
-            legacy_timeout = _DOWNLOAD_SYNC_TIMEOUT
-        else:
-            remaining = deadline - time.monotonic()
-            if remaining < _MIN_LEGACY_DOWNLOAD_TIMEOUT:
-                # Out of budget: REFUSE without spawning, the same position the
-                # `--background` path takes on a bound too small to resolve the
-                # download at all. Starting a transfer here would be worse than
-                # useless — `comfy model download` writes straight to the final
-                # path, so a child killed a moment after it opened the destination
-                # leaves a truncated file where a complete model may have been,
-                # and the caller would have bought that with a bound that could
-                # never have finished anyway. `timed_out=True` because this IS the
-                # caller's deadline expiring, just detected before the spend
-                # rather than after it.
-                raise ComfyCliError(
-                    "the installed comfy-cli predates `model download "
-                    "--background`, so the transfer has to run in the FOREGROUND "
-                    "inside this call — and the rejected submit left only "
-                    f"{max(remaining, 0.0):.1f}s of `timeout_seconds`, under the "
-                    f"{_MIN_LEGACY_DOWNLOAD_TIMEOUT:.0f}s minimum a foreground "
-                    "transfer is started for. NOTHING was downloaded and nothing "
-                    "on disk was touched: comfy-cli writes straight to the final "
-                    "path, so starting a transfer only to kill it moments later "
-                    f"would truncate {_legacy_download_partial(relative_path, filename)}"
-                    f". {_legacy_download_way_out(at_cap=False)}",
-                    timed_out=True,
-                ) from exc
-            legacy_timeout = min(_DOWNLOAD_SYNC_TIMEOUT, remaining)
-        # plain_ok=True: `comfy model download` exits 0 with human progress text
-        # and no envelope, so treat a clean exit as success instead of raising
-        # the "returned no JSON" false negative on a download that actually
-        # landed (BE-3345). A real error envelope or a non-zero exit still raises.
-        #
-        # `_run_comfy_async`, NOT `to_thread(_run_comfy, …)`: this is the one
-        # plain-JSON call that runs for the whole length of a multi-GB transfer,
-        # and a thread-offloaded `Popen` cannot be cancelled — a client that gave
-        # up (or a session being torn down) left the `comfy model download` worker
-        # and its partial file orphaned, killable only by pid. The async spawn's
-        # `finally` reaps the tree on cancellation as well as on timeout.
-        try:
-            legacy = await _run_comfy_async(
-                *args, timeout=legacy_timeout, plain_ok=True
-            )
-        # Bound to `legacy_exc`, NOT `exc`: this handler is nested inside the
-        # submit's own `except ComfyCliError as exc`, and Python deletes an
-        # `except ... as <name>` binding when its block ends — reusing the name
-        # would silently unbind the outer one for any code after this block.
-        except ComfyCliError as legacy_exc:
-            if not legacy_exc.timed_out:
-                raise
-            # A timeout HERE means the bytes were being moved by this very call,
-            # so the kill stopped a real transfer — unlike the `--background`
-            # path, where a timeout leaves a detached worker still going. Say so,
-            # and say where the incomplete file is: the caller cannot check
-            # `download_status` (no id exists) and a partial model on disk looks
-            # exactly like a complete one to `search_models`. APPEND to the
-            # original message so the stderr/stdout tails survive.
-            #
-            # Not deleted for them: the exact path is only fully known when
-            # `filename` was passed, so removing a file guessed from the URL could
-            # delete the wrong one. Reporting it is v1 (see BE-3428 for the
-            # adjacent trust-the-engine's-own-answer theme).
-            #
-            # The way out is keyed on whether the bound that just expired WAS the
-            # cap, not on `wait`: "raise `timeout_seconds`" is dead advice for
-            # `wait=False` (which never reads it here) AND for a waiting caller who
-            # already passed a value at or above the cap.
-            raise ComfyCliError(
-                f"{legacy_exc} (the installed comfy-cli predates `model download "
-                "--background`, so the transfer ran in the FOREGROUND and was "
-                "KILLED at that bound rather than continuing in the background. "
-                "An INCOMPLETE file may remain under "
-                f"{_legacy_download_partial(relative_path, filename)} — no "
-                "`download_id` exists to check it with, so verify or remove it "
-                "yourself. "
-                f"{_legacy_download_way_out(at_cap=legacy_timeout >= _DOWNLOAD_SYNC_TIMEOUT)})",
-                code=legacy_exc.code,
-                no_envelope=legacy_exc.no_envelope,
-                returncode=legacy_exc.returncode,
-                timed_out=True,
-                data=legacy_exc.data,
-            ) from legacy_exc
-        # Mark the legacy path in the payload on BOTH branches rather than only
-        # in the docstring. `wait=False` could not be honored at all here — with
-        # no `--background` there was nothing to detach and no `download_id` to
-        # hand back, so the whole transfer ran inside this call — but a `wait=True`
-        # caller is equally entitled to SEE that it ran on the old path and that
-        # the download family has no id to poll, instead of inferring that from a
-        # missing key. A fast small-file success is exactly the case where the
-        # absence of an id is otherwise invisible.
-        #
-        # Deliberately NOT an error. Refusing here would remove the only way to
-        # download a model on a comfy-cli that predates `--background`, which is
-        # the entire reason this fallback exists; the file did land.
-        if isinstance(legacy, dict):
-            return {**legacy, "background_unsupported": True}
-        return legacy
+        # The whole pre-`--background` contract — its own deadline arithmetic,
+        # pre-spawn refusal, timeout wrapping and payload marker — lives in
+        # `_legacy_foreground_download` so it can be deleted as one function once
+        # this repo's comfy-cli floor rises past that release, rather than being
+        # excavated out of the middle of this tool.
+        return await _legacy_foreground_download(
+            args,
+            deadline=deadline,
+            relative_path=relative_path,
+            filename=filename,
+            submit_exc=exc,
+        )
     # Validate the handle on BOTH paths. `wait=False` hands the envelope straight
     # to the caller, so a malformed or version-skewed one would otherwise leave a
     # transfer running detached behind a payload with nothing to poll or cancel
