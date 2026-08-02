@@ -4274,23 +4274,10 @@ async def generate_image(
     # `spend_consent_required` here would mean the constant above names a paid
     # template — fix the constant, not the consent plumbing.
     try:
-        if not wait:
-            # Fire-and-return: no stream to follow, so keep the plain --json
-            # path — off the event loop, in the same pool `run_template` uses.
-            args.append("--async")
-            return await _in_generate_pool(
-                _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
-            )
-        # Same grace as the submit path above (and as `run_template`): the child
-        # was handed `--timeout=min(budget, 120)`, so for a budget at or under
-        # comfy-cli's 120s cap the engine's deadline and the parent's kill land
-        # on the SAME instant. Without slack the parent can SIGKILL comfy-cli
-        # mid-write of its own structured timeout / `server_not_running` result,
-        # replacing an actionable error with a generic parent kill (and orphaning
-        # an already-enqueued run). The engine must be the side that gives up.
-        return await _run_comfy_streaming(
-            *args, ctx=ctx, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
-        )
+        # Submit-vs-stream and the parent's grace over the engine deadline are
+        # `_run_template_exec`'s, shared with `run_template` — this tool runs the
+        # same verb, so it spends the budget the same way.
+        return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
     except ComfyCliError as exc:
         hinted = _t2i_slot_hint(
             exc, template, prompt_slot, checkpoint_slot if checkpoint else None
@@ -5811,6 +5798,41 @@ def _run_template_argv(
     return args, budget
 
 
+async def _run_template_exec(
+    args: list[str], budget: float, *, wait: bool, ctx: Context | None
+) -> Any:
+    """Run a built ``run-template`` argv on the branch ``wait`` selects.
+
+    The dispatch half of :func:`_run_template_argv`, shared by
+    :func:`run_template` and :func:`generate_image` for the same reason: this is
+    where the budget that helper returned is actually SPENT, so the rule for
+    spending it belongs in one place rather than in two verbatim copies. ``args``
+    is that helper's argv plus whatever consent flag the caller resolved — the
+    caller owns consent, this owns the run.
+
+    ``wait=False`` is fire-and-return: submit ``--async`` and hand back a
+    ``prompt_id`` to poll. There is no stream to follow, so it keeps the plain
+    ``--json`` path, off the event loop in the dedicated generate pool.
+    ``wait=True`` streams: ``comfy run-template`` hands the filled graph to the
+    same comfy-cli run path ``comfy run`` uses, so under ``--json-stream`` it
+    emits the same per-node events, and a run that can block for an hour (long
+    video runs) must report progress rather than sit silent.
+
+    Both branches allow the parent :data:`_RUN_TEMPLATE_TIMEOUT_GRACE` beyond the
+    engine's budget. The child was handed ``--timeout=min(budget, 120)``, so for a
+    budget at or under comfy-cli's 120s cap the engine's deadline and the parent's
+    kill would otherwise land on the SAME instant. Without slack the parent can
+    SIGKILL comfy-cli mid-write of its own structured timeout /
+    ``server_not_running`` result, replacing an actionable error with a generic
+    parent kill (and orphaning an already-enqueued run). The engine must be the
+    side that gives up.
+    """
+    timeout = budget + _RUN_TEMPLATE_TIMEOUT_GRACE
+    if not wait:
+        return await _in_generate_pool(_run_comfy, *args, "--async", timeout=timeout)
+    return await _run_comfy_streaming(*args, ctx=ctx, timeout=timeout)
+
+
 @mcp.tool()
 async def run_template(
     name: str,
@@ -5929,31 +5951,10 @@ async def run_template(
     if await _resolve_template_spend_consent(name, confirm_spend, ctx):
         # comfy-cli's paid-node consent for run-template; a bare boolean flag.
         args.append("--allow-spend")
-    if not wait:
-        # Fire-and-return: submit and hand back a prompt_id to poll. No stream to
-        # follow, so keep the plain --json path — off the event loop, in the
-        # dedicated pool `generate_image`'s submit branch uses.
-        args.append("--async")
-        return await _in_generate_pool(
-            _run_comfy, *args, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
-        )
-    # wait=True streams. `comfy run-template` hands the filled graph to the same
-    # comfy-cli run path `comfy run` uses, so under `--json-stream` it emits the
-    # same per-node events — which is what `generate_image` already rides for
-    # this very verb. A template run can block for up to an hour (its own
-    # docstring calls out long video runs), so it must report progress rather
-    # than sit silent.
-    #
-    # Same grace as the submit path above (and as `generate_image`): the child
-    # was handed `--timeout=min(budget, 120)`, so for a budget at or under
-    # comfy-cli's 120s cap the engine's deadline and the parent's kill land on
-    # the SAME instant. Without slack the parent can SIGKILL comfy-cli mid-write
-    # of its own structured timeout / `server_not_running` result, replacing an
-    # actionable error with a generic parent kill (and orphaning an
-    # already-enqueued run). The engine must be the side that gives up.
-    return await _run_comfy_streaming(
-        *args, ctx=ctx, timeout=budget + _RUN_TEMPLATE_TIMEOUT_GRACE
-    )
+    # Submit-vs-stream and the parent's grace over the engine deadline are
+    # `_run_template_exec`'s, shared with `generate_image` — which rides this very
+    # verb, so the two spend the budget identically.
+    return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
 
 
 @mcp.tool()
