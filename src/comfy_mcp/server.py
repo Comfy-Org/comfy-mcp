@@ -6198,7 +6198,10 @@ def _poll_until_terminal(
     extra = timed_out_extra or {}
     reserved = sorted(extra.keys() & {"timed_out", "status"})
     if reserved:
-        raise ValueError(f"timed_out_extra may not carry reserved keys: {reserved}")
+        raise ComfyCliError(
+            f"timed_out_extra may not carry reserved keys: {reserved} — they are "
+            "the poll loop's own."
+        )
     deadline = time.monotonic() + timeout_seconds
     last: Any = None
     while True:

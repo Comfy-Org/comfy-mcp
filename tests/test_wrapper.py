@@ -3133,7 +3133,7 @@ def test_the_shared_poll_rejects_an_extra_that_shadows_its_own_keys(monkeypatch,
     """
     monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
 
-    with pytest.raises(ValueError, match=f"reserved keys: \\['{key}'\\]"):
+    with pytest.raises(server.ComfyCliError, match=f"reserved keys: \\['{key}'\\]"):
         server._poll_until_terminal(
             "model",
             "download-status",
