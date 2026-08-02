@@ -9472,6 +9472,148 @@ def _legacy_download_way_out(at_cap: bool) -> str:
     )
 
 
+async def _legacy_foreground_download(
+    args: list[str],
+    *,
+    deadline: float | None,
+    relative_path: str | None,
+    filename: str | None,
+    submit_exc: ComfyCliError,
+) -> Any:
+    """Run ``download_model``'s transfer the OLD way, in the foreground.
+
+    The fallback for a comfy-cli that predates ``model download --background``
+    and rejected it at parse time. ``download_model`` calls this from the submit's
+    own ``except`` block once :func:`_is_missing_option_error` has confirmed that
+    is what happened; *submit_exc* is that rejection, kept so the failures raised
+    here still chain from it.
+
+    It lives out here rather than inline because it is VESTIGIAL: it is the whole
+    of the pre-``--background`` contract — its own deadline arithmetic, its own
+    pre-spawn refusal, its own timeout wrapping, its own payload marker — and once
+    this repo's comfy-cli floor rises past that release the fallback is deletable
+    as one function rather than excavated out of the middle of the tool.
+
+    *args* is the already-built ``model download …`` argv (WITHOUT
+    ``--background``); *deadline* is the waiting caller's end-to-end
+    ``time.monotonic()`` budget, or ``None`` for ``wait=False``, which keeps the
+    full cap. *relative_path* / *filename* are the caller's own, needed only to
+    name where an incomplete file may sit — no ``download_id`` is ever minted on
+    this path, so the messages have to say it themselves.
+
+    Returns the payload ``download_model`` returns (the marker already applied),
+    or raises :class:`ComfyCliError`.
+    """
+    # Bound the foreground transfer by the caller's OWN budget rather than a
+    # silent 30 minutes. `deadline` is set only on the waiting path, and the
+    # submit attempt already spent part of it, so spend the remainder — the same
+    # two-phase spend the `--background` path does with its poll — capped by
+    # `_DOWNLOAD_SYNC_TIMEOUT`, which is this path's ceiling and no longer its
+    # flat bound.
+    #
+    # `wait=False` keeps the full cap: that caller explicitly decoupled from
+    # waiting (the docstring documents that `wait` cannot be honored here at
+    # all), so tightening the bound would only truncate a transfer they never
+    # asked to be quick. What they gain from this runner is the `finally`
+    # reaping on cancellation, not a shorter deadline.
+    if deadline is None:
+        legacy_timeout = _DOWNLOAD_SYNC_TIMEOUT
+    else:
+        remaining = deadline - time.monotonic()
+        if remaining < _MIN_LEGACY_DOWNLOAD_TIMEOUT:
+            # Out of budget: REFUSE without spawning, the same position the
+            # `--background` path takes on a bound too small to resolve the
+            # download at all. Starting a transfer here would be worse than
+            # useless — `comfy model download` writes straight to the final
+            # path, so a child killed a moment after it opened the destination
+            # leaves a truncated file where a complete model may have been,
+            # and the caller would have bought that with a bound that could
+            # never have finished anyway. `timed_out=True` because this IS the
+            # caller's deadline expiring, just detected before the spend
+            # rather than after it.
+            raise ComfyCliError(
+                "the installed comfy-cli predates `model download "
+                "--background`, so the transfer has to run in the FOREGROUND "
+                "inside this call — and the rejected submit left only "
+                f"{max(remaining, 0.0):.1f}s of `timeout_seconds`, under the "
+                f"{_MIN_LEGACY_DOWNLOAD_TIMEOUT:.0f}s minimum a foreground "
+                "transfer is started for. NOTHING was downloaded and nothing "
+                "on disk was touched: comfy-cli writes straight to the final "
+                "path, so starting a transfer only to kill it moments later "
+                f"would truncate {_legacy_download_partial(relative_path, filename)}"
+                f". {_legacy_download_way_out(at_cap=False)}",
+                timed_out=True,
+            ) from submit_exc
+        legacy_timeout = min(_DOWNLOAD_SYNC_TIMEOUT, remaining)
+    # plain_ok=True: `comfy model download` exits 0 with human progress text
+    # and no envelope, so treat a clean exit as success instead of raising
+    # the "returned no JSON" false negative on a download that actually
+    # landed (BE-3345). A real error envelope or a non-zero exit still raises.
+    #
+    # `_run_comfy_async`, NOT `to_thread(_run_comfy, …)`: this is the one
+    # plain-JSON call that runs for the whole length of a multi-GB transfer,
+    # and a thread-offloaded `Popen` cannot be cancelled — a client that gave
+    # up (or a session being torn down) left the `comfy model download` worker
+    # and its partial file orphaned, killable only by pid. The async spawn's
+    # `finally` reaps the tree on cancellation as well as on timeout.
+    try:
+        legacy = await _run_comfy_async(*args, timeout=legacy_timeout, plain_ok=True)
+    # Bound to `legacy_exc`, distinct from the `submit_exc` parameter: this
+    # handler's failure and the rejected submit are two different errors, and the
+    # message below reads both — the CLI's own diagnosis from one, the chain back
+    # to the version gap from the other.
+    except ComfyCliError as legacy_exc:
+        if not legacy_exc.timed_out:
+            raise
+        # A timeout HERE means the bytes were being moved by this very call,
+        # so the kill stopped a real transfer — unlike the `--background`
+        # path, where a timeout leaves a detached worker still going. Say so,
+        # and say where the incomplete file is: the caller cannot check
+        # `download_status` (no id exists) and a partial model on disk looks
+        # exactly like a complete one to `search_models`. APPEND to the
+        # original message so the stderr/stdout tails survive.
+        #
+        # Not deleted for them: the exact path is only fully known when
+        # `filename` was passed, so removing a file guessed from the URL could
+        # delete the wrong one. Reporting it is v1 (see BE-3428 for the
+        # adjacent trust-the-engine's-own-answer theme).
+        #
+        # The way out is keyed on whether the bound that just expired WAS the
+        # cap, not on `wait`: "raise `timeout_seconds`" is dead advice for
+        # `wait=False` (which never reads it here) AND for a waiting caller who
+        # already passed a value at or above the cap.
+        raise ComfyCliError(
+            f"{legacy_exc} (the installed comfy-cli predates `model download "
+            "--background`, so the transfer ran in the FOREGROUND and was "
+            "KILLED at that bound rather than continuing in the background. "
+            "An INCOMPLETE file may remain under "
+            f"{_legacy_download_partial(relative_path, filename)} — no "
+            "`download_id` exists to check it with, so verify or remove it "
+            "yourself. "
+            f"{_legacy_download_way_out(at_cap=legacy_timeout >= _DOWNLOAD_SYNC_TIMEOUT)})",
+            code=legacy_exc.code,
+            no_envelope=legacy_exc.no_envelope,
+            returncode=legacy_exc.returncode,
+            timed_out=True,
+            data=legacy_exc.data,
+        ) from legacy_exc
+    # Mark the legacy path in the payload on BOTH branches rather than only
+    # in the docstring. `wait=False` could not be honored at all here — with
+    # no `--background` there was nothing to detach and no `download_id` to
+    # hand back, so the whole transfer ran inside this call — but a `wait=True`
+    # caller is equally entitled to SEE that it ran on the old path and that
+    # the download family has no id to poll, instead of inferring that from a
+    # missing key. A fast small-file success is exactly the case where the
+    # absence of an id is otherwise invisible.
+    #
+    # Deliberately NOT an error. Refusing here would remove the only way to
+    # download a model on a comfy-cli that predates `--background`, which is
+    # the entire reason this fallback exists; the file did land.
+    if isinstance(legacy, dict):
+        return {**legacy, "background_unsupported": True}
+    return legacy
+
+
 def _download_verb_unsupported(exc: ComfyCliError, verb: str) -> dict[str, Any] | None:
     """The capability-gap degrade for a ``model <verb>`` this comfy-cli lacks.
 
@@ -9909,116 +10051,18 @@ async def download_model(
         # download the same file twice.
         if not _is_missing_option_error(exc, "--background"):
             raise
-        # Bound the foreground transfer by the caller's OWN budget rather than a
-        # silent 30 minutes. `deadline` is set only on the waiting path, and the
-        # submit attempt above already spent part of it, so spend the remainder —
-        # the same two-phase spend the `--background` path does with its poll —
-        # capped by `_DOWNLOAD_SYNC_TIMEOUT`, which is this path's ceiling and no
-        # longer its flat bound.
-        #
-        # `wait=False` keeps the full cap: that caller explicitly decoupled from
-        # waiting (the docstring documents that `wait` cannot be honored here at
-        # all), so tightening the bound would only truncate a transfer they never
-        # asked to be quick. What they gain from this runner is the `finally`
-        # reaping on cancellation, not a shorter deadline.
-        if deadline is None:
-            legacy_timeout = _DOWNLOAD_SYNC_TIMEOUT
-        else:
-            remaining = deadline - time.monotonic()
-            if remaining < _MIN_LEGACY_DOWNLOAD_TIMEOUT:
-                # Out of budget: REFUSE without spawning, the same position the
-                # `--background` path takes on a bound too small to resolve the
-                # download at all. Starting a transfer here would be worse than
-                # useless — `comfy model download` writes straight to the final
-                # path, so a child killed a moment after it opened the destination
-                # leaves a truncated file where a complete model may have been,
-                # and the caller would have bought that with a bound that could
-                # never have finished anyway. `timed_out=True` because this IS the
-                # caller's deadline expiring, just detected before the spend
-                # rather than after it.
-                raise ComfyCliError(
-                    "the installed comfy-cli predates `model download "
-                    "--background`, so the transfer has to run in the FOREGROUND "
-                    "inside this call — and the rejected submit left only "
-                    f"{max(remaining, 0.0):.1f}s of `timeout_seconds`, under the "
-                    f"{_MIN_LEGACY_DOWNLOAD_TIMEOUT:.0f}s minimum a foreground "
-                    "transfer is started for. NOTHING was downloaded and nothing "
-                    "on disk was touched: comfy-cli writes straight to the final "
-                    "path, so starting a transfer only to kill it moments later "
-                    f"would truncate {_legacy_download_partial(relative_path, filename)}"
-                    f". {_legacy_download_way_out(at_cap=False)}",
-                    timed_out=True,
-                ) from exc
-            legacy_timeout = min(_DOWNLOAD_SYNC_TIMEOUT, remaining)
-        # plain_ok=True: `comfy model download` exits 0 with human progress text
-        # and no envelope, so treat a clean exit as success instead of raising
-        # the "returned no JSON" false negative on a download that actually
-        # landed (BE-3345). A real error envelope or a non-zero exit still raises.
-        #
-        # `_run_comfy_async`, NOT `to_thread(_run_comfy, …)`: this is the one
-        # plain-JSON call that runs for the whole length of a multi-GB transfer,
-        # and a thread-offloaded `Popen` cannot be cancelled — a client that gave
-        # up (or a session being torn down) left the `comfy model download` worker
-        # and its partial file orphaned, killable only by pid. The async spawn's
-        # `finally` reaps the tree on cancellation as well as on timeout.
-        try:
-            legacy = await _run_comfy_async(
-                *args, timeout=legacy_timeout, plain_ok=True
-            )
-        # Bound to `legacy_exc`, NOT `exc`: this handler is nested inside the
-        # submit's own `except ComfyCliError as exc`, and Python deletes an
-        # `except ... as <name>` binding when its block ends — reusing the name
-        # would silently unbind the outer one for any code after this block.
-        except ComfyCliError as legacy_exc:
-            if not legacy_exc.timed_out:
-                raise
-            # A timeout HERE means the bytes were being moved by this very call,
-            # so the kill stopped a real transfer — unlike the `--background`
-            # path, where a timeout leaves a detached worker still going. Say so,
-            # and say where the incomplete file is: the caller cannot check
-            # `download_status` (no id exists) and a partial model on disk looks
-            # exactly like a complete one to `search_models`. APPEND to the
-            # original message so the stderr/stdout tails survive.
-            #
-            # Not deleted for them: the exact path is only fully known when
-            # `filename` was passed, so removing a file guessed from the URL could
-            # delete the wrong one. Reporting it is v1 (see BE-3428 for the
-            # adjacent trust-the-engine's-own-answer theme).
-            #
-            # The way out is keyed on whether the bound that just expired WAS the
-            # cap, not on `wait`: "raise `timeout_seconds`" is dead advice for
-            # `wait=False` (which never reads it here) AND for a waiting caller who
-            # already passed a value at or above the cap.
-            raise ComfyCliError(
-                f"{legacy_exc} (the installed comfy-cli predates `model download "
-                "--background`, so the transfer ran in the FOREGROUND and was "
-                "KILLED at that bound rather than continuing in the background. "
-                "An INCOMPLETE file may remain under "
-                f"{_legacy_download_partial(relative_path, filename)} — no "
-                "`download_id` exists to check it with, so verify or remove it "
-                "yourself. "
-                f"{_legacy_download_way_out(at_cap=legacy_timeout >= _DOWNLOAD_SYNC_TIMEOUT)})",
-                code=legacy_exc.code,
-                no_envelope=legacy_exc.no_envelope,
-                returncode=legacy_exc.returncode,
-                timed_out=True,
-                data=legacy_exc.data,
-            ) from legacy_exc
-        # Mark the legacy path in the payload on BOTH branches rather than only
-        # in the docstring. `wait=False` could not be honored at all here — with
-        # no `--background` there was nothing to detach and no `download_id` to
-        # hand back, so the whole transfer ran inside this call — but a `wait=True`
-        # caller is equally entitled to SEE that it ran on the old path and that
-        # the download family has no id to poll, instead of inferring that from a
-        # missing key. A fast small-file success is exactly the case where the
-        # absence of an id is otherwise invisible.
-        #
-        # Deliberately NOT an error. Refusing here would remove the only way to
-        # download a model on a comfy-cli that predates `--background`, which is
-        # the entire reason this fallback exists; the file did land.
-        if isinstance(legacy, dict):
-            return {**legacy, "background_unsupported": True}
-        return legacy
+        # The whole pre-`--background` contract — its own deadline arithmetic,
+        # pre-spawn refusal, timeout wrapping and payload marker — lives in
+        # `_legacy_foreground_download` so it can be deleted as one function once
+        # this repo's comfy-cli floor rises past that release, rather than being
+        # excavated out of the middle of this tool.
+        return await _legacy_foreground_download(
+            args,
+            deadline=deadline,
+            relative_path=relative_path,
+            filename=filename,
+            submit_exc=exc,
+        )
     # Validate the handle on BOTH paths. `wait=False` hands the envelope straight
     # to the caller, so a malformed or version-skewed one would otherwise leave a
     # transfer running detached behind a payload with nothing to poll or cancel
