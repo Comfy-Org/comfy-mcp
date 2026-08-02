@@ -622,6 +622,32 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
     return value
 
 
+def _guard_workflow_path(workflow_path: str, *, frontend: bool = False) -> str:
+    """Run the shared argv guards on a ``workflow_path`` tool argument.
+
+    ``frontend=True`` selects the error wording for the tools that require the
+    frontend-format (UI export) workflow ``fetch_template`` writes;
+    ``frontend=False`` for the tools that accept API-format or UI-export files
+    (``run_workflow`` / ``validate_workflow``). The two wordings track that
+    real format difference — do not merge them. WHY each site guards (bare
+    positional = mandatory injection defence vs ``--workflow`` option value =
+    input hygiene, see :func:`_reject_option_like`) stays in the per-site
+    comments; this helper only owns WHAT runs.
+    """
+    if frontend:
+        expected = (
+            "a path to a frontend-format workflow JSON file "
+            "(prefix a dash-leading name with './')"
+        )
+    else:
+        expected = (
+            "a path to a workflow JSON file (prefix a dash-leading name with './')"
+        )
+    _reject_option_like("workflow_path", workflow_path, expected=expected)
+    _reject_nul("workflow_path", workflow_path)
+    return workflow_path
+
+
 # Generous ceiling on a `prompt_id`'s length. Real ids are the server's UUIDs
 # (36 chars), and comfy-cli's own sanity check for one is `^[A-Za-z0-9_-]{1,128}$`
 # — so this deliberately sits at twice the engine's ceiling and can only refuse
@@ -4096,14 +4122,7 @@ async def run_workflow(
     # `workflow_path` rides behind `--workflow` as an option value (Click takes
     # that verbatim), so this is input hygiene, not injection defense — see
     # `_reject_option_like`.
-    _reject_option_like(
-        "workflow_path",
-        workflow_path,
-        expected=(
-            "a path to a workflow JSON file (prefix a dash-leading name with './')"
-        ),
-    )
-    _reject_nul("workflow_path", workflow_path)
+    _guard_workflow_path(workflow_path)
     if not workflow_path.strip():
         # Before the consent gate below, deliberately: an empty path cannot
         # possibly spend, and comfy-cli will reject it anyway, so raising a
@@ -10511,14 +10530,7 @@ def validate_workflow(workflow_path: str) -> Any:
     # the same call the guarded `search_templates` filters and `download_model`'s
     # `filename` make. A dash-leading path reaches comfy-cli as a usage error (or
     # prints `--help`) that fails envelope parsing; a named error is better.
-    _reject_option_like(
-        "workflow_path",
-        workflow_path,
-        expected=(
-            "a path to a workflow JSON file (prefix a dash-leading name with './')"
-        ),
-    )
-    _reject_nul("workflow_path", workflow_path)
+    _guard_workflow_path(workflow_path)
     return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
 
 
@@ -10549,15 +10561,7 @@ def list_workflow_slots(workflow_path: str) -> Any:
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
-    _reject_option_like(
-        "workflow_path",
-        workflow_path,
-        expected=(
-            "a path to a frontend-format workflow JSON file "
-            "(prefix a dash-leading name with './')"
-        ),
-    )
-    _reject_nul("workflow_path", workflow_path)
+    _guard_workflow_path(workflow_path, frontend=True)
     return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
 
 
@@ -10603,15 +10607,7 @@ def list_workflow_notes(workflow_path: str) -> Any:
     """
     # Bare positional, same as `list_workflow_slots` — a leading-dash path is
     # read as a flag rather than the path comfy-cli is meant to read.
-    _reject_option_like(
-        "workflow_path",
-        workflow_path,
-        expected=(
-            "a path to a frontend-format workflow JSON file "
-            "(prefix a dash-leading name with './')"
-        ),
-    )
-    _reject_nul("workflow_path", workflow_path)
+    _guard_workflow_path(workflow_path, frontend=True)
     try:
         return _run_comfy("workflow", "notes", workflow_path, timeout=60.0)
     except ComfyCliError as exc:
@@ -10843,15 +10839,7 @@ def set_workflow_slot(
     # argument owns. Guarding only the overrides would leave the path as an
     # equivalent way in: consumed as a flag, it shifts the first override into
     # the path slot.
-    _reject_option_like(
-        "workflow_path",
-        workflow_path,
-        expected=(
-            "a path to a frontend-format workflow JSON file "
-            "(prefix a dash-leading name with './')"
-        ),
-    )
-    _reject_nul("workflow_path", workflow_path)
+    _guard_workflow_path(workflow_path, frontend=True)
     rendered = []
     for item in overrides:
         # Rendered per item, then guarded, so the argv guards read what actually
@@ -11104,15 +11092,7 @@ def vary_workflow(
     # / `--out-dir` as option VALUES, which Click takes verbatim, so they are
     # already injection-safe; they are guarded below as input hygiene, matching
     # `search_templates`' filters. See `_reject_option_like` for the two cases.
-    _reject_option_like(
-        "workflow_path",
-        workflow_path,
-        expected=(
-            "a path to a frontend-format workflow JSON file "
-            "(prefix a dash-leading name with './')"
-        ),
-    )
-    _reject_nul("workflow_path", workflow_path)
+    _guard_workflow_path(workflow_path, frontend=True)
     args = ["workflow", "vary", workflow_path]
     for index, item in enumerate(slots):
         # Rendered first so every guard below reads what actually reaches argv,
