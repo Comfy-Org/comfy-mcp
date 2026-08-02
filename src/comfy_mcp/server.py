@@ -71,6 +71,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple, TypeVar
 from urllib.parse import urlparse
@@ -494,18 +495,21 @@ _DOWNLOAD_SYNC_TIMEOUT = 1800.0
 # rather than one status poll.
 _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 
-# Sleep between `model download-status` polls. Matches `wait_for_job`'s cadence:
-# a download's state file is rewritten at most once a second, so polling faster
-# buys nothing.
-_DOWNLOAD_POLL_INTERVAL = 2.0
+# Sleep between polls in the shared bounded-poll loop (`_poll_until_terminal`) —
+# `wait_for_job`'s `jobs status` polls and `_poll_download`'s
+# `model download-status` polls run on the same cadence: a job's queue state and
+# a download's state file are each rewritten at most once a second, so polling
+# faster buys nothing. One named constant rather than two identical 2.0s that
+# would only ever drift apart.
+_POLL_INTERVAL = 2.0
 
-# Per-poll subprocess budget for `wait_for_job`'s `comfy jobs status` calls, and
-# the smallest slice worth spawning one for. `wait_for_job` caps each poll to
-# whatever is left of the caller's own bound, so a wedged status call can't hold
-# a one-second wait open for the full budget; the floor keeps a sliver of
-# remaining time from spawning a poll that is guaranteed to hit its own deadline.
-# `_poll_download` polls `comfy model download-status` on the same terms and
-# shares these two rather than minting a second pair that would only ever drift.
+# Per-poll subprocess budget for the shared bounded-poll loop's calls
+# (`wait_for_job`'s `comfy jobs status`, `_poll_download`'s
+# `comfy model download-status`), and the smallest slice worth spawning one for.
+# Each poll is capped to whatever is left of the caller's own bound, so a wedged
+# status call can't hold a one-second wait open for the full budget; the floor
+# keeps a sliver of remaining time from spawning a poll that is guaranteed to hit
+# its own deadline.
 _JOB_STATUS_POLL_TIMEOUT = 60.0
 _MIN_JOB_STATUS_POLL_TIMEOUT = 1.0
 
@@ -6148,6 +6152,80 @@ def _is_terminal(status: Any) -> bool:
     return False
 
 
+def _poll_until_terminal(
+    *args: str,
+    timeout_seconds: float,
+    is_terminal: Callable[[Any], bool],
+    timed_out_extra: dict[str, Any] | None = None,
+) -> Any:
+    """Poll ``comfy <args>`` until ``is_terminal`` or ``timeout_seconds`` expires.
+
+    The one bounded-poll loop behind :func:`wait_for_job` (``jobs status``) and
+    :func:`_poll_download` (``model download-status``). Those two ran
+    statement-for-statement identical loops and differ only in argv, in the
+    terminal predicate, and in the extra keys their timed-out payload carries —
+    so the timing rules below hold identically for both, and cannot drift apart.
+
+    Returns the first payload ``is_terminal`` accepts, or ``{"timed_out": True,
+    **timed_out_extra, "status": <last payload>}`` on expiry (the extras go in
+    FRONT of ``status``, preserving the key order each caller already returned).
+    A terminal FAILURE payload is returned like any other terminal one; deciding
+    whether that is an error is the caller's job.
+
+    ``timeout_seconds`` must already be bounded by the caller (see
+    :func:`_bounded_timeout`): left raw, ``inf`` keeps ``remaining`` positive
+    forever and NaN makes every comparison False, either of which re-spawns
+    comfy-cli until the client gives up.
+    """
+    extra = timed_out_extra or {}
+    deadline = time.monotonic() + timeout_seconds
+    last: Any = None
+    while True:
+        # `last is not None` keeps the one-poll minimum: a bound small enough to
+        # expire before the first poll (`timeout_seconds=1e-9`) must still report
+        # a real status rather than the degenerate `{"status": None}`.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and last is not None:
+            return {"timed_out": True, **extra, "status": last}
+        # Cap each poll's own subprocess budget to what is left of the caller's
+        # bound. With a fixed 60s per poll the overall wait was only bounded
+        # between polls, so a wedged poll could hold a `timeout_seconds=1` call
+        # open for a full minute. The floor keeps a sliver of remaining time from
+        # spawning a poll that is guaranteed to hit its own deadline (and raise)
+        # instead of returning `timed_out`; it overshoots the caller's bound by
+        # at most that floor, never by 60s.
+        try:
+            last = _run_comfy(
+                *args,
+                timeout=min(
+                    _JOB_STATUS_POLL_TIMEOUT,
+                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
+                ),
+            )
+        except ComfyCliError as exc:
+            # Capping the poll to the time left means its deadline now doubles as
+            # the CALLER's: a slow-but-healthy poll (cold start plus imports)
+            # near the bound is killed where the old fixed 60s budget would have
+            # let it finish. That is this call expiring, not comfy-cli failing,
+            # so honor the documented envelope — and keep the last real status
+            # instead of discarding it with the exception. Two timeouts still
+            # raise, because neither is the caller's bound expiring: one with
+            # time left on that bound (the poll burned the full
+            # `_JOB_STATUS_POLL_TIMEOUT` — comfy-cli is genuinely wedged, which
+            # raised before this cap existed too), and one with no status yet
+            # read, where `{"status": None}` would bury a real failure under a
+            # contentless envelope.
+            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
+                raise
+            return {"timed_out": True, **extra, "status": last}
+        if is_terminal(last):
+            return last
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"timed_out": True, **extra, "status": last}
+        time.sleep(min(_POLL_INTERVAL, remaining))
+
+
 @mcp.tool()
 def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     """Wait (bounded) for a submitted job to reach a terminal status.
@@ -6172,59 +6250,17 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     prompt_id = _guard_prompt_id(prompt_id)
     # "Bounded by design" only holds if the bound itself is bounded. Left raw,
     # `inf` keeps `remaining` positive forever and NaN makes every comparison
-    # False (so `remaining <= 0` never fires and `min(2.0, nan)` yields 2.0) —
-    # either way the poll loop re-spawns `comfy jobs status` until the client
-    # gives up. See `_bounded_timeout`.
+    # False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
+    # yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
+    # `comfy jobs status` until the client gives up. See `_bounded_timeout`.
     timeout_seconds = _bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
-    deadline = time.monotonic() + timeout_seconds
-    poll_interval = 2.0
-    last: Any = None
-    while True:
-        # `last is not None` keeps the one-poll minimum: a bound small enough to
-        # expire before the first poll (`timeout_seconds=1e-9`) must still report
-        # a real status rather than the degenerate `{"status": None}`.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 and last is not None:
-            return {"timed_out": True, "status": last}
-        # Cap each poll's own subprocess budget to what is left of the caller's
-        # bound. With a fixed 60s per poll the overall wait was only bounded
-        # between polls, so a wedged `comfy jobs status` could hold a
-        # `timeout_seconds=1` call open for a full minute. The floor keeps a
-        # sliver of remaining time from spawning a poll that is guaranteed to
-        # hit its own deadline (and raise) instead of returning `timed_out`; it
-        # overshoots the caller's bound by at most that floor, never by 60s.
-        try:
-            last = _run_comfy(
-                "jobs",
-                "status",
-                prompt_id,
-                timeout=min(
-                    _JOB_STATUS_POLL_TIMEOUT,
-                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
-                ),
-            )
-        except ComfyCliError as exc:
-            # Capping the poll to the time left means its deadline now doubles as
-            # the CALLER's: a slow-but-healthy `comfy jobs status` (cold start
-            # plus imports) near the bound is killed where the old fixed 60s
-            # budget would have let it finish. That is this call expiring, not
-            # comfy-cli failing, so honor the documented envelope — and keep the
-            # last real status instead of discarding it with the exception.
-            # Two timeouts still raise, because neither is the caller's bound
-            # expiring: one with time left on that bound (the poll burned the
-            # full `_JOB_STATUS_POLL_TIMEOUT` — comfy-cli is genuinely wedged,
-            # which raised before this cap existed too), and one with no status
-            # yet read, where `{"status": None}` would bury a real failure under
-            # a contentless envelope.
-            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
-                raise
-            return {"timed_out": True, "status": last}
-        if _is_terminal(last):
-            return last
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return {"timed_out": True, "status": last}
-        time.sleep(min(poll_interval, remaining))
+    return _poll_until_terminal(
+        "jobs",
+        "status",
+        prompt_id,
+        timeout_seconds=timeout_seconds,
+        is_terminal=_is_terminal,
+    )
 
 
 @mcp.tool()
@@ -9520,10 +9556,10 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 
     The blocking half of ``wait_for_download`` and of ``download_model``'s wait
     path, shared so the two can never disagree about what a bound expiring means.
-    Structurally identical to ``wait_for_job``'s loop, including its per-poll
-    subprocess-budget capping — see that tool for why each poll is capped to the
-    time left on the caller's bound, why the floor exists, and why a poll killed
-    at that cap yields the ``timed_out`` payload instead of an error.
+    Runs on ``_poll_until_terminal``, the same bounded-poll loop ``wait_for_job``
+    uses — see it for why each poll is capped to the time left on the caller's
+    bound, why the floor exists, and why a poll killed at that cap yields the
+    ``timed_out`` payload instead of an error.
 
     Returns the terminal status payload, or ``{"timed_out": True, "download_id":
     ..., "status": <last payload>}`` on expiry. A ``failed`` / ``cancelled``
@@ -9531,37 +9567,14 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     turns that into a raise, matching ``wait_for_job``, which likewise hands back
     a failed job's status rather than raising on it.
     """
-    deadline = time.monotonic() + timeout_seconds
-    last: Any = None
-    while True:
-        # `last is not None` keeps the one-poll minimum: a bound small enough to
-        # expire before the first poll must still report a real status.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 and last is not None:
-            return {"timed_out": True, "download_id": download_id, "status": last}
-        try:
-            last = _run_comfy(
-                "model",
-                "download-status",
-                download_id,
-                timeout=min(
-                    _JOB_STATUS_POLL_TIMEOUT,
-                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
-                ),
-            )
-        except ComfyCliError as exc:
-            # This call's bound expiring, not comfy-cli failing — honor the
-            # documented envelope and keep the last real status. See
-            # `wait_for_job` for the two timeouts that still raise.
-            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
-                raise
-            return {"timed_out": True, "download_id": download_id, "status": last}
-        if _is_download_terminal(last):
-            return last
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return {"timed_out": True, "download_id": download_id, "status": last}
-        time.sleep(min(_DOWNLOAD_POLL_INTERVAL, remaining))
+    return _poll_until_terminal(
+        "model",
+        "download-status",
+        download_id,
+        timeout_seconds=timeout_seconds,
+        is_terminal=_is_download_terminal,
+        timed_out_extra={"download_id": download_id},
+    )
 
 
 @mcp.tool()

@@ -3053,6 +3053,75 @@ def test_wait_for_job_reraises_a_non_timeout_poll_failure(monkeypatch):
         server.wait_for_job("pid", timeout_seconds=1.0)
 
 
+def test_wait_for_job_sleeps_the_shared_poll_interval(monkeypatch):
+    """The gap between polls is the named cadence, not a second hardcoded 2.0.
+
+    `wait_for_job` used to keep its own `poll_interval = 2.0` local while
+    `_poll_download` read `_POLL_INTERVAL` — the same number spelled two ways,
+    which is exactly how a cadence change lands on one poller and not the other.
+    """
+    statuses = iter([{"status": "running"}, {"status": "completed"}])
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: next(statuses))
+
+    slept: list[float] = []
+    monkeypatch.setattr(server.time, "sleep", slept.append)
+
+    assert server.wait_for_job("pid", timeout_seconds=600.0) == {"status": "completed"}
+    assert slept == [server._POLL_INTERVAL]  # the sleep is capped by the remaining
+
+
+def test_the_two_bounded_polls_run_on_one_shared_loop(monkeypatch):
+    """`wait_for_job` and `_poll_download` both route through the shared loop.
+
+    The two ran statement-for-statement identical loops — the one-poll minimum,
+    the per-poll budget cap, the three-clause re-raise — and drifted apart in the
+    only place they were spelled twice. Re-inlining either one is what this
+    guards against; the loop's own behavior is covered by the tests around it.
+    """
+    calls: list[tuple[tuple, dict]] = []
+
+    def fake_poll(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"status": "completed"}
+
+    monkeypatch.setattr(server, "_poll_until_terminal", fake_poll)
+
+    server.wait_for_job("pid", timeout_seconds=25.0)
+    server._poll_download("a1b2c3d4e5f6", 25.0)
+
+    assert calls[0][0] == ("jobs", "status", "pid")
+    assert calls[0][1]["is_terminal"] is server._is_terminal
+    assert "timed_out_extra" not in calls[0][1]  # jobs add no extra key
+    assert calls[1][0] == ("model", "download-status", "a1b2c3d4e5f6")
+    assert calls[1][1]["is_terminal"] is server._is_download_terminal
+    assert calls[1][1]["timed_out_extra"] == {"download_id": "a1b2c3d4e5f6"}
+
+
+def test_the_shared_poll_puts_its_extra_keys_before_the_status(monkeypatch):
+    """A timed-out payload keeps the key order each caller already returned."""
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
+    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+
+    # A clock that jumps 10s per read, so the 25s bound expires mid-poll.
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        now = clock["t"]
+        clock["t"] += 10.0
+        return now
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    result = server._poll_download("a1b2c3d4e5f6", 25.0)
+
+    assert list(result) == ["timed_out", "download_id", "status"]
+    assert result == {
+        "timed_out": True,
+        "download_id": "a1b2c3d4e5f6",
+        "status": {"status": "running"},
+    }
+
+
 def test_run_comfy_marks_a_subprocess_timeout(patched_run):
     """The `timed_out` flag is set only where the child was killed at our budget.
 
