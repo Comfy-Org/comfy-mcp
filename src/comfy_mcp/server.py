@@ -1539,6 +1539,46 @@ def _cmd_for_message(cmd: list[str]) -> str:
     return failure_log._scrub_text(" ".join(cmd))
 
 
+def _timeout_failure(
+    cmd: list[str],
+    args: tuple[str, ...],
+    timeout: float | None,
+    stdout: str,
+    stderr: str,
+) -> ComfyCliError:
+    """Format + log a runner timeout, and RETURN the error for the caller to raise.
+
+    Shared by :func:`_run_comfy_raw` and :func:`_run_comfy_async` so both report a
+    timeout identically — a caller (or a QA log reader) sees one timeout report
+    regardless of which runner produced it, and a wording change lands in both at
+    once. Returning rather than raising keeps the ``raise ... from exc`` at the
+    call site: each runner stays visibly the thing that fails, its traceback
+    starts there rather than inside a formatting helper, and the explicit
+    ``from exc`` chaining to the originating ``TimeoutExpired`` /
+    ``asyncio.TimeoutError`` stays where that exception is actually bound.
+
+    Not shared with :func:`_run_comfy_streaming`, whose timeout is deliberately a
+    different report — it adds the progress snapshot and the poll-instead advice,
+    logs ``streaming=True``, and raises without ``timed_out``.
+    """
+    message = (
+        f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
+        f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
+        f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
+    )
+    # `exit_code=None`: the child was killed at the deadline, so it never
+    # reported one. The log keeps a longer slice of both streams than the
+    # message above does — see `failure_log._FAILURE_LOG_TAIL_CHARS`.
+    failure_log._log_failure(
+        "timeout",
+        args,
+        message=message,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    return ComfyCliError(message, timed_out=True)
+
+
 def _run_comfy_raw(
     *args: str, timeout: float | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
@@ -1605,22 +1645,7 @@ def _run_comfy_raw(
         # crashed, wedged comfy-cli (e.g. a traceback on stderr) is not
         # indistinguishable from a genuinely slow one. See BE-3343.
         stdout, stderr = _drain_timed_out(proc, exc)
-        message = (
-            f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
-            f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
-            f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
-        )
-        # `exit_code=None`: the child was killed at the deadline, so it never
-        # reported one. The log keeps a longer slice of both streams than the
-        # message above does — see `failure_log._FAILURE_LOG_TAIL_CHARS`.
-        failure_log._log_failure(
-            "timeout",
-            args,
-            message=message,
-            stdout=stdout,
-            stderr=stderr,
-        )
-        raise ComfyCliError(message, timed_out=True) from exc
+        raise _timeout_failure(cmd, args, timeout, stdout, stderr) from exc
     except BaseException:
         # Mirrors `subprocess.run`'s own bare `except` (it kills the child and
         # lets `Popen.__exit__` clean up): anything else raised while draining
@@ -2724,25 +2749,9 @@ async def _run_comfy_async(
             await _drain_timed_out_async(proc, stdout_sink, stderr_sink)
             stdout = stdout_sink[0].decode("utf-8", "replace")
             stderr = stderr_sink[0].decode("utf-8", "replace")
-            # Same message shape as `_run_comfy_raw`'s timeout, so a caller (or a
-            # QA log reader) sees one timeout report regardless of which runner
-            # produced it.
-            message = (
-                f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
-                f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
-                f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
-            )
-            # `exit_code=None`: the child was killed at the deadline, so it never
-            # reported one. The log keeps a longer slice of both streams than the
-            # message above does — see `failure_log._FAILURE_LOG_TAIL_CHARS`.
-            failure_log._log_failure(
-                "timeout",
-                args,
-                message=message,
-                stdout=stdout,
-                stderr=stderr,
-            )
-            raise ComfyCliError(message, timed_out=True) from exc
+            # Same report as `_run_comfy_raw`'s timeout, formatted and logged by
+            # the one shared body — see `_timeout_failure`.
+            raise _timeout_failure(cmd, args, timeout, stdout, stderr) from exc
         # comfy-cli's output is forced to UTF-8 (see `_comfy_env`); decode with
         # `replace` rather than strict for the same reason the streaming reader
         # does — a truncated or mis-encoded byte must degrade the text, not raise
