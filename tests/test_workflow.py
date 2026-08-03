@@ -295,6 +295,65 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     assert calls[1]["cmd"][4:] == ["workflow", "notes", "./-flux.json"]
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            lambda path: asyncio.run(server.run_workflow(path)), id="run_workflow"
+        ),
+        pytest.param(server.validate_workflow, id="validate_workflow"),
+        pytest.param(server.list_workflow_slots, id="list_workflow_slots"),
+        pytest.param(server.list_workflow_notes, id="list_workflow_notes"),
+        pytest.param(
+            lambda path: server.set_workflow_slot(path, ["6.text=x"]),
+            id="set_workflow_slot",
+        ),
+        pytest.param(
+            lambda path: server.vary_workflow(path, ["3.seed=[1,2]"]),
+            id="vary_workflow",
+        ),
+    ],
+)
+def test_workflow_path_guard_rejects_an_oversized_path(call, no_spawn, monkeypatch):
+    """A path far past PATH_MAX is refused before it can reach argv.
+
+    An oversized argv is rejected by the OS with an `OSError` (`E2BIG`) no
+    caller converts, rather than failing as a clean `ComfyCliError` like every
+    other bad input. One check in `_guard_workflow_path` covers all six tools
+    that take a `workflow_path`, so all six are exercised here.
+    """
+
+    def boom_async(*args, **kwargs):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    # `run_workflow` streams through `asyncio.create_subprocess_exec` rather
+    # than `_run_comfy`, so `no_spawn` alone would not prove it never spawned.
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", boom_async)
+
+    oversized = "w" * (server._MAX_WORKFLOW_PATH_LEN + 1)
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        call(oversized)
+
+    # Length-not-value: `_reject_option_like` would echo `{value!r}` whole, so
+    # the size check runs first precisely to keep the oversized string out of
+    # the tool response and the failure log.
+    assert oversized not in str(excinfo.value)
+
+
+def test_workflow_path_guard_allows_a_path_at_the_ceiling():
+    """The cap is generous enough that no real path is anywhere near it.
+
+    It is an argv-safety guard, not an attempt to close the residual
+    `_phrase_is_only_the_caller_s` forgery window — which would need a cap under
+    500 characters. The boundary value itself passes.
+    """
+    at_ceiling = "w" * server._MAX_WORKFLOW_PATH_LEN
+
+    assert server._guard_workflow_path(at_ceiling)
+    assert server._guard_workflow_path(at_ceiling, frontend=True)
+
+
 def test_workflow_tools_reject_embedded_nul(no_spawn):
     """A NUL anywhere surfaces as ComfyCliError, not subprocess's bare ValueError.
 

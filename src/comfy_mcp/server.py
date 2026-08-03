@@ -622,6 +622,22 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
     return value
 
 
+# Generous ceiling on a `workflow_path`'s length, set the same way
+# :data:`_MAX_DOWNLOAD_ID_LEN` is: PATH_MAX is 4096 on Linux and 1024 on macOS,
+# so a value past this ceiling can only name a path the filesystem would refuse
+# anyway (`ENAMETOOLONG`) — while still catching the oversized string before it
+# reaches argv, where the OS rejects the exec with an `OSError` (`E2BIG`) no
+# caller converts to a :class:`ComfyCliError`.
+#
+# It stays this GENEROUS on purpose. It is an argv-safety guard, NOT an attempt
+# to close the residual forgery window in :func:`_phrase_is_only_the_caller_s` —
+# that discount reads a bounded 500-char message tail, so only a cap BELOW 500
+# characters would close it, and that trade-off (refusing legitimately deep
+# paths to buy protection from a caller's own crafted argument) is recorded and
+# declined in that function's docstring. Do not reopen it by tightening this.
+_MAX_WORKFLOW_PATH_LEN = 4096
+
+
 def _guard_workflow_path(workflow_path: str, *, frontend: bool = False) -> str:
     """Run the shared argv guards on a ``workflow_path`` tool argument.
 
@@ -633,7 +649,22 @@ def _guard_workflow_path(workflow_path: str, *, frontend: bool = False) -> str:
     positional = mandatory injection defence vs ``--workflow`` option value =
     input hygiene, see :func:`_reject_option_like`) stays in the per-site
     comments; this helper only owns WHAT runs.
+
+    LENGTH runs first, ahead of both the wording branch and the value checks —
+    see :data:`_MAX_WORKFLOW_PATH_LEN` for what the cap buys, and the ordering
+    comment below for why it is first.
     """
+    if len(workflow_path) > _MAX_WORKFLOW_PATH_LEN:
+        # Report the length, not the value, and check it BEFORE the two value
+        # guards — `_reject_option_like` interpolates `{value!r}` whole, so a
+        # megabyte-long dash-leading path would otherwise be echoed back through
+        # the tool response and the failure log. Same reasoning as
+        # `_guard_prompt_id`. One wording for both `frontend` variants: a size
+        # error has nothing format-specific to say.
+        raise ComfyCliError(
+            f"invalid workflow_path: {len(workflow_path)} characters exceeds the "
+            f"{_MAX_WORKFLOW_PATH_LEN}-character maximum."
+        )
     if frontend:
         expected = (
             "a path to a frontend-format workflow JSON file "
@@ -9618,10 +9649,13 @@ def _phrase_is_only_the_caller_s(
       the tail arrives clipped. The id-shaped values are already capped well
       under that bound (``_MAX_DOWNLOAD_ID_LEN``, ``_MAX_NODE_PACK_ID_LEN``);
       ``workflow_path`` and ``download_model``'s ``url`` / ``relative_path`` /
-      ``filename`` are not, and are left uncapped deliberately — a cap tight
-      enough to close the gap would have to sit under 500 characters, and would
-      start refusing legitimately deep paths and long CivitAI/HuggingFace URLs
-      to buy nothing but protection from a caller's own crafted argument.
+      ``filename`` carry only the far more generous argv-safety ceilings
+      (``_MAX_WORKFLOW_PATH_LEN``, ``_MAX_URL_LEN``), which sit thousands of
+      characters ABOVE the tail and so leave this window exactly as open as it
+      was uncapped. That is deliberate — a cap tight enough to close the gap
+      would have to sit under 500 characters, and would start refusing
+      legitimately deep paths and long CivitAI/HuggingFace URLs to buy nothing
+      but protection from a caller's own crafted argument.
       That tail is also URL-SCRUBBED on its way to the client
       (``failure_log._scrubbed_stream_tail``), so a value whose echo carries
       credential material — userinfo or a query string, the only two things
@@ -10243,6 +10277,18 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     )
 
 
+# Generous ceiling on `download_model`'s `url`, set the same way
+# :data:`_MAX_WORKFLOW_PATH_LEN` is. 8 KiB sits past the request-line limit
+# common HTTP servers enforce (nginx's `large_client_header_buffers` and
+# Apache's `LimitRequestLine` both default to 8 KiB), so a URL past this ceiling
+# can only be one the remote server would refuse anyway — while real
+# HuggingFace / CivitAI URLs, signed and query-tokened forms included, sit far
+# below it. What it buys is the same thing the id caps buy: the oversized string
+# fails as a clean :class:`ComfyCliError` instead of reaching argv, where the OS
+# rejects the exec with an `OSError` no caller converts.
+_MAX_URL_LEN = 8192
+
+
 def _guard_model_relative_path(relative_path: str) -> str:
     """Reject a ``relative_path`` that would write outside the models tree.
 
@@ -10262,7 +10308,20 @@ def _guard_model_relative_path(relative_path: str) -> str:
     Raises :class:`ComfyCliError` on any of the three; otherwise returns the
     value UNCHANGED — this guard never rewrites an untrusted argument, for the
     reason the bare-``loras`` comment gives.
+
+    LENGTH runs first, ahead of all three — see :data:`_MAX_WORKFLOW_PATH_LEN`,
+    whose ceiling this reuses: both are path-shaped values headed for argv, and
+    a NAME_MAX-tight cap of its own would be tighter than the argv hazard needs.
     """
+    if len(relative_path) > _MAX_WORKFLOW_PATH_LEN:
+        # First, and reporting the length rather than the value, for the reason
+        # `_guard_prompt_id` gives: every check below interpolates the value
+        # whole, so an oversized one would be mirrored back through the tool
+        # response and the failure log.
+        raise ComfyCliError(
+            f"invalid relative_path: {len(relative_path)} characters exceeds the "
+            f"{_MAX_WORKFLOW_PATH_LEN}-character maximum."
+        )
     _reject_option_like("relative_path", relative_path)
     _reject_nul("relative_path", relative_path)
     # relative_path is a models-dir SUBFOLDER (e.g. `models/loras`), enforced
@@ -10406,7 +10465,17 @@ def _guard_model_filename(filename: str) -> str:
 
     Raises :class:`ComfyCliError` when the value is anything but a bare
     filename; otherwise returns it UNCHANGED, like the guard above.
+
+    LENGTH runs first here too, against the same :data:`_MAX_WORKFLOW_PATH_LEN`
+    ceiling the guard above uses — deliberately not a NAME_MAX-tight cap of its
+    own, which would be tighter than the argv hazard requires.
     """
+    if len(filename) > _MAX_WORKFLOW_PATH_LEN:
+        # Length before shape, reporting the size — see the guard above.
+        raise ComfyCliError(
+            f"invalid filename: {len(filename)} characters exceeds the "
+            f"{_MAX_WORKFLOW_PATH_LEN}-character maximum."
+        )
     _reject_option_like("filename", filename)
     _reject_nul("filename", filename)
     # filename is a single output name, not a path; reject separators, `..`,
@@ -10561,6 +10630,18 @@ async def download_model(
     # submit below). See `_reject_remote_model_download` for why it cannot be
     # made to work instead.
     _reject_remote_model_download()
+    # Length before every value check, and reporting the size rather than the
+    # value: an oversized `url` reaches argv, where the OS rejects the exec with
+    # an `OSError` (`E2BIG`) that neither `_run_comfy` nor this tool's own
+    # `except ComfyCliError` converts — and both checks below interpolate the
+    # value whole, so ordering the size check first also keeps a megabyte-long
+    # "URL" out of the tool response and the failure log. Same shape and same
+    # reasoning as `_guard_prompt_id`; see `_MAX_URL_LEN` for the ceiling.
+    if len(url) > _MAX_URL_LEN:
+        raise ComfyCliError(
+            f"invalid url: {len(url)} characters exceeds the "
+            f"{_MAX_URL_LEN}-character maximum."
+        )
     # comfy-cli parses a leading-dash value as an option/flag; reject any so a
     # crafted argument can't be smuggled in as a CLI flag (argument injection).
     _reject_option_like("url", url)
