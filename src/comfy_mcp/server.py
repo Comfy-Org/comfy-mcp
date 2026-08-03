@@ -1231,8 +1231,16 @@ def _check_comfy_version() -> None:
         # Full Disk Access and retrying in the same process must re-check.
         raise ComfyCliError(
             f"`{COMFY_BIN}` could not start.\n\n"
-            f"{tcc._tcc_guidance(tcc._tcc_path_from(proc.stderr))}\n\n"
-            f"Original error: {textutil._tail(proc.stderr)}"
+            f"{tcc._tcc_guidance(_scrubbed_tcc_path(proc.stderr))}\n\n"
+            # Same rule as `_unwrap_envelope`'s TCC branch: a captured stream is
+            # scrubbed on its way to the client, and so is the path pulled OUT
+            # of one (`_scrubbed_tcc_path`, a no-op on a real filesystem path).
+            # This probe is only `comfy --version`, so it carries no caller URL
+            # of its own — but comfy-cli reads its config at startup, so a
+            # warning naming a configured server URL can land on this stderr,
+            # and the asymmetry is not worth preserving.
+            "Original error: "
+            f"{failure_log._scrubbed_stream_tail(proc.stderr, _MAX_ERROR_FIELD_CHARS)}"
         )
     version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
     if version is not None and version < _MIN_COMFY_CLI:
@@ -1622,6 +1630,22 @@ def _reject_remote_model_download() -> None:
     )
 
 
+def _scrubbed_tcc_path(text: str | None) -> str | None:
+    """The denied path ``tcc._tcc_path_from`` found in ``text``, URL-masked.
+
+    ``tcc._tcc_guidance`` renders this token verbatim into a client-facing
+    message, and ``tcc._TCC_PATH_RE`` accepts ANY quoted string after the EPERM
+    marker — it is CPython's ``repr`` of an ``OSError`` filename in every case
+    that matters, but nothing structurally stops a credentialed URL landing
+    there and being echoed unmasked right above the scrubbed ``Original
+    error:``. A real filesystem path has no ``https://`` for
+    :data:`failure_log._URL_RE` to anchor on and so survives byte-for-byte,
+    which is what keeps the guidance naming the exact file the user has to move.
+    """
+    path = tcc._tcc_path_from(text)
+    return failure_log._scrub_text(path) if path else None
+
+
 def _cmd_for_message(cmd: list[str]) -> str:
     """The spawned argv rendered for an error message, credentials masked.
 
@@ -1634,10 +1658,31 @@ def _cmd_for_message(cmd: list[str]) -> str:
     (userinfo masked, query and fragment dropped) for every URL anywhere in a
     string, so reuse it rather than growing a second redactor —
     :func:`_synthesize_plain_result` omits raw args altogether for the same
-    reason. Everything that is not URL-shaped survives byte-for-byte, so the flags
-    and the subcommand stay legible.
+    reason (and scrubs its captured text, which omitting args does not cover).
+    Everything that is not URL-shaped survives byte-for-byte, so the flags
+    and the subcommand stay legible. The result is also bounded to
+    :data:`_MAX_ERROR_FIELD_CHARS` like every other field of that message —
+    ``run_workflow``'s rendered ``--param`` values are caller-supplied and can
+    inflate one argv arbitrarily, and it was the last unbounded piece of the
+    timeout sentence. The slice takes the HEAD, not the tail: the identifying
+    ``comfy --json --where local <subcommand>`` prefix sits at the front, and
+    everything a head slice can cut has already been scrubbed, so a URL it
+    bisects has no userinfo or query left to leak (the same scrub-then-cap
+    ordering :func:`failure_log._scrubbed_stream_tail` documents). The cap is
+    read at call time, so its definition sitting further down the module is
+    fine.
+
+    A cut is MARKED with a trailing ``...``, like every other bounded field in
+    the same sentence (:func:`textutil._stream_tail` prefixes one onto a tail
+    it clipped). A silently clipped argv reads as the COMPLETE invocation, so a
+    reader working out what wedged would conclude the wrong flags were passed.
+    The marker sits outside the cap rather than inside it, so the bound still
+    describes the argv itself.
     """
-    return failure_log._scrub_text(" ".join(cmd))
+    rendered = failure_log._scrub_text(" ".join(cmd))
+    if len(rendered) > _MAX_ERROR_FIELD_CHARS:
+        return rendered[:_MAX_ERROR_FIELD_CHARS] + "..."
+    return rendered
 
 
 def _timeout_failure(
@@ -1663,10 +1708,18 @@ def _timeout_failure(
     ``str`` first, but :func:`_drain_timed_out` can return ``None`` (nothing
     written) or ``bytes`` (POSIX attaches the undecoded partial read to
     ``TimeoutExpired``), and :func:`_run_comfy_raw` passes that through verbatim.
-    Both consumers below — :func:`textutil._tail` and
+    Both consumers below — :func:`failure_log._scrubbed_stream_tail` and
     :func:`failure_log._log_failure` — already declare that same union, so
     narrowing it here would only mislead a later edit into string-only work that
     blows up on exactly the POSIX timeout path.
+
+    The tails go through :func:`failure_log._scrubbed_stream_tail` rather than
+    :func:`textutil._tail` because comfy-cli echoes the URL it is fetching to
+    stderr, and this message goes straight to the MCP client — the same
+    credential the failure log has always masked on its way to disk. It renders
+    the ``<empty>`` marker itself, so there is no ``or '<empty>'`` fallback to
+    apply, and it takes the same ``str | bytes | None`` the POSIX timeout path
+    hands over.
 
     Not shared with :func:`_run_comfy_streaming`, whose timeout is deliberately a
     different report — it adds the progress snapshot and the poll-instead advice,
@@ -1674,8 +1727,8 @@ def _timeout_failure(
     """
     message = (
         f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
-        f"stderr tail: {textutil._tail(stderr) or '<empty>'}; "
-        f"stdout tail: {textutil._tail(stdout) or '<empty>'}"
+        f"stderr tail: {failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)}; "
+        f"stdout tail: {failure_log._scrubbed_stream_tail(stdout, _MAX_ERROR_FIELD_CHARS)}"
     )
     # `exit_code=None`: the child was killed at the deadline, so it never
     # reported one. The log keeps a longer slice of both streams than the
@@ -2143,15 +2196,22 @@ def _unwrap_envelope(
             # can fix, not the opaque "returned no JSON" this would otherwise be.
             message = (
                 f"comfy-cli could not run (exit {returncode}).\n\n"
-                f"{tcc._tcc_guidance(tcc._tcc_path_from(stderr))}\n\n"
-                # `textutil._stream_tail` for the truncation marker:
+                f"{tcc._tcc_guidance(_scrubbed_tcc_path(stderr))}\n\n"
+                # `failure_log._scrubbed_stream_tail` for the truncation marker:
                 # `tcc._looks_like_tcc_denial` only fires on a non-empty stderr,
                 # so the `<empty>` half is unreachable here — but a long denial
                 # traceback still gets clipped, and silently is how you misread
-                # it as the whole thing.
+                # it as the whole thing. Scrubbed for the same reason the log
+                # record below is: a denial traceback can quote the URL comfy-cli
+                # was fetching, credential and all.
                 # No stdout here on purpose: this branch has already identified
                 # the cause, so its curated guidance beats a second raw stream.
-                f"Original error: {textutil._stream_tail(stderr)}"
+                # `tcc._tcc_guidance` above renders a filesystem path rather than
+                # a captured stream, but it PULLS that path out of this same
+                # stderr, so it gets the scrub too (`_scrubbed_tcc_path`) — a no-op
+                # on any real path, which is the only thing that lands there.
+                "Original error: "
+                f"{failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)}"
             )
             # Still `no_json` — a TCC denial is the *reason* comfy-cli emitted no
             # envelope, not a different kind of failure. Unlike the message, the
@@ -2172,11 +2232,14 @@ def _unwrap_envelope(
         # Typer/click usage error or a plain-text status line on stdout), and
         # `_last_json_object` has already discarded the stdout text by the time
         # we get here. Rendering only stderr — and rendering an empty one as
-        # nothing at all — is what made this error opaque.
+        # nothing at all — is what made this error opaque. Both go through
+        # `failure_log._scrubbed_stream_tail`: a comfy-cli that dies mid-fetch
+        # prints the URL it was fetching, and this message is what the MCP
+        # client renders.
         message = (
             f"comfy-cli returned no JSON (exit {returncode}). "
-            f"stderr: {textutil._stream_tail(stderr)} | "
-            f"stdout: {textutil._stream_tail(stdout)}"
+            f"stderr: {failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)} | "
+            f"stdout: {failure_log._scrubbed_stream_tail(stdout, _MAX_ERROR_FIELD_CHARS)}"
         )
         failure_log._log_failure(
             "no_json",
@@ -2228,12 +2291,22 @@ def _unwrap_envelope(
         # credential) — dropping them was the exact workaround testers needed.
         # Each field is length-capped so a huge/malformed envelope can't bloat
         # the message propagated to the MCP client.
-        # The stderr fallback goes through `textutil._stream_tail` so an envelope
-        # with an empty `error.message` AND an empty stderr can't render a bare
-        # trailing colon with nothing after it. Note the cap is applied to the
-        # envelope's own message only — `textutil._stream_tail` already bounds
-        # its result, and re-slicing its HEAD here would chop off the truncation
-        # marker plus the very end of the tail, i.e. the part worth keeping.
+        # The stderr fallback goes through `failure_log._scrubbed_stream_tail` so
+        # an envelope with an empty `error.message` AND an empty stderr can't
+        # render a bare trailing colon with nothing after it. Note the cap is
+        # applied to the envelope's own message only — `_scrubbed_stream_tail`
+        # already bounds its result, and re-slicing its HEAD here would chop off
+        # the truncation marker plus the very end of the tail, i.e. the part
+        # worth keeping.
+        # Every field here is SCRUBBED on the way out, matching what
+        # `failure_log._log_failure` has always done on the way to disk: comfy-cli
+        # scrubs its own envelope fields today, but this server only floor-checks
+        # the child's version, so a URL in `error.message`/`hint` — or echoed to
+        # stderr by a child that died mid-fetch — is not something the client path
+        # may assume away. The scrub runs BEFORE each cap, never after: capping
+        # first can bisect a URL so its `https://` is gone and
+        # `failure_log._URL_RE` can no longer see the credential remainder (the
+        # same ordering `_scrubbed_stream_tail` documents).
         # Strip BEFORE the truthiness test: a whitespace-only `error.message`
         # ("   ") is truthy, so it would keep the fallback from firing and render
         # exactly the dangling-colon message this branch exists to prevent —
@@ -2242,14 +2315,39 @@ def _unwrap_envelope(
         raw_message = err.get("message")
         message = str(raw_message).strip() if raw_message else ""
         message = (
-            message[:_MAX_ERROR_FIELD_CHARS]
+            failure_log._scrub_text(message)[:_MAX_ERROR_FIELD_CHARS]
             if message
-            else textutil._stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
+            else failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
         )
-        parts = [f"comfy {' '.join(args)} failed [{code or 'unknown'}]: {message}"]
+        # `_cmd_for_message` renders the argv with the same masking, so a
+        # `model download --url https://<user>:<pass>@host/x?token=…` reads back
+        # as `model download --url https://***@host/x`: masked, not dropped, so
+        # the reader can still tell WHICH call failed. It is handed the
+        # subcommand tail only (the spawn's `--json --where local` prefix is the
+        # caller's), which is what keeps the `comfy <args> failed` reading;
+        # `list(args)` because it takes a list and `args` is a tuple.
+        # `code` gets the same scrub-then-cap as every other envelope field
+        # rendered here, and for the same reason: comfy-cli's own codes are
+        # short slugs, but this server only floor-checks the child's version, so
+        # a version-skewed or malformed envelope can put anything in it —
+        # including a URL, or a multi-KB blob that would bloat the sentence past
+        # every other field's bound. Rendered only: `code` itself rides on to
+        # `ComfyCliError.code` and the log record RAW, so the retry checks
+        # (`_RETRYABLE_*`) and a `jq 'select(.error_code == …)'` keep matching
+        # comfy-cli's literal value rather than a redacted echo of it.
+        rendered_code = (
+            failure_log._scrub_text(code)[:_MAX_ERROR_FIELD_CHARS]
+            if code
+            else "unknown"
+        )
+        parts = [
+            f"comfy {_cmd_for_message(list(args))} failed [{rendered_code}]: {message}"
+        ]
         hint = err.get("hint")
         if hint:
-            parts.append(f"hint: {str(hint)[:_MAX_ERROR_FIELD_CHARS]}")
+            parts.append(
+                f"hint: {failure_log._scrub_text(str(hint))[:_MAX_ERROR_FIELD_CHARS]}"
+            )
         detail_str = _render_error_details(err.get("details"))
         if detail_str:
             parts.append(detail_str)
@@ -2515,6 +2613,18 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
     # `model download` URL can carry a signed token / userinfo in its query
     # string, and this message lands in the tool response and host-side logs.
     message = text or f"comfy {' '.join(action_parts)} completed (exit 0)."
+    # Omitting the raw args is not on its own enough, because the captured text
+    # above is the OTHER side of the same credential: comfy-cli echoes the URL
+    # it is fetching (`Downloading <url>`) to stderr, so `model download`'s
+    # legacy foreground fallback and `partner_generate` would hand a signed
+    # CivitAI/HuggingFace URL straight back on the SUCCESS path — the one path
+    # the failure-side scrubbing this module does never sees. Scrubbed BEFORE
+    # the tail cap below, never after: capping first can bisect a URL so its
+    # `https://` is gone and `failure_log._URL_RE` can no longer see the
+    # credential remainder (the ordering `failure_log._scrubbed_stream_tail`
+    # documents). `saved_paths` below is parsed from the RAW text on purpose —
+    # those are local filesystem paths, and the caller needs them exact.
+    message = failure_log._scrub_text(message)
     result = {
         "ok": True,
         "action": " ".join(action_parts),
@@ -2557,7 +2667,14 @@ _MAX_ERROR_FIELD_CHARS = 500
 
 
 def _render_error_details(details: Any) -> str | None:
-    """Render the useful keys of an envelope's ``error.details`` for the message."""
+    """Render the useful keys of an envelope's ``error.details`` for the message.
+
+    Scrubbed before the cap like every other envelope-derived field
+    :func:`_unwrap_envelope` renders — today ``_SURFACED_DETAIL_KEYS`` is only
+    node names, so it masks nothing in practice, but this string lands in the
+    same client-facing sentence as ``error.message``/``hint`` and a later key
+    added to that tuple should not have to remember to redact separately.
+    """
     if not isinstance(details, dict):
         return None
     parts: list[str] = []
@@ -2567,7 +2684,8 @@ def _render_error_details(details: Any) -> str | None:
             continue
         if isinstance(value, (list, tuple)):
             value = ", ".join(str(v) for v in value)
-        parts.append(f"{key}: {str(value)[:_MAX_ERROR_FIELD_CHARS]}")
+        rendered = failure_log._scrub_text(str(value))[:_MAX_ERROR_FIELD_CHARS]
+        parts.append(f"{key}: {rendered}")
     return "; ".join(parts) if parts else None
 
 
@@ -3079,8 +3197,11 @@ async def _run_comfy_streaming(
                 f"Progress so far: {tracker.snapshot()}. The run may still be "
                 "going — check `job_status`, or for long generations submit "
                 "with `wait=False` and poll `wait_for_job` / `watch_job`. "
-                f"stderr tail: {textutil._tail(stderr_text) or '<empty>'}; "
-                f"stdout tail: {textutil._tail(timeout_stdout) or '<empty>'}"
+                # Scrubbed, not raw: comfy-cli echoes the URL it is fetching to
+                # stderr, and this sentence goes straight to the MCP client. See
+                # `_timeout_failure`, whose two fragments this mirrors.
+                f"stderr tail: {failure_log._scrubbed_stream_tail(stderr_text, _MAX_ERROR_FIELD_CHARS)}; "
+                f"stdout tail: {failure_log._scrubbed_stream_tail(timeout_stdout, _MAX_ERROR_FIELD_CHARS)}"
             )
             failure_log._log_failure(
                 "timeout",
@@ -9464,15 +9585,24 @@ def _phrase_is_only_the_caller_s(
       forward cover for is exactly where that shows: a Typer
       ``Path(..., resolve_path=True)`` echoes the RESOLVED path, and ``repr``
       doubles a backslash.
-    - The message this reads is a bounded ``textutil._tail`` (500 chars), so a
-      value longer than the tail arrives clipped. The id-shaped values are
-      already capped well under that bound (``_MAX_DOWNLOAD_ID_LEN``,
-      ``_MAX_NODE_PACK_ID_LEN``); ``workflow_path`` and ``download_model``'s
-      ``url`` / ``relative_path`` / ``filename`` are not, and are left uncapped
-      deliberately — a cap tight enough to close the gap would have to sit under
-      500 characters, and would start refusing legitimately deep paths and long
-      CivitAI/HuggingFace URLs to buy nothing but protection from a caller's own
-      crafted argument.
+    - The message this reads is a bounded 500-char tail, so a value longer than
+      the tail arrives clipped. The id-shaped values are already capped well
+      under that bound (``_MAX_DOWNLOAD_ID_LEN``, ``_MAX_NODE_PACK_ID_LEN``);
+      ``workflow_path`` and ``download_model``'s ``url`` / ``relative_path`` /
+      ``filename`` are not, and are left uncapped deliberately — a cap tight
+      enough to close the gap would have to sit under 500 characters, and would
+      start refusing legitimately deep paths and long CivitAI/HuggingFace URLs
+      to buy nothing but protection from a caller's own crafted argument.
+      That tail is also URL-SCRUBBED on its way to the client
+      (``failure_log._scrubbed_stream_tail``), so a value whose echo carries
+      credential material — userinfo or a query string, the only two things
+      ``failure_log._scrub_url`` rewrites — comes back masked rather than
+      verbatim. That is NOT a fourth way to reach the no-op, because the
+      subtraction below scrubs the value too, so the two sides are rewritten
+      identically and still cancel. Only ``download_model``'s ``url`` is
+      URL-shaped at all; the other sites pass identifiers and filesystem paths,
+      which need the ``https?://`` scheme ``failure_log._URL_RE`` anchors on and
+      so survive byte-for-byte.
 
     One residual runs the other way and is also accepted: requiring the value to
     carry the phrase whole means a value holding only a FRAGMENT is never
@@ -9496,7 +9626,16 @@ def _phrase_is_only_the_caller_s(
     """
     normalized = _normalize_cli_text(str(exc))
     for value in values:
-        echoed = _normalize_cli_text(value)
+        # SCRUBBED before normalizing, because the message being subtracted from
+        # is scrubbed too: `download_model`'s `url` is the one caller value that
+        # is URL-shaped, and `failure_log._scrub_url` rewrites it (userinfo
+        # masked, query dropped) on its way into `str(exc)`. Subtracting the RAW
+        # value would then miss its own echo — `str.replace` finds nothing — and
+        # the forged phrase would survive the discount, which at this site means
+        # a crafted `url` re-enables the legacy foreground transfer the
+        # `--background` degrade exists to gate. Both sides through the same two
+        # passes is what keeps the comparison honest.
+        echoed = _normalize_cli_text(failure_log._scrub_text(value))
         # A value that does not carry the phrase itself could not have forged
         # it — see above. This also disposes of the empty-normalization case
         # (`" "`, which normalizes to `""`): `str.replace("", " ")` would
