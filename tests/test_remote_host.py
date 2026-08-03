@@ -125,8 +125,51 @@ def test_target_url_with_path_rejected(monkeypatch):
         server._comfy_target()
 
 
+def test_target_url_with_query_rejected(monkeypatch):
+    """An auth proxy's `?token=…` can't be forwarded -> reject, don't drop it silently.
+
+    The realistic shape for an auth-proxied ComfyUI. `_with_target` forwards only
+    `--host` / `--port`, so accepting this would submit every run unauthenticated
+    and surface as a 401/403 that names nothing about the dropped credential.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/?token=<SECRETTOKEN>")
+    with pytest.raises(server.ComfyCliError, match="query or fragment") as excinfo:
+        server._comfy_target()
+    # The rejection must not echo back the secret it exists to protect.
+    assert "SECRETTOKEN" not in str(excinfo.value)
+
+
+def test_target_url_with_fragment_rejected(monkeypatch):
+    """A fragment is dropped just as silently as a query -> same rejection."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/#SECRETFRAG")
+    with pytest.raises(server.ComfyCliError, match="query or fragment") as excinfo:
+        server._comfy_target()
+    assert "SECRETFRAG" not in str(excinfo.value)
+
+
+def test_target_url_with_params_rejected(monkeypatch):
+    """`;params` is the spelling that slips past the path check.
+
+    `urlparse` splits `;token=abc` off the last path segment, so this value's
+    `path` is a bare "/" — accepted by the path check above — while `params`
+    carries the credential. It must be rejected alongside query/fragment, and
+    redacted the same way even though there is no `?` to cut at.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/;token=<SECRETTOKEN>")
+    with pytest.raises(server.ComfyCliError, match="query or fragment") as excinfo:
+        server._comfy_target()
+    assert "SECRETTOKEN" not in str(excinfo.value)
+    # The host:port — the whole diagnostic — survives the cut.
+    assert "http://gpu.example:8188/;<redacted>" in str(excinfo.value)
+
+
 def test_target_url_root_path_allowed(monkeypatch):
-    """A bare trailing slash is not a real base path -> accepted."""
+    """A bare trailing slash is not a real base path -> accepted.
+
+    The counter-case to the three rejections above: an empty query, fragment and
+    `params` alongside a `/` path must stay accepted, so the new check cannot
+    turn the documented `http://host:port/` form into a hard error.
+    """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001/")
     assert server._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
 
