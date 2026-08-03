@@ -205,6 +205,67 @@ def test_download_model_rejects_option_like_filename(patched_run):
     assert calls == []
 
 
+def test_download_model_rejects_an_oversized_url(patched_run):
+    """A url far past any real one is refused before it can reach argv.
+
+    An oversized argv is rejected by the OS with an `OSError` (`E2BIG`) that
+    neither `_run_comfy` nor this tool's own `except ComfyCliError` converts,
+    rather than failing as a clean `ComfyCliError` like every other bad input.
+    """
+    calls = patched_run(envelope(data=_submit()))
+    oversized = "https://hf.co/" + "u" * server._MAX_URL_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        _download_model(oversized)
+
+    assert calls == []
+    # Length, not value — see `_guard_prompt_id`.
+    assert oversized not in str(excinfo.value)
+
+    # The cap is generous enough that the boundary value itself rides through
+    # to argv — real signed CivitAI/HuggingFace URLs sit far below it.
+    at_ceiling = "https://hf.co/" + "u" * (server._MAX_URL_LEN - len("https://hf.co/"))
+    assert len(at_ceiling) == server._MAX_URL_LEN
+    _download_model(at_ceiling, wait=False)
+    assert calls[0]["cmd"][4:8] == ["model", "download", "--url", at_ceiling]
+
+
+def test_download_model_rejects_an_oversized_relative_path(patched_run):
+    """An oversized `relative_path` is capped ahead of the models-tree check.
+
+    Prefixed with `models/` so it would otherwise pass every containment check
+    and land in argv — the size refusal is what stops it, not the tree guard.
+    """
+    calls = patched_run(envelope(data=_submit()))
+    oversized = "models/" + "d" * server._MAX_WORKFLOW_PATH_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        _download_model("https://hf.co/x.safetensors", relative_path=oversized)
+
+    assert calls == []
+    assert oversized not in str(excinfo.value)
+    # Generous boundary: the value at exactly the ceiling still passes.
+    at_ceiling = "models/" + "d" * (server._MAX_WORKFLOW_PATH_LEN - len("models/"))
+    assert server._guard_model_relative_path(at_ceiling) == at_ceiling
+
+
+def test_download_model_rejects_an_oversized_filename(patched_run):
+    """An oversized `filename` is capped ahead of the bare-name shape check."""
+    calls = patched_run(envelope(data=_submit()))
+    oversized = "f" * (server._MAX_WORKFLOW_PATH_LEN + 1) + ".safetensors"
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        _download_model("https://hf.co/x.safetensors", filename=oversized)
+
+    assert calls == []
+    assert oversized not in str(excinfo.value)
+    # Generous boundary: the name at exactly the ceiling still passes — the cap
+    # is the argv one, deliberately not a NAME_MAX-tight one of its own.
+    suffix = ".safetensors"
+    at_ceiling = "f" * (server._MAX_WORKFLOW_PATH_LEN - len(suffix)) + suffix
+    assert server._guard_model_filename(at_ceiling) == at_ceiling
+
+
 @pytest.mark.parametrize(
     "bad_url", ["file:///etc/passwd", "ftp://host/x", "/etc/passwd"]
 )
