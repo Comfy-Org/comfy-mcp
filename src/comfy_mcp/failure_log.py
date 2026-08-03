@@ -139,15 +139,37 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # `_scrubbed_stream_tail`.
 _LEADING_TOKEN_RE = re.compile(r"\S*")
 
+# Closing punctuation, peeled off the END of a `_URL_RE` match before scrubbing
+# and re-attached after. `\S+` cannot tell a URL from the character that merely
+# FOLLOWS it, and `_scrub_url` deletes everything from the first `?` — so
+# without this, comfy-cli's `Invalid value for '--url': 'https://h/x?q=1'`
+# comes back having lost its closing quote and the rest of the sentence glued
+# to it, and `_render_error_details`' `", "`-joined entries merge into one
+# token. These messages now go to the MCP CLIENT, not just to the log, so that
+# rewrite is no longer something only a maintainer reading a JSONL trail sees.
+# Re-attaching gives nothing back: none of these characters is credential
+# material, and the peel is lossless for a URL with no query at all (they are
+# scrubbed to themselves and then restored).
+_URL_TRAILING_PUNCT = "'\"`,;:!.)]}>"
+
+
+def _scrub_url_match(match: re.Match[str]) -> str:
+    """Scrub one :data:`_URL_RE` hit, keeping the punctuation glued to its end."""
+    token = match.group(0)
+    kept = token.rstrip(_URL_TRAILING_PUNCT)
+    # `_URL_RE` anchors on `https?://`, so `kept` can never strip to empty.
+    return _scrub_url(kept) + token[len(kept) :]
+
 
 def _scrub_text(text: str) -> str:
     """Apply :func:`_scrub_url` to every URL embedded anywhere in ``text``.
 
     Only URL-shaped substrings are touched; everything around them (a path, a
     subcommand, a flag name, the prose of a message — the point of keeping the
-    field at all) is preserved byte-for-byte.
+    field at all) is preserved byte-for-byte, down to the quote or comma that
+    closes a URL the surrounding text quoted (:data:`_URL_TRAILING_PUNCT`).
     """
-    return _URL_RE.sub(lambda match: _scrub_url(match.group(0)), text)
+    return _URL_RE.sub(_scrub_url_match, text)
 
 
 def _scrub_arg(arg: str) -> str:
@@ -182,13 +204,34 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
     and only then clip.
 
     The generous bound is NOT on its own enough, which is why the head fragment
-    is masked explicitly below rather than left for the re-clip to push out of
+    is handled explicitly below rather than left for the re-clip to push out of
     range: scrubbing SHRINKS the window — ``_scrub_url`` deletes whole query
     strings and userinfo — so a URL-dense capture can come out of it already at
     or under ``limit``, take the early return, and be written with its
     scheme-shorn head still attached. The re-clip is safe by contrast:
     everything it can cut has been scrubbed already, so a URL it bisects has no
     userinfo or query left to leak.
+
+    That head fragment is DROPPED, not masked. Masking it (running the token
+    through ``_scrub_url`` as if it were a whole URL) covers a clip that landed
+    before the ``?`` and no further: a window cut PAST it arrives as
+    ``token=…&x=1`` — or, cut mid-value, as a bare suffix of the secret — with
+    no delimiter left for ``_scrub_url`` to anchor on, so the query it exists to
+    delete survives verbatim. A clipped leading token is a fragment of something
+    we cannot identify, and the ``...`` marker already says so; the host it
+    might have named is still legible in the same message, which renders the
+    argv through :func:`_scrub_text`. The cost is one partial token of a debug
+    tail, and a capture whose real first line happens to start with ``...``
+    loses its first token the same way.
+
+    Unless that token is the WHOLE window — a capture with no whitespace in its
+    last ``limit * 2`` chars — in which case dropping would return a bare
+    ``...`` and throw away the error the tail exists to keep (a single unbroken
+    blob is exactly the shape a chatty child's last line takes). There it falls
+    back to masking, accepting the narrower residual: a lone unbroken token that
+    is a scheme-shorn URL fragment clipped past its ``?`` keeps that remnant.
+    Losing the entire capture is the worse failure of the two, and every
+    multi-token case — which is every real CLI stderr — takes the drop.
     """
     if limit <= 0:
         # Mirror `_stream_tail`'s own non-positive guard: `[-0:]` is the WHOLE
@@ -201,14 +244,15 @@ def _scrubbed_stream_tail(stream: str | bytes | None, limit: int) -> str:
         # `_stream_tail` prefixes that marker onto a window it CLIPPED, and a
         # clipped window can begin part-way through a URL — past the `https://`
         # that `_URL_RE` anchors on, which is precisely why the scrub above
-        # cannot see a credential sitting in that leading remainder.
-        # `_scrub_url` handles a scheme-less string (it reads offset 0 as the
-        # netloc's start), so mask the head token as if it were a whole URL.
-        # A capture whose real first line happens to start with `...` is masked
-        # the same way; over-redacting one debug-log token is the right side to
-        # err on.
+        # cannot see a credential sitting in that leading remainder. Drop the
+        # token outright rather than trying to mask it: see the docstring for
+        # why no anchor is left to mask it ON. Over-redacting one debug-log
+        # token is the right side to err on — but only while something else
+        # survives it, hence the `rest` test: a whitespace-free window is one
+        # token, and dropping it would hand back a bare `...`.
         head = _LEADING_TOKEN_RE.match(scrubbed, 3).group(0)
-        scrubbed = "..." + _scrub_url(head) + scrubbed[3 + len(head) :]
+        rest = scrubbed[3 + len(head) :]
+        scrubbed = "..." + (rest if rest.strip() else _scrub_url(head) + rest)
     if len(scrubbed) <= limit:
         return scrubbed
     # Re-clipping loses the marker `_stream_tail` may have added, so re-add it:

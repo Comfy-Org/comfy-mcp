@@ -2494,6 +2494,62 @@ def test_error_envelope_masks_its_own_message_hint_and_details():
     assert f"partner_nodes: node fetching {_MASKED_URL}" in msg
 
 
+def test_error_envelope_masks_and_bounds_its_code():
+    """`error.code` renders in the same sentence, so it gets the same treatment.
+
+    comfy-cli's own codes are short slugs, but this server only floor-checks the
+    child's version — a version-skewed or malformed envelope can put a URL or a
+    multi-KB blob in that field, and it was the one interpolated without either
+    guard.
+    """
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": f"fetch_failed {_CREDENTIALED_URL}", "message": "nope"},
+    }
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+
+    msg = str(excinfo.value)
+    assert "SECRETTOKEN" not in msg
+    assert "<user>:<pw>" not in msg
+    assert f"[fetch_failed {_MASKED_URL}]" in msg
+
+
+def test_error_envelope_code_rides_on_raw_for_the_retry_checks():
+    """Only the RENDERED code is rewritten — `ComfyCliError.code` stays comfy-cli's.
+
+    `run_workflow`'s `_RETRYABLE_*` membership tests and the failure log's
+    `error_code` both key on the literal value, so scrubbing it in place would
+    stop them matching.
+    """
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": f"x {_CREDENTIALED_URL}", "message": "nope"},
+    }
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+
+    assert excinfo.value.code == f"x {_CREDENTIALED_URL}"
+
+
+def test_error_envelope_bounds_a_huge_code():
+    """A pathological `code` cannot bloat the message past every other field's cap."""
+    envelope = {
+        "type": "envelope",
+        "ok": False,
+        "error": {"code": "z" * 5000, "message": "nope"},
+    }
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._unwrap_envelope(envelope, ("env",), 1, "")
+
+    assert f"[{'z' * server._MAX_ERROR_FIELD_CHARS}]" in str(excinfo.value)
+
+
 def test_no_envelope_error_masks_credentials_on_both_streams(patched_plain_run):
     """The no-JSON path renders both raw streams — both need the same masking."""
     patched_plain_run(
@@ -2516,8 +2572,9 @@ def test_no_envelope_error_masks_credentials_on_both_streams(patched_plain_run):
 def test_tcc_denial_message_masks_the_credential_in_its_original_error(monkeypatch):
     """The TCC branch quotes stderr verbatim as `Original error:` — scrub that too.
 
-    `tcc._tcc_guidance` is deliberately left alone: it renders a filesystem path,
-    not a captured stream.
+    `tcc._tcc_guidance` renders a filesystem path rather than a captured stream,
+    but it pulls that path out of this same stderr, so it gets the scrub too —
+    see `test_scrubbed_tcc_path_*`.
     """
     monkeypatch.setattr(tcc, "_looks_like_tcc_denial", lambda _: True)
     stderr = f"PermissionError: /Users/x/Documents while fetching {_CREDENTIALED_URL}"
@@ -3442,6 +3499,79 @@ def test_sync_timeout_masks_a_credential_in_a_bytes_stderr_capture(patched_run):
     assert f"stderr tail: curl: (22) on {_MASKED_URL}" in msg
 
 
+def test_scrubbed_tcc_path_leaves_a_real_filesystem_path_alone():
+    """The guidance names the file the user has to move, so it must stay exact.
+
+    A path has no `https://` for `failure_log._URL_RE` to anchor on, which is
+    what makes the scrub a no-op on every input that actually lands here.
+    """
+    stderr = (
+        "PermissionError: [Errno 1] Operation not permitted: "
+        "'/Users/x/Documents/ComfyUI/venv/pyvenv.cfg'"
+    )
+
+    assert (
+        server._scrubbed_tcc_path(stderr)
+        == "/Users/x/Documents/ComfyUI/venv/pyvenv.cfg"
+    )
+
+
+def test_scrubbed_tcc_path_masks_a_credentialed_url():
+    """`tcc._TCC_PATH_RE` accepts any quoted string after the EPERM marker.
+
+    It is CPython's `repr` of an `OSError` filename in every case that matters,
+    but nothing structurally stops a credentialed URL landing there — and
+    `tcc._tcc_guidance` renders it verbatim, right above the scrubbed
+    `Original error:`.
+    """
+    stderr = f"[Errno 1] Operation not permitted: '{_CREDENTIALED_URL}'"
+
+    scrubbed = server._scrubbed_tcc_path(stderr)
+
+    assert "SECRETTOKEN" not in scrubbed
+    assert "<user>:<pw>" not in scrubbed
+    assert scrubbed == _MASKED_URL
+
+
+def test_scrubbed_tcc_path_is_none_when_stderr_named_no_path():
+    """`tcc._tcc_guidance` falls back to its general wording on `None`."""
+    assert server._scrubbed_tcc_path("something else entirely") is None
+
+
+def test_synthesize_plain_result_masks_a_credential_in_its_captured_text():
+    """The exit-0 path returns the captured stream, and that stream carries the URL.
+
+    Omitting the raw args covers one side; comfy-cli echoing `Downloading <url>`
+    to stderr is the other, and it reaches `model download`'s legacy foreground
+    fallback and `partner_generate` on SUCCESS — the one path none of the
+    failure-side scrubbing sees.
+    """
+    result = server._synthesize_plain_result(
+        ("model", "download", "--url", _CREDENTIALED_URL),
+        "",
+        f"Downloading {_CREDENTIALED_URL}\nDone in 55.8s",
+    )
+
+    assert "SECRETTOKEN" not in result["message"]
+    assert "<user>:<pw>" not in result["message"]
+    # Masked, not dropped: which fetch succeeded is still legible, and the
+    # `Done in …` metadata this payload exists to surface survives.
+    assert f"Downloading {_MASKED_URL}" in result["message"]
+    assert result["message"].endswith("Done in 55.8s")
+
+
+def test_synthesize_plain_result_scrubs_before_its_tail_cap():
+    """Capping first would bisect a URL past its scheme, leaving the remainder raw."""
+    noise = "n" * 1200
+    result = server._synthesize_plain_result(
+        ("model", "download"), "", f"{noise} fetching {_CREDENTIALED_URL} ok"
+    )
+
+    assert "SECRETTOKEN" not in result["message"]
+    assert "<user>:<pw>" not in result["message"]
+    assert len(result["message"]) <= 1000
+
+
 def test_cmd_for_message_bounds_a_huge_argv_from_the_head():
     """`run_workflow`'s `--param` values are caller-supplied and otherwise unbounded.
 
@@ -3449,6 +3579,10 @@ def test_cmd_for_message_bounds_a_huge_argv_from_the_head():
     `comfy --json --where local <subcommand>` prefix sits at the front — and
     everything it can cut has already been scrubbed, so a bisected URL has no
     userinfo or query left to leak.
+
+    The cut is MARKED: an argv clipped silently reads as the whole invocation,
+    so a reader diagnosing the wedge would blame flags that were never passed.
+    The marker is additive to the bound, like `textutil._stream_tail`'s.
     """
     cmd = [
         server.COMFY_BIN,
@@ -3464,10 +3598,29 @@ def test_cmd_for_message_bounds_a_huge_argv_from_the_head():
 
     rendered = server._cmd_for_message(cmd)
 
-    assert len(rendered) == server._MAX_ERROR_FIELD_CHARS
+    assert len(rendered) == server._MAX_ERROR_FIELD_CHARS + len("...")
+    assert rendered.endswith("...")
     assert rendered.startswith(
         f"{server.COMFY_BIN} --json --where local run --workflow"
     )
+
+
+def test_cmd_for_message_leaves_a_fitting_argv_unmarked():
+    """The `...` is evidence of a cut, so an argv under the bound must not carry one."""
+    rendered = server._cmd_for_message(
+        [
+            server.COMFY_BIN,
+            "--json",
+            "--where",
+            "local",
+            "model",
+            "download-status",
+            "x",
+        ]
+    )
+
+    assert not rendered.endswith("...")
+    assert rendered.endswith("model download-status x")
 
 
 def test_timeout_message_stays_bounded_on_a_huge_argv(monkeypatch):

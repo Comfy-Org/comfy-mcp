@@ -451,6 +451,39 @@ def test_scrub_arg_finds_a_url_anywhere_in_the_token(arg, expected):
     assert failure_log._scrub_arg(arg) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Click quotes the offending value; `\S+` swallows the closing quote and
+        # `_scrub_url` cuts from the `?`, so the rest of the sentence went with
+        # the query. These messages reach the MCP CLIENT now, not just the log.
+        (
+            "Invalid value for '--url': 'https://h/x?q=1' is not reachable.",
+            "Invalid value for '--url': 'https://h/x' is not reachable.",
+        ),
+        # `_render_error_details` joins list entries with `", "` — without the
+        # peel the comma is eaten and two entries merge into one token.
+        ("https://h/a?t=1, https://h/b?t=2", "https://h/a, https://h/b"),
+        ("see https://h/p?q=1.", "see https://h/p."),
+        ("(https://h/p?q=1)", "(https://h/p)"),
+        # Lossless where there is no query to cut: the peeled characters are
+        # scrubbed to themselves and put straight back.
+        ("https://h/p.", "https://h/p."),
+        ("'https://<u>:<p>@h/p'", "'https://***@h/p'"),
+        # Punctuation INSIDE the URL is still dropped with the rest of the query.
+        ("https://h/x?a=1,2,3 next", "https://h/x next"),
+    ],
+)
+def test_scrub_text_keeps_the_punctuation_glued_to_a_url(text, expected):
+    """`_URL_RE`'s `\\S+` cannot tell a URL from what merely FOLLOWS it.
+
+    None of the peeled characters is credential material, so restoring them
+    gives nothing back — and without them a scrubbed message loses the quote,
+    comma or full stop that made it a sentence.
+    """
+    assert failure_log._scrub_text(text) == expected
+
+
 def test_message_is_scrubbed_before_it_is_capped(log_path):
     """A URL straddling the message cap is masked, not cut into an unmasked half.
 
@@ -518,7 +551,7 @@ def test_stream_tail_scrubs_a_url_straddling_the_tail_cut(log_path):
     assert len(entry["stderr_tail"]) == limit + 3
 
 
-def test_stream_tail_scrubs_the_head_fragment_of_a_url_dense_capture(log_path):
+def test_stream_tail_drops_the_head_fragment_of_a_url_dense_capture(log_path):
     """The straddling-URL guard holds even when scrubbing shrinks the window.
 
     The double-width window is bounded generously so a half-URL at its head
@@ -545,8 +578,53 @@ def test_stream_tail_scrubs_the_head_fragment_of_a_url_dense_capture(log_path):
     (entry,) = _entries(log_path)
     assert len(entry["stderr_tail"]) <= limit  # it DID take the early return
     assert "user:tok" not in log_path.read_text()
-    # Masked rather than dropped: the host still says which fetch was in flight.
-    assert entry["stderr_tail"].startswith("...***@host/x ")
+    # Dropped, not masked — see the next test for why masking is not enough.
+    # What follows the fragment is intact, so the tail still reads.
+    assert entry["stderr_tail"].startswith("... https://h/a ")
+
+
+def test_stream_tail_drops_a_head_fragment_clipped_past_its_query_marker(log_path):
+    """Masking the head fragment covers a clip BEFORE the `?` and no further.
+
+    ``_scrub_url`` deletes from the first ``?``, so a window whose cut landed
+    PAST one arrives as a bare ``token=…`` remnant with no delimiter left to
+    anchor on — masking it is a no-op and the credential is written verbatim.
+    Dropping the fragment is what closes that, and it is the case the log's
+    own `Downloading <signed url>` progress lines make reachable.
+    """
+    limit = failure_log._FAILURE_LOG_TAIL_CHARS
+    remnant = "tok=SECRETVALUE&x=1 "
+    # Same shrink-to-under-`limit` trick as above: it is the early return that
+    # would otherwise carry the head fragment out to disk.
+    unit = "https://h/a?token=" + "A" * 100 + " "
+    filler = unit * ((limit * 2 - len(remnant)) // len(unit))
+    window = remnant + filler
+    stderr = "Z" * 10_000 + window.ljust(limit * 2, "B")
+
+    failure_log._log_failure("no_json", ("run",), stderr=stderr)
+
+    (entry,) = _entries(log_path)
+    assert len(entry["stderr_tail"]) <= limit  # it DID take the early return
+    assert "SECRETVALUE" not in log_path.read_text()
+    assert entry["stderr_tail"].startswith("... https://h/a ")
+
+
+def test_stream_tail_keeps_a_whitespace_free_window_rather_than_emptying_it(log_path):
+    """The head-fragment drop stops short of throwing the whole capture away.
+
+    A capture with no whitespace in its last ``limit * 2`` chars is ONE token,
+    so dropping it would return a bare ``...`` and lose the error the tail
+    exists to keep. There the fragment is masked instead — the narrower
+    residual the docstring accepts.
+    """
+    limit = failure_log._FAILURE_LOG_TAIL_CHARS
+    stderr = "x" * (limit * 3) + "THE-REAL-ERROR"
+
+    failure_log._log_failure("no_json", ("run",), stderr=stderr)
+
+    (entry,) = _entries(log_path)
+    assert entry["stderr_tail"].endswith("THE-REAL-ERROR")
+    assert len(entry["stderr_tail"]) == limit + len("...")
 
 
 # --- best-effort + rotation --------------------------------------------------

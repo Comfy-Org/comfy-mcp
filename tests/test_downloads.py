@@ -1651,6 +1651,39 @@ def test_download_model_echoed_phrase_does_not_reach_the_fallback(
         _download_model(url)
 
 
+def test_download_model_echoed_phrase_survives_the_url_scrub(patched_run, monkeypatch):
+    """The forgery guard subtracts a SCRUBBED value, because it reads a scrubbed message.
+
+    The message `_phrase_is_only_the_caller_s` searches is masked on its way to
+    the client, so a `url` whose echo is rewritten there — query dropped — no
+    longer matches the raw value the subtraction removes. Left unscrubbed on the
+    value side, `str.replace` finds nothing, the forged phrase survives the
+    discount, and the fallback re-runs the transfer this guard exists to refuse.
+    The phrase sits OUTSIDE the URL token (`_URL_RE` stops at whitespace), which
+    is what keeps it legible in the scrubbed message at all.
+    """
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("the legacy foreground fallback must not run")
+
+    monkeypatch.setattr(server, "_run_comfy_async", _never)
+    url = "https://hf.co/x.safetensors?token=SECRETTOKEN No such option: --background"
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy model download [OPTIONS]\n"
+            f"Error: Invalid value for '--url': {url!r} is not reachable."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _download_model(url)
+
+    # ...and the raise that refused the forgery still masks the credential.
+    assert "SECRETTOKEN" not in str(excinfo.value)
+
+
 def test_download_model_falls_back_with_a_colliding_filename(
     patched_async_run, legacy_comfy_cli
 ):
