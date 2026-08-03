@@ -1380,7 +1380,7 @@ def _strip_brackets(host: str) -> str:
 
 
 def _redact_config_url(url: str) -> str:
-    """:func:`textutil._redact_url`, plus the query/fragment a secret also hides in.
+    """:func:`textutil._redact_url`, plus the query/fragment/params a secret hides in.
 
     :func:`_comfy_target`'s errors echo the offending ``COMFYUI_URL`` back, and
     that text is quoted onward — into ``server_info``'s ``comfy_target`` block,
@@ -1392,13 +1392,26 @@ def _redact_config_url(url: str) -> str:
     moment ANY of the checks below rejects it — the ``https`` scheme most of
     all, which is what such a proxy is usually reached over.
 
-    The query and fragment are replaced WHOLESALE rather than parsed for
-    key names: what makes the value diagnosable is the scheme, host and port, so
-    nothing in either part is worth echoing — and a placeholder still tells the
-    user they wrote one, which "silently dropped" would not.
+    ``;`` is cut alongside them because ``urlparse`` splits ``;params`` off the
+    last path segment: ``http://host:8188/;token=…`` carries a secret with no
+    ``?`` anywhere in it, and is rejected (and echoed) by the same check. It is
+    searched only from after the scheme separator, the way
+    :func:`textutil._redact_url` bounds its own netloc scan — a ``;`` before that
+    is inside the scheme, and cutting there would take the host and port with it.
+
+    All three are replaced WHOLESALE rather than parsed for key names: what makes
+    the value diagnosable is the scheme, host and port, so nothing in any of them
+    is worth echoing — and a placeholder still tells the user they wrote one,
+    which "silently dropped" would not.
     """
     masked = textutil._redact_url(url)
-    cuts = [i for i in (masked.find("?"), masked.find("#")) if i != -1]
+    scheme_sep = masked.find("://")
+    semi_from = scheme_sep + 3 if scheme_sep != -1 else 0
+    cuts = [
+        i
+        for i in (masked.find("?"), masked.find("#"), masked.find(";", semi_from))
+        if i != -1
+    ]
     if not cuts:
         return masked
     cut = min(cuts)
@@ -1416,9 +1429,11 @@ def _comfy_target() -> tuple[str, int, str] | None:
     malformed value rather than silently retargeting to the wrong place.
 
     comfy-cli's ``--host`` / ``--port`` carry only a host and port, so a
-    ``COMFYUI_URL`` that also names a non-``http`` scheme (``https://``) or a base
-    path (``/comfyui``) is REJECTED rather than silently dropped — otherwise a
-    user asking for TLS or a reverse-proxy path would be quietly downgraded.
+    ``COMFYUI_URL`` that also names a non-``http`` scheme (``https://``), a base
+    path (``/comfyui``), or a query / fragment / ``;params`` (``?token=…``) is
+    REJECTED rather than silently dropped — otherwise a user asking for TLS, a
+    reverse-proxy path, or an auth proxy's token would be quietly downgraded to a
+    plain unauthenticated request against the bare host.
     """
     url = os.environ.get("COMFYUI_URL", "").strip()
     if url:
@@ -1446,6 +1461,20 @@ def _comfy_target() -> tuple[str, int, str] | None:
                 f"COMFYUI_URL must not include a path ({_redact_config_url(url)!r}): "
                 "comfy-cli forwards only host/port, so a reverse-proxy base path "
                 "would be dropped. Point COMFYUI_URL at the bare host:port."
+            )
+        # `params` is the `;token=abc` spelling: `urlparse` splits it off the
+        # last path segment, so `http://host:8188/;token=abc` leaves `path` at
+        # "/" and slips past the check above. Same silent drop, same rejection.
+        if parsed.query or parsed.fragment or parsed.params:
+            raise ComfyCliError(
+                f"COMFYUI_URL must not include a query or fragment "
+                f"({_redact_config_url(url)!r}): comfy-cli forwards only "
+                "host/port, so a query or fragment (e.g. a proxy auth "
+                "?token=...) would be silently dropped. The ';token=...' "
+                "spelling goes the same way — it is a path parameter, so it is "
+                "neither the path this checks above nor a query. Point "
+                "COMFYUI_URL at the bare host:port and carry the credential "
+                "another way."
             )
         if not host:
             raise ComfyCliError(
