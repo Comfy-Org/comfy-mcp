@@ -314,30 +314,25 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
         ),
     ],
 )
-def test_workflow_path_guard_rejects_an_oversized_path(call, no_spawn, monkeypatch):
+def test_workflow_path_guard_rejects_an_oversized_path(call, no_spawn):
     """A path far past PATH_MAX is refused before it can reach argv.
 
     An oversized argv is rejected by the OS with an `OSError` (`E2BIG`) no
     caller converts, rather than failing as a clean `ComfyCliError` like every
     other bad input. One check in `_guard_workflow_path` covers all six tools
-    that take a `workflow_path`, so all six are exercised here.
+    that take a `workflow_path`, so all six are exercised here — `no_spawn`
+    blocks both spawn paths, which is what makes `run_workflow` (which streams
+    rather than going through `_run_comfy`) provable in the same parametrization.
     """
-
-    def boom_async(*args, **kwargs):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    # `run_workflow` streams through `asyncio.create_subprocess_exec` rather
-    # than `_run_comfy`, so `no_spawn` alone would not prove it never spawned.
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", boom_async)
-
     oversized = "w" * (server._MAX_WORKFLOW_PATH_LEN + 1)
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         call(oversized)
 
-    # Length-not-value: `_reject_option_like` would echo `{value!r}` whole, so
-    # the size check runs first precisely to keep the oversized string out of
-    # the tool response and the failure log.
+    # Length-not-value: the size check runs first so the failure is named as a
+    # size rather than as whatever shape complaint the value happens to also
+    # trip, and so the refused string itself stays out of the tool response and
+    # the failure log.
     assert oversized not in str(excinfo.value)
 
 
@@ -352,6 +347,40 @@ def test_workflow_path_guard_allows_a_path_at_the_ceiling():
 
     assert server._guard_workflow_path(at_ceiling)
     assert server._guard_workflow_path(at_ceiling, frontend=True)
+
+
+def test_option_like_rejection_bounds_the_value_it_echoes():
+    """A value UNDER the cap is still bounded on its way into the error.
+
+    The length guards above stop the megabyte case, but a dash-leading value at
+    the 4096-character ceiling is legal input to `_reject_option_like`, whose
+    echo has the widest reach in the module — most of its twenty-odd call sites
+    guard values with no length cap at all. It renders through
+    `_clip_for_error`, so the message honors `_MAX_ERROR_FIELD_CHARS` like every
+    other field that quotes caller input.
+    """
+    at_ceiling = "-" + "w" * (server._MAX_WORKFLOW_PATH_LEN - 1)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'") as excinfo:
+        server._guard_workflow_path(at_ceiling)
+
+    message = str(excinfo.value)
+    assert at_ceiling not in message
+    # A few words of prose around the bounded field, not 4 KB of `w`.
+    assert len(message) < server._MAX_ERROR_FIELD_CHARS + 200
+
+
+def test_option_like_rejection_is_unchanged_for_an_ordinary_value():
+    """Bounding the echo did not change the message any real caller sees.
+
+    `_clip_for_error` quotes the fragment itself, so for anything whose rendered
+    form already fits the bound it is byte-identical to the `{value!r}` this
+    used to interpolate — the wording every other guard test asserts on.
+    """
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._guard_workflow_path("-flux.json")
+
+    assert repr("-flux.json") in str(excinfo.value)
 
 
 def test_workflow_tools_reject_embedded_nul(no_spawn):
