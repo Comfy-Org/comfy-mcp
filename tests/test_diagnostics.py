@@ -3,14 +3,21 @@
 It wraps ``comfy jobs status <id>`` and normalizes ComfyUI's raw
 ``execution_error`` payload (carried under the snapshot's ``error`` field) into a
 compact verdict: the failing node + exception + a bounded traceback tail. These
-lock in the three shapes the tool must handle: a failed status with a multi-frame
+lock in the shapes the tool must handle: a failed status with a multi-frame
 traceback (fields extracted, tail bounded), a healthy status (explicit
 ``error: None``, no raise), and a leading-dash prompt_id (rejected).
+
+Plus the other kind of failure — the one comfy-cli diagnosed ITSELF (a server
+that died mid-run), whose ``code``/``message`` pair carries none of ComfyUI's
+execution_error fields. That verdict must survive as ``error_code`` rather than
+flatten to an all-null answer, and must lose the shared fields to a real
+node-level failure when a payload happens to carry both.
 """
 
 from __future__ import annotations
 
 import pytest
+from conftest import envelope
 
 from comfy_mcp import server
 
@@ -93,6 +100,112 @@ def test_get_execution_error_tolerates_non_dict_error(monkeypatch):
     assert result["exception_message"] == "raw failure text"
     assert result["node_id"] is None
     assert result["traceback_tail"] == []
+
+
+def test_get_execution_error_preserves_wrapper_verdict(patched_run):
+    """comfy-cli's OWN verdict survives instead of flattening to an all-null answer.
+
+    A ComfyUI that died mid-run is diagnosed by comfy-cli, not by ComfyUI, so the
+    payload carries a ``code``/``message`` pair and none of the execution_error
+    fields. Normalizing only the latter reported every field as ``null`` — a
+    verdict that reads like a diagnosis which found nothing, while comfy-cli had
+    already named the cause.
+    """
+    patched_run(
+        envelope(
+            data={
+                "status": "error",
+                "error": {
+                    "code": "server_died",
+                    "message": "Lost connection to ComfyUI while job pid was running",
+                    "details": {"last_node": "KSampler"},
+                },
+            }
+        )
+    )
+
+    result = server.get_execution_error("pid")
+
+    assert result["error_code"] == "server_died"
+    # The wrapper shape has no `exception_message`; its `message` backfills it.
+    assert (
+        result["exception_message"]
+        == "Lost connection to ComfyUI while job pid was running"
+    )
+    # Every ComfyUI-shaped field the verdict does not carry stays absent-as-None:
+    # nothing is invented, but the failure is no longer reported as "no details".
+    assert result["exception_type"] is None
+    assert result["node_id"] is None
+    assert result["node_type"] is None
+    assert result["traceback_tail"] == []
+
+
+def test_get_execution_error_node_failure_reports_error_code_none(patched_run):
+    """A real ComfyUI ``execution_error`` is unchanged, with ``error_code: None``.
+
+    ``error_code`` is always present on a failure verdict, so a caller can read it
+    without a ``.get`` dance; on an ordinary node failure comfy-cli sends no code
+    and it is ``None``.
+    """
+    patched_run(
+        envelope(
+            data={
+                "status": "error",
+                "error": {
+                    "exception_message": "Tensor size mismatch",
+                    "exception_type": "RuntimeError",
+                    "node_id": 7,
+                    "node_type": "KSampler",
+                    "traceback": ["frame one", "frame two"],
+                },
+            }
+        )
+    )
+
+    assert server.get_execution_error("pid") == {
+        "prompt_id": "pid",
+        "status": "error",
+        "error_code": None,
+        "exception_message": "Tensor size mismatch",
+        "exception_type": "RuntimeError",
+        "node_id": "7",
+        "node_type": "KSampler",
+        "traceback_tail": ["frame one", "frame two"],
+    }
+
+
+def test_get_execution_error_node_fields_win_over_wrapper_message(patched_run):
+    """A payload carrying BOTH keeps ComfyUI's fields and still reports the code.
+
+    The failing node is the more specific cause, so it wins the shared fields; the
+    wrapper's ``code`` is additive rather than competing, and the ``message`` is
+    only a backfill — it must not displace an ``exception_message`` that exists.
+    """
+    patched_run(
+        envelope(
+            data={
+                "status": "error",
+                "error": {
+                    "code": "execution_error",
+                    "message": "the job failed",
+                    "exception_message": "Tensor size mismatch",
+                    "exception_type": "RuntimeError",
+                    "node_id": 7,
+                    "node_type": "KSampler",
+                    "traceback": ["frame one"],
+                },
+            }
+        )
+    )
+
+    result = server.get_execution_error("pid")
+
+    assert result["error_code"] == "execution_error"
+    assert result["exception_message"] == "Tensor size mismatch"  # not "the job failed"
+    assert result["exception_type"] == "RuntimeError"
+    assert result["node_id"] == "7"
+    assert result["node_type"] == "KSampler"
+    assert result["traceback_tail"] == ["frame one"]
 
 
 def test_get_execution_error_no_error_returns_explicit_none(monkeypatch):

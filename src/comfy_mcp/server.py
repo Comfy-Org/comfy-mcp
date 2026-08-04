@@ -4379,20 +4379,24 @@ async def run_workflow(
     range, and no layer estimates memory — and then crash the whole ComfyUI
     process mid-run when the OS kills it on the allocation. When that
     happens there is no node-level error to fetch: this tool surfaces a
-    connection-loss / timeout error, and subsequent ``job_status`` /
-    ``get_execution_error`` calls report ``server_not_running`` (both query the
-    live server, which is gone). The evidence is still on disk — ``get_logs``
-    reads comfy-cli's captured log file rather than the server, so it keeps
-    working across the crash whenever the server was started with
-    ``launch_comfyui``; call it to confirm the kill — pass
+    connection-loss / timeout error, and what a subsequent ``job_status`` /
+    ``get_execution_error`` says depends on the comfy-cli release. On a comfy-cli
+    NEWER than v1.13.0 (:data:`_MIN_COMFY_CLI`, the floor this server enforces —
+    the verdict landed after that release was cut) they report comfy-cli's own
+    ``server_died`` verdict for the run, which ``get_execution_error`` surfaces
+    as ``error_code``; on v1.13.0 and older they report a bare
+    ``server_not_running``. Neither is a node-level cause, and both query the
+    live server, so the run's own history is gone either way. The evidence is
+    still on disk — ``get_logs`` reads comfy-cli's captured log file rather than
+    the server, so it keeps working across the crash whenever the server was
+    started with ``launch_comfyui``; call it to confirm the kill — pass
     ``get_logs(port=...)`` when more than one port has run on this machine, or
     an unqualified call can serve a different instance's log and hide the very
-    OOM trace you are after. If you get
-    ``server_not_running`` right after running a workflow with large
-    image/latent dimensions or batch sizes, assume that workflow killed the
-    server: reduce width/height/``batch_size``, and relaunch with
-    ``launch_comfyui`` (or ``restart_comfyui`` if a stale server record remains)
-    before retrying.
+    OOM trace you are after. If you get either verdict right after running a
+    workflow with large image/latent dimensions or batch sizes, assume that
+    workflow killed the server: reduce width/height/``batch_size``, and relaunch
+    with ``launch_comfyui`` (or ``restart_comfyui`` if a stale server record
+    remains) before retrying.
 
     Partner-API nodes (Seedream/Veo/Kling/Gemini/…) need a Comfy credential in
     the server's environment (``COMFY_API_KEY`` in the client registration). A
@@ -6387,11 +6391,17 @@ def job_status(prompt_id: str) -> Any:
     Wraps ``comfy jobs status <prompt_id>``. Returns the job status and, when
     finished, its output references. Poll this after ``run_workflow(wait=False)``.
 
-    A ``server_not_running`` error from this tool immediately after a
-    ``run_workflow`` most likely means that run crashed the server (commonly an
-    out-of-memory kill from an oversized allocation) — this tool queries the
-    live server, so it has no history left to read, but ``get_logs`` reads the
-    captured log file and still works across the crash; check it — passing
+    A crashed server immediately after a ``run_workflow`` — most likely that run
+    killing it (commonly an out-of-memory kill from an oversized allocation) —
+    surfaces differently by comfy-cli release. On a comfy-cli NEWER than v1.13.0
+    (:data:`_MIN_COMFY_CLI`, the floor this server enforces — the verdict landed
+    after that release was cut) the call SUCCEEDS and reports comfy-cli's own
+    verdict for the run, a ``server_died`` error naming the lost connection;
+    ``get_execution_error`` surfaces that as its ``error_code``. On v1.13.0 and
+    older there is no such verdict and the call fails with a bare
+    ``server_not_running`` instead. Either way this tool reads the live server,
+    so the run's own history is gone, while ``get_logs`` reads the captured log
+    file and still works across the crash; check it — passing
     ``get_logs(port=...)`` if more than one port has run here, since a dead
     server leaves nothing to infer the port from — then relaunch the server and
     reduce the workflow's allocation sizes before retrying.
@@ -6484,14 +6494,31 @@ def get_execution_error(prompt_id: str) -> Any:
     ``{"prompt_id", "status", "error": None}`` rather than raising, so it is safe
     to call speculatively.
 
-    A ``server_not_running`` error from this tool immediately after a
-    ``run_workflow`` most likely means that run crashed the server (commonly an
-    out-of-memory kill from an oversized allocation) — this tool queries the
-    live server, so it has no history left to read, but ``get_logs`` reads the
-    captured log file and still works across the crash; check it — passing
-    ``get_logs(port=...)`` if more than one port has run here, since a dead
-    server leaves nothing to infer the port from — then relaunch the server and
-    reduce the workflow's allocation sizes before retrying.
+    NOT every failure is a node's. Some are diagnosed by comfy-cli itself rather
+    than by ComfyUI, and those carry none of the execution_error fields — so the
+    verdict also reports ``error_code``, comfy-cli's own code for the failure
+    (e.g. ``server_died``), with its ``message`` backfilling
+    ``exception_message``. ``error_code`` is always present on a failure verdict
+    and is ``None`` when the payload carried no code (the ordinary node-level
+    failure); a payload carrying both keeps ComfyUI's fields, since the failing
+    node is the more specific cause, and reports the code alongside them. Read
+    ``error_code`` FIRST: a non-``None`` value with no ``node_type`` means the
+    run did not fail inside a node, so there is no graph edit to make.
+
+    A crash of the whole ComfyUI process mid-run (commonly an out-of-memory kill
+    from an oversized allocation) is the case that matters most here, and what
+    it looks like depends on the comfy-cli release. On a comfy-cli NEWER than
+    v1.13.0 (:data:`_MIN_COMFY_CLI`, the floor this server enforces — the
+    verdict landed after that release was cut) it comes back as
+    ``error_code: "server_died"`` with a message naming the lost connection. On
+    v1.13.0 and older there is no such verdict and the call instead fails with a
+    bare ``server_not_running``. Either way the run is gone from the live server
+    this tool queries, and either way the evidence is on disk: ``get_logs`` reads
+    comfy-cli's captured log file rather than the server, so it still works
+    across the crash; check it — passing ``get_logs(port=...)`` if more than one
+    port has run here, since a dead server leaves nothing to infer the port from
+    — then relaunch the server and reduce the workflow's allocation sizes before
+    retrying.
     """
     prompt_id = _guard_prompt_id(prompt_id)
 
@@ -6509,6 +6536,7 @@ def get_execution_error(prompt_id: str) -> Any:
             return {
                 "prompt_id": prompt_id,
                 "status": "error",
+                "error_code": None,
                 "exception_message": None,
                 "exception_type": None,
                 "node_id": None,
@@ -6523,6 +6551,23 @@ def get_execution_error(prompt_id: str) -> Any:
     # crashes on an unexpected shape — mirrors comfy-cli's parse_error_message.
     if not isinstance(error, dict):
         error = {"exception_message": str(error)}
+
+    # comfy-cli's own WRAPPER verdict, kept rather than flattened. Some failures
+    # are diagnosed by the CLI itself instead of by ComfyUI — a server that died
+    # mid-run comes back as `{"code": "server_died", "message": ...}` — and that
+    # shape carries NONE of the execution_error fields read below, so
+    # normalizing it alone reported every field as `null`: a verdict that reads
+    # like a successful diagnosis which found nothing, when comfy-cli had
+    # actually named the cause. `code` is surfaced as its own field (always
+    # present, `None` when comfy-cli sent no code, so the flat verdict keeps one
+    # fixed key set) and `message` backfills `exception_message`, which the
+    # wrapper shape does not carry. Both are additive: a payload that DOES carry
+    # ComfyUI's fields keeps them verbatim — a verdict holding both wins with
+    # ComfyUI's, since that is the node-level cause, and still reports the code.
+    error_code = _cap_text(error.get("code"))
+    exception_message = _cap_text(error.get("exception_message"))
+    if exception_message is None and error_code is not None:
+        exception_message = _cap_text(error.get("message"))
 
     # Mirror comfy-cli's parse_error_message shape (execution_errors.py): flat
     # fields plus a tail of the traceback frames, with node_id coerced to str.
@@ -6541,7 +6586,8 @@ def get_execution_error(prompt_id: str) -> Any:
     return {
         "prompt_id": prompt_id,
         "status": "error",
-        "exception_message": _cap_text(error.get("exception_message")),
+        "error_code": error_code,
+        "exception_message": exception_message,
         "exception_type": _cap_text(error.get("exception_type")),
         "node_id": str(node_id) if node_id is not None else None,
         "node_type": _cap_text(error.get("node_type")),
