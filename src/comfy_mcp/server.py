@@ -21,7 +21,9 @@ Tools so far: the run -> get-output core loop plus job management
 user to confirm any flag that would publish the unauthenticated local ComfyUI to
 the network) with ``get_logs`` (``comfy logs``) to read a
 detached launch's captured output, the install verbs ``update_comfyui``
-(``comfy update``, forward-only) and ``switch_comfyui_version``
+(``comfy update``, forward-only — and its ``target="all"`` rebuilds every
+installed third-party node pack, so that target asks the user to confirm) and
+``switch_comfyui_version``
 (``comfy update comfy --version <X>``, which can also roll BACK and so asks the
 user to confirm per call), and the
 ``discover`` / ``which`` introspection pair (``comfy discover`` /
@@ -210,7 +212,12 @@ flows:
   are stashed, dependencies are reinstalled), so the USER is asked to confirm
   every call; on a client that cannot show prompts it errors unless you pass
   `confirm_switch=True`, which you may set ONLY when the user has agreed.
-  `update_comfyui` is the different, forward-only "get me current" verb.
+  `update_comfyui` is the different, forward-only "get me current" verb — and
+  its `target="all"` git-pulls and pip-installs EVERY installed third-party node
+  pack, running those packs' own code, so that ONE target asks the USER to
+  confirm as well (`confirm_update_all=True` is the fallback on a client that
+  cannot show prompts, and only when the user has agreed). `target="comfy"` and
+  `target="cli"` update first-party code and are never prompted.
 - Hosted PARTNER models (Flux / Ideogram / DALL·E / …) run via `partner_generate`,
   which SPENDS the user's Comfy credits. `generate_image` is always free — it
   runs an OSS graph on the user's own ComfyUI, whichever machine that is — and
@@ -3782,10 +3789,11 @@ def server_info() -> Any:
     (``comfy update comfy`` for core, ``comfy node update <pack>`` for a pack)
     before concluding the catalog lacks it; silent staleness is the usual
     culprit. The ``update_comfyui`` tool runs that update from here
-    (``target="comfy"`` for core, ``target="all"`` for the node packs; the
-    per-pack form is terminal-only), and ``restart_comfyui`` afterwards is what
-    makes the updated code take effect. The probe is best-effort and degrades
-    two ways — ``server_info`` itself still succeeds either way. The verb ships
+    (``target="comfy"`` for core, ``target="all"`` for the node packs — which
+    rebuilds EVERY pack and so asks the user to confirm; the per-pack form is
+    terminal-only), and ``restart_comfyui`` afterwards is what makes the updated
+    code take effect. The probe is best-effort and degrades two ways —
+    ``server_info`` itself still succeeds either way. The verb ships
     in comfy-cli 1.13.0, this server's enforced floor, so a compliant install
     answers it; on a comfy-cli that lacks it anyway (the version guard fails
     OPEN, so a source build or fork can slip past the floor), ``freshness`` is
@@ -4947,7 +4955,7 @@ def _client_elicitation_support(ctx: Context | None) -> bool | None:
 # client that advertises elicitation but never answers leaves the request pending
 # forever and stuck calls accumulate with nothing to reclaim them. Generous,
 # because a human has to notice the prompt and decide. Shared by every gate that
-# elicits — the two spend prompts and `switch_comfyui_version`'s destructive one.
+# elicits, deliberately un-enumerated here so the list cannot go stale.
 _ELICIT_TIMEOUT = 300.0
 
 # Cap on how much of a caller-supplied model name is echoed into the prompt.
@@ -5076,11 +5084,11 @@ async def _elicit_approval(
 ) -> bool:
     """Raise one confirmation prompt and report whether it was approved.
 
-    The shared body behind every per-call consent prompt — ``partner_generate``'s
-    and ``run_template``'s spend gates, and ``switch_comfyui_version``'s
-    destructive gate. Only the message, the answer schema, and ``wording`` differ;
-    the fail-closed handling below must not. True = the user affirmatively
-    approved.
+    The shared body behind every per-call consent prompt — the spend gates, the
+    destructive install gates (``switch_comfyui_version``, ``update_comfyui``'s
+    ``target="all"``), and the launch pair's network-exposure gate. Only the
+    message, the answer schema, and ``wording`` differ; the fail-closed handling
+    below must not. True = the user affirmatively approved.
     """
     try:
         result = await asyncio.wait_for(
@@ -8221,6 +8229,16 @@ async def restart_comfyui(
 # instead of surfacing as a bare non-zero exit from the CLI.
 _UPDATE_TARGETS = ("all", "comfy", "cli")
 
+# The one target of the three that runs code nobody in this chain vets. comfy-cli
+# maps it to `execute_cm_cli(["update", "all"])`, which walks EVERY installed
+# custom node pack — a `git pull` plus a `pip install` of that pack's new
+# requirements, into ComfyUI's own Python environment, executing whatever the
+# pack's authors have since published (its install script, its `pip` hooks, and
+# then its module code at the next boot). `"comfy"` and `"cli"` move first-party
+# code from known repositories instead, which is why the consent gate below is
+# scoped to this value alone rather than to the verb.
+_UPDATE_ALL_TARGET = "all"
+
 # `comfy update` can pull a git repo and then `pip install -r requirements.txt`
 # (multi-GB torch wheels), or walk every installed custom node pack for
 # `target="all"` — far longer than `launch_comfyui`'s 180s boot. Use the same
@@ -8228,18 +8246,160 @@ _UPDATE_TARGETS = ("all", "comfy", "cli")
 # network fetch that must not be killed halfway).
 _UPDATE_TIMEOUT = 1800.0
 
-# Only one `comfy update` may be in flight per server process. MCPServer dispatches
-# sync tools onto a worker thread pool, so a client is free to issue a second
-# `update_comfyui` while the first is still running — and both would drive `git`
-# and `pip` against the SAME workspace and Python environment at once (a fight
-# over `index.lock`, or two installers writing the same `site-packages`), which
-# can leave a partially-installed ComfyUI. Held for the whole subprocess.
+# Only one `comfy update` may be in flight per server process. Nothing in MCP
+# serializes tool calls, so a client is free to issue a second `update_comfyui`
+# while the first is still running — and both would drive `git` and `pip` against
+# the SAME workspace and Python environment at once (a fight over `index.lock`, or
+# two installers writing the same `site-packages`), which can leave a
+# partially-installed ComfyUI. Held for the whole subprocess, which outlives the
+# request that started it: see the done-callback in `update_comfyui`.
 _UPDATE_LOCK = threading.Lock()
+
+# The busy refusal, shared by the advisory peek before the confirmation prompt and
+# the authoritative acquire after it, so the two cannot drift into telling the
+# caller different things about the same condition.
+_UPDATE_BUSY = (
+    "an update is already running in this server; `comfy update` mutates the "
+    "ComfyUI git checkout and Python environment, so two at once can corrupt the "
+    "install. Wait for the in-flight update to finish (up to 30 minutes for a "
+    "core update) and call again."
+)
+
+# Kept OFF asyncio's shared default executor for the reason `_SWITCH_EXECUTOR`
+# spells out, and more so: this is the longest-running child in the server
+# (`_UPDATE_TIMEOUT` is 30 minutes), and a run abandoned by its caller keeps its
+# worker for all of it. On the default pool that starves every other `to_thread`
+# caller in the process (`_check_comfy_version`, `_engine_auto_confirms`, the
+# download pollers). One worker is enough because `_UPDATE_LOCK` — acquired
+# BEFORE anything is submitted here — already admits exactly one update at a
+# time, so a second can never be queued behind the first.
+_UPDATE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comfy-update")
+
+
+class UpdateAllApproval(BaseModel):
+    """What the client returns from the custom-node-pack update prompt.
+
+    Same affirmative-answer design as :class:`SpendApproval` and
+    :class:`VersionSwitchApproval`, for the same reason: an accept that never
+    actually answered lands on the ``False`` default and is treated as a refusal.
+    The question differs again — this one runs third-party code rather than
+    spending money or rewriting the core checkout — so it gets its own wording.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Update every custom node pack installed in this ComfyUI?",
+        description=(
+            "Yes git-pulls and pip-installs every third-party node pack into "
+            "ComfyUI's Python environment, running code their authors have "
+            "published since you installed them. No cancels it and updates "
+            "nothing."
+        ),
+    )
+
+
+_UPDATE_ALL_APPROVAL_WORDING = _ApprovalWording(
+    subject="node pack update",
+    what="updating the installed custom node packs",
+    nothing_done="Nothing was updated.",
+    # The route out for a client this server cannot prompt. As with the version
+    # switch and the launch flags there is no engine-side durable consent to point
+    # at — comfy-cli does not gate `comfy update all` at all — so the escape hatch
+    # is the user running it themselves, where their own shell IS the confirmation.
+    escape_hatch=(
+        " If this client cannot show prompts, run `comfy update all` in a "
+        "terminal instead."
+    ),
+)
+
+# Said in the prompt AND in the cannot-be-prompted refusal, because both have to
+# answer the same question — what is the user actually approving? — and an agent
+# relaying only one of them should not be able to relay a milder version.
+_UPDATE_ALL_STAKES = (
+    "This runs `git pull` and `pip install` for EVERY third-party custom node "
+    "pack installed in this ComfyUI, into its Python environment — so it executes "
+    "code those packs' own authors have published since you installed them. It "
+    "can take a long time, and it can move a pack (or a shared dependency) to a "
+    "version other packs and your saved workflows do not work with."
+)
+
+
+async def _elicit_update_all_consent(ctx: Context) -> bool:
+    """Ask the USER to approve one update of every installed node pack.
+
+    Nothing caller-supplied is interpolated: the gate fires on a target already
+    pinned to the literal ``"all"``, so there is no text here for
+    :func:`_display_caller_text` to neutralize.
+    """
+    return await _elicit_approval(
+        ctx,
+        (
+            "Update every custom node pack installed in the local ComfyUI? "
+            f"{_UPDATE_ALL_STAKES} Updating ComfyUI core or comfy-cli itself is a "
+            "different call and is not part of this. The running server keeps "
+            "executing the OLD code until it is restarted. Declining cancels it "
+            "and updates nothing."
+        ),
+        UpdateAllApproval,
+        _UPDATE_ALL_APPROVAL_WORDING,
+    )
+
+
+async def _resolve_update_all_consent(
+    confirm_update_all: bool, ctx: Context | None
+) -> None:
+    """Return only if the USER approved updating every node pack; otherwise raise.
+
+    ``comfy update all`` is not gated by comfy-cli at all, so this prompt is the
+    only thing standing between a tool call and third-party code running on the
+    user's machine — the same position :func:`_resolve_switch_consent` is in, and
+    it keeps that function's two load-bearing properties:
+
+    1. **Elicitation wins, and is raised even when ``confirm_update_all=True``.**
+       The agent host's permission to CALL this tool is a different question from
+       the user's consent to rebuild every third-party pack in their install, and
+       an "always allow this tool" toggle answers only the first. The caller may
+       also be a prompt-injected agent, so its own assertion can never be the
+       authority on a client that can be prompted.
+    2. **An unknown capability counts as CAPABLE.** ``None`` from
+       :func:`_client_elicitation_support` is the probe failing, not a "no";
+       guessing "cannot elicit" would silently demote a real client onto the
+       caller's own say-so. Being wrong the other way costs a prompt that lapses
+       into a refusal at :data:`_ELICIT_TIMEOUT`, having updated nothing.
+
+    What it does NOT keep, again like the switch, is an engine-consent branch:
+    ``comfy update`` has no durable "always proceed" to read, so nothing can
+    consent here on the user's behalf.
+    """
+    if _client_elicitation_support(ctx) is not False:
+        if await _elicit_update_all_consent(ctx):
+            return
+        raise ComfyCliError(
+            "node pack update not confirmed: the user declined to update the "
+            "installed custom node packs. Nothing was updated and no pack code "
+            "was run."
+        )
+    # Client cannot be prompted: `confirm_update_all` is the documented fallback,
+    # and its `False` default is why a bare `target="all"` from such a client runs
+    # no third-party code.
+    if not confirm_update_all:
+        raise ComfyCliError(
+            "node pack update not confirmed: this client cannot show a "
+            'confirmation prompt, so target="all" requires '
+            f"confirm_update_all=True. {_UPDATE_ALL_STAKES} Ask the USER first "
+            "and pass it only once they have actually agreed, never just to "
+            'clear this error. Updating ComfyUI core (target="comfy") or '
+            'comfy-cli (target="cli") needs no confirmation. Nothing was updated.'
+        )
 
 
 @mcp.tool()
-def update_comfyui(target: str = "comfy") -> Any:
-    """Update the LOCAL install — ComfyUI core, the custom node packs, or comfy-cli itself.
+async def update_comfyui(
+    target: str = "comfy",
+    confirm_update_all: bool = False,
+    ctx: Context | None = None,
+) -> Any:
+    """Update the LOCAL install — ComfyUI core, the custom node packs (asks first), or comfy-cli.
 
     Thin passthrough to ``comfy update <target>``. The three targets are
     comfy-cli's own, and they do different things:
@@ -8247,7 +8407,7 @@ def update_comfyui(target: str = "comfy") -> Any:
     * ``"comfy"`` (default) — updates **ComfyUI core** in the selected workspace
       (``git pull`` + reinstall of its ``requirements.txt``).
     * ``"all"`` — updates the installed **custom node packs** (via the node
-      manager), not core.
+      manager), not core. **The USER is asked to confirm this one** — see below.
     * ``"cli"`` — updates **comfy-cli** itself, the binary this whole server
       shells out to.
 
@@ -8274,6 +8434,22 @@ def update_comfyui(target: str = "comfy") -> Any:
     allowed targets, and only the matched value — never the caller's raw string
     — is forwarded on the command line.
 
+    **``target="all"`` asks the USER first, and only that target.** Updating the
+    node packs runs ``git pull`` + ``pip install`` for every third-party pack in
+    the install, into ComfyUI's Python environment — so it executes code those
+    packs' authors have published since, and it can move a pack (or a shared
+    dependency) to a version other packs and your saved workflows do not work
+    with. comfy-cli does not gate that, so on a client that supports MCP
+    elicitation the human is shown a prompt naming exactly what will happen, and a
+    decline refuses the call with nothing updated and no pack code run. That
+    prompt is raised even when ``confirm_update_all=True``: the host's permission
+    to call this tool is not the user's permission to rebuild their node packs. On
+    a client that CANNOT be prompted, ``confirm_update_all=True`` is the
+    documented fallback — set it ONLY when the user has actually agreed, never to
+    clear the error — and its ``False`` default means a bare ``target="all"`` from
+    such a client runs nothing. ``target="comfy"`` and ``target="cli"`` update
+    first-party code from known repositories and are never prompted.
+
     **One update at a time.** An update rewrites the ComfyUI git checkout and
     reinstalls into its Python environment, so a second concurrent call would
     race the first over ``index.lock`` / ``site-packages`` and can leave a
@@ -8298,24 +8474,42 @@ def update_comfyui(target: str = "comfy") -> Any:
             "('comfy' = ComfyUI core, 'all' = installed custom node packs, "
             "'cli' = comfy-cli itself)."
         )
-    # Refuse rather than queue: blocking would park an MCPServer worker thread for
-    # up to 30 minutes behind an update the caller cannot see, and present as a
-    # hang. Failing immediately names what is happening and leaves retrying to
-    # the caller. Acquired AFTER target validation so a bad target is still
-    # rejected while an update is running.
+    if normalized == _UPDATE_ALL_TARGET:
+        # An advisory peek before the prompt, the way `switch_comfyui_version`
+        # does it: a user should not be asked to approve something that is then
+        # refused anyway. The authoritative, race-free acquire is below.
+        if _UPDATE_LOCK.locked():
+            raise ComfyCliError(_UPDATE_BUSY)
+        # Deliberately BEFORE the lock. An elicitation can sit for
+        # `_ELICIT_TIMEOUT`, and holding the lock across it would park a
+        # legitimately-waiting update (or `switch_comfyui_version`, which shares
+        # it) behind a human deciding — and a declined call would have blocked
+        # them for nothing.
+        await _resolve_update_all_consent(confirm_update_all, ctx)
+    # Refuse rather than queue: blocking would park a worker thread for up to 30
+    # minutes behind an update the caller cannot see, and present as a hang.
+    # Failing immediately names what is happening and leaves retrying to the
+    # caller. Acquired AFTER target validation so a bad target is still rejected
+    # while an update is running, and after consent so a declined call never
+    # blocks an update that is legitimately in flight.
     if not _UPDATE_LOCK.acquire(blocking=False):
-        raise ComfyCliError(
-            "an update is already running in this server; `comfy update` "
-            "mutates the ComfyUI git checkout and Python environment, so two "
-            "at once can corrupt the install. Wait for the in-flight update to "
-            "finish (up to 30 minutes for a core update) and call again."
-        )
+        raise ComfyCliError(_UPDATE_BUSY)
     try:
         # Forward `normalized` (a member of `_UPDATE_TARGETS`), not `target`: the
         # caller's raw string never reaches argv.
-        return _run_comfy("update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True)
-    finally:
+        job = _UPDATE_EXECUTOR.submit(
+            _run_comfy, "update", normalized, timeout=_UPDATE_TIMEOUT, plain_ok=True
+        )
+    except BaseException:
         _UPDATE_LOCK.release()
+        raise
+    # The lock belongs to the SUBPROCESS, not to this coroutine — see
+    # `switch_comfyui_version` for the full reasoning. Cancelling the request
+    # neither interrupts the worker thread nor kills the `comfy update` it
+    # spawned, so releasing in a `finally` here would hand the lock to a retry
+    # that then runs a second `git`/`pip` against the same workspace and venv.
+    job.add_done_callback(lambda _job: _UPDATE_LOCK.release())
+    return await asyncio.wrap_future(job)
 
 
 # The two moving targets `comfy update comfy --version` accepts alongside a

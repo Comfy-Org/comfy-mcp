@@ -34,6 +34,7 @@ import test_partner_generate
 import test_run_template
 import test_run_workflow_spend
 import test_switch_version
+import test_update_consent
 from mcp.server.mcpserver import Context
 from mcp.server.session import ServerSession
 
@@ -67,8 +68,9 @@ def _params(func) -> list[tuple[str, bool]]:
 
 
 # Every fake standing in for the real `Context.elicit`. One per consent gate: the
-# three spend gates, the version switch, and the network-exposure gate on the
-# launch pair. Each entry is the class itself — `_label` says where it lives.
+# three spend gates, the version switch, `update_comfyui`'s node-pack gate, and
+# the network-exposure gate on the launch pair. Each entry is the class itself —
+# `_label` says where it lives.
 _ELICIT_FAKES = [
     test_install_node._FakeCtx,
     test_network_exposure._FakeCtx,
@@ -76,13 +78,14 @@ _ELICIT_FAKES = [
     test_run_template._FakeCtx,
     test_run_workflow_spend._FakeCtx,
     test_switch_version._FakeCtx,
+    test_update_consent._FakeCtx,
 ]
 
 # Only the doubles that stand in for a context which also carries progress: the
 # two STREAMING run verbs hand the same object to the prompt and to the run. The
-# `switch_version` / `network_exposure` fakes have no `report_progress` because
-# neither tool streams, so registering them here would assert a method their
-# production path never calls.
+# `switch_version` / `update_consent` / `network_exposure` fakes have no
+# `report_progress` because none of those tools stream, so registering them here
+# would assert a method their production path never calls.
 _PROGRESS_FAKES = [
     conftest._RecordingCtx,
     test_run_template._FakeCtx,
@@ -96,6 +99,7 @@ _SESSION_FAKES = [
     test_run_template._FakeSession,
     test_run_workflow_spend._FakeSession,
     test_switch_version._FakeSession,
+    test_update_consent._FakeSession,
 ]
 
 #: Which registry above owns each SDK method a double may stand in for. Drives
@@ -190,7 +194,7 @@ def test_fake_check_client_capability_matches_the_real_session_signature(fake):
 
 @pytest.mark.parametrize("method", sorted(_REGISTRY_BY_METHOD))
 def test_every_module_level_fake_is_registered(method):
-    """A sixth copy of a consent fake must be CHECKED, not merely written.
+    """A seventh copy of a consent fake must be CHECKED, not merely written.
 
     The registries above are hand-written, and hand-written lists rot: three of
     the five consent fakes went unlisted for as long as they existed, so they

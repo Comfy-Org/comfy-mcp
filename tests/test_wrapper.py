@@ -4824,6 +4824,17 @@ def test_lifecycle_lock_is_released_after_a_failed_launch(
 # --- update_comfyui (`comfy update [all|comfy|cli]`) ------------------------
 
 
+def _update(*args, **kwargs):
+    """Drive the async ``update_comfyui`` tool from a sync test.
+
+    These tests are about the PASSTHROUGH — argv, timeout, the lock — and pass no
+    ``ctx``, which reads as "this client cannot be prompted". That is why the
+    ``target="all"`` cases below carry ``confirm_update_all=True``: the consent
+    gate itself is exercised in ``test_update_consent.py``.
+    """
+    return asyncio.run(server.update_comfyui(*args, **kwargs))
+
+
 def test_update_comfyui_defaults_to_core_target(patched_plain_run):
     """Bare call updates ComfyUI core: `comfy … update comfy`, plain-exit success.
 
@@ -4835,7 +4846,7 @@ def test_update_comfyui_defaults_to_core_target(patched_plain_run):
         0, stderr="Updating ComfyUI in /ws...\nAlready up to date."
     )
 
-    result = server.update_comfyui()
+    result = _update()
 
     cmd = calls[0]["cmd"]
     assert cmd[1:4] == ["--json", "--where", "local"]  # global flags still first
@@ -4850,7 +4861,9 @@ def test_update_comfyui_forwards_each_accepted_target(patched_plain_run, target)
     """Every target comfy-cli accepts is forwarded verbatim."""
     calls = patched_plain_run(0, stderr="done")
 
-    server.update_comfyui(target)
+    # `confirm_update_all` is inert for the two first-party targets — only `"all"`
+    # is gated — so one call shape covers all three.
+    _update(target, confirm_update_all=True)
 
     assert calls[0]["cmd"][4:] == ["update", target]
 
@@ -4862,7 +4875,7 @@ def test_update_comfyui_nonzero_exit_raises(patched_plain_run):
     )
 
     with pytest.raises(server.ComfyCliError, match="returned no JSON"):
-        server.update_comfyui()
+        _update()
 
     assert len(calls) == 1  # it really did run, and the failure was not swallowed
 
@@ -4878,7 +4891,7 @@ def test_update_comfyui_surfaces_error_envelope(patched_run):
     )
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.update_comfyui("comfy")
+        _update("comfy")
     assert excinfo.value.code == "workspace_not_found"
 
 
@@ -4891,7 +4904,7 @@ def test_update_comfyui_rejects_unknown_target_before_spawning(patched_run, targ
     calls = patched_run(envelope(data={}))
 
     with pytest.raises(server.ComfyCliError, match="invalid update target"):
-        server.update_comfyui(target)
+        _update(target)
 
     assert calls == []  # nothing was forwarded to comfy-cli
 
@@ -4901,7 +4914,7 @@ def test_update_comfyui_error_names_the_allowed_targets(patched_run):
     patched_run(envelope(data={}))
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server.update_comfyui("everything")
+        _update("everything")
     message = str(excinfo.value)
     assert "'everything'" in message  # the offending value, echoed back
     for allowed in ("'all'", "'comfy'", "'cli'"):
@@ -4912,7 +4925,7 @@ def test_update_comfyui_normalizes_case_and_whitespace(patched_plain_run):
     """`" Comfy "` resolves to the canonical target; the raw string never hits argv."""
     calls = patched_plain_run(0, stderr="done")
 
-    server.update_comfyui("  COMFY ")
+    _update("  COMFY ")
 
     assert calls[0]["cmd"][4:] == ["update", "comfy"]
 
@@ -4921,7 +4934,7 @@ def test_update_comfyui_timeout_is_generous(patched_plain_run):
     """The update timeout must comfortably exceed launch_comfyui's 180s boot."""
     calls = patched_plain_run(0, stderr="done")
 
-    server.update_comfyui()
+    _update()
 
     assert calls[0]["timeout"] >= 180.0
     assert calls[0]["timeout"] == server._UPDATE_TIMEOUT
@@ -4935,7 +4948,7 @@ def test_update_comfyui_is_non_interactive(patched_plain_run):
     """
     calls = patched_plain_run(0, stderr="done")
 
-    server.update_comfyui()
+    _update()
 
     assert calls[0]["stdin"] == subprocess.DEVNULL
     assert calls[0]["env"]["GIT_TERMINAL_PROMPT"] == "0"
@@ -4945,10 +4958,11 @@ def test_update_comfyui_is_non_interactive(patched_plain_run):
 def test_update_comfyui_refuses_a_concurrent_update(monkeypatch, patched_plain_run):
     """A second update while one is in flight is refused, not run in parallel.
 
-    MCPServer dispatches sync tools onto a worker thread pool, so two calls really
-    can overlap — and both would then drive git/pip against the same checkout and
-    Python environment. A real second thread here, pinned inside the first
-    update's subprocess (i.e. while the lock is held).
+    Nothing in MCP serializes tool calls, so two really can overlap — and both
+    would then drive git/pip against the same checkout and Python environment. A
+    real second thread here, pinned inside the first update's subprocess (i.e.
+    while the lock is held). `confirm_update_all=True` on the second call so what
+    refuses it is unmistakably the lock and not the consent gate.
     """
     calls = patched_plain_run(0, stderr="done")
     inside = threading.Event()
@@ -4961,12 +4975,12 @@ def test_update_comfyui_refuses_a_concurrent_update(monkeypatch, patched_plain_r
         return fixture_popen(*args, **kwargs)
 
     monkeypatch.setattr(server.subprocess, "Popen", blocking_popen)
-    worker = threading.Thread(target=server.update_comfyui, args=("comfy",))
+    worker = threading.Thread(target=_update, args=("comfy",))
     worker.start()
     try:
         assert inside.wait(5), "the first update never reached its subprocess"
         with pytest.raises(server.ComfyCliError, match="already running"):
-            server.update_comfyui("all")
+            _update("all", confirm_update_all=True)
     finally:
         release.set()
         worker.join(5)
@@ -4980,7 +4994,7 @@ def test_update_comfyui_lock_is_released_after_failure(patched_plain_run):
     patched_plain_run(1, stderr="error: local changes would be overwritten")
 
     with pytest.raises(server.ComfyCliError):
-        server.update_comfyui()
+        _update()
 
     # The lock is free again, so a retry proceeds instead of being refused.
     assert server._UPDATE_LOCK.acquire(blocking=False)
@@ -4991,8 +5005,8 @@ def test_update_comfyui_lock_is_released_after_success(patched_plain_run):
     """The happy path releases too — two sequential updates are always allowed."""
     calls = patched_plain_run(0, stderr="done")
 
-    server.update_comfyui("comfy")
-    server.update_comfyui("cli")
+    _update("comfy")
+    _update("cli")
 
     assert [c["cmd"][4:] for c in calls] == [["update", "comfy"], ["update", "cli"]]
 
@@ -5002,7 +5016,7 @@ def test_update_comfyui_invalid_target_does_not_take_the_lock(patched_run):
     patched_run(envelope(data={}))
 
     with pytest.raises(server.ComfyCliError, match="invalid update target"):
-        server.update_comfyui("nope")
+        _update("nope")
 
     assert server._UPDATE_LOCK.acquire(blocking=False)
     server._UPDATE_LOCK.release()
