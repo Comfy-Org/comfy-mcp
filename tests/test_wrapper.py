@@ -1481,6 +1481,16 @@ def test_upload_file_rejects_a_bare_string_for_paths(no_spawn):
         server.upload_file("a.png")
 
 
+def test_upload_file_rejects_an_empty_list(no_spawn):
+    """`[]` clears every cap and builds `comfy upload` with no positionals.
+
+    The emptiest list-level mistake, so it is named here with the rest rather
+    than surfacing as a success-shaped result for an upload that moved nothing.
+    """
+    with pytest.raises(server.ComfyCliError, match="empty list"):
+        server.upload_file([])
+
+
 def test_upload_file_rejects_a_non_string_entry(no_spawn):
     """A non-string entry dies inside `subprocess` with a bare `TypeError`.
 

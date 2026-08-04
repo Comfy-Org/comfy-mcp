@@ -720,7 +720,52 @@ def _guard_arg_len(label: str, value: str, limit: int | None = None) -> str:
             f"invalid {label}: {len(value)} characters exceeds the "
             f"{limit}-character maximum."
         )
+    # Length is not the only way a string fails to reach `execve`: one that
+    # cannot be ENCODED never becomes an argv entry at all. Checked here so the
+    # whole path-shaped family is covered in one place, and after the size check
+    # so an oversized value is still named as a size.
+    _encode_argv(label, value)
     return value
+
+
+def _encode_argv(label: str, value: str) -> bytes:
+    """Render a tool argument the way ``subprocess`` will, or refuse it.
+
+    ``subprocess`` encodes POSIX argv with :func:`os.fsencode`, so this is both
+    the CHECK that a value can become an argv entry and the only honest way to
+    MEASURE one in the bytes the kernel counts. :func:`upload_file` uses it for
+    the second — its aggregate is sized against ``ARG_MAX`` directly and cannot
+    afford a proxy — and :func:`_guard_arg_len` for the first.
+
+    Refusing matters because the alternative is not a bad answer but an
+    unconverted one: an unencodable argument raises :class:`UnicodeEncodeError`
+    inside ``Popen``, which sits OUTSIDE the ``try`` in :func:`_run_comfy_raw`,
+    so it escapes as an internal error rather than the :class:`ComfyCliError`
+    every other bad input produces. Exactly the reason :func:`_reject_nul`
+    exists for the bare ``ValueError`` on an embedded NUL.
+
+    POSIX only, and deliberately not papered over. On Windows ``subprocess``
+    builds a UTF-16 command line for ``CreateProcessW`` and never calls
+    :func:`os.fsencode` at all, and that platform's filesystem error handler is
+    ``surrogatepass`` — so nothing here raises and the byte count is a UTF-8
+    estimate of a limit Windows does not express in bytes. The guard is a no-op
+    there rather than wrong, and the Windows command-line limit is out of scope
+    for the same reason :data:`_MAX_UPLOAD_PATHS_TOTAL_BYTES` says it is.
+    """
+    try:
+        return os.fsencode(value)
+    except UnicodeEncodeError:
+        # NOT diagnosed as "unpaired surrogate": `os.fsencode` uses the
+        # interpreter's filesystem encoding, inherited from the environment this
+        # server was launched in, so under a non-UTF-8 locale an ordinary
+        # multibyte filename raises the same error. Name the encoding and offer
+        # the usual cause rather than asserting one.
+        raise ComfyCliError(
+            f"invalid {label}: cannot be encoded with this system's filesystem "
+            f"encoding ({sys.getfilesystemencoding()}), so it cannot be passed to "
+            "comfy-cli as a command-line argument — usually an unpaired "
+            "surrogate, or a character the current locale cannot represent."
+        ) from None
 
 
 def _guard_workflow_path(workflow_path: str, *, frontend: bool = False) -> str:
@@ -10041,6 +10086,16 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # value picks which folder to LIST rather than where to write a
         # downloaded file, and `comfy models list-folder` resolving it is the
         # engine's call to make, not this wrapper's.
+        #
+        # That deferral is checked, not assumed. comfy-cli's `list_folder_cmd`
+        # runs `_reject_unsafe_path_segment(folder, kind="folder", ...)` as its
+        # FIRST statement, which refuses an empty value, one containing `..`,
+        # `/` or `\`, or anything outside `[alnum _ - .]` — a stricter rule than
+        # the one this module applies to `relative_path`. And the value is never
+        # joined onto a filesystem path: it becomes a URL path segment for an
+        # HTTP GET against the ComfyUI server, so there is no models root for
+        # `..` to escape. Duplicating that here would be this wrapper deriving
+        # an answer it should be asking the engine for.
         _guard_arg_len("folder", folder)
         _reject_option_like(
             "folder", folder, expected="a model folder (e.g. 'checkpoints')"
@@ -10427,8 +10482,16 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 # decision), NOT a claim that they are safe. `_MAX_PRECHECKED_SLOT_BYTES` is not
 # that bound either: it gates only whether `_reject_non_json_array_slot` bothers
 # to PARSE, ABSTAINING above it, and the slot still reaches argv. The
-# identifier-shaped names (a template name, a node class name, a slot
+# identifier-shaped names (`fetch_template`'s `name`, a node class name, a slot
 # `address`) sit in the same residue for the same reason.
+#
+# SIZE is not the only axis, and the residue is the same shape on the other one:
+# a string that cannot be ENCODED never becomes an argv entry either.
+# `_guard_arg_len` runs `_encode_argv` for every value listed at
+# `_MAX_PATH_ARG_LEN`, so the path-shaped family is covered on BOTH axes; the
+# free-form and identifier-shaped values above are uncovered on both. Converting
+# the spawn failure itself is what would close the residue on either axis at
+# once, and that is deliberately a separate change from this sweep.
 _MAX_URL_LEN = 8192
 
 
@@ -11059,10 +11122,14 @@ def cancel_download(download_id: str) -> Any:
 # with an unconverted `OSError`. Converting that `OSError` at the spawn site is
 # the airtight backstop underneath them, and is tracked separately.
 #
-# Sized so that no upload a caller would plausibly make reaches them: a
-# 4096-file batch at a roomy 200 bytes of path each is 800 KiB and so is refused
-# by the aggregate, but the same batch at a realistic ~30 bytes is 120 KiB and
-# clears both. Clearing these caps is not a promise the upload COMPLETES —
+# The AGGREGATE is the one that binds in practice, and the count is the backstop
+# under it rather than a second ceiling a caller meets. At a typical absolute
+# path — `/home/user/Pictures/comfy-inputs/IMG_20260804_123456.png` is about 58
+# bytes — 128 KiB is reached around 2,200 files, well before the 4096-entry cap,
+# so that entry count is only reachable with short paths (a `/tmp/frames/NNNN.png`
+# sequence is ~20 bytes and does fit). Read the count cap as what stops a list of
+# a million tiny or empty strings, not as a promise that 4096 real files fit.
+# Clearing these caps is not a promise the upload COMPLETES —
 # `upload_file`'s 300s timeout is the binding constraint on a batch that large,
 # and it is comfy-cli's transfer being timed, not this guard's business. A
 # caller who does reach one is told to split the batch; the tool takes any
@@ -11097,6 +11164,15 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
         raise ComfyCliError(
             f"invalid paths: expected a list of strings, got {type(paths).__name__}."
         )
+    # The emptiest list-level mistake, and the one every cap below waves through:
+    # `[]` builds `comfy upload` with no positionals, so the caller gets either a
+    # success-shaped result for an upload that moved nothing or comfy-cli's raw
+    # Click usage dump. Name it here like the rest.
+    if not paths:
+        raise ComfyCliError(
+            "invalid paths: empty list — pass at least one file to upload "
+            "(e.g. ['/tmp/source.png'])."
+        )
     # COUNT next, ahead of the per-entry loop: it is the whole-list mistake, and
     # checking it first is what keeps the loop below proportional to a plausible
     # command line rather than to whatever the caller sent. See
@@ -11127,18 +11203,12 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
         )
         _reject_nul(label, p)
         # Encoded exactly as `subprocess` will encode it, so the running total is
-        # the kernel's count — see `_MAX_UPLOAD_PATHS_TOTAL_BYTES`. `os.fsencode`
-        # is also the one thing here that can REFUSE a path: a lone surrogate
-        # outside the `surrogateescape` range cannot be rendered into argv at all
-        # and would otherwise reach `Popen` as an uncaught `UnicodeEncodeError` —
-        # the same unconverted-spawn-failure class `_reject_nul` exists to close.
-        try:
-            total += len(os.fsencode(p))
-        except UnicodeEncodeError:
-            raise ComfyCliError(
-                f"invalid {label}: contains characters that cannot be encoded as "
-                "a filesystem path (unpaired surrogate)."
-            ) from None
+        # the kernel's count rather than a proxy — see
+        # `_MAX_UPLOAD_PATHS_TOTAL_BYTES` for why this aggregate cannot afford
+        # one. The encodability REFUSAL already happened inside `_guard_arg_len`
+        # above, which runs `_encode_argv` for every path-shaped value; this is
+        # the same call for its byte count.
+        total += len(_encode_argv(label, p))
     # AGGREGATE last, once every entry is known to be a legal path: reporting it
     # before the per-entry checks would name the sum for a list whose real
     # problem is one bad member. Reports the total, never the paths.

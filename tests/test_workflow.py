@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import pytest
 from conftest import envelope
@@ -295,25 +296,30 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     assert calls[1]["cmd"][4:] == ["workflow", "notes", "./-flux.json"]
 
 
-@pytest.mark.parametrize(
-    "call",
-    [
-        pytest.param(
-            lambda path: asyncio.run(server.run_workflow(path)), id="run_workflow"
-        ),
-        pytest.param(server.validate_workflow, id="validate_workflow"),
-        pytest.param(server.list_workflow_slots, id="list_workflow_slots"),
-        pytest.param(server.list_workflow_notes, id="list_workflow_notes"),
-        pytest.param(
-            lambda path: server.set_workflow_slot(path, ["6.text=x"]),
-            id="set_workflow_slot",
-        ),
-        pytest.param(
-            lambda path: server.vary_workflow(path, ["3.seed=[1,2]"]),
-            id="vary_workflow",
-        ),
-    ],
-)
+# The six tools that take a `workflow_path`. One guard covers all of them, so
+# every test of that guard runs against the whole set rather than a
+# representative — `no_spawn` blocks both spawn paths, which is what makes
+# `run_workflow` (which streams rather than going through `_run_comfy`) provable
+# in the same parametrization.
+_WORKFLOW_PATH_CALLS = [
+    pytest.param(
+        lambda path: asyncio.run(server.run_workflow(path)), id="run_workflow"
+    ),
+    pytest.param(server.validate_workflow, id="validate_workflow"),
+    pytest.param(server.list_workflow_slots, id="list_workflow_slots"),
+    pytest.param(server.list_workflow_notes, id="list_workflow_notes"),
+    pytest.param(
+        lambda path: server.set_workflow_slot(path, ["6.text=x"]),
+        id="set_workflow_slot",
+    ),
+    pytest.param(
+        lambda path: server.vary_workflow(path, ["3.seed=[1,2]"]),
+        id="vary_workflow",
+    ),
+]
+
+
+@pytest.mark.parametrize("call", _WORKFLOW_PATH_CALLS)
 def test_workflow_path_guard_rejects_an_oversized_path(call, no_spawn):
     """A path far past PATH_MAX is refused before it can reach argv.
 
@@ -364,6 +370,38 @@ def test_guard_arg_len_reads_the_module_constant_at_call_time(monkeypatch):
     assert server._guard_arg_len("workflow_path", "w" * 8) == "w" * 8
     # An explicit `limit` still wins over the module default.
     assert server._guard_arg_len("url", "u" * 9, 16) == "u" * 9
+
+
+@pytest.mark.parametrize("call", _WORKFLOW_PATH_CALLS)
+def test_workflow_path_guard_rejects_an_unencodable_path(call, no_spawn):
+    """Length is not the only way a string fails to reach `execve`.
+
+    A lone surrogate survives the MCP JSON wire intact — `json.loads` accepts
+    `"\\ud800"` — and passes every value guard, but `subprocess` encodes POSIX
+    argv with `os.fsencode`, which cannot render it. That raises
+    `UnicodeEncodeError` from the `Popen(...)` OUTSIDE `_run_comfy_raw`'s `try`,
+    so it escapes as an internal error rather than a `ComfyCliError`. Covered
+    for the whole path-shaped family in `_guard_arg_len`, so all six
+    `workflow_path` tools are exercised here.
+    """
+    with pytest.raises(server.ComfyCliError, match="cannot be encoded") as excinfo:
+        call("/tmp/\ud800.json")
+
+    # The message names the encoding rather than asserting a cause: under a
+    # non-UTF-8 filesystem encoding an ordinary multibyte name fails the same way.
+    assert sys.getfilesystemencoding() in str(excinfo.value)
+
+
+def test_guard_arg_len_reports_size_before_encodability():
+    """A value that is BOTH oversized and unencodable is named as a size.
+
+    Same per-value ordering rule the rest of these guards follow: the size is
+    the more actionable of the two, and it is what the caller can see.
+    """
+    oversized = "\ud800" + "w" * server._MAX_PATH_ARG_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds"):
+        server._guard_arg_len("workflow_path", oversized)
 
 
 def test_option_like_rejection_bounds_the_value_it_echoes():
