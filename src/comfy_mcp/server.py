@@ -652,6 +652,11 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
 # ``limit``. Keep this list in sync — the SCOPE note at :data:`_MAX_URL_LEN`
 # points here for exactly the values that are covered.
 #
+# ``upload_file``'s ``paths`` is the one entry that needs MORE than this: it is
+# splatted into many argv slots, so a per-entry ceiling leaves the sum unbounded
+# and :data:`_MAX_UPLOAD_PATHS` / :data:`_MAX_UPLOAD_PATHS_TOTAL_BYTES` bound
+# the list itself, the way :data:`_MAX_EXTRA_ARGS` does for ``extra_args``.
+#
 # It stays this GENEROUS on purpose. It is an argv-safety guard, NOT an attempt
 # to close the residual forgery window in :func:`_phrase_is_only_the_caller_s` —
 # that discount reads a bounded 500-char message tail, so only a cap BELOW 500
@@ -681,7 +686,7 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
 _MAX_PATH_ARG_LEN = 4096
 
 
-def _guard_arg_len(label: str, value: str, limit: int = _MAX_PATH_ARG_LEN) -> str:
+def _guard_arg_len(label: str, value: str, limit: int | None = None) -> str:
     """Refuse a caller-supplied argv string too long to survive ``execve``.
 
     The one length check every path-shaped tool argument runs, so the family
@@ -690,6 +695,13 @@ def _guard_arg_len(label: str, value: str, limit: int = _MAX_PATH_ARG_LEN) -> st
     default ceiling buys and which values carry it; ``limit`` exists for
     ``download_model``'s ``url``, whose ceiling is :data:`_MAX_URL_LEN` rather
     than the path one.
+
+    ``None`` rather than ``limit: int = _MAX_PATH_ARG_LEN`` because a default
+    argument is bound once at DEFINITION time: the constant would be copied into
+    the signature, and this repo's documented convention of patching the owning
+    module (``monkeypatch.setattr(server, "_MAX_PATH_ARG_LEN", …)``) would then
+    move the name while leaving every call reading the old 4096. Resolving it in
+    the body keeps :data:`_MAX_PATH_ARG_LEN` the single source of truth.
 
     Reports the LENGTH, never the value — echoing a megabyte-long "path" back is
     the same denial-of-legibility the cap exists to prevent, and every other
@@ -701,6 +713,8 @@ def _guard_arg_len(label: str, value: str, limit: int = _MAX_PATH_ARG_LEN) -> st
     Returns the value UNCHANGED when it fits, so it can wrap an assignment the
     way the other ``_guard_*`` helpers do.
     """
+    if limit is None:
+        limit = _MAX_PATH_ARG_LEN
     if len(value) > limit:
         raise ComfyCliError(
             f"invalid {label}: {len(value)} characters exceeds the "
@@ -9387,10 +9401,13 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     # an option value, which Click takes verbatim — guarding it is input hygiene
     # (a file literally named `-x` is a caller mistake worth naming), matching
     # `download_model`'s `filename`. See `_reject_option_like` for the split.
-    # The size cap runs first, for the ordering reason `_guard_arg_len` gives:
-    # both guards below name the value rather than its size.
-    _guard_arg_len("out_path", out_path)
     _reject_option_like("name", name, expected="a template name (e.g. 'image_flux2')")
+    # `out_path`'s size cap runs ahead of `out_path`'s OWN two guards, for the
+    # ordering reason `_guard_arg_len` gives: both name the value rather than its
+    # size. Ahead of those two and no further — that rule is per-value, so
+    # hoisting it above `name`'s check would make a call with a dash-leading
+    # `name` AND an oversized `out_path` report the wrong argument.
+    _guard_arg_len("out_path", out_path)
     _reject_option_like(
         "out_path",
         out_path,
@@ -9730,8 +9747,10 @@ def _phrase_is_only_the_caller_s(
       every PATH-shaped value carries only the far more generous argv-safety
       ceiling ``_MAX_PATH_ARG_LEN`` — ``workflow_path``, ``download_model``'s
       ``relative_path`` and ``filename``, the three ``out_path`` values, the two
-      ``out_dir`` values and each entry of ``upload_file``'s ``paths`` — as
-      ``download_model``'s ``url`` carries ``_MAX_URL_LEN``. Both ceilings sit
+      ``out_dir`` values, each entry of ``upload_file``'s ``paths`` and
+      ``search_models``' ``folder`` — as ``download_model``'s ``url`` carries
+      ``_MAX_URL_LEN``. (That list and the one at :data:`_MAX_PATH_ARG_LEN` are
+      the same set, and are meant to stay in sync.) Both ceilings sit
       thousands of characters ABOVE the tail and so leave this window exactly as
       open as it was uncapped. That is deliberate — a cap tight enough to close
       the gap would have to sit under 500 characters, and would start refusing
@@ -10015,8 +10034,13 @@ def search_models(query: str = "", folder: str = "") -> Any:
     if folder:
         # `folder` rides as a bare positional, so its leading-dash guard is the
         # mandatory kind. Size runs ahead of it: this is a models-subfolder path,
-        # the same shape as `download_model`'s `relative_path`, so it takes the
-        # same ceiling for the same reason — see `_guard_arg_len`.
+        # so it takes the same argv-safety CEILING as `download_model`'s
+        # `relative_path` for the same reason — see `_guard_arg_len`. Only the
+        # ceiling is shared: `_guard_model_relative_path`'s traversal and
+        # models-tree checks are deliberately NOT applied here, because this
+        # value picks which folder to LIST rather than where to write a
+        # downloaded file, and `comfy models list-folder` resolving it is the
+        # engine's call to make, not this wrapper's.
         _guard_arg_len("folder", folder)
         _reject_option_like(
             "folder", folder, expected="a model folder (e.g. 'checkpoints')"
@@ -10386,16 +10410,25 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 #
 # What remains deliberately UNCAPPED is the FREE-FORM half: `search_models`'
 # `--text` query, the enumerated `search_templates` / `search_nodes` filter
-# values, and the params `_generate_param_args` renders. Those are prompt- and
-# query-shaped rather than path-shaped, so a path-sized ceiling would be the
-# wrong instrument — it would refuse a legitimately long prompt while buying
-# nothing a caller cannot already spend by sending more of them. The one
-# free-form value whose size genuinely matters is the JSON slot, and it is
-# bounded on its own terms by `_MAX_PRECHECKED_SLOT_BYTES`, which is measured in
-# BYTES against the kernel's per-argument limit directly because it has to land
-# on that exact boundary. The identifier-shaped names (a template name, a node
-# class name, a slot `address`) are likewise uncapped and likewise not
-# path-shaped; capping them is a separate call, not part of this sweep.
+# values, the params `_generate_param_args` renders, and `vary_workflow`'s /
+# `set_workflow_slot`'s JSON slot. Those are prompt- and query-shaped rather
+# than path-shaped, so a path-sized ceiling would be the wrong instrument — it
+# would refuse a legitimately long prompt to buy a bound the argv hazard does
+# not, on its own, justify putting there.
+#
+# Be precise about what that leaves open, because the obvious defense of it is
+# WRONG: "a caller can spend the same bytes by sending more, smaller values" is
+# true of the TOTAL `ARG_MAX` and false of Linux's PER-ARGUMENT `MAX_ARG_STRLEN`
+# (128 KiB), which one oversized string trips on its own and which no number of
+# smaller ones can reach. So a >128 KiB query, filter value, param or slot does
+# still die as the unconverted `OSError` — the residue of this sweep, not
+# something it covers. Leaving it is a scope call (these are the values a
+# path-sized ceiling would misjudge, and the right bound for them is a separate
+# decision), NOT a claim that they are safe. `_MAX_PRECHECKED_SLOT_BYTES` is not
+# that bound either: it gates only whether `_reject_non_json_array_slot` bothers
+# to PARSE, ABSTAINING above it, and the slot still reaches argv. The
+# identifier-shaped names (a template name, a node class name, a slot
+# `address`) sit in the same residue for the same reason.
 _MAX_URL_LEN = 8192
 
 
@@ -10982,6 +11015,45 @@ def cancel_download(download_id: str) -> Any:
         return degraded
 
 
+# Ceilings on `upload_file`'s `paths` LIST, alongside the per-entry
+# `_MAX_PATH_ARG_LEN` each path carries. The per-entry cap alone does not bound
+# the argv this tool builds: `paths` is the one caller-supplied value here that
+# is splatted into MANY argv slots, so a list of individually-legal paths still
+# sums past the kernel's TOTAL `ARG_MAX` (256 KiB on macOS, typically 2 MiB on
+# Linux) and dies as the `OSError` (`E2BIG`) `_run_comfy_raw` never converts —
+# its `try` wraps `communicate()`, not the `Popen(...)` that raises. That is the
+# same reason `_guard_extra_args` caps `_MAX_EXTRA_ARGS` as well as
+# `_MAX_EXTRA_ARG_LEN`, and this is the same pair of caps for the same hazard.
+#
+# TWO of them, because either alone leaves the other open, and between them they
+# are DERIVED rather than picked: `ARG_MAX` counts each entry's bytes plus its
+# terminator and its pointer, so the aggregate bounds the bytes and the count
+# bounds the per-entry overhead the aggregate cannot see (a list of a million
+# EMPTY strings sums to zero bytes and still blows the limit on pointers alone).
+# 128 KiB of path bytes plus 4096 entries of overhead — call it 32 KiB of
+# pointers and 4 KiB of terminators — lands around 164 KiB, comfortably under
+# the 256 KiB that is the SMALLEST `ARG_MAX` of the two platforms.
+#
+# BYTES, not characters, and this is the one place in this module where that
+# distinction bites. The per-value ceilings above count characters and say why:
+# each sits so far under the limit it is guarding that a 4x UTF-8 expansion
+# still cannot reach it. An AGGREGATE has no such headroom — it is sized against
+# `ARG_MAX` directly, so 128 KiB of CHARACTERS would be up to 512 KiB of
+# multibyte path on the wire and would sail past the very limit it exists to
+# hold. Encoded with `surrogatepass` for the reason
+# `_reject_non_json_array_slot` encodes that way: a lone surrogate can arrive
+# over the wire, and this guard must not be the thing that raises on it.
+#
+# Both are backstops, deliberately sized so that no upload a caller would
+# actually make can reach them: a 4096-file batch at a roomy 200 bytes of path
+# each is 800 KiB and so is refused by the aggregate, but the same batch at a
+# realistic ~30 bytes is 120 KiB and rides through. A caller who does reach one
+# is told to split the batch — the tool takes any number of files across several
+# calls, so neither cap makes an upload impossible, only unbatched.
+_MAX_UPLOAD_PATHS = 4096
+_MAX_UPLOAD_PATHS_TOTAL_BYTES = 128 * 1024
+
+
 @mcp.tool()
 def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     """Upload local files into the LOCAL ComfyUI ``input`` directory.
@@ -10998,8 +11070,18 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     # to that (it is refused wherever it rides, positional or not): `subprocess`
     # raises a bare `ValueError` on one, which would escape as an internal error
     # instead of the `ComfyCliError` every other bad input produces.
-    # The size cap names the INDEX the way `_reject_non_json_array_slot` names
-    # `slots[i]`: the list is splatted, so "which of the paths" is the first
+    # COUNT first, ahead of the per-entry loop: it is the whole-list mistake, and
+    # checking it first is what keeps the loop below proportional to a plausible
+    # command line rather than to whatever the caller sent. See
+    # `_MAX_UPLOAD_PATHS`.
+    if len(paths) > _MAX_UPLOAD_PATHS:
+        raise ComfyCliError(
+            f"invalid paths: {len(paths)} entries exceeds the "
+            f"{_MAX_UPLOAD_PATHS}-entry maximum (they are forwarded to comfy-cli "
+            "as command-line arguments) — upload in batches."
+        )
+    # The per-entry size cap names the INDEX the way `_reject_non_json_array_slot`
+    # names `slots[i]`: the list is splatted, so "which of the paths" is the first
     # thing a caller with several needs to know. It runs before the two value
     # guards for the ordering reason `_guard_arg_len` gives.
     for index, p in enumerate(paths):
@@ -11010,6 +11092,19 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
             expected="a file path (prefix a dash-leading name with './')",
         )
         _reject_nul("upload path", p)
+    # AGGREGATE last, once every entry is known to be a legal path: this is the
+    # bound that actually holds the splatted argv under `ARG_MAX`, and reporting
+    # it before the per-entry checks would name the sum for a list whose real
+    # problem is one bad member. Encoded, because the kernel counts bytes — see
+    # `_MAX_UPLOAD_PATHS_TOTAL_BYTES`. Reports the total, never the paths.
+    total = sum(len(p.encode("utf-8", "surrogatepass")) for p in paths)
+    if total > _MAX_UPLOAD_PATHS_TOTAL_BYTES:
+        raise ComfyCliError(
+            f"invalid paths: {len(paths)} entries totalling {total} bytes exceeds "
+            f"the {_MAX_UPLOAD_PATHS_TOTAL_BYTES}-byte maximum for the whole list "
+            "(the paths are forwarded to comfy-cli as command-line arguments) — "
+            "upload in batches."
+        )
     args = ["upload", *paths]
     if overwrite:
         args.append("--overwrite")

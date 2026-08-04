@@ -349,6 +349,23 @@ def test_workflow_path_guard_allows_a_path_at_the_ceiling():
     assert server._guard_workflow_path(at_ceiling, frontend=True)
 
 
+def test_guard_arg_len_reads_the_module_constant_at_call_time(monkeypatch):
+    """The default ceiling is resolved in the BODY, not bound at definition.
+
+    `limit: int = _MAX_PATH_ARG_LEN` would copy the constant into the signature
+    once, so the repo's patch-the-owning-module convention would move the name
+    while every call kept reading the old 4096 — a guard that silently tests
+    nothing. `_MAX_PATH_ARG_LEN` stays the single source of truth instead.
+    """
+    monkeypatch.setattr(server, "_MAX_PATH_ARG_LEN", 8)
+
+    with pytest.raises(server.ComfyCliError, match="exceeds"):
+        server._guard_arg_len("workflow_path", "w" * 9)
+    assert server._guard_arg_len("workflow_path", "w" * 8) == "w" * 8
+    # An explicit `limit` still wins over the module default.
+    assert server._guard_arg_len("url", "u" * 9, 16) == "u" * 9
+
+
 def test_option_like_rejection_bounds_the_value_it_echoes():
     """A value UNDER the cap is still bounded on its way into the error.
 

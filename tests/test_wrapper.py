@@ -1415,6 +1415,95 @@ def test_upload_file_rejects_an_oversized_path(no_spawn):
     assert oversized not in message
 
 
+def test_upload_file_rejects_too_many_paths(no_spawn):
+    """The per-entry cap does not bound the LIST — the count cap does.
+
+    `paths` is splatted into many argv slots, so entries that are each legal
+    still sum past the kernel's total `ARG_MAX` and die as the `OSError`
+    (`E2BIG`) `_run_comfy_raw` never converts. Same pair of caps, for the same
+    reason, as `_guard_extra_args`' `_MAX_EXTRA_ARGS`.
+    """
+    paths = [f"/tmp/{index}.png" for index in range(server._MAX_UPLOAD_PATHS + 1)]
+
+    with pytest.raises(server.ComfyCliError, match="entries exceeds") as excinfo:
+        server.upload_file(paths)
+
+    assert str(server._MAX_UPLOAD_PATHS) in str(excinfo.value)
+
+
+def test_upload_file_rejects_paths_totalling_past_the_aggregate_cap(no_spawn):
+    """A short-enough list of individually-legal paths is still bounded.
+
+    The count cap alone leaves this open — a mere 33 entries at the per-entry
+    ceiling already pass it while summing past `ARG_MAX` — so the aggregate is
+    what actually holds the splatted command line under the kernel's limit.
+    """
+    entry = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
+    paths = [entry] * count
+    assert count <= server._MAX_UPLOAD_PATHS, "must clear the count cap first"
+
+    with pytest.raises(server.ComfyCliError, match="totalling") as excinfo:
+        server.upload_file(paths)
+
+    # Reports the total, never the paths.
+    assert entry not in str(excinfo.value)
+
+
+def test_upload_file_measures_the_aggregate_in_bytes_not_characters(no_spawn):
+    """The aggregate is sized against `ARG_MAX`, which counts BYTES.
+
+    The per-value ceilings in this module count characters and can afford to —
+    each sits far enough under the limit it guards that a 4x UTF-8 expansion
+    cannot reach it. This one has no such headroom, so a list of multibyte paths
+    whose CHARACTER count is comfortably legal is still refused when its encoded
+    size is not — otherwise the cap would sail past the very limit it holds.
+    """
+    # 3 bytes per character, so this is a third of the cap in characters and
+    # just past it in bytes.
+    entry = "/tmp/" + "中" * 1000
+    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // (3 * 1000) + 1
+    paths = [entry] * count
+    assert sum(len(p) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+
+    with pytest.raises(server.ComfyCliError, match="bytes exceeds"):
+        server.upload_file(paths)
+
+
+def test_upload_file_reports_a_bad_entry_ahead_of_the_aggregate(no_spawn):
+    """A list that is BOTH too large and holds a bad entry names the entry.
+
+    The aggregate is a property of the whole list; a dash-leading path is a
+    property of one member, and that is the more actionable of the two — so the
+    per-entry loop runs before the sum is judged.
+    """
+    entry = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
+    paths = [*[entry] * count, "--overwrite"]
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.upload_file(paths)
+
+
+def test_upload_file_allows_a_full_batch_of_real_paths(patched_run):
+    """Both caps are backstops: a real batch AT the count boundary rides through.
+
+    The whole point of sizing them the way `_MAX_UPLOAD_PATHS` documents is that
+    no upload a caller would actually make reaches either — a frame sequence
+    filling the count cap at realistic path lengths is still well inside the
+    aggregate, so the caps refuse runaway argv rather than bulk uploads.
+    """
+    calls = patched_run(envelope(data={"uploaded": server._MAX_UPLOAD_PATHS}))
+    paths = [
+        f"/tmp/frames/{index:04d}.png" for index in range(server._MAX_UPLOAD_PATHS)
+    ]
+    assert sum(len(p) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+
+    server.upload_file(paths)
+
+    assert calls[0]["cmd"][4:] == ["upload", *paths]
+
+
 def test_upload_file_allows_a_path_at_the_ceiling(patched_run):
     """The boundary value itself rides through as a positional."""
     calls = patched_run(envelope(data={"uploaded": 1}))

@@ -392,6 +392,21 @@ def test_fetch_template_rejects_an_oversized_out_path(no_spawn):
     assert oversized not in str(excinfo.value)
 
 
+def test_fetch_template_reports_a_bad_name_ahead_of_an_oversized_out_path(no_spawn):
+    """Size-before-value is a PER-VALUE rule, not a whole-function one.
+
+    `out_path`'s cap sits ahead of `out_path`'s own guards so an oversized path
+    is named as a size rather than as a shape. Hoisting it above `name`'s check
+    too would make a call with both mistakes report the wrong argument.
+    """
+    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+
+    with pytest.raises(server.ComfyCliError, match="invalid name") as excinfo:
+        server.fetch_template("--help", oversized)
+
+    assert "exceeds" not in str(excinfo.value)
+
+
 def test_fetch_template_allows_an_out_path_at_the_ceiling(patched_run):
     """The boundary value itself rides through to argv — the cap is generous."""
     calls = patched_run(envelope(data=None))
