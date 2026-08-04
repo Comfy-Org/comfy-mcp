@@ -28,6 +28,7 @@ import pathlib
 
 import conftest
 import pytest
+import test_install_node
 import test_network_exposure
 import test_partner_generate
 import test_run_template
@@ -69,6 +70,7 @@ def _params(func) -> list[tuple[str, bool]]:
 # three spend gates, the version switch, and the network-exposure gate on the
 # launch pair. Each entry is the class itself — `_label` says where it lives.
 _ELICIT_FAKES = [
+    test_install_node._FakeCtx,
     test_network_exposure._FakeCtx,
     test_partner_generate._FakeCtx,
     test_run_template._FakeCtx,
@@ -88,6 +90,7 @@ _PROGRESS_FAKES = [
 ]
 
 _SESSION_FAKES = [
+    test_install_node._FakeSession,
     test_network_exposure._FakeSession,
     test_partner_generate._FakeSession,
     test_run_template._FakeSession,

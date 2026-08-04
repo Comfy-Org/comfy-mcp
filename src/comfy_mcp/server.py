@@ -8748,6 +8748,364 @@ async def switch_comfyui_version(
     return {"switched_to": target, "result": result, "restart_required": True}
 
 
+# `comfy node install` clones each pack and pip-installs its requirements into the
+# workspace venv, so the work is the same SHAPE as `update_comfyui(target="all")`
+# — dominated by dependency resolution and wheel downloads — and it gets the same
+# generous ceiling rather than `_SWITCH_TIMEOUT`'s 900s. A pack that pulls a
+# torch-adjacent wheel is as slow as a core update, and a resolve killed halfway
+# leaves the venv in exactly the state nobody wants to inherit.
+_INSTALL_TIMEOUT = _UPDATE_TIMEOUT
+
+# Shared by the advisory pre-consent peek and the authoritative acquire below, so
+# the two cannot drift into telling the caller different things — the same reason
+# `_SWITCH_UPDATE_BUSY` exists. Names `switch_comfyui_version` alongside
+# `update_comfyui` because all three share `_UPDATE_LOCK`, and a caller told only
+# about "an update" would go looking for the wrong in-flight call.
+_INSTALL_UPDATE_BUSY = (
+    "an update or version switch is already running in this server; installing a "
+    "pack pip-installs into the same Python environment, so the two at once can "
+    "corrupt the install. Wait for the in-flight call to finish (up to 30 "
+    "minutes) and call again. Nothing was installed."
+)
+
+# Kept OFF asyncio's shared default executor for the reason `_SWITCH_EXECUTOR`
+# spells out: an install abandoned by its caller keeps its worker for up to
+# `_INSTALL_TIMEOUT`, and on the default pool that starves every other
+# `to_thread` caller in the process. One worker is enough and says what is true —
+# `_UPDATE_LOCK`, shared with `update_comfyui` / `switch_comfyui_version`, already
+# admits exactly one of the three at a time, so a second can never be queued
+# behind the first.
+_INSTALL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="comfy-node-install"
+)
+
+# How many packs one call may install. Not a comfy-cli limit — the engine takes
+# any number — but the consent prompt has to be READABLE for the approval to mean
+# anything, and a prompt echoing hundreds of ids is one the user scrolls past
+# rather than reads. Refusing past this point keeps "the user approved these
+# packs" true rather than nominal.
+_MAX_NODE_PACK_NAMES = 32
+
+# A registry node id: an alphanumeric-led slug. Anchored end-to-end, so a value
+# that matches carries no whitespace, no NUL, no shell metacharacter, no leading
+# dash, and — the load-bearing exclusion — no `/`, `:` or `@`, which is what keeps
+# a git URL or a filesystem path off this argv.
+#
+# This is DELIBERATELY narrower than the engine, which is normally this repo's
+# anti-pattern (see `_VERSION_RE`, which refuses to out-strict comfy-cli). The
+# justification is the consent contract, not taste: the prompt below tells the
+# user they are approving a download of a NAMED PACK FROM THE REGISTRY. If an
+# arbitrary git URL could ride through here, that sentence would be false for the
+# one call where it mattered most, and the approval it collected would have been
+# given for something other than what happened. A wrapper may not narrow the
+# engine to invent product behavior; it must narrow the engine where a wider
+# input would make its own consent prompt lie.
+_REGISTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# What the caller is really being stopped from doing, repeated in both the
+# unpromptable-client refusal and the prompt itself. Hoisted for the reason
+# `_NETWORK_EXPOSURE_STAKES` is: the same decision must not be described two
+# different ways depending on which branch the caller landed in.
+_NODE_INSTALL_STAKES = (
+    "Installing a pack DOWNLOADS third-party code from the ComfyUI-Manager "
+    "registry and RUNS it — a `pip install` of the pack's dependencies into the "
+    "ComfyUI Python environment, plus the pack's own install script — and an "
+    "installed pack then executes inside ComfyUI on every start. It can take "
+    "many minutes and can change versions other packs depend on."
+)
+
+
+class NodeInstallApproval(BaseModel):
+    """What the client returns from the node-install confirmation prompt.
+
+    Same affirmative-answer design as :class:`SpendApproval` and
+    :class:`VersionSwitchApproval`, for the same reason: an accept that never
+    actually answered lands on the ``False`` default and is treated as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Install these custom node packs?",
+        description=(
+            "Yes downloads the named packs from the registry and installs their "
+            "Python dependencies into the ComfyUI environment, running "
+            "third-party code. No cancels it and installs nothing."
+        ),
+    )
+
+
+_INSTALL_APPROVAL_WORDING = _ApprovalWording(
+    subject="node install",
+    what="the custom node install",
+    nothing_done="Nothing was installed.",
+    # The route out for a client this server cannot prompt. As with the version
+    # switch and the launch flags there is no engine-side durable consent to point
+    # at — comfy-cli does not gate `comfy node install` at all — so the escape
+    # hatch is the user running it themselves, where their shell IS the
+    # confirmation.
+    escape_hatch=(
+        " If this client cannot show prompts, run "
+        "`comfy node install <name>` in a terminal instead."
+    ),
+)
+
+
+async def _elicit_node_install_consent(ctx: Context, names_display: str) -> bool:
+    """Ask the USER to approve this one install. True = approved.
+
+    ``names_display`` is interpolated directly rather than through
+    :func:`_display_model`: every entry has already been pinned by
+    :data:`_REGISTRY_ID_RE`, so it cannot carry the backticks or newlines that
+    sanitizer exists to neutralize.
+    """
+    return await _elicit_approval(
+        ctx,
+        (
+            f"Install the custom node pack(s) `{names_display}` into the local "
+            f"ComfyUI? {_NODE_INSTALL_STAKES} The new nodes are not available "
+            "until ComfyUI is restarted, which this tool does NOT do. Approve "
+            "only if you recognise these pack names. Declining installs nothing."
+        ),
+        NodeInstallApproval,
+        _INSTALL_APPROVAL_WORDING,
+    )
+
+
+async def _resolve_install_consent(
+    names_display: str, confirm_install: bool, ctx: Context | None
+) -> None:
+    """Return only if the USER approved this install; otherwise raise.
+
+    :func:`_resolve_switch_consent`'s shape, chosen because comfy-cli's contract
+    here matches ``comfy update``'s rather than ``comfy generate``'s: `comfy node
+    install` has NO interlock of its own — no ``--yes``, no ``typer.confirm``, no
+    ``spend.auto_confirm`` analogue — so there is no engine gate to forward a flag
+    to and no durable consent that could answer on the user's behalf. The only
+    move available to this server is to refuse to spawn the command, which is
+    exactly what ``switch_comfyui_version`` and the launch-flag gate do.
+
+    Both of that function's load-bearing properties are kept:
+
+    1. **Elicitation wins, and is raised even when ``confirm_install=True``.** The
+       agent host's permission to CALL this tool is a different question from the
+       user's consent to run third-party code on their machine, and an "always
+       allow this tool" toggle answers only the first. The pack names are very
+       often a model's guess at what a workflow needs, so the caller's own
+       assertion can never be the authority on a promptable client.
+    2. **An unknown capability counts as CAPABLE.** ``None`` from
+       :func:`_client_elicitation_support` is the probe failing, not a "no";
+       guessing "cannot elicit" would silently demote a real client onto the
+       caller's say-so. Being wrong the other way costs a prompt that lapses into
+       a refusal at :data:`_ELICIT_TIMEOUT`, having installed nothing.
+    """
+    if _client_elicitation_support(ctx) is not False:
+        if await _elicit_node_install_consent(ctx, names_display):
+            return
+        raise ComfyCliError(
+            "node install not confirmed: the user declined to install "
+            f"{names_display}. {_INSTALL_APPROVAL_WORDING.nothing_done}"
+        )
+    # Client cannot be prompted: `confirm_install` is the documented fallback, and
+    # its `False` default is why a bare call from such a client installs nothing.
+    if not confirm_install:
+        raise ComfyCliError(
+            "node install not confirmed: this client cannot show a confirmation "
+            f"prompt, so installing {names_display} requires "
+            f"confirm_install=True. {_NODE_INSTALL_STAKES} Ask the USER first and "
+            "pass the flag only once they have actually agreed — never just to "
+            f"clear this error. {_INSTALL_APPROVAL_WORDING.nothing_done}"
+        )
+
+
+def _guard_node_names(names: Any) -> list[str]:
+    """Validate ``install_node``'s pack list, or raise before anything is spawned.
+
+    Ordered so the message a caller gets names the most useful problem: the list
+    shape first, then each entry's LENGTH (reported as a size, never by echoing a
+    megabyte-long "pack name" back through the tool response and the failure log —
+    see :data:`_MAX_NODE_PACK_ID_LEN`), then ``all``, then the id shape.
+
+    ``all`` is rejected here with its own message even though comfy-cli refuses it
+    too (```install all` is not allowed``): the engine's refusal arrives as plain
+    text on a non-zero exit, and a caller who meant "update everything I have"
+    should be pointed at ``update_comfyui(target="all")`` rather than left to
+    reverse-engineer that from a usage error.
+    """
+    if not isinstance(names, list) or not names:
+        raise ComfyCliError(
+            "invalid names: expected a non-empty list of registry pack ids "
+            "(e.g. ['comfyui-impact-pack'])."
+        )
+    if len(names) > _MAX_NODE_PACK_NAMES:
+        raise ComfyCliError(
+            f"invalid names: {len(names)} packs exceeds the "
+            f"{_MAX_NODE_PACK_NAMES}-pack maximum for one call. The confirmation "
+            "prompt has to stay readable for the approval to mean anything; "
+            "install them in smaller batches."
+        )
+    guarded: list[str] = []
+    for entry in names:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ComfyCliError(
+                "invalid names: every entry must be a non-empty registry pack id "
+                "(e.g. 'comfyui-impact-pack')."
+            )
+        value = entry.strip()
+        if len(value) > _MAX_NODE_PACK_ID_LEN:
+            # Report the length, not the value — see `_MAX_NODE_PACK_ID_LEN`.
+            raise ComfyCliError(
+                f"invalid names: {len(value)} characters exceeds the "
+                f"{_MAX_NODE_PACK_ID_LEN}-character maximum for a pack id."
+            )
+        if value.lower() == "all":
+            raise ComfyCliError(
+                "invalid names: 'all' is not an installable pack id. To update "
+                "every pack you ALREADY have, call "
+                'update_comfyui(target="all") instead — this tool only installs '
+                "packs you name."
+            )
+        _reject_option_like(
+            "names", value, expected="a registry pack id (e.g. 'comfyui-impact-pack')"
+        )
+        _reject_nul("names", value)
+        if not _REGISTRY_ID_RE.match(value):
+            raise ComfyCliError(
+                f"invalid names: {value!r} is not a registry pack id. Expected a "
+                "slug like 'comfyui-impact-pack' (letters, digits, '.', '_', "
+                "'-'). A git URL or a filesystem path is deliberately refused: "
+                "the confirmation prompt tells the user they are approving a "
+                "named pack from the registry, so it must not be able to carry "
+                "anything else. To install from a URL, run `comfy node install` "
+                "in a terminal, where your shell is the confirmation."
+            )
+        guarded.append(value)
+    return guarded
+
+
+def _run_node_install(names: list[str]) -> Any:
+    """Run the install. ``--exit-on-fail`` is NOT optional.
+
+    Without it comfy-cli reports success on a failed install: ``node install``
+    passes ``raise_on_error=exit_on_fail`` into ``execute_cm_cli``, whose handler
+    swallows a ``CalledProcessError`` with ``returncode == 1`` — it prints the
+    failure to stderr and returns ``None``, so the command exits 0. A tool that
+    omitted the flag would tell an agent the pack is installed when it is not, and
+    the agent's next call would fail somewhere much less informative. The flag
+    ships in comfy-cli 1.13.0, this server's floor, so there is no capability
+    degrade to write for it.
+
+    Like ``launch``/``stop``/``update``, ``node install`` prints human text and
+    emits no envelope — ``execute_cm_cli`` writes the node manager's output
+    straight to stdout, which under ``--json`` is the envelope channel — so this
+    takes ``plain_ok=True`` and returns that text rather than structured rows.
+    That is a real thinness cost, and the honest fix is a comfy-cli change adding
+    an envelope to the verb, not synthesis here.
+    """
+    return _run_comfy(
+        "node",
+        "install",
+        *names,
+        "--exit-on-fail",
+        timeout=_INSTALL_TIMEOUT,
+        plain_ok=True,
+    )
+
+
+@mcp.tool()
+async def install_node(
+    names: list[str],
+    confirm_install: bool = False,
+    ctx: Context | None = None,
+) -> Any:
+    """Install custom node packs into the LOCAL ComfyUI — runs third-party code, asks first.
+
+    Thin passthrough to ``comfy node install <name...> --exit-on-fail``. This is
+    the acquisition half of the missing-node story: ``validate_workflow`` and
+    ``run_workflow`` can tell you a workflow needs a node class this install does
+    not have, and ``node_dependencies(registry_id=...)`` can pre-check a pack's
+    Python requirements against the venv before you commit — this is the tool that
+    then installs it.
+
+    ``names`` are REGISTRY PACK IDS (slugs like ``"comfyui-impact-pack"``), not
+    node class names and not URLs. A git URL or filesystem path is refused before
+    anything is spawned; run ``comfy node install`` in a terminal for those, where
+    your shell is the confirmation. ``"all"`` is refused too — to update the packs
+    you already have, call ``update_comfyui(target="all")``.
+
+    **This does not restart anything, deliberately.** A running ComfyUI builds its
+    node registry at boot, so newly installed nodes do not appear until it
+    restarts. The canonical flow is::
+
+        install_node -> restart_comfyui -> search_nodes / validate_workflow
+
+    Restarting is left to the caller because the lifecycle verbs are orthogonal
+    (see ``switch_comfyui_version``, which makes the same choice for the same
+    reason), and because a user who said "install it, I'll restart the server
+    myself" must be obeyed.
+
+    **Consent is per call, and the USER gives it — not the agent.** On a client
+    that supports MCP elicitation the human is shown a prompt naming the exact
+    packs and what installing them does, and a decline installs nothing. That
+    prompt is raised even when ``confirm_install=True``: the host's permission to
+    call this tool is not the user's permission to run third-party code on their
+    machine, and the pack names are frequently a model's guess rather than
+    something the user typed. On a client that CANNOT be prompted,
+    ``confirm_install=True`` is the documented fallback — set it ONLY when the
+    user has actually agreed, never to clear the error — and its ``False`` default
+    means a bare call from such a client installs nothing.
+
+    comfy-cli does not gate this verb at all, so unlike ``partner_generate``'s
+    spend gate there is no engine interlock to forward a flag to and no durable
+    "always proceed" to honor: on a refusal this server simply does not run the
+    command.
+
+    **This can take a while, and one at a time.** Installing a pack resolves and
+    installs its Python dependencies, so the timeout is a generous 30 minutes.
+    Shares ``update_comfyui``'s lock with ``switch_comfyui_version``: all three
+    drive ``pip`` against the same Python environment, so a call made while any of
+    them is in flight is refused immediately rather than queued behind a job that
+    may run for half an hour.
+
+    A pack id that does not exist, an unreachable registry, a dependency conflict,
+    or a missing ComfyUI-Manager all fail inside comfy-cli and raise
+    :class:`ComfyCliError` carrying its message.
+
+    Returns ``{"installed", "result", "restart_required"}`` —
+    ``restart_required`` is always ``True``, because a running ComfyUI will not
+    see the new nodes until it is restarted.
+    """
+    guarded = _guard_node_names(names)
+    names_display = ", ".join(guarded)
+    # Everything before the prompt answers one question: could this install
+    # proceed at all? A user should not be asked to approve something that is then
+    # refused. This peek is advisory — the authoritative, race-free acquire is
+    # below — but it means an in-flight update refuses here rather than after a
+    # prompt the user answered.
+    if _UPDATE_LOCK.locked():
+        raise ComfyCliError(_INSTALL_UPDATE_BUSY)
+    await _resolve_install_consent(names_display, confirm_install, ctx)
+    # Refuse rather than queue, exactly as `update_comfyui` does and for the same
+    # reason — see its comment. Acquired AFTER consent so a declined call never
+    # blocks an update that is legitimately in flight.
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        raise ComfyCliError(_INSTALL_UPDATE_BUSY)
+    try:
+        job = _INSTALL_EXECUTOR.submit(_run_node_install, guarded)
+    except BaseException:
+        _UPDATE_LOCK.release()
+        raise
+    # The lock belongs to the SUBPROCESS, not to this coroutine — the reasoning is
+    # `switch_comfyui_version`'s verbatim: cancelling the request makes the await
+    # below raise `CancelledError` but neither interrupts the worker thread nor
+    # kills the `comfy node install` it spawned, so releasing in a `finally` here
+    # would hand the lock to a retry that then runs a second concurrent pip
+    # against the same venv. A done-callback ties the release to the job's own
+    # lifetime, and still fires if the job is cancelled before it ever starts.
+    job.add_done_callback(lambda _job: _UPDATE_LOCK.release())
+    result = await asyncio.wrap_future(job)
+    return {"installed": guarded, "result": result, "restart_required": True}
+
+
 # comfy-cli's `logs` reports this error code when no persisted log file exists
 # yet (nothing has been launched in the background, so nothing was captured).
 _NO_LOG_FILE_CODE = "no_log_file"

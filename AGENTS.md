@@ -52,15 +52,15 @@ protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
 confirmation on the tools that can spend money, destroy local state, or expose
 the machine: `partner_generate`, `run_template`, `run_workflow`,
-`switch_comfyui_version`, and the `launch_comfyui` / `restart_comfyui` pair
-when `extra_args` would publish ComfyUI to the network. comfy-cli owns the
-credit-spend interlock and the durable "always proceed"
+`switch_comfyui_version`, `install_node`, and the `launch_comfyui` /
+`restart_comfyui` pair when `extra_args` would publish ComfyUI to the network.
+comfy-cli owns the credit-spend interlock and the durable "always proceed"
 (`comfy generate consent always`), and this server only raises the confirmation
 over MCP **elicitation** — the protocol's equivalent of the CLI's y/N prompt —
 then forwards the answer as `--yes` / `--allow-spend`, or (for the version
-switch and the launch flags, which the CLI does not gate at all) simply refuses
-to run the command. It stores no consent of its own. All of them share one
-fail-closed body, `_elicit_approval`; give a new gate its own
+switch, the install, and the launch flags, which the CLI never gates) simply
+refuses to run the command. It stores no consent of its own. All of them share
+one fail-closed body, `_elicit_approval`; give a new gate its own
 `_ApprovalWording` rather than a second copy of that handling. Adding *product*
 behavior here is still a guardrail breach; adapting comfy-cli's contract to an
 MCP primitive is this repo's job.
@@ -73,18 +73,19 @@ free and never read that setting — so those two prompt only when
 `confirm_spend=True` asks to unlock spending, and treat the generate-scoped
 always-proceed as granting nothing. That shared opt-in policy is one body,
 `_resolve_optin_spend_consent`, whose per-verb wording is an argument the way
-`_ApprovalWording` is `_elicit_approval`'s. What still differs is the
-capability SIGNAL: `run_template` can trust the verb, `run_workflow` must PROBE
-`comfy run --help` for the flag — its docstring says why, and what an engine
-without it means. `switch_comfyui_version` sits outside that axis: it spends no
-credits and the CLI does not gate it at all, so its prompt is this server's
-only gate — raised on every call, with no always-proceed setting to read. The
-launch pair sits outside it too, and differs in WHEN it fires: the argument is
-what is dangerous, not the verb, so the prompt is raised only for `extra_args`
-that would publish an unauthenticated ComfyUI (`_network_exposing_args` — a
-non-loopback `--listen`, including its bare form, or `--enable-cors-header`);
-an ordinary launch is untouched. Mirror the engine's contract per tool; do not
-generalize one tool's consent rules onto another.
+`_ApprovalWording` is `_elicit_approval`'s. What still differs is the capability
+SIGNAL: `run_template` can trust the verb, `run_workflow` must PROBE `comfy run
+--help` for the flag — its docstring says why, and what an engine without it
+means. `switch_comfyui_version` and `install_node` sit outside that axis:
+neither spends credits and the CLI gates neither, so their prompt is this
+server's only gate, raised every call with no always-proceed to read.
+`install_node` also risks its ARGUMENT, so `_guard_node_names` pins `names` to
+registry slugs and refuses a URL — stricter than the engine because the prompt
+promises a named REGISTRY pack. The launch pair differs in WHEN it fires: the
+argument is what is dangerous, not the verb, so the prompt is raised only for
+`extra_args` that would publish an unauthenticated ComfyUI
+(`_network_exposing_args`); an ordinary launch is untouched. Mirror the engine's
+contract per tool; do not generalize one tool's consent rules onto another.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via
