@@ -620,6 +620,38 @@ def test_partner_generate_rejects_an_empty_out_path(patched_plain_run):
     assert calls == []
 
 
+def test_partner_generate_rejects_an_oversized_out_path(no_spawn):
+    """An oversized `out_path` is refused before it can reach argv.
+
+    The sixth of the path-shaped siblings, and the one whose empty-string branch
+    runs FIRST: `out_path=""` carries distinct None-vs-empty semantics, so the
+    size cap sits between that branch and `_reject_nul` rather than at the top.
+    """
+    oversized = "/tmp/" + "p" * server._MAX_PATH_ARG_LEN + ".png"
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        _generate("flux-pro", out_path=oversized)
+
+    # Length-not-value: `_reject_nul`'s message would name the value instead.
+    assert oversized not in str(excinfo.value)
+
+
+def test_partner_generate_allows_an_out_path_at_the_ceiling(patched_plain_run):
+    """The boundary value itself rides through into `--download=`."""
+    calls = patched_plain_run(0, stdout="done")
+    at_ceiling = "/tmp/" + "p" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    _generate("flux-pro", out_path=at_ceiling)
+
+    assert calls[0]["cmd"][4:] == [
+        "generate",
+        "flux-pro",
+        f"--download={at_ceiling}",
+        "--timeout=600.0",
+    ]
+
+
 def test_partner_generate_clamps_timeout(patched_plain_run):
     """An absurd timeout is clamped, so no `comfy generate` child runs forever."""
     calls = patched_plain_run(0, stdout="done")

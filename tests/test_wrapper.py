@@ -1395,6 +1395,195 @@ def test_upload_file_rejects_option_like_path_among_valid_ones():
         server.upload_file(["/tmp/a.png", "--overwrite"])
 
 
+def test_upload_file_rejects_an_oversized_path(no_spawn):
+    """An oversized entry is refused, and the error NAMES WHICH ONE.
+
+    The list is splatted into argv, so "which of the paths" is the first thing a
+    caller with several needs to know — the label carries the index the way
+    `_reject_non_json_array_slot` names `slots[i]`. A good first entry proves
+    the guard scans past it rather than stopping at `paths[0]`.
+    """
+    oversized = "/tmp/" + "u" * server._MAX_PATH_ARG_LEN + ".png"
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        server.upload_file(["/tmp/ok.png", oversized])
+
+    message = str(excinfo.value)
+    assert "paths[1]" in message
+    # Length-not-value: the size check runs ahead of both per-entry value
+    # guards, whose echoes would name the value instead of its size.
+    assert oversized not in message
+
+
+def test_upload_file_rejects_too_many_paths(no_spawn):
+    """The per-entry cap does not bound the LIST — the count cap does.
+
+    `paths` is splatted into many argv slots, so entries that are each legal
+    still sum past the kernel's total `ARG_MAX` and die as the `OSError`
+    (`E2BIG`) `_run_comfy_raw` never converts. Same pair of caps, for the same
+    reason, as `_guard_extra_args`' `_MAX_EXTRA_ARGS`.
+    """
+    paths = [f"/tmp/{index}.png" for index in range(server._MAX_UPLOAD_PATHS + 1)]
+
+    with pytest.raises(server.ComfyCliError, match="entries exceeds") as excinfo:
+        server.upload_file(paths)
+
+    assert str(server._MAX_UPLOAD_PATHS) in str(excinfo.value)
+
+
+def test_upload_file_rejects_paths_totalling_past_the_aggregate_cap(no_spawn):
+    """A short-enough list of individually-legal paths is still bounded.
+
+    The count cap alone leaves this open — a mere 33 entries at the per-entry
+    ceiling already pass it while summing past `ARG_MAX` — so the aggregate is
+    what actually holds the splatted command line under the kernel's limit.
+    """
+    entry = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
+    paths = [entry] * count
+    assert count <= server._MAX_UPLOAD_PATHS, "must clear the count cap first"
+
+    with pytest.raises(server.ComfyCliError, match="totalling") as excinfo:
+        server.upload_file(paths)
+
+    # Reports the total, never the paths.
+    assert entry not in str(excinfo.value)
+
+
+def test_upload_file_measures_the_aggregate_in_bytes_not_characters(no_spawn):
+    """The aggregate is sized against `ARG_MAX`, which counts BYTES.
+
+    The per-value ceilings in this module count characters and can afford to —
+    each sits far enough under the limit it guards that a 4x UTF-8 expansion
+    cannot reach it. This one has no such headroom, so a list of multibyte paths
+    whose CHARACTER count is comfortably legal is still refused when its encoded
+    size is not — otherwise the cap would sail past the very limit it holds.
+    """
+    # 3 bytes per character, so this is a third of the cap in characters and
+    # just past it in bytes.
+    entry = "/tmp/" + "中" * 1000
+    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // (3 * 1000) + 1
+    paths = [entry] * count
+    assert sum(len(p) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+
+    with pytest.raises(server.ComfyCliError, match="bytes exceeds"):
+        server.upload_file(paths)
+
+
+def test_upload_file_rejects_a_bare_string_for_paths(no_spawn):
+    """A bare `str` would be splatted one CHARACTER per argv slot.
+
+    `len()` accepts it and iteration yields characters, so every per-entry guard
+    passes and `comfy upload a . p n g` is what gets spawned. Same refusal
+    `_guard_extra_args` makes, for the same reason.
+    """
+    with pytest.raises(server.ComfyCliError, match="expected a list of strings"):
+        server.upload_file("a.png")
+
+
+def test_upload_file_rejects_an_empty_list(no_spawn):
+    """`[]` clears every cap and builds `comfy upload` with no positionals.
+
+    The emptiest list-level mistake, so it is named here with the rest rather
+    than surfacing as a success-shaped result for an upload that moved nothing.
+    """
+    with pytest.raises(server.ComfyCliError, match="empty list"):
+        server.upload_file([])
+
+
+def test_upload_file_rejects_a_non_string_entry(no_spawn):
+    """A non-string entry dies inside `subprocess` with a bare `TypeError`.
+
+    That is an internal error rather than the `ComfyCliError` every other bad
+    input produces, and the message names WHICH entry.
+    """
+    with pytest.raises(server.ComfyCliError, match=r"paths\[1\].*expected a string"):
+        server.upload_file(["/tmp/ok.png", 42])
+
+
+def test_upload_file_rejects_an_unencodable_path(no_spawn):
+    """A lone surrogate cannot be rendered into argv at all.
+
+    It survives the MCP JSON wire intact, passes the length and NUL guards, and
+    then makes `Popen` raise an uncaught `UnicodeEncodeError` — the same
+    unconverted-spawn-failure class `_reject_nul` exists to close. `os.fsencode`
+    is what refuses it here, because it is also what `subprocess` would use.
+    """
+    with pytest.raises(server.ComfyCliError, match=r"paths\[1\].*cannot be encoded"):
+        server.upload_file(["/tmp/ok.png", "/tmp/\ud800.png"])
+
+
+def test_upload_file_counts_undecodable_filename_bytes_as_subprocess_would(patched_run):
+    """The aggregate uses `os.fsencode`, not a near-enough proxy.
+
+    A filename byte that is not valid UTF-8 arrives as a `surrogateescape`
+    surrogate and `os.fsencode` renders it back as the SINGLE byte it came from.
+    Measuring with `surrogatepass` instead would charge 3 bytes for each of
+    those, over-counting such a path threefold and refusing a batch that fits.
+    """
+    calls = patched_run(envelope(data={"uploaded": 1}))
+    # One undecodable byte (0xFF) per character of name, at a size that fits
+    # under the cap when counted as `subprocess` counts it and blows past it
+    # when counted with `surrogatepass`.
+    per_entry = "/tmp/" + "\udcff" * 2000
+    count = 60
+    paths = [per_entry] * count
+    assert (
+        sum(len(os.fsencode(p)) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+    )
+    surrogatepass_total = sum(len(p.encode("utf-8", "surrogatepass")) for p in paths)
+    assert surrogatepass_total > server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+
+    server.upload_file(paths)
+
+    assert calls[0]["cmd"][4:] == ["upload", *paths]
+
+
+def test_upload_file_reports_a_bad_entry_ahead_of_the_aggregate(no_spawn):
+    """A list that is BOTH too large and holds a bad entry names the entry.
+
+    The aggregate is a property of the whole list; a dash-leading path is a
+    property of one member, and that is the more actionable of the two — so the
+    per-entry loop runs before the sum is judged.
+    """
+    entry = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
+    paths = [*[entry] * count, "--overwrite"]
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.upload_file(paths)
+
+
+def test_upload_file_allows_a_full_batch_of_real_paths(patched_run):
+    """Both caps are backstops: a real batch AT the count boundary rides through.
+
+    The whole point of sizing them the way `_MAX_UPLOAD_PATHS` documents is that
+    no upload a caller would actually make reaches either — a frame sequence
+    filling the count cap at realistic path lengths is still well inside the
+    aggregate, so the caps refuse runaway argv rather than bulk uploads.
+    """
+    calls = patched_run(envelope(data={"uploaded": server._MAX_UPLOAD_PATHS}))
+    paths = [
+        f"/tmp/frames/{index:04d}.png" for index in range(server._MAX_UPLOAD_PATHS)
+    ]
+    assert sum(len(p) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+
+    server.upload_file(paths)
+
+    assert calls[0]["cmd"][4:] == ["upload", *paths]
+
+
+def test_upload_file_allows_a_path_at_the_ceiling(patched_run):
+    """The boundary value itself rides through as a positional."""
+    calls = patched_run(envelope(data={"uploaded": 1}))
+    at_ceiling = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    server.upload_file(["/tmp/ok.png", at_ceiling])
+
+    assert calls[0]["cmd"][4:] == ["upload", "/tmp/ok.png", at_ceiling]
+
+
 def test_upload_file_rejects_embedded_nul_path():
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
@@ -1940,6 +2129,35 @@ def test_fetch_outputs_rejects_a_nul_in_out_dir(monkeypatch):
 
     with pytest.raises(server.ComfyCliError, match="out_dir"):
         server.fetch_outputs("pid", "/tmp/o\x00ut")
+
+
+def test_fetch_outputs_rejects_an_oversized_out_dir(no_spawn):
+    """An oversized `out_dir` is refused before it can reach argv.
+
+    `-o`'s value is the one caller-supplied string here with no `-` guard (a
+    dash-leading directory is legitimate input for an option that takes a
+    value), so the size cap is the only thing standing between it and the
+    `OSError` (`E2BIG`) `_run_comfy_raw` never converts — its `try` wraps
+    `communicate()`, not the `Popen(...)` that raises.
+    """
+    oversized = "/tmp/" + "d" * server._MAX_PATH_ARG_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        server.fetch_outputs("pid", oversized)
+
+    # Length-not-value: `_reject_nul`'s message would name the value instead.
+    assert oversized not in str(excinfo.value)
+
+
+def test_fetch_outputs_allows_an_out_dir_at_the_ceiling(patched_run):
+    """The boundary value itself rides through to `-o`."""
+    calls = patched_run(envelope(data={"files": []}))
+    at_ceiling = "/tmp/" + "d" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    server.fetch_outputs("pid", at_ceiling)
+
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", at_ceiling]
 
 
 def test_fetch_outputs_wraps_comfy_download(patched_run):

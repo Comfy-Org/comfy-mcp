@@ -374,6 +374,56 @@ def test_fetch_template_rejects_option_like_name_and_out_path(monkeypatch):
         server.fetch_template("flux_dev", "--help")
 
 
+def test_fetch_template_rejects_an_oversized_out_path(no_spawn):
+    """An oversized `out_path` is refused before it can reach argv.
+
+    `--out`'s value rides the same argv as everything else, where the OS rejects
+    an oversized exec with an `OSError` (`E2BIG`) that `_run_comfy_raw` does not
+    convert — its `try` wraps only `communicate()`, not the `Popen(...)` that
+    raises. The cap is what turns that into a clean `ComfyCliError`.
+    """
+    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        server.fetch_template("flux_dev", oversized)
+
+    # Length-not-value: the size check runs ahead of `_reject_option_like` /
+    # `_reject_nul`, whose echoes would name the value instead of its size.
+    assert oversized not in str(excinfo.value)
+
+
+def test_fetch_template_reports_a_bad_name_ahead_of_an_oversized_out_path(no_spawn):
+    """Size-before-value is a PER-VALUE rule, not a whole-function one.
+
+    `out_path`'s cap sits ahead of `out_path`'s own guards so an oversized path
+    is named as a size rather than as a shape. Hoisting it above `name`'s check
+    too would make a call with both mistakes report the wrong argument.
+    """
+    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+
+    with pytest.raises(server.ComfyCliError, match="invalid name") as excinfo:
+        server.fetch_template("--help", oversized)
+
+    assert "exceeds" not in str(excinfo.value)
+
+
+def test_fetch_template_allows_an_out_path_at_the_ceiling(patched_run):
+    """The boundary value itself rides through to argv — the cap is generous."""
+    calls = patched_run(envelope(data=None))
+    at_ceiling = "/tmp/" + "o" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    server.fetch_template("flux_dev", at_ceiling, check_local=False)
+
+    assert calls[0]["cmd"][4:] == [
+        "templates",
+        "fetch",
+        "flux_dev",
+        "--out",
+        at_ceiling,
+    ]
+
+
 def test_template_tools_reject_embedded_nul(monkeypatch):
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
 
