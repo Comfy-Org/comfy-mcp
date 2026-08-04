@@ -518,6 +518,25 @@ def test_refuses_while_an_update_holds_the_shared_lock(patched_plain_run):
     assert calls == []
 
 
+def test_the_busy_refusal_names_every_lock_sharer(patched_plain_run):
+    """`install_node` holds the same lock, so the refusal has to name it too.
+
+    Otherwise a caller blocked by a 25-minute pack install is told "an update is
+    already running" and goes hunting for an update nobody started.
+    """
+    patched_plain_run(0, stderr="done")
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    try:
+        with pytest.raises(server.ComfyCliError) as excinfo:
+            _switch("0.24.0", ctx=_FakeCtx())
+    finally:
+        server._UPDATE_LOCK.release()
+
+    message = str(excinfo.value)
+    assert "node install" in message
+    assert "Nothing was changed." in message
+
+
 def test_a_declined_switch_leaves_the_lock_free(patched_plain_run):
     """A refusal must not park the lock an in-flight update legitimately needs."""
     patched_plain_run(0, stderr="done")

@@ -23,6 +23,12 @@ third-party code by accident:
 5. The result contract, including ``restart_required: True`` — this tool never
    restarts anything, which is what lets a user say "install it, I'll restart the
    server myself".
+6. The async plumbing that posture required, mirroring ``test_update_consent``'s:
+   the install keeps its OWN worker thread rather than asyncio's shared pool, it
+   forwards the 30-minute timeout, and the lock it holds belongs to the SUBPROCESS
+   rather than to the request. Without those three, replacing the done-callback
+   release with a ``try/finally`` around the await passes every other test in this
+   file while handing the lock to a retry that then runs a second concurrent pip.
 
 comfy-cli is mocked throughout: no real ComfyUI and nothing is ever installed.
 """
@@ -30,6 +36,8 @@ comfy-cli is mocked throughout: no real ComfyUI and nothing is ever installed.
 from __future__ import annotations
 
 import asyncio
+import threading
+from unittest import mock
 
 import pytest
 from mcp.server.elicitation import (
@@ -156,6 +164,69 @@ def test_an_oversized_name_is_reported_by_length_not_echoed(patched_plain_run):
     message = str(excinfo.value)
     assert "5000 characters" in message
     assert huge not in message
+
+
+def test_an_oversized_invalid_name_is_still_reported_by_length(patched_plain_run):
+    """The ordering the guard documents, pinned: length is checked before shape.
+
+    The test above cannot see that ordering — ``"a" * 5000`` MATCHES the registry
+    pattern, so it reaches the length error whichever check runs first. A value
+    that is both oversized and malformed is the case that separates them: with the
+    checks reversed it takes the id-shape branch, which echoes the value, and a
+    5000-character echo is exactly what the length branch exists to avoid.
+    """
+    patched_plain_run(0, stderr="installed")
+    junk = "/" * 5000
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _install([junk], ctx=_FakeCtx())
+
+    message = str(excinfo.value)
+    assert "5000 characters" in message
+    assert "not a registry pack id" not in message  # took the length branch
+    assert junk not in message
+    assert "/" * 100 not in message  # nor any long slice of it
+
+
+def test_a_batch_that_joins_too_long_is_refused(patched_plain_run):
+    """The count cap and the per-id cap leave their PRODUCT unbounded.
+
+    32 ids of 128 characters each is a legal list by both other bounds and a
+    4,698-character confirmation prompt — the "scrolls past rather than reads"
+    failure the count cap exists to prevent, reached by padding instead of by
+    counting. Refused rather than shown truncated: the prompt naming every pack IS
+    the consent, so a batch padded with look-alike slugs must not be able to hide
+    the real pack past a truncation marker.
+    """
+    calls = patched_plain_run(0, stderr="installed")
+    names = [f"pack-{n}-" + "x" * 120 for n in range(server._MAX_NODE_PACK_NAMES)]
+    ctx = _FakeCtx()
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _install(names, ctx=ctx)
+
+    message = str(excinfo.value)
+    assert "smaller batches" in message
+    assert str(server._MAX_NODE_PACK_NAMES_CHARS) in message
+    assert calls == []
+    assert ctx.elicitations == []  # nobody was asked to approve an unreadable list
+
+
+def test_a_full_size_batch_of_real_looking_ids_still_installs(patched_plain_run):
+    """The joined cap must not refuse a batch anyone would actually send.
+
+    Registry slugs run ~15-30 characters, so a full 32-pack call of realistic ids
+    lands under the bound; a cap that refused this would be the wrapper inventing
+    a limitation rather than keeping its own prompt readable.
+    """
+    calls = patched_plain_run(0, stderr="installed")
+    names = [f"comfyui-node-pack-{n:02d}" for n in range(server._MAX_NODE_PACK_NAMES)]
+
+    result = _install(names, ctx=(ctx := _FakeCtx()))
+
+    assert len(calls) == 1
+    assert result["installed"] == names
+    assert names[-1] in ctx.elicitations[0]  # every pack was named in the prompt
 
 
 def test_too_many_packs_is_refused_so_the_prompt_stays_readable(patched_plain_run):
@@ -456,3 +527,131 @@ def test_a_refused_install_never_took_the_lock(patched_plain_run):
 
     assert server._UPDATE_LOCK.acquire(blocking=False)
     server._UPDATE_LOCK.release()
+
+
+def test_the_busy_refusal_names_every_lock_sharer(patched_plain_run):
+    """The holder may be an update OR a version switch; say both.
+
+    A caller told only about "an update" goes hunting for an in-flight call that
+    may not exist. `update_comfyui` and `switch_comfyui_version` name a node
+    install in their own refusals for the same reason.
+    """
+    patched_plain_run(0, stderr="done")
+
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    try:
+        with pytest.raises(server.ComfyCliError) as excinfo:
+            _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+    finally:
+        server._UPDATE_LOCK.release()
+
+    message = str(excinfo.value)
+    assert "version switch" in message
+    assert "Nothing was installed." in message
+
+
+# --- discoverability --------------------------------------------------------
+
+
+def test_the_handshake_instructions_teach_the_install_flow():
+    """An agent reads `INSTRUCTIONS` once, at handshake — it must find the door.
+
+    Before this, the missing-node guidance ended at "tell the USER what is
+    missing", which is precisely the dead end this tool removes: an agent that
+    learned the wall at handshake never discovers the tool that resolves it. The
+    restart is part of the same clause because installing without restarting looks
+    like a no-op from `search_nodes`.
+    """
+    flat = " ".join(server.INSTRUCTIONS.split())
+
+    assert "install_node" in flat
+    assert "`install_node` -> `restart_comfyui`" in flat
+
+
+def test_the_module_docstring_lists_the_tool():
+    """The inventory at the top of `server.py` is the other place a reader looks."""
+    assert "install_node" in server.__doc__
+
+
+# --- the async plumbing the gate required -----------------------------------
+
+
+def test_the_install_stays_off_the_default_executor(patched_plain_run):
+    """A 30-minute blocking call on asyncio's shared pool starves everything else.
+
+    `_UPDATE_EXECUTOR` and `_SWITCH_EXECUTOR` exist for exactly this reason, and an
+    install runs as long as either: on the default pool it would park the only
+    worker every other `to_thread` caller in the process shares.
+    """
+    patched_plain_run(0, stderr="done")
+    threads: list[str] = []
+
+    def _capture(*args, **kwargs):
+        threads.append(threading.current_thread().name)
+        return {"ok": True}
+
+    with mock.patch.object(server, "_run_comfy", _capture):
+        _install(
+            ["comfyui-impact-pack"],
+            confirm_install=True,
+            ctx=_FakeCtx(supports_elicitation=False),
+        )
+
+    assert threads and all(name.startswith("comfy-node-install") for name in threads)
+
+
+def test_the_timeout_is_generous(patched_plain_run):
+    """Resolving and installing a pack's dependencies is minutes, not seconds."""
+    calls = patched_plain_run(0, stderr="done")
+
+    _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+    assert calls[0]["timeout"] == server._INSTALL_TIMEOUT
+    assert calls[0]["timeout"] >= 1800.0
+
+
+def test_the_lock_is_held_until_the_subprocess_finishes(patched_plain_run):
+    """Cancelling the REQUEST must not hand the lock to a second concurrent pip.
+
+    Cancellation raises `CancelledError` at the await but neither interrupts the
+    worker thread nor kills the `comfy node install` it spawned, so pip keeps
+    resolving. If the lock were released in a `finally` here, a retry, an
+    `update_comfyui` or a `switch_comfyui_version` would acquire it and run a
+    second install against the same venv — the corrupted environment the lock
+    exists to prevent. The done-callback ties the release to the JOB's lifetime
+    instead, so this is what fails if anyone "simplifies" it back to a `finally`.
+    """
+    started = threading.Event()
+    finish = threading.Event()
+
+    def _slow(*_args, **_kwargs):
+        started.set()
+        finish.wait(5)
+        return {"ok": True}
+
+    patched_plain_run(0, stderr="done")
+
+    async def _drive():
+        task = asyncio.ensure_future(
+            server.install_node(["comfyui-impact-pack"], confirm_install=True, ctx=None)
+        )
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The abandoned install is still running, so the lock must still be taken.
+        assert not server._UPDATE_LOCK.acquire(blocking=False)
+        finish.set()
+        # ...and released once it actually ends, rather than leaked forever.
+        for _ in range(500):
+            if server._UPDATE_LOCK.acquire(blocking=False):
+                server._UPDATE_LOCK.release()
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the lock was never released")
+
+    with mock.patch.object(server, "_run_comfy", _slow):
+        try:
+            asyncio.run(_drive())
+        finally:
+            finish.set()
