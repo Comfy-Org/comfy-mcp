@@ -83,9 +83,9 @@ _ELICIT_FAKES = [
 
 # Only the doubles that stand in for a context which also carries progress: the
 # two STREAMING run verbs hand the same object to the prompt and to the run. The
-# `switch_version` / `update_consent` / `network_exposure` fakes have no
-# `report_progress` because none of those tools stream, so registering them here
-# would assert a method their production path never calls.
+# `switch_version` / `update_consent` / `install_node` / `network_exposure`
+# fakes have no `report_progress` because none of those tools stream, so
+# registering them here would assert a method their production path never calls.
 _PROGRESS_FAKES = [
     conftest._RecordingCtx,
     test_run_template._FakeCtx,
@@ -194,14 +194,19 @@ def test_fake_check_client_capability_matches_the_real_session_signature(fake):
 
 @pytest.mark.parametrize("method", sorted(_REGISTRY_BY_METHOD))
 def test_every_module_level_fake_is_registered(method):
-    """A seventh copy of a consent fake must be CHECKED, not merely written.
+    """Every copy of a consent fake must be CHECKED, not merely written.
 
-    The registries above are hand-written, and hand-written lists rot: three of
-    the five consent fakes went unlisted for as long as they existed, so they
-    could have drifted from the SDK while their own tests stayed green. This
-    asserts the lists name every module-level double, in both directions — an
-    unregistered fake fails here, and so does a registry entry for a class that
-    no longer defines the method.
+    The registries above are hand-written, and hand-written lists rot: most of
+    the consent fakes that existed when this test was added had gone unlisted
+    for as long as they existed, so they could have drifted from the SDK while
+    their own tests stayed green. This asserts the lists name every module-level
+    double, in both directions — an unregistered fake fails here, and so does a
+    registry entry for a class that no longer defines the method.
+
+    Deliberately phrased without a count. Every new consent gate adds a fake,
+    and a docstring that said "a seventh copy" was already wrong by the time the
+    seventh landed — the number is exactly the sort of hand-maintained detail
+    this test exists to stop relying on.
     """
     registry_name, registry = _REGISTRY_BY_METHOD[method]
     labels = [_label(fake) for fake in registry]
