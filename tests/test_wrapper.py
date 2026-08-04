@@ -1470,6 +1470,65 @@ def test_upload_file_measures_the_aggregate_in_bytes_not_characters(no_spawn):
         server.upload_file(paths)
 
 
+def test_upload_file_rejects_a_bare_string_for_paths(no_spawn):
+    """A bare `str` would be splatted one CHARACTER per argv slot.
+
+    `len()` accepts it and iteration yields characters, so every per-entry guard
+    passes and `comfy upload a . p n g` is what gets spawned. Same refusal
+    `_guard_extra_args` makes, for the same reason.
+    """
+    with pytest.raises(server.ComfyCliError, match="expected a list of strings"):
+        server.upload_file("a.png")
+
+
+def test_upload_file_rejects_a_non_string_entry(no_spawn):
+    """A non-string entry dies inside `subprocess` with a bare `TypeError`.
+
+    That is an internal error rather than the `ComfyCliError` every other bad
+    input produces, and the message names WHICH entry.
+    """
+    with pytest.raises(server.ComfyCliError, match=r"paths\[1\].*expected a string"):
+        server.upload_file(["/tmp/ok.png", 42])
+
+
+def test_upload_file_rejects_an_unencodable_path(no_spawn):
+    """A lone surrogate cannot be rendered into argv at all.
+
+    It survives the MCP JSON wire intact, passes the length and NUL guards, and
+    then makes `Popen` raise an uncaught `UnicodeEncodeError` — the same
+    unconverted-spawn-failure class `_reject_nul` exists to close. `os.fsencode`
+    is what refuses it here, because it is also what `subprocess` would use.
+    """
+    with pytest.raises(server.ComfyCliError, match=r"paths\[1\].*cannot be encoded"):
+        server.upload_file(["/tmp/ok.png", "/tmp/\ud800.png"])
+
+
+def test_upload_file_counts_undecodable_filename_bytes_as_subprocess_would(patched_run):
+    """The aggregate uses `os.fsencode`, not a near-enough proxy.
+
+    A filename byte that is not valid UTF-8 arrives as a `surrogateescape`
+    surrogate and `os.fsencode` renders it back as the SINGLE byte it came from.
+    Measuring with `surrogatepass` instead would charge 3 bytes for each of
+    those, over-counting such a path threefold and refusing a batch that fits.
+    """
+    calls = patched_run(envelope(data={"uploaded": 1}))
+    # One undecodable byte (0xFF) per character of name, at a size that fits
+    # under the cap when counted as `subprocess` counts it and blows past it
+    # when counted with `surrogatepass`.
+    per_entry = "/tmp/" + "\udcff" * 2000
+    count = 60
+    paths = [per_entry] * count
+    assert (
+        sum(len(os.fsencode(p)) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+    )
+    surrogatepass_total = sum(len(p.encode("utf-8", "surrogatepass")) for p in paths)
+    assert surrogatepass_total > server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+
+    server.upload_file(paths)
+
+    assert calls[0]["cmd"][4:] == ["upload", *paths]
+
+
 def test_upload_file_reports_a_bad_entry_ahead_of_the_aggregate(no_spawn):
     """A list that is BOTH too large and holds a bad entry names the entry.
 

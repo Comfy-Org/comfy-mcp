@@ -11021,18 +11021,18 @@ def cancel_download(download_id: str) -> Any:
 # is splatted into MANY argv slots, so a list of individually-legal paths still
 # sums past the kernel's TOTAL `ARG_MAX` (256 KiB on macOS, typically 2 MiB on
 # Linux) and dies as the `OSError` (`E2BIG`) `_run_comfy_raw` never converts —
-# its `try` wraps `communicate()`, not the `Popen(...)` that raises. That is the
-# same reason `_guard_extra_args` caps `_MAX_EXTRA_ARGS` as well as
-# `_MAX_EXTRA_ARG_LEN`, and this is the same pair of caps for the same hazard.
+# its `try` wraps `communicate()`, not the `Popen(...)` that raises. Bounding
+# both the count and the size of a splatted list is the same thing
+# `_guard_extra_args` does for `extra_args`, for the same reason.
 #
-# TWO of them, because either alone leaves the other open, and between them they
-# are DERIVED rather than picked: `ARG_MAX` counts each entry's bytes plus its
-# terminator and its pointer, so the aggregate bounds the bytes and the count
-# bounds the per-entry overhead the aggregate cannot see (a list of a million
-# EMPTY strings sums to zero bytes and still blows the limit on pointers alone).
-# 128 KiB of path bytes plus 4096 entries of overhead — call it 32 KiB of
-# pointers and 4 KiB of terminators — lands around 164 KiB, comfortably under
-# the 256 KiB that is the SMALLEST `ARG_MAX` of the two platforms.
+# TWO of them, because either alone leaves the other open: the aggregate bounds
+# the path BYTES, and the count bounds the per-entry overhead the aggregate
+# cannot see, since `execve` charges a pointer and a terminator per entry (a
+# list of a million EMPTY strings sums to zero bytes and still blows the limit).
+# `_guard_extra_args` splits the same job differently — count plus PER-ENTRY
+# length, no aggregate — so the two are the same pair of concerns rather than
+# literally the same pair of caps; its own worst case is a residue of the kind
+# the last paragraph describes.
 #
 # BYTES, not characters, and this is the one place in this module where that
 # distinction bites. The per-value ceilings above count characters and say why:
@@ -11040,16 +11040,34 @@ def cancel_download(download_id: str) -> Any:
 # still cannot reach it. An AGGREGATE has no such headroom — it is sized against
 # `ARG_MAX` directly, so 128 KiB of CHARACTERS would be up to 512 KiB of
 # multibyte path on the wire and would sail past the very limit it exists to
-# hold. Encoded with `surrogatepass` for the reason
-# `_reject_non_json_array_slot` encodes that way: a lone surrogate can arrive
-# over the wire, and this guard must not be the thing that raises on it.
+# hold. Measured with `os.fsencode`, which is what `subprocess` itself uses to
+# render argv, so the count is the kernel's rather than a near-enough proxy:
+# `surrogatepass` would charge 3 bytes for each surrogate in the
+# `surrogateescape` range that `os.fsencode` renders back as the SINGLE
+# undecodable filename byte it came from, over-counting a path with non-UTF-8
+# bytes in its name threefold and refusing a batch that fits.
 #
-# Both are backstops, deliberately sized so that no upload a caller would
-# actually make can reach them: a 4096-file batch at a roomy 200 bytes of path
-# each is 800 KiB and so is refused by the aggregate, but the same batch at a
-# realistic ~30 bytes is 120 KiB and rides through. A caller who does reach one
-# is told to split the batch — the tool takes any number of files across several
-# calls, so neither cap makes an upload impossible, only unbatched.
+# NOT a proof that the spawn fits, and the comment must not pretend otherwise.
+# `execve` charges the inherited ENVIRONMENT against the same budget and
+# `_comfy_env` forwards a copy of `os.environ`, which on a loaded shell is tens
+# of KiB on its own; Windows does not work like this at all, capping the whole
+# rendered command line at 32,767 UTF-16 code units. A ceiling that actually
+# held under all of that would have to be computed per-spawn against the live
+# environment, which is a different mechanism from a tool-argument guard. What
+# these two DO buy is what the id caps buy: a runaway list is refused as a clean
+# `ComfyCliError` naming the mistake, rather than reaching a spawn that fails
+# with an unconverted `OSError`. Converting that `OSError` at the spawn site is
+# the airtight backstop underneath them, and is tracked separately.
+#
+# Sized so that no upload a caller would plausibly make reaches them: a
+# 4096-file batch at a roomy 200 bytes of path each is 800 KiB and so is refused
+# by the aggregate, but the same batch at a realistic ~30 bytes is 120 KiB and
+# clears both. Clearing these caps is not a promise the upload COMPLETES —
+# `upload_file`'s 300s timeout is the binding constraint on a batch that large,
+# and it is comfy-cli's transfer being timed, not this guard's business. A
+# caller who does reach one is told to split the batch; the tool takes any
+# number of files across several calls, so neither cap makes an upload
+# impossible, only unbatched.
 _MAX_UPLOAD_PATHS = 4096
 _MAX_UPLOAD_PATHS_TOTAL_BYTES = 128 * 1024
 
@@ -11070,7 +11088,16 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     # to that (it is refused wherever it rides, positional or not): `subprocess`
     # raises a bare `ValueError` on one, which would escape as an internal error
     # instead of the `ComfyCliError` every other bad input produces.
-    # COUNT first, ahead of the per-entry loop: it is the whole-list mistake, and
+    # SHAPE first, the way `_guard_extra_args` checks it: a bare `str` would pass
+    # `len()` and then be splatted one CHARACTER per argv slot (`"a.png"` ->
+    # `a`, `.`, `p`, …), and a non-string entry dies inside `subprocess` with a
+    # `TypeError` this module's error contract never promised. This is the block
+    # where list-level mistakes are named, so they are both named here.
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise ComfyCliError(
+            f"invalid paths: expected a list of strings, got {type(paths).__name__}."
+        )
+    # COUNT next, ahead of the per-entry loop: it is the whole-list mistake, and
     # checking it first is what keeps the loop below proportional to a plausible
     # command line rather than to whatever the caller sent. See
     # `_MAX_UPLOAD_PATHS`.
@@ -11080,24 +11107,41 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
             f"{_MAX_UPLOAD_PATHS}-entry maximum (they are forwarded to comfy-cli "
             "as command-line arguments) — upload in batches."
         )
-    # The per-entry size cap names the INDEX the way `_reject_non_json_array_slot`
+    # Every per-entry failure names the INDEX the way `_reject_non_json_array_slot`
     # names `slots[i]`: the list is splatted, so "which of the paths" is the first
-    # thing a caller with several needs to know. It runs before the two value
-    # guards for the ordering reason `_guard_arg_len` gives.
+    # thing a caller with several needs to know, and that is as true of a
+    # dash-leading or NUL-bearing entry as of an oversized one. Size runs ahead
+    # of the two value guards for the ordering reason `_guard_arg_len` gives.
+    total = 0
     for index, p in enumerate(paths):
-        _guard_arg_len(f"upload path paths[{index}]", p)
+        label = f"upload path paths[{index}]"
+        if not isinstance(p, str):
+            raise ComfyCliError(
+                f"invalid {label}: expected a string, got {type(p).__name__}."
+            )
+        _guard_arg_len(label, p)
         _reject_option_like(
-            "upload path",
+            label,
             p,
             expected="a file path (prefix a dash-leading name with './')",
         )
-        _reject_nul("upload path", p)
-    # AGGREGATE last, once every entry is known to be a legal path: this is the
-    # bound that actually holds the splatted argv under `ARG_MAX`, and reporting
-    # it before the per-entry checks would name the sum for a list whose real
-    # problem is one bad member. Encoded, because the kernel counts bytes — see
-    # `_MAX_UPLOAD_PATHS_TOTAL_BYTES`. Reports the total, never the paths.
-    total = sum(len(p.encode("utf-8", "surrogatepass")) for p in paths)
+        _reject_nul(label, p)
+        # Encoded exactly as `subprocess` will encode it, so the running total is
+        # the kernel's count — see `_MAX_UPLOAD_PATHS_TOTAL_BYTES`. `os.fsencode`
+        # is also the one thing here that can REFUSE a path: a lone surrogate
+        # outside the `surrogateescape` range cannot be rendered into argv at all
+        # and would otherwise reach `Popen` as an uncaught `UnicodeEncodeError` —
+        # the same unconverted-spawn-failure class `_reject_nul` exists to close.
+        try:
+            total += len(os.fsencode(p))
+        except UnicodeEncodeError:
+            raise ComfyCliError(
+                f"invalid {label}: contains characters that cannot be encoded as "
+                "a filesystem path (unpaired surrogate)."
+            ) from None
+    # AGGREGATE last, once every entry is known to be a legal path: reporting it
+    # before the per-entry checks would name the sum for a list whose real
+    # problem is one bad member. Reports the total, never the paths.
     if total > _MAX_UPLOAD_PATHS_TOTAL_BYTES:
         raise ComfyCliError(
             f"invalid paths: {len(paths)} entries totalling {total} bytes exceeds "
