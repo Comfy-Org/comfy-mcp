@@ -78,14 +78,14 @@ SIGNAL: `run_template` can trust the verb, `run_workflow` must PROBE `comfy run
 --help` for the flag — its docstring says why, and what an engine without it
 means. `switch_comfyui_version`, `install_node` and `update_comfyui` sit outside
 that axis: none spends credits, the CLI gates none of them, so their prompt is
-this server's only gate, with no always-proceed to read. Three are
+this server's only gate, with no always-proceed to read. TWO gates are
 ARGUMENT-scoped, the danger being the argument and not the verb: the launch pair
 prompts only for `extra_args` that would publish an unauthenticated ComfyUI
-(`_network_exposing_args`); `update_comfyui` only for `target="all"`, which
-pip-installs every third-party pack (`comfy`/`cli` never prompt); and
-`install_node` pins `names` to registry slugs, refusing a URL — stricter than
-the engine, since the prompt promises a REGISTRY pack. Mirror the engine's
-contract per tool; do not generalize one tool's consent rules onto another.
+(`_network_exposing_args`), `update_comfyui` only for `target="all"`, which
+pip-installs every third-party pack (`comfy`/`cli` never prompt). `install_node`
+is NOT one: it prompts on EVERY call, and its argument is a RESTRICTION — `names`
+pinned to registry slugs, refusing a URL, as the prompt promises a REGISTRY pack.
+Mirror the engine's contract per tool; never generalize one gate onto another.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
 `search_models`) read the **user's live install** — custom nodes included — via

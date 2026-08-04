@@ -22,10 +22,12 @@ user to confirm any flag that would publish the unauthenticated local ComfyUI to
 the network) with ``get_logs`` (``comfy logs``) to read a
 detached launch's captured output, the install verbs ``update_comfyui``
 (``comfy update``, forward-only — and its ``target="all"`` rebuilds every
-installed third-party node pack, so that target asks the user to confirm) and
+installed third-party node pack, so that target asks the user to confirm),
 ``switch_comfyui_version``
 (``comfy update comfy --version <X>``, which can also roll BACK and so asks the
-user to confirm per call), and the
+user to confirm per call) and ``install_node`` (``comfy node install``, the
+acquisition half of the missing-node story — it downloads and runs third-party
+pack code, so it asks the user to confirm every call), and the
 ``discover`` / ``which`` introspection pair (``comfy discover`` /
 ``comfy which``) that lets an agent learn the CLI's own contract and selection.
 ``partner_generate`` (``comfy generate <model>``) reaches the hosted PARTNER
@@ -127,8 +129,9 @@ flows:
   install does not have yet — clearing `local_check` is MANDATORY, not advisory,
   and "the fetch succeeded" is not a substitute. On
   `{"checked": true, "runnable": false}` tell the USER what is missing (update
-  ComfyUI / custom nodes, or pick another template) instead of running it and
-  hitting the failure deep in execution; `{"checked": false}` is "could not
+  ComfyUI / custom nodes, `install_node` a missing pack, or pick another template)
+  instead of running it and hitting the failure deep in execution;
+  `{"checked": false}` is "could not
   compare", not a verdict — it leaves the gate UNDONE, so run
   `validate_workflow(result["path"])` yourself before running anything. Read that
   block with `.get("runnable")`: a `checked: false` block has no `runnable` key.
@@ -164,7 +167,12 @@ flows:
   `definitions.subgraphs` — tweak it through `set_workflow_slot` /
   `run_template(params=...)` like any other template.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
-  before running.
+  before running. A missing node PACK is not a dead end: `install_node(names=[...])`
+  installs it from the registry (registry pack ids, never URLs; the USER is asked
+  to confirm every call because it runs third-party code), and the flow is
+  `install_node` -> `restart_comfyui` -> `validate_workflow` again, since a running
+  ComfyUI cannot see new nodes until it restarts. A missing MODEL is
+  `download_model`.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
 - VRAM is shared with everything else on the machine. Before a heavy run, read
   `system_stats` for per-device `vram_free`; if it is short, `free_memory`
@@ -8258,11 +8266,17 @@ _UPDATE_LOCK = threading.Lock()
 # The busy refusal, shared by the advisory peek before the confirmation prompt and
 # the authoritative acquire after it, so the two cannot drift into telling the
 # caller different things about the same condition.
+#
+# Names all three lock sharers, not just "an update": `switch_comfyui_version` and
+# `install_node` take the same `_UPDATE_LOCK`, so a 25-minute node install is
+# enough to refuse this call — and a caller told only about "an update" would go
+# hunting for an in-flight call that does not exist. Same reasoning as
+# `_SWITCH_UPDATE_BUSY` / `_INSTALL_UPDATE_BUSY`; keep the three in step.
 _UPDATE_BUSY = (
-    "an update is already running in this server; `comfy update` mutates the "
-    "ComfyUI git checkout and Python environment, so two at once can corrupt the "
-    "install. Wait for the in-flight update to finish (up to 30 minutes for a "
-    "core update) and call again."
+    "an update, version switch or node install is already running in this server; "
+    "`comfy update` mutates the ComfyUI git checkout and Python environment, so "
+    "two at once can corrupt the install. Wait for the in-flight call to finish "
+    "(up to 30 minutes for a core update) and call again. Nothing was updated."
 )
 
 # Kept OFF asyncio's shared default executor for the reason `_SWITCH_EXECUTOR`
@@ -8462,9 +8476,26 @@ async def update_comfyui(
 
     Like ``launch_comfyui`` / ``stop_comfyui``, ``comfy update`` prints human
     text and exits 0 without a JSON envelope, so success returns a synthesized
-    ``{"ok": True, ...}`` payload carrying that text. A failed update (a dirty
-    git tree, a broken requirements install, an unreachable network) exits
-    non-zero and still raises a :class:`ComfyCliError`.
+    ``{"ok": True, ...}`` payload carrying that text.
+
+    **What ``ok`` actually proves depends on the target.** For ``"comfy"`` and
+    ``"cli"`` a failed update (a dirty git tree, a broken requirements install, an
+    unreachable network) exits non-zero and raises a :class:`ComfyCliError`.
+    ``"all"`` currently CANNOT distinguish a failed pack update from a clean one:
+    comfy-cli hands that target to the node manager without its
+    ``raise_on_error``, and that handler swallows a failed exit — it prints the
+    failure to stderr and returns — so ``comfy update all`` exits 0 either way and
+    the synthesized ``{"ok": True}`` is not evidence the packs updated. Read the
+    returned ``message`` text, and re-check ``server_info``'s
+    ``freshness.packs``, rather than trusting the ok on that one target. Note what
+    this costs the gate above: a false success rides on the approval the USER just
+    gave, so an agent that reports "updated" from ``ok`` alone can tell them their
+    consent achieved something it did not. ``install_node`` does not have this
+    problem because ``comfy node install`` takes ``--exit-on-fail``; ``comfy
+    update all`` has no such flag, and adding one is a comfy-cli change (filed as
+    a comfy-cli follow-up) rather than something this wrapper may synthesize —
+    deciding here whether the packs moved would mean deriving the verdict instead
+    of asking the engine.
     """
     normalized = target.strip().lower() if isinstance(target, str) else ""
     if normalized not in _UPDATE_TARGETS:
@@ -8770,11 +8801,14 @@ _RUNNING_REFUSAL = (
 )
 
 # Shared by the advisory pre-consent peek and the authoritative acquire below.
+# Names all three lock sharers for the reason `_UPDATE_BUSY` spells out: a node
+# install holds `_UPDATE_LOCK` too, and "an update is already running" would send
+# the caller looking for the wrong in-flight call.
 _SWITCH_UPDATE_BUSY = (
-    "an update is already running in this server; switching versions mutates the "
-    "same ComfyUI git checkout and Python environment, so the two at once can "
-    "corrupt the install. Wait for the in-flight update to finish and call "
-    "again. Nothing was changed."
+    "an update or node install is already running in this server; switching "
+    "versions mutates the same ComfyUI git checkout and Python environment, so "
+    "the two at once can corrupt the install. Wait for the in-flight call to "
+    "finish and call again. Nothing was changed."
 )
 
 
@@ -8954,7 +8988,8 @@ _INSTALL_TIMEOUT = _UPDATE_TIMEOUT
 # the two cannot drift into telling the caller different things — the same reason
 # `_SWITCH_UPDATE_BUSY` exists. Names `switch_comfyui_version` alongside
 # `update_comfyui` because all three share `_UPDATE_LOCK`, and a caller told only
-# about "an update" would go looking for the wrong in-flight call.
+# about "an update" would go looking for the wrong in-flight call. The other two
+# messages name this tool for the same reason; keep the three in step.
 _INSTALL_UPDATE_BUSY = (
     "an update or version switch is already running in this server; installing a "
     "pack pip-installs into the same Python environment, so the two at once can "
@@ -8980,10 +9015,36 @@ _INSTALL_EXECUTOR = ThreadPoolExecutor(
 # packs" true rather than nominal.
 _MAX_NODE_PACK_NAMES = 32
 
-# A registry node id: an alphanumeric-led slug. Anchored end-to-end, so a value
-# that matches carries no whitespace, no NUL, no shell metacharacter, no leading
-# dash, and — the load-bearing exclusion — no `/`, `:` or `@`, which is what keeps
-# a git URL or a filesystem path off this argv.
+# The same readability bound applied to the JOINED prompt text, because neither cap
+# on its own reaches it: `_MAX_NODE_PACK_NAMES` bounds the COUNT and
+# `_MAX_NODE_PACK_ID_LEN` bounds each ENTRY, but nothing bounded their product, and
+# 32 ids of 128 characters is a 4,698-character prompt — the exact "scrolls past
+# rather than reads" failure the count cap exists to prevent, reached by padding
+# instead of by counting. 1024 characters clears any realistic batch (registry
+# slugs run ~15-30 characters, so even a full 32-pack call of real ids lands near
+# 900) while refusing the padded one.
+#
+# REFUSED rather than elided, which is where this parts company with
+# `_display_extra_args`: eliding a long argument list still shows the user the
+# flags that make it dangerous, so prompting beats refusing to prompt. Eliding a
+# PACK LIST would do the opposite — it would collect an approval for names the
+# prompt never showed, which is how a batch padded with look-alike slugs hides the
+# one pack the user would have declined. The enumeration IS the consent here, so an
+# over-long list never reaches the prompt at all.
+_MAX_NODE_PACK_NAMES_CHARS = 1024
+
+# A registry node id: an alphanumeric-led slug. Matched with `re.fullmatch` (see
+# `_guard_node_names`), so a value that matches carries no whitespace, no NUL, no
+# shell metacharacter, no leading dash, and — the load-bearing exclusion — no `/`,
+# `:` or `@`, which is what keeps a git URL or a filesystem path off this argv.
+#
+# `fullmatch` rather than a `^…$` + `.match()` pair, because that pair does NOT
+# carry the claim above: Python's `$` also matches just before a trailing newline,
+# so `.match("pack\n")` succeeded. Nothing reached argv with a newline in it even
+# then — `_guard_node_names` strips each entry first, and a full sweep of the code
+# points that survive `str.strip()` found no other character this pattern would
+# admit — but the invariant was being carried by that `strip()` while this comment
+# credited the anchors. `fullmatch` puts it where the comment says it is.
 #
 # This is DELIBERATELY narrower than the engine, which is normally this repo's
 # anti-pattern (see `_VERSION_RE`, which refuses to out-strict comfy-cli). The
@@ -8994,7 +9055,7 @@ _MAX_NODE_PACK_NAMES = 32
 # given for something other than what happened. A wrapper may not narrow the
 # engine to invent product behavior; it must narrow the engine where a wider
 # input would make its own consent prompt lie.
-_REGISTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_REGISTRY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # What the caller is really being stopped from doing, repeated in both the
 # unpromptable-client refusal and the prompt itself. Hoisted for the reason
@@ -9048,9 +9109,18 @@ async def _elicit_node_install_consent(ctx: Context, names_display: str) -> bool
     """Ask the USER to approve this one install. True = approved.
 
     ``names_display`` is interpolated directly rather than through
-    :func:`_display_model`: every entry has already been pinned by
-    :data:`_REGISTRY_ID_RE`, so it cannot carry the backticks or newlines that
-    sanitizer exists to neutralize.
+    :func:`_display_caller_text`, and it needs BOTH halves of that function's job
+    covered elsewhere:
+
+    * the CHARACTER SET, by :data:`_REGISTRY_ID_RE` — every entry is pinned to a
+      registry slug, so it cannot carry the backticks or newlines that sanitizer
+      exists to neutralize;
+    * the LENGTH, by :data:`_MAX_NODE_PACK_NAMES_CHARS` — a bounded count of
+      bounded ids still multiplies out to a prompt nobody reads, so
+      :func:`_guard_node_names` refuses the over-long JOIN before it gets here.
+
+    That second one is why this is not merely "the regex makes it safe". The cap is
+    a refusal rather than a truncation on purpose: see the constant.
     """
     return await _elicit_approval(
         ctx,
@@ -9115,9 +9185,19 @@ def _guard_node_names(names: Any) -> list[str]:
     """Validate ``install_node``'s pack list, or raise before anything is spawned.
 
     Ordered so the message a caller gets names the most useful problem: the list
-    shape first, then each entry's LENGTH (reported as a size, never by echoing a
-    megabyte-long "pack name" back through the tool response and the failure log —
-    see :data:`_MAX_NODE_PACK_ID_LEN`), then ``all``, then the id shape.
+    shape first, then each entry's LENGTH, then ``all``, then the id shape, and
+    last the length of the whole JOINED list
+    (:data:`_MAX_NODE_PACK_NAMES_CHARS`).
+
+    **The length check must stay AHEAD of the id-shape check**, which is the one
+    ordering here that is load-bearing rather than cosmetic. The shape refusal
+    echoes the value so the caller can see what was wrong with it; the length
+    refusal reports a SIZE and never echoes, so a megabyte-long "pack name" does
+    not come back through the tool response and the failure log (see
+    :data:`_MAX_NODE_PACK_ID_LEN`). Reversed, an oversized *invalid* value would
+    take the echoing branch. The echo is clipped by :func:`_clip_for_error` as a
+    second line of defense, but the bound stays where it is: a 4096-character
+    preview of a caller's junk is not what the message is for.
 
     ``all`` is rejected here with its own message even though comfy-cli refuses it
     too (```install all` is not allowed``): the engine's refusal arrives as plain
@@ -9145,8 +9225,9 @@ def _guard_node_names(names: Any) -> list[str]:
                 "(e.g. 'comfyui-impact-pack')."
             )
         value = entry.strip()
+        # BEFORE the id-shape check below, which echoes the value — see the
+        # docstring. Report the length, not the value: `_MAX_NODE_PACK_ID_LEN`.
         if len(value) > _MAX_NODE_PACK_ID_LEN:
-            # Report the length, not the value — see `_MAX_NODE_PACK_ID_LEN`.
             raise ComfyCliError(
                 f"invalid names: {len(value)} characters exceeds the "
                 f"{_MAX_NODE_PACK_ID_LEN}-character maximum for a pack id."
@@ -9162,17 +9243,32 @@ def _guard_node_names(names: Any) -> list[str]:
             "names", value, expected="a registry pack id (e.g. 'comfyui-impact-pack')"
         )
         _reject_nul("names", value)
-        if not _REGISTRY_ID_RE.match(value):
+        if not _REGISTRY_ID_RE.fullmatch(value):
             raise ComfyCliError(
-                f"invalid names: {value!r} is not a registry pack id. Expected a "
-                "slug like 'comfyui-impact-pack' (letters, digits, '.', '_', "
-                "'-'). A git URL or a filesystem path is deliberately refused: "
-                "the confirmation prompt tells the user they are approving a "
-                "named pack from the registry, so it must not be able to carry "
-                "anything else. To install from a URL, run `comfy node install` "
-                "in a terminal, where your shell is the confirmation."
+                f"invalid names: {_clip_for_error(value)} is not a registry pack "
+                "id. Expected a slug like 'comfyui-impact-pack' (letters, digits, "
+                "'.', '_', '-'). A git URL, a filesystem path, or a "
+                "'<pack>@<version>' pin is deliberately refused: the confirmation "
+                "prompt tells the user they are approving a named pack from the "
+                "registry, so it must not be able to carry anything else. To "
+                "install from a URL, or to pin a specific pack version, run "
+                "`comfy node install` in a terminal, where your shell is the "
+                "confirmation."
             )
         guarded.append(value)
+    # Last, because it is a property of the whole list rather than of any entry —
+    # and the one bound that makes the prompt's enumeration readable rather than
+    # merely finite. See `_MAX_NODE_PACK_NAMES_CHARS` for why this refuses instead
+    # of truncating the display.
+    joined = len(", ".join(guarded))
+    if joined > _MAX_NODE_PACK_NAMES_CHARS:
+        raise ComfyCliError(
+            f"invalid names: {len(guarded)} pack ids join to {joined} characters, "
+            f"past the {_MAX_NODE_PACK_NAMES_CHARS}-character maximum for one "
+            "call. The confirmation prompt has to stay readable for the approval "
+            "to mean anything, and it names every pack it installs; install them "
+            "in smaller batches."
+        )
     return guarded
 
 
@@ -9184,9 +9280,22 @@ def _run_node_install(names: list[str]) -> Any:
     swallows a ``CalledProcessError`` with ``returncode == 1`` — it prints the
     failure to stderr and returns ``None``, so the command exits 0. A tool that
     omitted the flag would tell an agent the pack is installed when it is not, and
-    the agent's next call would fail somewhere much less informative. The flag
-    ships in comfy-cli 1.13.0, this server's floor, so there is no capability
-    degrade to write for it.
+    the agent's next call would fail somewhere much less informative.
+
+    What this server's comfy-cli floor (1.13.0) establishes is narrower than "the
+    flag works", and worth stating exactly, because there is no capability degrade
+    written for it. The floor guarantees two things: comfy-cli's own parser ACCEPTS
+    ``--exit-on-fail``, and comfy-cli itself acts on it (it is what sets
+    ``raise_on_error``, which is what makes a non-zero exit reach this wrapper at
+    all). What it does NOT establish is the other end: the flag is also forwarded
+    verbatim to ComfyUI-Manager's ``cm_cli``, whose version is a property of the
+    user's ComfyUI install rather than of comfy-cli, so a Manager old enough not to
+    know the option fails EVERY call here with its own usage error — relayed raw,
+    with no remap of the kind :func:`_run_version_switch` writes for
+    ``--version`` (:func:`_is_missing_option_error`). That is accepted rather than
+    handled because comfy-cli's own e2e suite exercises the flag, so in practice
+    the Manager floor travels with the comfy-cli floor; it is not something this
+    docstring can claim the version pin proves.
 
     Like ``launch``/``stop``/``update``, ``node install`` prints human text and
     emits no envelope — ``execute_cm_cli`` writes the node manager's output
@@ -9223,7 +9332,12 @@ async def install_node(
     ``names`` are REGISTRY PACK IDS (slugs like ``"comfyui-impact-pack"``), not
     node class names and not URLs. A git URL or filesystem path is refused before
     anything is spawned; run ``comfy node install`` in a terminal for those, where
-    your shell is the confirmation. ``"all"`` is refused too — to update the packs
+    your shell is the confirmation. So is a VERSION PIN: cm-cli's
+    ``<pack-id>@<version>`` form needs an ``@``, which the id guard excludes for
+    the same reason it excludes ``:`` and ``/`` (that is what keeps
+    ``git@github.com:…`` off argv), so pinning a pack to a specific version is
+    terminal-only exactly the way a URL is — this tool always installs whatever
+    version the registry serves. ``"all"`` is refused too — to update the packs
     you already have, call ``update_comfyui(target="all")``.
 
     **This does not restart anything, deliberately.** A running ComfyUI builds its
@@ -9237,6 +9351,18 @@ async def install_node(
     reason), and because a user who said "install it, I'll restart the server
     myself" must be obeyed.
 
+    **It does NOT refuse while ComfyUI is running**, and that is a deliberate
+    difference from ``switch_comfyui_version``, which does — worth saying out loud
+    because the two share a lock precisely because they pip-install into the same
+    venv. The switch REPLACES the dependency set the live process already imported,
+    which can leave it serving half-replaced code; an install ADDS a pack the
+    running process has never loaded, which is ComfyUI-Manager's normal operating
+    mode (it installs into a running server from the UI). The failure mode a
+    running server does have here is milder and is handled by telling you about it
+    rather than by refusing: the new nodes are invisible until the restart above.
+    A pack that upgrades a dependency ComfyUI has already imported is the one case
+    that can disturb a live process, which is another reason to restart promptly.
+
     **Consent is per call, and the USER gives it — not the agent.** On a client
     that supports MCP elicitation the human is shown a prompt naming the exact
     packs and what installing them does, and a decline installs nothing. That
@@ -9247,6 +9373,12 @@ async def install_node(
     ``confirm_install=True`` is the documented fallback — set it ONLY when the
     user has actually agreed, never to clear the error — and its ``False`` default
     means a bare call from such a client installs nothing.
+
+    Because that prompt has to NAME every pack to be worth answering, an unreadable
+    batch is refused rather than shown truncated: at most
+    :data:`_MAX_NODE_PACK_NAMES` ids per call, and at most
+    :data:`_MAX_NODE_PACK_NAMES_CHARS` characters once they are joined. Both errors
+    say to install in smaller batches.
 
     comfy-cli does not gate this verb at all, so unlike ``partner_generate``'s
     spend gate there is no engine interlock to forward a flag to and no durable
