@@ -11552,6 +11552,27 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     what unlocks img2img / inpaint workflows on a local ComfyUI. Pass
     ``overwrite=True`` to replace files that already exist in the input dir
     (otherwise comfy-cli skips or errors on collisions).
+
+    **Every entry must already exist on this filesystem, and should be
+    ABSOLUTE.** comfy-cli runs with the ComfyUI workspace as its working
+    directory, so a relative path resolves against the workspace rather than
+    against the agent's own cwd — which is a quiet way for a correct-looking
+    call to fail.
+
+    **If the user attached the image in chat, look for a path before giving
+    up.** An MCP server never receives an attachment's BYTES: the protocol has
+    no client-to-server path for them, so there is no argument here that could
+    take them and no tool anywhere in this server that accepts inline image
+    data. What several clients DO provide is the attachment saved to disk with
+    its absolute path placed in the agent's context (Claude Code, for one,
+    injects an ``[Image: source: <absolute path>]`` line) — that path is an
+    ordinary local file, so pass it straight to ``paths`` and this works today.
+
+    Do not hardcode any client's cache location: it is an undocumented internal
+    that clients rotate and clean up. Use the path the client actually gave you
+    for this conversation, and if there is none, ask the user to save the file
+    and tell you where — that is the portable flow, and on clients that
+    deliberately withhold the path it is the only one.
     """
     # Each path is splatted in as a positional, so a leading-dash entry is read
     # by comfy-cli as a flag instead — `paths=["--overwrite"]` would silently
