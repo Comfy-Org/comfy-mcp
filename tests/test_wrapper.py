@@ -1395,6 +1395,37 @@ def test_upload_file_rejects_option_like_path_among_valid_ones():
         server.upload_file(["/tmp/a.png", "--overwrite"])
 
 
+def test_upload_file_rejects_an_oversized_path(no_spawn):
+    """An oversized entry is refused, and the error NAMES WHICH ONE.
+
+    The list is splatted into argv, so "which of the paths" is the first thing a
+    caller with several needs to know — the label carries the index the way
+    `_reject_non_json_array_slot` names `slots[i]`. A good first entry proves
+    the guard scans past it rather than stopping at `paths[0]`.
+    """
+    oversized = "/tmp/" + "u" * server._MAX_PATH_ARG_LEN + ".png"
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        server.upload_file(["/tmp/ok.png", oversized])
+
+    message = str(excinfo.value)
+    assert "paths[1]" in message
+    # Length-not-value: the size check runs ahead of both per-entry value
+    # guards, whose echoes would name the value instead of its size.
+    assert oversized not in message
+
+
+def test_upload_file_allows_a_path_at_the_ceiling(patched_run):
+    """The boundary value itself rides through as a positional."""
+    calls = patched_run(envelope(data={"uploaded": 1}))
+    at_ceiling = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    server.upload_file(["/tmp/ok.png", at_ceiling])
+
+    assert calls[0]["cmd"][4:] == ["upload", "/tmp/ok.png", at_ceiling]
+
+
 def test_upload_file_rejects_embedded_nul_path():
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
@@ -1940,6 +1971,35 @@ def test_fetch_outputs_rejects_a_nul_in_out_dir(monkeypatch):
 
     with pytest.raises(server.ComfyCliError, match="out_dir"):
         server.fetch_outputs("pid", "/tmp/o\x00ut")
+
+
+def test_fetch_outputs_rejects_an_oversized_out_dir(no_spawn):
+    """An oversized `out_dir` is refused before it can reach argv.
+
+    `-o`'s value is the one caller-supplied string here with no `-` guard (a
+    dash-leading directory is legitimate input for an option that takes a
+    value), so the size cap is the only thing standing between it and the
+    `OSError` (`E2BIG`) `_run_comfy_raw` never converts — its `try` wraps
+    `communicate()`, not the `Popen(...)` that raises.
+    """
+    oversized = "/tmp/" + "d" * server._MAX_PATH_ARG_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        server.fetch_outputs("pid", oversized)
+
+    # Length-not-value: `_reject_nul`'s message would name the value instead.
+    assert oversized not in str(excinfo.value)
+
+
+def test_fetch_outputs_allows_an_out_dir_at_the_ceiling(patched_run):
+    """The boundary value itself rides through to `-o`."""
+    calls = patched_run(envelope(data={"files": []}))
+    at_ceiling = "/tmp/" + "d" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    server.fetch_outputs("pid", at_ceiling)
+
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", at_ceiling]
 
 
 def test_fetch_outputs_wraps_comfy_download(patched_run):

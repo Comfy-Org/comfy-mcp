@@ -205,6 +205,35 @@ def test_emit_requires_an_out_path(patched_run, bad):
     assert calls == []
 
 
+def test_emit_rejects_an_oversized_out_path(no_spawn):
+    """An oversized `out_path` is refused before it can reach argv.
+
+    It rides `--emit-workflow=<path>`, so its size lands in a single argv
+    string, where the OS rejects the exec with an `OSError` (`E2BIG`)
+    `_run_comfy_raw` never converts — its `try` wraps only `communicate()`, not
+    the `Popen(...)` that raises.
+    """
+    oversized = "/tmp/" + "e" * server._MAX_PATH_ARG_LEN + ".json"
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        _emit("flux-pro", oversized)
+
+    # Length-not-value: the size check runs ahead of the two value guards,
+    # whose echoes would name the value instead of its size.
+    assert oversized not in str(excinfo.value)
+
+
+def test_emit_allows_an_out_path_at_the_ceiling(patched_run):
+    """The boundary value itself rides through into `--emit-workflow=`."""
+    calls = patched_run(envelope(data=_EMIT_DATA))
+    at_ceiling = "/tmp/" + "e" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    _emit("flux-pro", at_ceiling)
+
+    assert calls[0]["cmd"][-1] == f"--emit-workflow={at_ceiling}"
+
+
 def test_emit_rejects_an_option_like_out_path(patched_run):
     """A dash-leading destination is a caller mistake worth naming."""
     calls = patched_run(envelope(data=_EMIT_DATA))

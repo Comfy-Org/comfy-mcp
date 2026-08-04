@@ -237,7 +237,7 @@ def test_download_model_rejects_an_oversized_relative_path(patched_run):
     and land in argv — the size refusal is what stops it, not the tree guard.
     """
     calls = patched_run(envelope(data=_submit()))
-    oversized = "models/" + "d" * server._MAX_WORKFLOW_PATH_LEN
+    oversized = "models/" + "d" * server._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model("https://hf.co/x.safetensors", relative_path=oversized)
@@ -245,14 +245,14 @@ def test_download_model_rejects_an_oversized_relative_path(patched_run):
     assert calls == []
     assert oversized not in str(excinfo.value)
     # Generous boundary: the value at exactly the ceiling still passes.
-    at_ceiling = "models/" + "d" * (server._MAX_WORKFLOW_PATH_LEN - len("models/"))
+    at_ceiling = "models/" + "d" * (server._MAX_PATH_ARG_LEN - len("models/"))
     assert server._guard_model_relative_path(at_ceiling) == at_ceiling
 
 
 def test_download_model_rejects_an_oversized_filename(patched_run):
     """An oversized `filename` is capped ahead of the bare-name shape check."""
     calls = patched_run(envelope(data=_submit()))
-    oversized = "f" * (server._MAX_WORKFLOW_PATH_LEN + 1) + ".safetensors"
+    oversized = "f" * (server._MAX_PATH_ARG_LEN + 1) + ".safetensors"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model("https://hf.co/x.safetensors", filename=oversized)
@@ -262,7 +262,7 @@ def test_download_model_rejects_an_oversized_filename(patched_run):
     # Generous boundary: the name at exactly the ceiling still passes — the cap
     # is the argv one, deliberately not a NAME_MAX-tight one of its own.
     suffix = ".safetensors"
-    at_ceiling = "f" * (server._MAX_WORKFLOW_PATH_LEN - len(suffix)) + suffix
+    at_ceiling = "f" * (server._MAX_PATH_ARG_LEN - len(suffix)) + suffix
     assert server._guard_model_filename(at_ceiling) == at_ceiling
 
 

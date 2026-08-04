@@ -551,6 +551,54 @@ def test_search_models_rejects_leading_dash_folder(patched_run, folder):
     assert calls == []
 
 
+def test_search_models_rejects_an_oversized_folder(no_spawn):
+    """An oversized `folder` is refused before it can reach argv.
+
+    `folder` is a models-SUBFOLDER positional — path-shaped, so it takes the
+    same ceiling as `download_model`'s `relative_path` and for the same reason:
+    an oversized argv string is rejected by the OS with an `OSError` (`E2BIG`)
+    `_run_comfy_raw` never converts, because its `try` wraps only
+    `communicate()` and not the `Popen(...)` that raises.
+    """
+    oversized = "checkpoints/" + "f" * server._MAX_PATH_ARG_LEN
+
+    with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
+        server.search_models(folder=oversized)
+
+    # Length-not-value: the size check runs ahead of both value guards, whose
+    # echoes would name the value instead of its size.
+    assert oversized not in str(excinfo.value)
+
+
+def test_search_models_allows_a_folder_at_the_ceiling(patched_run):
+    """The boundary value itself rides through as the `list-folder` positional."""
+    calls = patched_run(envelope(data=[]))
+    prefix = "checkpoints/"
+    at_ceiling = prefix + "f" * (server._MAX_PATH_ARG_LEN - len(prefix))
+    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+
+    server.search_models(folder=at_ceiling)
+
+    assert calls[0]["cmd"][4:] == ["models", "list-folder", at_ceiling]
+
+
+def test_search_models_leaves_the_free_form_query_uncapped(patched_run):
+    """The `--text` query is deliberately NOT capped — it is prompt-shaped.
+
+    The counterpart to the `folder` cap above, and the reason the sweep is
+    scoped to path-shaped values: a path-sized ceiling on a free-form search
+    term would refuse a legitimately long query while buying nothing a caller
+    cannot already spend by sending more of them. See the SCOPE note at
+    `_MAX_URL_LEN`.
+    """
+    calls = patched_run(envelope(data=[]))
+    long_query = "q" * (server._MAX_PATH_ARG_LEN + 1)
+
+    server.search_models(query=long_query)
+
+    assert calls[0]["cmd"][4:] == ["models", "search", "--text", long_query]
+
+
 @pytest.mark.parametrize("query", ["-fp16", "-fp8-e4m3fn", "--help"])
 def test_search_models_allows_leading_dash_query(patched_run, query):
     """`--text` is free-form filename matching: a leading dash is data, not a flag.
