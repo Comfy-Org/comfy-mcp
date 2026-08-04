@@ -52,7 +52,8 @@ protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
 confirmation on the tools that can spend money, destroy local state, or expose
 the machine: `partner_generate`, `run_template`, `run_workflow`,
-`switch_comfyui_version`, and the `launch_comfyui` / `restart_comfyui` pair
+`switch_comfyui_version`, `install_node`, and the `launch_comfyui` /
+`restart_comfyui` pair
 when `extra_args` would publish ComfyUI to the network. comfy-cli owns the
 credit-spend interlock and the durable "always proceed"
 (`comfy generate consent always`), and this server only raises the confirmation
@@ -83,7 +84,18 @@ launch pair sits outside it too, and differs in WHEN it fires: the argument is
 what is dangerous, not the verb, so the prompt is raised only for `extra_args`
 that would publish an unauthenticated ComfyUI (`_network_exposing_args` — a
 non-loopback `--listen`, including its bare form, or `--enable-cors-header`);
-an ordinary launch is untouched. Mirror the engine's contract per tool; do not
+an ordinary launch is untouched. `install_node` is the version switch's shape
+again, for the same engine reason: `comfy node install` has no interlock at all
+— no `--yes`, no `typer.confirm`, no `spend.auto_confirm` analogue — so there is
+nothing to forward and nothing that could consent on the user's behalf, and a
+refusal means this server does not spawn the command. What it adds is that the
+ARGUMENT is the risk as well as the verb: a pack id is very often a model's
+guess, and installing one runs third-party code, so `_guard_node_names` pins
+`names` to registry slugs (`_REGISTRY_ID_RE`) and refuses a git URL or a path.
+That is deliberately stricter than the engine — the one case where narrowing
+comfy-cli is correct, because the prompt tells the user they are approving a
+NAMED PACK FROM THE REGISTRY and a wider input would make its own consent
+prompt lie. Mirror the engine's contract per tool; do not
 generalize one tool's consent rules onto another.
 
 The local differentiator: discovery tools (`search_nodes`, `get_node`,
