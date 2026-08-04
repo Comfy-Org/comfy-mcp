@@ -164,7 +164,11 @@ flows:
   `definitions.subgraphs` — tweak it through `set_workflow_slot` /
   `run_template(params=...)` like any other template.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
-  before running.
+  before running. If it reports an unknown node CLASS, `workflow_deps` names the
+  packs that provide the workflow's classes (and which are not installed yet) —
+  `validate_workflow` -> `workflow_deps` -> `install_node` -> `restart_comfyui`.
+  `search_nodes` cannot answer this: it reads the running install's live catalog,
+  so it only ever finds classes you already have.
 - Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
 - VRAM is shared with everything else on the machine. Before a heavy run, read
   `system_stats` for per-device `vram_free`; if it is short, `free_memory`
@@ -2846,6 +2850,24 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
         # in `_extract_saved_paths` (over-long entries are dropped, not sliced).
         result["saved_paths"] = saved_paths[:_MAX_SAVED_PATHS]
     return result
+
+
+def _plain_message(result: Any) -> str:
+    """The human text a :func:`_synthesize_plain_result` payload carries, if any.
+
+    The reader half of the synthesizer, for a caller whose real answer is a side
+    effect rather than the return value (:func:`workflow_deps`) and which needs
+    comfy-cli's printed output only to explain a failure. Everything is checked
+    rather than assumed, because the same call site sees a REAL envelope's
+    ``data`` the moment comfy-cli grows one for that verb — an arbitrary payload
+    with no ``message``, and possibly not a dict at all. The text is already
+    scrubbed and capped by the synthesizer.
+    """
+    if isinstance(result, dict):
+        message = result.get("message")
+        if isinstance(message, str):
+            return message
+    return ""
 
 
 # Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
@@ -9226,6 +9248,11 @@ async def install_node(
     your shell is the confirmation. ``"all"`` is refused too — to update the packs
     you already have, call ``update_comfyui(target="all")``.
 
+    Holding a node CLASS name rather than a pack id — which is what a validation
+    failure hands you — is the one thing this tool cannot start from. Turn it
+    into pack ids with ``workflow_deps(workflow_path=...)`` first; the full path
+    is ``validate_workflow -> workflow_deps -> install_node -> restart_comfyui``.
+
     **This does not restart anything, deliberately.** A running ComfyUI builds its
     node registry at boot, so newly installed nodes do not appear until it
     restarts. The canonical flow is::
@@ -10602,6 +10629,216 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
                 "unsupported": True,
             }
         raise
+
+
+# ComfyUI-Manager's absence, as `comfy node deps-in-workflow` reports it. The verb
+# shells out to Manager's `cm-cli`, and comfy-cli's `execute_cm_cli` hard-exits
+# (status 1, this line on stderr, no envelope) when the module is not importable
+# from the workspace Python. Matched on the two halves of that sentence with
+# `.{0,80}` between them so rich's panel wrapping — folded to single spaces by
+# `_normalize_cli_text` — cannot separate them, while an unrelated line that
+# merely says "not found" much later in the stream still fails to match.
+_MANAGER_MISSING_RE = r"comfyui-manager not found.{0,80}cm-cli.{0,40}not available"
+
+
+def _is_manager_missing_error(exc: ComfyCliError, *caller_values: str) -> bool:
+    """Is *exc* comfy-cli refusing because ComfyUI-Manager is not installed?
+
+    The sibling of :func:`_is_missing_verb_error` for a DEPENDENCY gap rather
+    than a version one, and narrow for the same reason: the caller's degrade
+    tells the agent that nothing is broken except a missing prerequisite.
+
+    ``exc.no_envelope`` is required exactly as it is there — comfy-cli aborts
+    before any envelope is emitted, so an error envelope that merely quotes this
+    sentence (a pack's own output relayed through a verb that DID run) is not
+    this. What is deliberately NOT required is Click's usage status: this abort
+    happens after dispatch, inside the command body, so it exits 1 rather than 2
+    and the missing-verb matcher's second condition does not apply.
+
+    That missing status check makes the echoed-argument door wider here than it
+    is for ``node deps``, so :func:`_phrase_is_only_the_caller_s` is not optional
+    on this path: a ``workflow_path`` carrying the sentence comes back verbatim
+    in cm-cli's own ``File not found: <path>`` line, on the same exit 1 with no
+    envelope, and would otherwise forge this degrade.
+    """
+    return (
+        exc.no_envelope
+        and re.search(_MANAGER_MISSING_RE, _normalize_cli_text(str(exc))) is not None
+        and not _phrase_is_only_the_caller_s(exc, _MANAGER_MISSING_RE, *caller_values)
+    )
+
+
+# Ceiling on the dependency manifest read back off disk. The file is written by
+# ComfyUI-Manager, not by a caller, and a real one is a few KB — one entry per
+# pack the workflow touches — so this is a "something is very wrong" bound, not a
+# tuning knob: without it a corrupted or pathological output would be read whole
+# into this process and returned into the agent's context. 8 MiB leaves several
+# orders of magnitude of headroom over any plausible graph.
+_MAX_DEPS_MANIFEST_BYTES = 8 * 1024 * 1024
+
+
+@mcp.tool()
+def workflow_deps(workflow_path: str) -> Any:
+    """Map a workflow's node classes to the node PACKS that provide them (read-only).
+
+    Wraps ``comfy node deps-in-workflow``, which resolves every class the graph
+    references against ComfyUI-Manager's node→pack map. This is the diagnosis
+    half of the missing-node story, and the step that closes the loop
+    ``validate_workflow`` opens::
+
+        validate_workflow  ->  workflow_deps  ->  install_node  ->  restart_comfyui
+
+    When ``validate_workflow`` / ``run_workflow`` reports an unknown node class,
+    nothing else here can tell you WHICH pack to install: ``search_nodes`` and
+    ``get_node`` read the running ComfyUI's live ``object_info``, so by
+    construction they can only find classes this install ALREADY has, and
+    ``install_node`` / ``node_dependencies(registry_id=...)`` both need the pack
+    id as input. This tool is what produces that id — feed the pack ids it
+    returns straight to ``install_node``, then ``restart_comfyui`` so the new
+    classes are loaded.
+
+    NOT the same tool as ``node_dependencies``, despite the name. That one wraps
+    ``comfy node deps`` and answers "does this pack's PYTHON requirements match
+    my venv" for a pack you already name; this one takes a WORKFLOW and answers
+    "which packs does this graph need". Different verb, different question.
+
+    Returns ComfyUI-Manager's manifest verbatim, which today is::
+
+        {"custom_nodes": {"<pack-id-or-repo-url>": {"state": "installed" |
+                          "not-installed" | "disabled" | "invalid-installation",
+                          "hash": ...}, ...},
+         "unknown_nodes": ["SomeClass", ...]}
+
+    ``custom_nodes`` is the answer to "what does this workflow need", with
+    ``state`` saying which of those are already here — the ``not-installed`` ones
+    are the ``install_node`` list. ``unknown_nodes`` are classes Manager could
+    not attribute to ANY pack (a hand-written node, a pack absent from the
+    channel, or a typo in the graph); those are not installable from this result
+    and need the user. The shape is comfy-cli's/Manager's, not this server's, so
+    read it defensively.
+
+    Requires ComfyUI-Manager: the verb runs Manager's ``cm-cli``, and without it
+    comfy-cli refuses. That case returns ``{"error": ..., "unsupported": True}``
+    INSTEAD of the manifest — check for that key before indexing
+    ``["custom_nodes"]`` — rather than the raw usage dump, the same way
+    ``node_dependencies`` degrades on a comfy-cli that predates its verb. Any
+    other failure raises, as everywhere else — including the ones comfy-cli
+    reports by exiting 0 with no manifest written (an unreadable workflow file,
+    an unreachable Manager channel: it swallows ``cm-cli``'s status and only
+    PRINTS the reason). Those raise carrying that printed text, so the message
+    still names what went wrong.
+
+    Nothing is installed, downloaded, or changed — this only reads the workflow
+    and Manager's map. Accepts the same ``.json`` (API or UI export) file
+    ``run_workflow`` / ``validate_workflow`` take, and a ``.png`` with an
+    embedded workflow.
+
+    Freshness: LIVE against Manager's node map, which Manager fetches per its own
+    channel/mode settings and caches — so a pack published minutes ago may not be
+    attributed yet. The ``state`` field is read off this install's disk on every
+    call.
+    """
+    # Same hygiene as `validate_workflow`: the path rides behind `--workflow` as
+    # an option value, so a dash-leading path reaches comfy-cli as a usage error
+    # (or prints `--help`) that fails envelope parsing, and a named error beats
+    # that. NOT injection defence — Click takes an option value verbatim.
+    _guard_workflow_path(workflow_path)
+    # comfy-cli requires `--output` and writes the manifest THERE rather than
+    # emitting it (there is no `renderer.emit` on this verb yet), so the round
+    # trip through a file is the engine's contract, not a choice this server
+    # makes. The temp directory is ours and is removed on every exit path,
+    # including the raising ones: nothing is left in the user's workspace, and
+    # the caller never has to know a file existed. Returning the PATH instead
+    # would hand back a name that is deleted by the time the client reads it —
+    # and on a client that is not on this filesystem, unreadable anyway.
+    # `ignore_cleanup_errors`: the manifest has already been read into memory by
+    # the time the directory is torn down, so a teardown that fails (a file the
+    # child left behind unreadable, a filesystem that refuses the unlink) must
+    # not convert a successful answer into an exception. Leaked bytes in the
+    # system temp directory are the cheaper failure. Requires Python 3.10, which
+    # is this package's floor.
+    with tempfile.TemporaryDirectory(
+        prefix="comfy-mcp-deps-", ignore_cleanup_errors=True
+    ) as tmpdir:
+        out_path = os.path.join(tmpdir, "deps.json")
+        try:
+            # plain_ok=True: `deps-in-workflow` prints a human "saved into <path>"
+            # line and exits 0 without an envelope. The synthesized result is
+            # discarded — the answer is the FILE, and a clean exit is the signal
+            # that it was written.
+            #
+            # 300s: resolving classes can make Manager fetch its node map over
+            # the network on a cold cache, which is slower than the 60s the other
+            # `node` tools use but nowhere near an install.
+            plain = _run_comfy(
+                "node",
+                "deps-in-workflow",
+                "--workflow",
+                workflow_path,
+                "--output",
+                out_path,
+                timeout=300.0,
+                plain_ok=True,
+            )
+        except ComfyCliError as exc:
+            if _is_manager_missing_error(exc, workflow_path):
+                return {
+                    "error": (
+                        "workflow_deps unavailable: this ComfyUI install does not "
+                        "have ComfyUI-Manager, and 'comfy node deps-in-workflow' "
+                        "resolves node classes to packs through Manager's map. "
+                        "Nothing else is affected. Install ComfyUI-Manager into "
+                        "the workspace to use this tool. Until then a class this "
+                        "install already has is still described by "
+                        "`get_node`/`search_nodes`, and a pack you can already "
+                        "name is still installable with `install_node`."
+                    ),
+                    "unsupported": True,
+                }
+            raise
+        try:
+            size = os.path.getsize(out_path)
+        except OSError as exc:
+            # Exit 0 and no file is the SHAPE a failed cm-cli run arrives in, not
+            # an exotic edge: comfy-cli's `execute_cm_cli` catches a
+            # `CalledProcessError` with status 1 or 2 from Manager's `cm-cli`,
+            # prints "Execution error: …", and RETURNS — so `deps-in-workflow`
+            # finishes and exits 0 having written nothing. An unreadable workflow
+            # file and an unreachable channel both land here. cm-cli's own stderr
+            # is relayed through comfy-cli's, which is what the plain result
+            # carries, so quote that rather than reporting only the absence — it
+            # is the only place the actual reason survives.
+            raise ComfyCliError(
+                "comfy node deps-in-workflow reported success but wrote no "
+                f"dependency manifest ({exc}). comfy-cli's own output: "
+                f"{_plain_message(plain) or '<empty>'}"
+            ) from exc
+        if size > _MAX_DEPS_MANIFEST_BYTES:
+            raise ComfyCliError(
+                f"comfy node deps-in-workflow wrote a {size}-byte dependency "
+                f"manifest, over the {_MAX_DEPS_MANIFEST_BYTES}-byte maximum this "
+                "server will read back."
+            )
+        try:
+            with open(out_path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ComfyCliError(
+                "comfy node deps-in-workflow wrote a dependency manifest this "
+                f"server could not read: {exc}"
+            ) from exc
+    # Manager writes a JSON OBJECT. Anything else means the format changed under
+    # us, and passing it through would hand the caller a payload whose documented
+    # keys it cannot have — better to say so than to return a bare list an agent
+    # will index blindly.
+    if not isinstance(manifest, dict):
+        raise ComfyCliError(
+            "comfy node deps-in-workflow wrote a dependency manifest of an "
+            f"unexpected shape (got {type(manifest).__name__}, expected an "
+            "object); comfy-cli's or ComfyUI-Manager's output format may have "
+            "changed."
+        )
+    return manifest
 
 
 @mcp.tool()

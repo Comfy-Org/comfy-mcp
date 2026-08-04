@@ -47,6 +47,15 @@ the graph, keeping a table of what is "supported") instead of asking the engine
 — for `download_model` that would mean sizing the file on disk to decide whether
 it finished, rather than reading comfy-cli's `status`.
 
+`workflow_deps` is the one tool that reads its answer back off DISK rather than
+out of an envelope: `comfy node deps-in-workflow` emits no envelope and requires
+an `--output` path to write its manifest to, so the round trip through a
+temporary file this server owns (and removes) is the engine's contract, not a
+choice made here. That is still a passthrough — the manifest is returned
+verbatim, the pack→class attribution is ComfyUI-Manager's, and nothing about the
+graph is parsed here. Should comfy-cli grow a `renderer.emit` on that verb, the
+file half deletes and the tool becomes an ordinary `_run_comfy` call.
+
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
 client, and that comfy-cli has no way to express. Today that is the per-call
@@ -143,9 +152,13 @@ hand-rolled stub.** They are the single place that mirrors how `server` spawns
 the CLI, so a change to the spawn signature is one edit rather than a sweep:
 
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
-- `patched_run(stdout=…, returncode=…, stderr=…, raises=…) -> calls` — the plain
-  `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/
-  `encoding` per invocation for exact-argv assertions.
+- `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) -> calls`
+  — the plain `--json` path (`subprocess.run`); `calls` records
+  `cmd`/`env`/`timeout`/`encoding` per invocation for exact-argv assertions.
+  `on_spawn(cmd)` fires when the fake child starts, for the one verb whose real
+  answer is a FILE rather than stdout: `node deps-in-workflow` writes its
+  manifest to the `--output` path it is handed, so `workflow_deps`' tests use it
+  to write that file the way ComfyUI-Manager would.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for the verbs
   that print human text and emit no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
