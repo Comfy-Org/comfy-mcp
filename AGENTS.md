@@ -54,18 +54,22 @@ fails every install. `workflow_deps` reads its answer off DISK because the engin
 leaves none — `comfy node deps-in-workflow` emits no envelope and REQUIRES an
 `--output` path — so the temp-file round trip is that contract, and the manifest
 goes back as written bar `failure_log._scrub_text` masking repo-URL credentials.
+`restart_comfyui` composes a THIRD pair: `comfy stop --port <p> --dry-run` /
+`comfy stop --port <p>` say who holds a leftover port and recycle it — never a
+`psutil`/HTTP check here, since that verdict stays comfy-cli's.
 
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities comfy-cli has no way to express. Today that is
 the per-call confirmation on the tools that can spend money, destroy local state,
-run third-party code, or expose the machine: `partner_generate`, `run_template`,
-`run_workflow`, `switch_comfyui_version`, `install_node`, `update_comfyui` when
-`target="all"`, and the `launch_comfyui` / `restart_comfyui` pair when
-`extra_args` would publish ComfyUI to the network. comfy-cli owns the
+run third-party code, kill a process, or expose the machine: `partner_generate`,
+`run_template`, `run_workflow`, `switch_comfyui_version`, `install_node`,
+`update_comfyui` when `target="all"`, the `launch_comfyui` / `restart_comfyui`
+pair when `extra_args` would publish ComfyUI to the network, and again to kill
+an untracked server. comfy-cli owns the
 credit-spend interlock and the durable "always proceed" (`comfy generate consent
 always`); this server only raises the confirmation over MCP **elicitation** —
 the protocol's y/N prompt — then forwards the answer as `--yes` /
-`--allow-spend`, or (for the four the CLI does not gate at all) refuses to run
+`--allow-spend`, or (for the five the CLI does not gate at all) refuses to run
 the command. It stores no consent of its own, and all share one fail-closed body,
 `_elicit_approval`; give a new gate its own `_ApprovalWording`, not a second
 copy. Adding *product* behavior here is still a guardrail breach; adapting
@@ -90,8 +94,9 @@ unauthenticated ComfyUI (`_network_exposing_args`), `update_comfyui` only for
 `target="all"`, which pip-installs every third-party pack (`comfy`/`cli` never
 prompt). `install_node` is NOT one — it prompts on EVERY call, its `names`
 argument being a RESTRICTION to registry slugs refusing a URL, as the prompt
-promises a REGISTRY pack. Mirror the engine's contract per tool; never
-generalize one gate onto another.
+promises a REGISTRY pack. `restart_comfyui`'s kill gate is STATE-scoped
+instead, firing mid-sequence once a launch loses the port. Mirror the engine's
+contract per tool; never generalize one gate onto another.
 
 The local differentiator: discovery (`search_nodes`, `get_node`, `search_models`)
 reads the **user's live install** — custom nodes included — not a static catalog.
@@ -150,36 +155,33 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for the verbs
   that print human text and emit no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
-  (`asyncio.create_subprocess_exec`); its fake pipes are real `StreamReader`s,
-  built by conftest's `stream_reader(text, limit)` — reuse it rather than
-  hand-rolling an awaitable, so a fake still exercises buffer-limit behavior.
+  (`asyncio.create_subprocess_exec`). Its fake pipes are real
+  `asyncio.StreamReader`s, built by conftest's `stream_reader(text, limit)`
+  helper; reuse that rather than hand-rolling an awaitable, so a fake still
+  exercises the reader's buffer-limit behavior.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) ->
   procs` — the plain-JSON *async* path (`_run_comfy_async`): same
-  `asyncio.create_subprocess_exec` spawn and the same real `StreamReader` pipes,
-  but the capture is parsed once at the end instead of read line-by-line.
-  `hang=True` leaves those pipes OPEN so the fake child never finishes, for the
-  timeout/cancellation cases; its `kill()` closes them, mirroring the process-group
-  kill that lets a post-kill drain reach EOF, and records `killed` so a test can
-  assert it fired. `on_spawn(cmd)` fires at spawn, exactly as `patched_run`'s does.
+  `asyncio.create_subprocess_exec` spawn and real `StreamReader` pipes, but the
+  capture is parsed once at the end, not line-by-line. `hang=True` leaves the
+  pipes OPEN so the fake child never finishes, for the timeout/cancellation
+  cases; `kill()` closes them (mirroring the process-group kill that lets a post-
+  kill drain reach EOF) and records `killed` so a test can assert it fired.
+  `on_spawn(cmd)` fires at spawn, exactly as `patched_run`'s does.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
-(`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
-async callers), while every path that STREAMS or is otherwise long-lived spawns
-with `asyncio.create_subprocess_exec` — nothing blocking may run on the event
-loop, and ruff's `select` enables `ASYNC` to enforce that. Two async runners sit
-on that side: `_run_comfy_streaming` (NDJSON + progress notifications) and
-`_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the same result
-contract. The twin exists for CANCELLATION, not for the event loop —
-`asyncio.to_thread(_run_comfy, …)` is already non-blocking but its cancellation
-never reaches the thread, so a long-lived call left the `comfy` child running
-when a client gave up. It carries the legacy foreground `model download` (the
-`--background`-less fallback) and `workflow_deps`' 300s network-backed resolve;
-short metadata calls stay on the thread-pool path.
-Reserved for the longest-lived children, it bounds each captured stream to its
-trailing `_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining
-everything `communicate()` does — the one place its contract is narrower.
-`auth_login` is a third async spawn site (`_start_login`) for the same reason,
-but drives its own browser flow.
+(`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by
+async callers), while anything that STREAMS or is long-lived spawns via
+`asyncio.create_subprocess_exec` — nothing blocking may run on the event loop,
+enforced by ruff's `ASYNC` select. Two async runners live there:
+`_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON
+twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is already non-
+blocking, but cancellation never reaches the thread, leaving the `comfy` child
+running after a client gives up. It carries the legacy foreground `model
+download` and `workflow_deps`' 300s network-backed resolve; short metadata
+calls stay on the thread pool. It bounds each captured stream to
+`_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining everything
+like `communicate()`. `auth_login` is a third async spawn site
+(`_start_login`) for the same reason, with its own browser flow.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.
