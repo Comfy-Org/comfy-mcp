@@ -46,7 +46,8 @@ partner API and spends nothing, so it carries no consent gate — but the graph 
 writes does bill the partner node when it runs, so the ``run_workflow`` that
 follows takes the same opt-in ``confirm_spend`` gate ``run_template`` does.
 
-Requires comfy-cli >= 1.13.0 (the ``comfy logs`` verb, the ``envelope/1``
+Requires comfy-cli >= 1.14.0 — the release carrying every verb this tool surface
+calls, on top of the 1.13.0 basics (the ``comfy logs`` verb, the ``envelope/1``
 contract, and the ``login_url`` event ``auth_login`` depends on):
 :func:`_run_comfy` guards this once, up front, with an actionable upgrade error
 so a stale install fails clearly rather than cryptically.
@@ -151,8 +152,10 @@ flows:
   `API`-tagged template's graph still carries the paid nodes, so `run_workflow`
   takes the same `confirm_spend` flag. On an engine carrying the `comfy run`
   gate the default fails closed (`spend_consent_required`, naming the
-  `partner_nodes`); no release has it yet, so treat a paid graph as able to
-  spend either way and ASK before running one.
+  `partner_nodes`); that is every release from comfy-cli 1.14.0 on, which this
+  server's floor requires. Still ASK before running a paid graph: the floor check
+  fails OPEN, so a source build or fork can reach the tool with no interlock at
+  all, and then the default withholds nothing.
   For the quickest path from text to an image, `generate_image(prompt)` runs the
   default OSS text-to-image template through that same verb — free, no API key.
   It submits to the same ComfyUI `run_workflow` does: this machine, or the
@@ -424,7 +427,7 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # is only safe when comfy-cli actually accepts the flags on it — otherwise the
 # forward turns every call into "No such option". There is no such window for
 # this one: ``run-template`` shipped WITH both options, in the same comfy-cli
-# release (1.13.0) that introduced the verb — which is also the floor
+# release (1.13.0) that introduced the verb — which is at or below the floor
 # ``_check_comfy_version`` enforces (``_MIN_COMFY_CLI``). A comfy-cli old enough
 # to reject ``--host`` here has no ``run-template`` at all, so it fails on the
 # verb before the flags are ever parsed. That argument is about RELEASED
@@ -1013,29 +1016,45 @@ _STDERR_READ_CHUNK = 64 * 1024
 _STREAM_LINE_LIMIT = 1024 * 1024
 
 
-# comfy-cli floor. Three things this server relies on require comfy-cli
-# >= 1.13.0: `comfy logs` (get_logs), the structured `envelope/1` contract, and
-# the machine-readable `login_url` event `comfy cloud login --json` emits, which
-# `auth_login` blocks on. Against an older install the first two surface as a
-# cryptic "No such command", and `auth_login` burns its whole
-# `_LOGIN_URL_WAIT_S` budget before it can say why — so `_run_comfy` guards this
-# once, up front, with an upgrade message. `auth_login` keeps its own timeout
-# branch as the backstop for an install that slips past the guard (which fails
-# OPEN on a `--version` it cannot read).
+# comfy-cli floor. 1.13.0 is where the wrapper BASICS landed — `comfy logs`
+# (get_logs), the structured `envelope/1` contract, and the machine-readable
+# `login_url` event `comfy cloud login --json` emits, which `auth_login` blocks
+# on — and it was the floor until 1.14.0 shipped. Against an install below the
+# floor a missing verb surfaces as a cryptic "No such command", and `auth_login`
+# burns its whole `_LOGIN_URL_WAIT_S` budget before it can say why — so
+# `_run_comfy` guards this once, up front, with an upgrade message. `auth_login`
+# keeps its own timeout branch as the backstop for an install that slips past the
+# guard (which fails OPEN on a `--version` it cannot read).
 #
-# NOT yet raised for `comfy run`'s paid-node spend gate (`--allow-spend`): that
-# gate landed after 1.13.0 and is in no comfy-cli RELEASE yet, so naming a
-# version here would refuse EVERY tool against every installed comfy-cli — the
-# floor is checked once for the whole server, not per verb. That verb-scoped
-# question is answered per call by `_comfy_run_takes_allow_spend` instead, which
-# is why forwarding the flag to an engine that lacks it never becomes a usage
-# error. Until the gate ships in a release the fail-closed behavior is whatever
-# the installed comfy-cli does (an older one spends silently, as it does today).
-# Raising the floor to that release is the one-line change that upgrades
-# `run_workflow`'s docstring promise from "upgrade to get this" to a guarantee —
-# see `run_workflow`'s SPEND CONSENT section.
-_MIN_COMFY_CLI = (1, 13, 0)
-_MIN_COMFY_CLI_STR = "1.13.0"
+# Raised to 1.14.0 when that release shipped, because a large slice of this
+# server's tool surface calls verbs and options that exist only at >= 1.14.0:
+# `comfy node deps` + its `--registry` (node_dependencies), `system-stats` /
+# `free`, `workflow notes` (list_workflow_notes), `logs --port`, the background
+# download group (`model download --background` and its `download-status` /
+# `downloads` / `download-cancel` companions), `models search`'s cross-folder
+# walk, the `templates` gallery cache TTL, and `comfy run`'s `--allow-spend`
+# interlock.
+#
+# Why that raise was cheap, as precedent for the next one: this server is
+# pre-launch (private repo, not published to PyPI), so ~nobody is pinned to the
+# previous release — a floor is only cheap to raise BEFORE you have users. And on
+# 1.13.0 enough of the tool surface is inert that the server reads as BROKEN
+# rather than as out-of-date, which is a worse first contact than a clear
+# "upgrade comfy-cli" refusal.
+#
+# Raising the floor does NOT retire the per-verb `{"error": ..., "unsupported":
+# true}` degrades, and they were deliberately kept: the floor and a degrade guard
+# DIFFERENT failures. The floor catches a WRONG comfy-cli version; a degrade
+# catches a CORRECT version in a broken environment. Both halves of that still
+# happen at 1.14.0 — this guard fails OPEN, so a source build or fork whose
+# `--version` cannot be parsed reaches the tools from below the floor, and a
+# dependency OUTSIDE comfy-cli (a ComfyUI-Manager too old to know a flag
+# comfy-cli forwarded to it) can fail on an otherwise-compliant install. Same
+# reason `_comfy_run_takes_allow_spend` still probes for a flag the floor now
+# guarantees in every published release. Deleting any of them would trade a clear
+# message for a raw Click usage dump.
+_MIN_COMFY_CLI = (1, 14, 0)
+_MIN_COMFY_CLI_STR = "1.14.0"
 
 # The version guard shells out to `comfy --version`; memoize so it runs at most
 # once per process (it sits on the hot path of every _run_comfy call).
@@ -1307,7 +1326,7 @@ def _require_comfy_bin() -> None:
     # replaced was shell-agnostic and the advice must stay that way. `>` is a
     # redirection operator in every shell here, so it has to be quoted — but
     # cmd.exe does not treat `'` as a quoting character, so the single-quoted
-    # form would run `pip install 'comfy-cli` and leave a stray `=1.13.0'`
+    # form would run `pip install 'comfy-cli` and leave a stray `=1.14.0'`
     # file behind. `"` quotes in cmd.exe, PowerShell, and POSIX shells alike.
     message = (
         f"`{COMFY_BIN}` not found on PATH. Install comfy-cli "
@@ -1343,7 +1362,7 @@ def _spawn_comfy_version() -> subprocess.CompletedProcess:
     """Run ``comfy --version`` and return the completed process.
 
     The single spawn site shared by the two ``--version`` probes —
-    :func:`_check_comfy_version` (the hard ``>= 1.13.0`` floor) and
+    :func:`_check_comfy_version` (the hard ``>= 1.14.0`` floor) and
     :func:`_detect_comfy_cli_version` (the opt-in ``COMFY_CLI_MIN_VERSION``
     report). It deliberately does NOT catch anything: the two callers have
     different, load-bearing failure policies (fail-open with a latched timeout
@@ -1366,7 +1385,7 @@ def _check_comfy_version() -> None:
     Runs ``comfy --version`` once per process (memoized via ``_version_checked``).
     If the reported version is below the floor, raises a clear, actionable
     :class:`ComfyCliError` telling the user to upgrade — so a stale install fails
-    with "upgrade comfy-cli to >= 1.13.0" instead of a cryptic "No such command:
+    with "upgrade comfy-cli to >= 1.14.0" instead of a cryptic "No such command:
     logs" deep inside a tool call. Fails OPEN on anything it can't positively read
     as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
     future comfy-cli output-format change can never wedge a working install.
@@ -3735,9 +3754,10 @@ def _freshness_report() -> Any:
     two shapes instead.
 
     The MISSING-VERB degrade is its own shape: ``comfy outdated`` ships in
-    comfy-cli 1.13.0 (:data:`_MIN_COMFY_CLI`, the floor this server enforces), so
-    a compliant install answers this probe. It stays as a degrade because the
-    version guard fails OPEN — an install whose ``comfy --version`` can't be
+    comfy-cli 1.13.0, below the floor this server enforces
+    (:data:`_MIN_COMFY_CLI`), so a compliant install answers this probe. It stays
+    as a degrade because the version guard fails OPEN — an install whose
+    ``comfy --version`` can't be
     parsed (a source build, a fork) reaches here below the floor, and
     Click/Typer's raw ``No such command 'outdated'.`` usage dump, relayed
     verbatim, reads like a broken MCP rather than the benign capability gap it
@@ -3842,9 +3862,9 @@ def server_info() -> Any:
     terminal-only), and ``restart_comfyui`` afterwards is what makes the updated
     code take effect. The probe is best-effort and degrades two ways —
     ``server_info`` itself still succeeds either way. The verb ships
-    in comfy-cli 1.13.0, this server's enforced floor, so a compliant install
-    answers it; on a comfy-cli that lacks it anyway (the version guard fails
-    OPEN, so a source build or fork can slip past the floor), ``freshness`` is
+    in comfy-cli 1.13.0, below this server's enforced floor, so a compliant
+    install answers it; on a comfy-cli that lacks it anyway (the version guard
+    fails OPEN, so a source build or fork can slip past the floor), ``freshness`` is
     ``{"error": "freshness unavailable: ...", "unsupported": true}``:
     ``unsupported: true`` means SKIP staleness advice entirely and do NOT tell
     the user anything is broken — nothing failed, this comfy-cli just cannot
@@ -4435,12 +4455,12 @@ async def run_workflow(
     range, and no layer estimates memory — and then crash the whole ComfyUI
     process mid-run when the OS kills it on the allocation. When that
     happens there is no node-level error to fetch: this tool surfaces a
-    connection-loss / timeout error, and what a subsequent ``job_status`` /
-    ``get_execution_error`` says depends on the comfy-cli release. On a comfy-cli
-    NEWER than v1.13.0 (:data:`_MIN_COMFY_CLI`, the floor this server enforces —
-    the verdict landed after that release was cut) they report comfy-cli's own
-    ``server_died`` verdict for the run, which ``get_execution_error`` surfaces
-    as ``error_code``; on v1.13.0 and older they report a bare
+    connection-loss / timeout error, and a subsequent ``job_status`` /
+    ``get_execution_error`` reports comfy-cli's own ``server_died`` verdict for
+    the run, which ``get_execution_error`` surfaces as ``error_code``. That
+    verdict landed in comfy-cli 1.14.0 (:data:`_MIN_COMFY_CLI`, the floor this
+    server enforces), so every install satisfying the floor has it; only a build
+    that slipped past the fail-OPEN version guard reports the older bare
     ``server_not_running``. Neither is a node-level cause, and both query the
     live server, so the run's own history is gone either way. The evidence is
     still on disk — ``get_logs`` reads comfy-cli's captured log file rather than
@@ -4470,9 +4490,10 @@ async def run_workflow(
     - ``confirm_spend=False`` (the default) forwards nothing, so on a comfy-cli
       that HAS the gate a paid workflow fails CLOSED (``spend_consent_required``,
       nothing spent — the error names the offending ``partner_nodes``) while a
-      free workflow runs normally. On one that does not — every release so far,
-      see the capability note below — nothing is withheld and a paid graph still
-      runs and spends. Either way nothing is unlocked FROM HERE, so the user is
+      free workflow runs normally. That is every release from 1.14.0 on, which
+      the floor now requires; on a build that lacks it anyway (see the capability
+      note below) nothing is withheld and a paid graph still runs and spends.
+      Either way nothing is unlocked FROM HERE, so the user is
       NOT prompted: free runs, which is nearly all of them, stay a single silent
       call.
     - ``confirm_spend=True`` asks to unlock spending, and on a client that
@@ -4494,16 +4515,17 @@ async def run_workflow(
     gate inline, so a CLI with the verb and without the gate does not exist),
     whereas ``comfy run`` long predates its gate, so the verb proves nothing and
     the flag has to be PROBED — :func:`_comfy_run_takes_allow_spend`, run only on
-    the calls that actually granted consent. The gate landed after the 1.13.0
-    floor this server enforces (:data:`_MIN_COMFY_CLI`) and is in no comfy-cli
-    release yet, so on the comfy-cli you almost certainly have: an approved call
-    runs WITHOUT ``--allow-spend`` (the approval the user just gave is what
-    authorizes it — there is no engine interlock to engage), and the default
-    withholds nothing because there is nothing to withhold, so a paid graph
-    still runs and spends exactly as it did before this argument existed.
-    ``pip install -U comfy-cli`` is what turns ``confirm_spend=False`` into a
-    guarantee rather than a default; raising the floor once the gate ships in a
-    release is what will make it one unconditionally.
+    the calls that actually granted consent. The gate shipped in comfy-cli 1.14.0,
+    which is the floor this server enforces (:data:`_MIN_COMFY_CLI`), so on every
+    PUBLISHED comfy-cli this server accepts ``confirm_spend=False`` is a
+    guarantee and not merely a default — the engine interlock is there to engage.
+    The probe stays because the floor cannot PROVE it: the version guard fails
+    OPEN, so a source build or fork whose ``--version`` cannot be read reaches
+    here without the flag. On such a build an approved call runs WITHOUT
+    ``--allow-spend`` (the approval the user just gave is what authorizes it —
+    there is no engine interlock to engage), and the default withholds nothing
+    because there is nothing to withhold, so a paid graph still runs and spends.
+    That is the residual case; ``pip install -U comfy-cli`` closes it.
     """
     # Guarded HERE rather than inside `_attempt` so it covers BOTH the
     # `wait=False` submit and the streaming path, and so a bad path fails once
@@ -4851,7 +4873,7 @@ def _require_spend_gate() -> None:
 
     This tool's core safety claim is that ``confirm_spend=False`` spends nothing
     because comfy-cli fails CLOSED. That interlock ships in comfy-cli 1.13.0, so
-    the ``>= 1.13.0`` floor :data:`_MIN_COMFY_CLI` enforces now covers it — but
+    the ``>= 1.14.0`` floor :data:`_MIN_COMFY_CLI` enforces now covers it — but
     the floor check fails OPEN (an unparseable ``--version``, a source build, a
     fork), so it still cannot PROVE the gate is present, and against a comfy-cli
     without it the default call would silently charge the user's card. This
@@ -6449,12 +6471,12 @@ def job_status(prompt_id: str) -> Any:
 
     A crashed server immediately after a ``run_workflow`` — most likely that run
     killing it (commonly an out-of-memory kill from an oversized allocation) —
-    surfaces differently by comfy-cli release. On a comfy-cli NEWER than v1.13.0
-    (:data:`_MIN_COMFY_CLI`, the floor this server enforces — the verdict landed
-    after that release was cut) the call SUCCEEDS and reports comfy-cli's own
-    verdict for the run, a ``server_died`` error naming the lost connection;
-    ``get_execution_error`` surfaces that as its ``error_code``. On v1.13.0 and
-    older there is no such verdict and the call fails with a bare
+    makes this call SUCCEED and report comfy-cli's own verdict for the run, a
+    ``server_died`` error naming the lost connection; ``get_execution_error``
+    surfaces that as its ``error_code``. That verdict landed in comfy-cli 1.14.0
+    (:data:`_MIN_COMFY_CLI`, the floor this server enforces), so a compliant
+    install has it; on a build that slipped past the fail-OPEN version guard
+    there is no such verdict and the call fails with a bare
     ``server_not_running`` instead. Either way this tool reads the live server,
     so the run's own history is gone, while ``get_logs`` reads the captured log
     file and still works across the crash; check it — passing
@@ -6563,11 +6585,11 @@ def get_execution_error(prompt_id: str) -> Any:
 
     A crash of the whole ComfyUI process mid-run (commonly an out-of-memory kill
     from an oversized allocation) is the case that matters most here, and what
-    it looks like depends on the comfy-cli release. On a comfy-cli NEWER than
-    v1.13.0 (:data:`_MIN_COMFY_CLI`, the floor this server enforces — the
-    verdict landed after that release was cut) it comes back as
-    ``error_code: "server_died"`` with a message naming the lost connection. On
-    v1.13.0 and older there is no such verdict and the call instead fails with a
+    it comes back as ``error_code: "server_died"`` with a message naming the
+    lost connection. That verdict landed in comfy-cli 1.14.0
+    (:data:`_MIN_COMFY_CLI`, the floor this server enforces), so a compliant
+    install reports it; on a build that slipped past the fail-OPEN version guard
+    there is no such verdict and the call instead fails with a
     bare ``server_not_running``. Either way the run is gone from the live server
     this tool queries, and either way the evidence is on disk: ``get_logs`` reads
     comfy-cli's captured log file rather than the server, so it still works
@@ -6915,16 +6937,23 @@ def get_queue() -> Any:
     return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
 
 
-# `comfy system-stats` and `comfy free` landed in comfy-cli AFTER 1.13.0 — the
-# newest release when these two tools were written — so there is no released
-# version number to name yet, and `_MIN_COMFY_CLI` (the 1.13.0 floor
-# `_check_comfy_version` enforces) cannot cover them. The hint therefore points
-# at the upgrade rather than at a floor, the same shape
-# `_require_emit_workflow_capability` uses for `--emit-workflow`: name the verb,
-# say it is newer than the floor, and give the one command that fixes it.
+# `comfy system-stats` and `comfy free` landed in comfy-cli 1.14.0, which is also
+# the floor `_check_comfy_version` enforces (`_MIN_COMFY_CLI`) — so a compliant
+# install answers both verbs and this hint is no longer the common path. It stays
+# because the floor guard fails OPEN: a source build or fork whose `--version`
+# cannot be parsed reaches these tools from below the floor, and without the hint
+# it gets Click's raw usage dump instead of the version gap it actually is.
+#
+# "1.14.0" is written out rather than interpolated from `_MIN_COMFY_CLI_STR`:
+# that constant is this server's version FLOOR, and "requires a comfy-cli NEWER
+# than the floor" is a contradiction now that the floor is the release carrying
+# the verb. The release a verb landed in is a fact about comfy-cli, so it is
+# spelled out — the same way `_download_verb_unsupported` and
+# `node_dependencies` spell out their own. Name the release that has it, and give
+# the one command that fixes it.
 _RESOURCE_VERB_UPGRADE_HINT = (
-    f"requires a comfy-cli NEWER than {_MIN_COMFY_CLI_STR} (the verb landed after "
-    "that release); upgrade with `pip install -U comfy-cli`"
+    "requires comfy-cli 1.14.0 or newer (the verb landed in that release); "
+    "upgrade with `pip install -U comfy-cli`"
 )
 
 
@@ -6933,9 +6962,10 @@ def _resource_verb_upgrade_error(
 ) -> ComfyCliError | None:
     """A version-skew ``ComfyCliError`` for *verb*, or ``None`` to keep *exc* raw.
 
-    `system_stats` / `free_memory` wrap comfy-cli verbs newer than the version
-    floor this server enforces, so an otherwise-current install can be missing
-    them. Left alone, that surfaces as `_unwrap_envelope`'s generic "comfy-cli
+    `system_stats` / `free_memory` wrap comfy-cli verbs that landed in the version
+    floor this server enforces, so only a build that slipped past the fail-OPEN
+    version guard can be missing them. Left alone, that surfaces as
+    `_unwrap_envelope`'s generic "comfy-cli
     returned no JSON (exit 2)" wrapped around Click's raw usage dump — which
     reads like a broken MCP rather than the one-command capability gap it is.
 
@@ -9322,7 +9352,7 @@ def _run_node_install(names: list[str]) -> Any:
     omitted the flag would tell an agent the pack is installed when it is not, and
     the agent's next call would fail somewhere much less informative.
 
-    What this server's comfy-cli floor (1.13.0) establishes is narrower than "the
+    What this server's comfy-cli floor (1.14.0) establishes is narrower than "the
     flag works", and worth stating exactly, because there is no capability degrade
     written for it. The floor guarantees two things: comfy-cli's own parser ACCEPTS
     ``--exit-on-fail``, and comfy-cli itself acts on it (it is what sets
@@ -9568,14 +9598,16 @@ def _guard_log_port(port: Any) -> int:
     return int(port)
 
 
-# `comfy logs --port` landed in comfy-cli AFTER 1.13.0 (:data:`_MIN_COMFY_CLI`,
-# the floor this server enforces), so — exactly like
-# :data:`_RESOURCE_VERB_UPGRADE_HINT` — there is no released version number to
-# name and the message points at the upgrade itself.
+# `comfy logs --port` landed in comfy-cli 1.14.0, which is also the floor this
+# server enforces (:data:`_MIN_COMFY_CLI`) — so, exactly like
+# :data:`_RESOURCE_VERB_UPGRADE_HINT`, a compliant install accepts the option and
+# this message survives only for a build that slipped past the fail-OPEN version
+# guard. The version is spelled out for the same reason it is there: interpolating
+# the FLOOR would claim the option needs something newer than the release that
+# introduced it.
 _LOG_PORT_UPGRADE_HINT = (
     "the installed comfy-cli's `comfy logs` does not accept `--port` (the option "
-    f"landed after comfy-cli {_MIN_COMFY_CLI_STR}); upgrade with "
-    "`pip install -U comfy-cli`"
+    "landed in comfy-cli 1.14.0); upgrade with `pip install -U comfy-cli`"
 )
 
 
@@ -9816,11 +9848,12 @@ def search_templates(
     before ``run_workflow`` — is MANDATORY, not a nicety; see ``fetch_template``.
 
     Freshness: CACHED, not live — comfy-cli serves the gallery out of
-    ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL on a comfy-cli
-    NEWER than v1.13.0 (the TTL landed in Comfy-Org/comfy-cli#559, after v1.13.0
-    was cut) and NO expiry at all on v1.13.0 and older, where the first fetch is
-    kept indefinitely until ``comfy templates refresh`` is run in a terminal
-    (this server does not wrap that verb). And the catalog is NOT read from the
+    ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL (the TTL landed in
+    Comfy-Org/comfy-cli#559 and shipped in v1.14.0 — this server's floor, so
+    every compliant install expires the cache). Only a build that slipped past
+    the fail-OPEN version guard has NO expiry, keeping its first fetch
+    indefinitely until ``comfy templates refresh`` is run in a terminal (this
+    server does not wrap that verb). And the catalog is NOT read from the
     local install: a listed template may need node classes this install lacks.
     Nothing on these rows has been checked against the install — the check is
     ``get_template`` / ``fetch_template``'s ``local_check``, and clearing it is
@@ -10108,11 +10141,12 @@ def get_template(name: str, check_local: bool = True) -> Any:
     ``local_check`` key at all. Reach it defensively rather than by indexing.
 
     Freshness: CACHED, not live — the template metadata comes from comfy-cli's
-    gallery cache at ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL on
-    a comfy-cli NEWER than v1.13.0 (the TTL landed in Comfy-Org/comfy-cli#559,
-    after v1.13.0 was cut) and NO expiry at all on v1.13.0 and older, where the
-    first fetch is kept indefinitely until ``comfy templates refresh`` is run in
-    a terminal (this server does not wrap that verb). The template fields are also
+    gallery cache at ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL
+    (the TTL landed in Comfy-Org/comfy-cli#559 and shipped in v1.14.0 — this
+    server's floor, so every compliant install expires the cache). Only a build
+    that slipped past the fail-OPEN version guard has NO expiry, keeping its
+    first fetch indefinitely until ``comfy templates refresh`` is run in a
+    terminal (this server does not wrap that verb). The template fields are also
     NOT read from the local install — only the ``local_check`` half of this
     response is, which is exactly why that check exists.
     """
@@ -10208,11 +10242,12 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     ``set_workflow_slot``, which address subgraph-interior inputs too.
 
     Freshness: CACHED, not live — the template written here comes from comfy-cli's
-    gallery cache at ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL on
-    a comfy-cli NEWER than v1.13.0 (the TTL landed in Comfy-Org/comfy-cli#559,
-    after v1.13.0 was cut) and NO expiry at all on v1.13.0 and older, where the
-    first fetch is kept indefinitely until ``comfy templates refresh`` is run in
-    a terminal (this server does not wrap that verb). The gallery is NOT read from
+    gallery cache at ``~/.cache/comfy-cli/gallery/index.json``, with a 24h TTL
+    (the TTL landed in Comfy-Org/comfy-cli#559 and shipped in v1.14.0 — this
+    server's floor, so every compliant install expires the cache). Only a build
+    that slipped past the fail-OPEN version guard has NO expiry, keeping its
+    first fetch indefinitely until ``comfy templates refresh`` is run in a
+    terminal (this server does not wrap that verb). The gallery is NOT read from
     the local install, which is the whole reason step 4 above is mandatory: a
     template this call happily writes may need node classes this install lacks.
     """
@@ -10704,10 +10739,12 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
         # registry lookup on top.
         return _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
-        # `comfy node deps` ships in comfy-cli releases AFTER 1.13.0, which is
-        # also this server's floor (`_MIN_COMFY_CLI`) — so every comfy-cli that
-        # currently satisfies the version guard still lacks the verb, making this
-        # the COMMON path today rather than an edge one. Verified against the
+        # `comfy node deps` ships in comfy-cli 1.14.0, which is also this server's
+        # floor (`_MIN_COMFY_CLI`) — so every comfy-cli that satisfies the version
+        # guard HAS the verb, and this is now an edge path rather than the common
+        # one it was under the 1.13.0 floor. It stays because the guard fails
+        # OPEN: a source build or fork whose `--version` cannot be parsed reaches
+        # here from below the floor. Verified against the
         # released 1.13.0: `comfy --json --where local node deps` exits 2 with no
         # envelope and Click's `No such command 'deps'.` on stderr, inside a rich
         # panel — i.e. a missing SUBcommand of `node` produces exactly the message
@@ -10731,16 +10768,17 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
             return {
                 "error": (
                     "node_dependencies unavailable: the installed comfy-cli does "
-                    "not support 'comfy node deps' (the verb ships in releases "
-                    # "1.13.0" is written out rather than interpolated from
+                    "not support 'comfy node deps' (the verb ships in "
+                    # "1.14.0" is written out rather than interpolated from
                     # `_MIN_COMFY_CLI_STR`: that constant is this server's version
-                    # FLOOR, and raising the floor to a release that HAS the verb
-                    # would turn this sentence into a contradiction. The release
-                    # the verb landed in is a fact about comfy-cli, so it is
-                    # spelled out — the same way `_download_verb_unsupported`
+                    # FLOOR, and the floor is now the release that HAS the verb —
+                    # interpolating it would make this sentence say the verb needs
+                    # something newer than the release that introduced it. The
+                    # release the verb landed in is a fact about comfy-cli, so it
+                    # is spelled out — the same way `_download_verb_unsupported`
                     # spells out its own.
-                    "after 1.13.0). Nothing else is affected. Update comfy-cli "
-                    "to use this tool."
+                    "1.14.0 and newer). Nothing else is affected. Update "
+                    "comfy-cli to use this tool."
                 ),
                 "unsupported": True,
             }
@@ -10749,11 +10787,11 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
         # comfy-cli with `node deps` but without `--registry` raises Click's
         # `No such option: --registry` — exit 2, no envelope, and no match for
         # the verb pattern above — which would otherwise fall through as the raw
-        # usage dump this degrade exists to replace. Forward cover rather than a
-        # gap that exists today: on comfy-cli main the option and the verb are
-        # one commit (`comfy_cli/command/node_deps.py`), and neither is in any
-        # release yet — which is precisely the window in which the option could
-        # still be renamed before it ships. `download_model` carries the same
+        # usage dump this degrade exists to replace. Cover for a shape no RELEASE
+        # produces: the option and the verb are one commit
+        # (`comfy_cli/command/node_deps.py`) and shipped together in 1.14.0, so a
+        # comfy-cli with the verb and without the option can only be a source
+        # build or a fork. `download_model` carries the same
         # both-halves cover over a verb group its own docstring calls
         # all-or-nothing. Gated on `registry_id` because with it empty the flag
         # is never on the command line, so any such phrase can only have been
@@ -10771,7 +10809,7 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
                 "error": (
                     "node_dependencies registry_id unavailable: the installed "
                     "comfy-cli's 'comfy node deps' does not support '--registry' "
-                    "(it ships with the verb, in releases after 1.13.0). The "
+                    "(it ships with the verb, in 1.14.0 and newer). The "
                     "installed-pack half still works — call again with "
                     "registry_id empty — or update comfy-cli to pre-check a pack "
                     "before installing it."
@@ -11088,10 +11126,11 @@ def search_models(query: str = "", folder: str = "") -> Any:
       …), so a LoRA or VAE is findable by name without knowing its folder.
       ``--text`` is required: comfy-cli's ``search`` takes the query as an
       option, not a positional (a positional exits 2 with a usage error).
-      The cross-folder walk needs a comfy-cli release NEWER than v1.13.0 — the
-      fix landed in Comfy-Org/comfy-cli#603, after v1.13.0 was cut. On v1.13.0
-      and older this mode searches ``checkpoints`` only, and anything outside
-      that folder is reachable via ``folder`` mode below.
+      The cross-folder walk landed in Comfy-Org/comfy-cli#603 and shipped in
+      v1.14.0 — this server's floor, so every compliant install walks every
+      folder. A build that slipped past the fail-OPEN version guard searches
+      ``checkpoints`` only, and anything outside that folder is reachable via
+      ``folder`` mode below.
     - else ``folder`` given → ``comfy models list-folder <folder>`` (list one
       model folder, e.g. ``checkpoints``, ``loras``).
     - else (both empty) → ``comfy models list-folders`` (list the folder names).
@@ -11116,7 +11155,7 @@ def search_models(query: str = "", folder: str = "") -> Any:
 
     - present but outside what this call searched. Each mode looks somewhere
       narrower than "the install": the no-argument mode lists folder NAMES and no
-      files at all, ``folder`` mode reads one folder, and on the v1.13.0 floor
+      files at all, ``folder`` mode reads one folder, and below the v1.14.0 floor
       ``query`` mode reads ``checkpoints`` only (see the mode list above). A LoRA
       or VAE already on disk is simply absent from those results — re-check with
       ``folder="loras"`` / ``folder="vae"`` (or list the folders first) before
@@ -11440,10 +11479,13 @@ def _download_verb_unsupported(
     ``download_model`` already degrades for the OPTION-shaped half of this same
     version gap (``--background``, see :func:`_is_missing_option_error`); this is
     the VERB-shaped half, for the ``model download-status`` / ``download-cancel``
-    companions. The three ship as one group, in comfy-cli releases after 1.13.0
-    — so on every release through 1.13.0 these tools hit Click's raw usage dump,
-    which reads like a broken MCP rather than the version gap it is. That is the
-    common case today, not an edge one: this repo's floor is only 1.12.0.
+    companions. The three ship as one group, in comfy-cli 1.14.0 — which is also
+    this repo's floor (:data:`_MIN_COMFY_CLI`), so a compliant install has all
+    three and this is an edge path rather than the common one it was under the
+    1.13.0 floor. It stays because the floor guard fails OPEN: a source build or
+    fork whose ``--version`` cannot be parsed reaches these tools from below the
+    floor, and there they hit Click's raw usage dump, which reads like a broken
+    MCP rather than the version gap it is.
 
     This degrade REPORTS NO LOST CAPABILITY, which is why it is safe. The verb
     group is all-or-nothing, so a CLI missing these two also rejects
@@ -11475,7 +11517,12 @@ def _download_verb_unsupported(
         "error": (
             f"model {verb} unavailable: the installed comfy-cli does not support "
             f"'comfy model {verb}' (the background-download verbs ship in "
-            "releases after 1.13.0). Downloads themselves still work — on this "
+            # Spelled out, not interpolated from `_MIN_COMFY_CLI_STR`: that
+            # constant is the FLOOR, which is now the release carrying these
+            # verbs, so interpolating it would claim they need something newer
+            # than the release that introduced them. Same reasoning as
+            # `node_dependencies`, which points at this site for the precedent.
+            "1.14.0 and newer). Downloads themselves still work — on this "
             "comfy-cli `download_model` runs the transfer inline and returns "
             "once the file has landed, so there is no background download to "
             f"{'check on' if verb == 'download-status' else 'cancel'}."
@@ -11854,7 +11901,9 @@ async def download_model(
 
     LEGACY FALLBACK (comfy-cli older than the ``--background`` download; the verb
     group ships with ``model download-status`` / ``model download-cancel``
-    alongside it, in releases after 1.13.0). Such a CLI rejects ``--background``
+    alongside it, in 1.14.0 and newer — this server's floor, so only a build that
+    slipped past the fail-OPEN version guard takes this path). Such a CLI rejects
+    ``--background``
     as an unknown option before running anything, and this falls back to the old
     call — one FOREGROUND ``comfy model download`` that holds the MCP request open
     for the whole transfer. That path also keeps the old return shape: ``comfy
@@ -12439,10 +12488,12 @@ def list_workflow_notes(workflow_path: str) -> Any:
     try:
         return _run_comfy("workflow", "notes", workflow_path, timeout=60.0)
     except ComfyCliError as exc:
-        # `workflow notes` ships in comfy-cli releases AFTER 1.13.0, which is
-        # also this server's floor (`_MIN_COMFY_CLI`) — so every comfy-cli that
-        # currently satisfies the guard still lacks the verb, making this the
-        # COMMON path today rather than an edge one. Without the degrade the
+        # `workflow notes` ships in comfy-cli 1.14.0, which is also this server's
+        # floor (`_MIN_COMFY_CLI`) — so every comfy-cli that satisfies the guard
+        # HAS the verb, making this an edge path rather than the common one it was
+        # under the 1.13.0 floor. It stays because the guard fails OPEN: a source
+        # build or fork whose `--version` cannot be parsed reaches here from below
+        # the floor. Without the degrade the
         # caller gets Click's raw `No such command 'notes'.` usage text with no
         # envelope, which reads as a broken MCP server rather than the version
         # gap it is. Same shape and same strictness as `_freshness_report` /

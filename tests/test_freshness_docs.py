@@ -133,37 +133,44 @@ def test_node_tools_are_documented_as_live(tool_name):
 
 
 @pytest.mark.parametrize("tool_name", CACHED_TEMPLATE_TOOLS)
-def test_template_tools_are_documented_as_cached_with_the_version_split(tool_name):
-    """CACHED — and the TTL is comfy-cli-version-dependent, which must be stated.
+def test_template_tools_are_documented_as_cached_with_the_ttl(tool_name):
+    """CACHED — and the 24h TTL is now unconditional in the supported range.
 
-    The 24h TTL landed in Comfy-Org/comfy-cli#559, *after* v1.13.0 was cut, and
-    v1.13.0 is this server's hard floor (``_MIN_COMFY_CLI``). So both behaviors
-    are live in the supported range: documenting the TTL unconditionally would be
-    a false claim for every user on the floor version, where the first fetch is
-    kept until ``comfy templates refresh``. Same shape as the comfy-cli version
-    split already documented in ``search_models``.
+    The TTL landed in Comfy-Org/comfy-cli#559 and shipped in v1.14.0, which IS
+    this server's hard floor (``_MIN_COMFY_CLI``), so every install that
+    satisfies the floor expires the cache. That is why these docstrings state the
+    TTL flatly and name v1.14.0 rather than hedging "NEWER than <floor>", which
+    would claim the TTL needs something newer than the release carrying it.
+    ``comfy templates refresh`` still has to appear: it is the manual escape
+    hatch, and the only behavior left on a build that slipped past the fail-OPEN
+    version guard.
     """
     text = doc(tool_name)
     assert "Freshness: CACHED" in text
     assert "24h TTL" in text
-    assert "v1.13.0" in text
+    assert "v1.14.0" in text
     assert "comfy templates refresh" in text
     # The install-independence caveat — the reason a cached hit can be unrunnable.
     assert "NOT read from the local install" in text
 
 
-def test_the_cached_ttl_floor_claim_still_matches_this_servers_version_floor():
-    """The version in the TTL caveat is the floor, not a number frozen in prose.
+def test_the_cached_ttl_release_is_covered_by_this_servers_version_floor():
+    """The TTL prose may only be unconditional while the floor carries the TTL.
 
-    The caveat's "NEWER than v1.13.0" is only meaningful while v1.13.0 is what
-    ``_MIN_COMFY_CLI`` requires. If the floor moves past the release that carries
-    the TTL, the split disappears and these docstrings should stop hedging — this
-    is the test that says so instead of leaving stale prose behind.
+    This is the guard that fired when the floor moved from 1.13.0 to 1.14.0: back
+    then the TTL release was ABOVE the floor, so the docstrings had to document
+    both behaviors, and the test pinned the floor so the prose could not silently
+    outlive it. The floor now includes comfy-cli#559, so the assertion is
+    inverted — it holds the docstrings' unconditional claim to the condition that
+    makes it true. If the TTL release ever ends up above the floor again (a
+    revert, a floor lowered), the template tools must go back to documenting the
+    split rather than promising a TTL the floor does not guarantee.
     """
-    assert server._MIN_COMFY_CLI_STR == "1.13.0", (
-        "the comfy-cli floor moved — re-check the template tools' `Freshness:` "
-        "caveat: once the floor includes comfy-cli#559 the 24h TTL is "
-        "unconditional and the v1.13.0 hedge should be dropped."
+    ttl_release = (1, 14, 0)  # Comfy-Org/comfy-cli#559 shipped here
+    assert server._MIN_COMFY_CLI >= ttl_release, (
+        "the comfy-cli floor no longer covers comfy-cli#559 — the template "
+        "tools' `Freshness:` caveat states the 24h TTL unconditionally, which is "
+        "only true while the floor carries it. Restore the version split."
     )
 
 
@@ -183,8 +190,8 @@ def test_search_models_absence_names_the_out_of_scope_reading_first():
     """Absence has TWO readings here, and the wrong one costs a multi-GB download.
 
     Each mode searches something narrower than "the install" — no-argument lists
-    folder names, ``folder`` reads one folder, and on the v1.13.0 floor ``query``
-    reads ``checkpoints`` only. A LoRA already on disk is absent from those
+    folder names, ``folder`` reads one folder, and below the v1.14.0 floor
+    ``query`` reads ``checkpoints`` only. A LoRA already on disk is absent from those
     results, so "not downloaded here" cannot be the only documented reading.
     """
     text = doc("search_models")

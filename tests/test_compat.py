@@ -13,7 +13,9 @@ dependency. These lock in the runtime checks that guard it:
 
 from __future__ import annotations
 
+import re
 import subprocess
+from pathlib import Path
 
 import pytest
 from conftest import _FakeRunProc, _raises_at_spawn
@@ -394,7 +396,7 @@ def test_server_info_attaches_freshness_block(patched_env_then_outdated):
 def test_server_info_freshness_degrades_on_missing_verb(patched_env_then_outdated):
     """A comfy-cli without `outdated` -> the purpose-built `unsupported` degrade.
 
-    `comfy outdated` ships in comfy-cli 1.13.0, this server's enforced floor, so
+    `comfy outdated` ships in comfy-cli 1.13.0, below this server's floor, so
     a compliant install answers the probe and this is now the RARE path — it
     survives because the version guard fails OPEN, letting an install with an
     unparseable `--version` (a source build, a fork) reach here below the floor.
@@ -821,3 +823,80 @@ def test_server_info_docstring_teaches_freshness_and_update_commands():
     assert "freshness" in doc
     assert "comfy update comfy" in doc
     assert "comfy node update" in doc
+
+
+# --- floor-vs-prose consistency (the desync that outlives a floor raise) -----
+
+# Matches a capability claim that hedges a version: "requires a comfy-cli NEWER
+# than 1.13.0", "the verb landed after comfy-cli 1.13.0", "ships in releases
+# after 1.13.0". The captured version is what the prose says you need to be
+# ABOVE, so it is a bug whenever it is at or below the floor.
+_HEDGE_RE = re.compile(
+    r"(?:newer than|landed after|ships? in releases after|releases after)"
+    r"\s+(?:comfy-cli\s+)?v?(\d+)\.(\d+)(?:\.(\d+))?",
+    re.IGNORECASE,
+)
+
+# A hint that interpolated the floor would render this phrase; it must not appear.
+_MIN_STR_INTERPOLATION_LEAKED = f"NEWER than {server._MIN_COMFY_CLI_STR}"
+
+
+def _hedged_versions(text: str) -> list[tuple[int, int, int]]:
+    """Every version a "you need something newer than this" phrase names."""
+    return [
+        (int(major), int(minor), int(patch or 0))
+        for major, minor, patch in _HEDGE_RE.findall(text)
+    ]
+
+
+def test_the_hedge_detector_actually_detects():
+    """Self-test: a clean sweep below must mean "clean", not "regex rotted"."""
+    assert _hedged_versions("requires a comfy-cli NEWER than 1.13.0") == [(1, 13, 0)]
+    assert _hedged_versions("the verb landed after comfy-cli 1.13.0") == [(1, 13, 0)]
+    assert _hedged_versions("ships in releases after 1.9") == [(1, 9, 0)]
+    assert _hedged_versions("the TTL shipped in v1.14.0") == []
+
+
+def test_no_capability_claim_hedges_a_version_the_floor_already_covers():
+    """No docstring may say "you need a comfy-cli newer than X" for X <= floor.
+
+    This is the class of staleness a floor raise creates and nothing else
+    catches. Every such sentence was TRUE when written — the verb really did land
+    after the then-current floor — and every one of them silently became either
+    vacuous or false the moment the floor moved to the release carrying the verb.
+    An agent reading "node_dependencies requires a comfy-cli newer than 1.13.0"
+    on a server that refuses to start below 1.14.0 is being told to upgrade to
+    something it already has.
+
+    The fix at each site is to name the release that HAS the capability, spelled
+    out rather than interpolated from `_MIN_COMFY_CLI_STR` (which is the FLOOR,
+    so interpolating it re-creates exactly this contradiction), and to say what
+    the degrade really protects against now: a build that slipped past the
+    fail-OPEN version guard, or a dependency outside comfy-cli.
+    """
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    offenders = [v for v in _hedged_versions(source) if v <= server._MIN_COMFY_CLI]
+    assert offenders == [], (
+        f"{len(offenders)} capability claim(s) in server.py hedge a comfy-cli "
+        f"version at or below the {server._MIN_COMFY_CLI_STR} floor "
+        f"({', '.join('.'.join(map(str, v)) for v in offenders)}) — the floor "
+        "already guarantees it, so the sentence is vacuous or false. Name the "
+        "release that carries the capability instead."
+    )
+
+
+def test_the_spelled_out_upgrade_hints_name_a_release_the_floor_guarantees():
+    """The two hand-written upgrade hints must not outlive the floor either.
+
+    `_RESOURCE_VERB_UPGRADE_HINT` and `_LOG_PORT_UPGRADE_HINT` deliberately spell
+    their version out instead of interpolating `_MIN_COMFY_CLI_STR`, because that
+    constant is the floor and these sentences are about the release a verb landed
+    in. That is correct, and it is also exactly why they cannot be reflowed
+    automatically when the floor moves — so pin them here. Both name 1.14.0,
+    which the floor covers, so the message reads as "this build is not a
+    published release" rather than "upgrade to what you already run".
+    """
+    for hint in (server._RESOURCE_VERB_UPGRADE_HINT, server._LOG_PORT_UPGRADE_HINT):
+        assert "1.14.0" in hint
+        assert _MIN_STR_INTERPOLATION_LEAKED not in hint
+        assert _hedged_versions(hint) == []
