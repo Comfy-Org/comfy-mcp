@@ -864,10 +864,18 @@ def test_workflow_deps_degrades_without_comfyui_manager(patched_run):
 
     assert result["unsupported"] is True
     assert "ComfyUI-Manager" in result["error"]
-    # The degrade must route on, not dead-end: the two things that still work
-    # without Manager are named.
-    assert "install_node" in result["error"]
+    # The degrade must route on, not dead-end — and it must route somewhere that
+    # actually WORKS. `comfy nodes search/show` reads the running ComfyUI, so
+    # `search_nodes`/`get_node` are unaffected by a missing Manager…
     assert "search_nodes" in result["error"]
+    assert "get_node" in result["error"]
+    # …while `comfy node install` goes through the very same `execute_cm_cli`
+    # that aborted here, so `install_node` is NOT an alternative. Naming it as
+    # one would send the agent into a second guaranteed failure.
+    assert "`install_node` is NOT a way around this" in result["error"]
+    # It still ROUTES rather than dead-ends: the remedy named restores both
+    # tools, and is checked here so a future reword cannot drop it.
+    assert "Installing ComfyUI-Manager into the workspace" in result["error"]
 
 
 def test_workflow_deps_degrades_through_a_rich_panel(patched_run):
@@ -980,11 +988,117 @@ def test_workflow_deps_quotes_comfy_cli_when_no_manifest_was_written(patched_run
 
 
 def test_workflow_deps_reports_an_unreadable_manifest(patched_run):
-    """Unparseable JSON is comfy-cli's/Manager's problem, reported as such."""
-    patched_run("saved", on_spawn=_writes("{not json", encode=str))
+    """Unparseable JSON is comfy-cli's/Manager's problem, reported as such.
+
+    And it quotes comfy-cli's printed output for the same reason the
+    never-written branch does: a cm-cli run that creates the file and then fails
+    mid-write lands HERE, and its "Execution error: …" line is still the only
+    place the cause survives.
+    """
+    patched_run(
+        "",
+        stderr="Execution error: cm-cli deps-in-workflow\nchannel unreachable",
+        on_spawn=_writes("{not json", encode=str),
+    )
+
+    with pytest.raises(server.ComfyCliError, match="could not read") as excinfo:
+        server.workflow_deps("/tmp/flux.json")
+
+    assert "channel unreachable" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Well-formed JSON that a given interpreter may decline to BUILD, both
+        # far under the size cap and neither a `JSONDecodeError`: nesting past
+        # the stack raises `RecursionError`, and an integer literal over
+        # `sys.get_int_max_str_digits` raises a plain `ValueError` (3.11+). A
+        # decode-error-only `except` lets both escape as an internal error.
+        "[" * 20_000 + "]" * 20_000,
+        "1" * 10_000,
+    ],
+    ids=["deeply-nested", "huge-int-literal"],
+)
+def test_workflow_deps_reports_a_manifest_this_interpreter_cannot_build(
+    patched_run, payload
+):
+    """Never an UNCONVERTED interpreter error, on any supported interpreter.
+
+    Which branch catches these is deliberately not asserted, because it is a
+    property of the running Python and not of this server: 3.10 refuses the deep
+    nesting the parse where 3.14's scanner builds it, and only 3.11+ has the
+    integer-literal ceiling. Either way the caller must see a named
+    `ComfyCliError` — the parse failure on the interpreter that refuses, the
+    wrong-shape error on the one that succeeds — and never a bare
+    `RecursionError` / `ValueError` surfacing as an internal error.
+    """
+    patched_run("saved", on_spawn=_writes(payload, encode=str))
+
+    with pytest.raises(server.ComfyCliError, match="dependency manifest"):
+        server.workflow_deps("/tmp/flux.json")
+
+
+def test_workflow_deps_reports_a_manifest_that_is_not_utf8(patched_run):
+    """A non-utf-8 manifest is a read failure, not an unconverted decode error."""
+
+    def write_latin1(cmd):
+        with open(_output_path(cmd), "wb") as handle:
+            handle.write(b'{"custom_nodes": {"caf\xe9": {}}}')
+
+    patched_run("saved", on_spawn=write_latin1)
 
     with pytest.raises(server.ComfyCliError, match="could not read"):
         server.workflow_deps("/tmp/flux.json")
+
+
+def test_workflow_deps_says_empty_when_the_child_printed_nothing(patched_run):
+    """A silent child reads as `<empty>`, never as the wrapper's own placeholder.
+
+    `_synthesize_plain_result` INVENTS "comfy … completed (exit 0)." when both
+    streams are empty, so quoting it under "comfy-cli's own output" would pass a
+    wrapper line off as the engine's and hide that there was nothing to say.
+    """
+    patched_run("", stderr="")  # no `on_spawn`: nothing writes the output path
+
+    with pytest.raises(server.ComfyCliError, match="wrote no dependency manifest"):
+        server.workflow_deps("/tmp/flux.json")
+
+
+def test_workflow_deps_masks_credentials_in_repo_url_keys(patched_run):
+    """A private channel can key a pack by a URL carrying userinfo — mask it.
+
+    The manifest reaches the MCP client and the model transcript, which is the
+    same path `failure_log._scrub_text` already guards everywhere else here.
+    Slug keys are untouched: the scrubber anchors on `https?://`.
+    """
+    patched_run(
+        "saved",
+        on_spawn=_writes(
+            {
+                "custom_nodes": {
+                    "https://<user>:<pass>@example.invalid/pack.git": {
+                        "state": "not-installed"
+                    },
+                    "comfyui-kjnodes": {"state": "installed"},
+                },
+                "unknown_nodes": [],
+            }
+        ),
+    )
+
+    packs = server.workflow_deps("/tmp/flux.json")["custom_nodes"]
+
+    assert "comfyui-kjnodes" in packs
+    assert not any("<pass>" in key for key in packs)
+    assert any("example.invalid/pack.git" in key for key in packs)
+
+
+def test_workflow_deps_leaves_a_credential_free_manifest_identical(patched_run):
+    """The ordinary case is not copied or reordered — same object back."""
+    patched_run("saved", on_spawn=_writes(_DEPS_MANIFEST))
+
+    assert server.workflow_deps("/tmp/flux.json") == _DEPS_MANIFEST
 
 
 def test_workflow_deps_reports_a_manifest_of_the_wrong_shape(patched_run):
@@ -999,12 +1113,37 @@ def test_workflow_deps_reports_a_manifest_of_the_wrong_shape(patched_run):
 
 
 def test_workflow_deps_refuses_an_oversized_manifest(patched_run):
-    """The read-back is bounded: a pathological file never lands in the response."""
+    """The read-back is bounded: a pathological file never lands in the response.
+
+    The bound is on bytes this process actually CONSUMES — one read of
+    `_MAX_DEPS_MANIFEST_BYTES + 1` — not on a `getsize` taken before it, so a
+    file that grows between the two cannot slip past.
+    """
     oversized = {"custom_nodes": {"x" * (server._MAX_DEPS_MANIFEST_BYTES + 1): {}}}
     patched_run("saved", on_spawn=_writes(oversized))
 
     with pytest.raises(server.ComfyCliError, match="maximum"):
         server.workflow_deps("/tmp/flux.json")
+
+
+def test_workflow_deps_reads_a_manifest_exactly_at_the_ceiling(patched_run):
+    """…and the ceiling itself is INSIDE the bound, not one byte outside it."""
+    pad = "y" * (server._MAX_DEPS_MANIFEST_BYTES - len('{"custom_nodes": {"": {}}}'))
+    at_limit = {"custom_nodes": {pad: {}}}
+    patched_run("saved", on_spawn=_writes(at_limit))
+
+    assert server.workflow_deps("/tmp/flux.json") == at_limit
+
+
+def test_workflow_deps_rejects_an_empty_path(no_spawn):
+    """An empty path is a caller mistake, named here rather than by the engine.
+
+    The shared `_guard_workflow_path` cannot catch it — empty is neither
+    dash-leading nor oversized — so it would otherwise ride out as
+    `--workflow ""`. `run_workflow` guards this the same way.
+    """
+    with pytest.raises(server.ComfyCliError, match="empty"):
+        server.workflow_deps("   ")
 
 
 @pytest.mark.parametrize("workflow_path", ["-flux.json", "--workflow=x"])

@@ -62,7 +62,7 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 50 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 52 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -693,9 +693,11 @@ machines.
 **Not remoted (this repo is a thin wrapper and never opens its own socket):**
 
 - **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `update_comfyui`,
-  `switch_comfyui_version`, `get_logs`) — these manage a **local** ComfyUI process/install and stay
-  local-only; they cannot start/stop, update, version-switch, or read logs from a remote box. Start
-  and update ComfyUI on the remote host yourself.
+  `switch_comfyui_version`, `install_node`, `get_logs`) — these manage a **local** ComfyUI
+  process/install and stay local-only; they cannot start/stop, update, version-switch, install node
+  packs into, or read logs from a remote box. Start and update ComfyUI, and install its node packs,
+  on the remote host yourself. `install_node` in particular writes into *this* machine's ComfyUI
+  workspace and venv, so with `COMFYUI_URL` set the pack lands where the run isn't.
 - **Catalog / partner verbs** — `search_templates` / `search_models` / `download_model` /
   `partner_generate` — this server forwards **no** `--host`/`--port` to these verbs (they accept
   none at all), so they run against comfy-cli's local default. A model must be installed on the
@@ -817,7 +819,7 @@ MCP client config today, it keeps working unchanged.
 
 ## Tools
 
-50 tools, grouped below by what they do. Every tool runs `comfy` with the global
+52 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake

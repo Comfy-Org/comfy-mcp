@@ -334,6 +334,27 @@ def test_an_in_flight_update_refuses_before_the_prompt(patched_plain_run):
     assert calls == []
 
 
+def test_the_busy_refusal_names_every_lock_sharer(patched_plain_run):
+    """`_UPDATE_LOCK` is shared three ways, so "an update" is not the whole story.
+
+    A 25-minute `install_node` (or a `switch_comfyui_version`) is enough to refuse
+    this call, and a caller told only about "an update" goes looking for an
+    in-flight call that does not exist.
+    """
+    patched_plain_run(0, stderr="done")
+    assert server._UPDATE_LOCK.acquire(blocking=False)
+    try:
+        with pytest.raises(server.ComfyCliError) as excinfo:
+            _update("comfy", ctx=_FakeCtx())
+    finally:
+        server._UPDATE_LOCK.release()
+
+    message = str(excinfo.value)
+    assert "version switch" in message
+    assert "node install" in message
+    assert "Nothing was updated." in message
+
+
 def test_a_declined_update_leaves_the_lock_free(patched_plain_run):
     """A refusal must not park the lock a legitimate update (or switch) needs.
 

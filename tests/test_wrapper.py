@@ -2263,6 +2263,26 @@ def test_tool_arguments_follow_the_naming_convention():
         assert not banned & set(properties), name
 
 
+def test_the_readme_tool_count_matches_the_live_tool_set():
+    """The README states the count twice; both have to be the real one.
+
+    Pure prose, so nothing else notices it going stale — and it went stale exactly
+    that way when a tool was added without recounting. A wrong count is the first
+    thing a reader can check and the first thing that costs the rest of the
+    document its credibility, so it gets a tripwire rather than a convention.
+    """
+    count = len(server.mcp._tool_manager.list_tools())
+    readme = (pathlib.Path(__file__).resolve().parent.parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    stated = re.findall(r"\b(\d+) tools\b", readme)
+    assert stated, "the README no longer states a tool count"
+    assert set(stated) == {str(count)}, (
+        f"the README says {sorted(set(stated))} tools; the server exposes {count}"
+    )
+
+
 def test_auth_status_maps_command_and_passes_payload_through(patched_run, monkeypatch):
     """auth_status wraps `comfy --json --where local cloud whoami`, payload unchanged."""
     whoami = {
