@@ -4698,6 +4698,24 @@ def test_is_no_recorded_server_accepts_an_envelope_without_a_code():
     assert server._is_no_recorded_server(exc)
 
 
+@pytest.fixture(autouse=True)
+def _no_untracked_probe(monkeypatch):
+    """Keep `restart_comfyui`'s untracked-server probe out of this module.
+
+    A restart that hits the port-clash signature now asks comfy-cli what is
+    holding the port (`comfy stop --port <p> --dry-run`) before it re-raises. The
+    guidance tests below reach that branch while patching only `stop_comfyui` /
+    `_launch_comfyui_sync`, so without this the probe would SPAWN A REAL
+    `comfy` child on any machine that has comfy-cli installed — the one thing
+    this suite promises it never does.
+
+    Stubbing it to "comfy-cli would not vouch for the listener" is also the state
+    those tests are about: no identity, so the original hedged guidance. The
+    probe and the gate it feeds have their own file, `test_untracked_kill.py`.
+    """
+    monkeypatch.setattr(server, "_verified_untracked_listener", lambda port: None)
+
+
 def test_restart_comfyui_reraises_a_timed_out_stop_that_printed_the_phrase(monkeypatch):
     """The gate is load-bearing: a timed-out stop must not be relaunched over."""
 

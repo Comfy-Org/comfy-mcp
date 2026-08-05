@@ -50,19 +50,26 @@ its answer off DISK because the engine leaves no choice — `comfy node
 deps-in-workflow` emits no envelope and REQUIRES an `--output` path — so the
 temp-file round trip is that contract, and Manager's manifest goes back as
 written bar `failure_log._scrub_text` masking credentials in its repo-URL keys.
+`restart_comfyui` composes a THIRD pair on one branch only: when its stop found
+nothing recorded and its launch then lost the port, `comfy stop --port <p>
+--dry-run` says WHO holds it and `comfy stop --port <p>` recycles it. Whether
+that listener is a ComfyUI is comfy-cli's verdict, never a check here — a
+`psutil` walk or an HTTP probe in this repo would be the breach.
 
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that exist only between this server and its
 client, which comfy-cli has no way to express. Today that is the per-call
 confirmation on the tools that can spend money, destroy local state, run
-third-party code, or expose the machine: `partner_generate`, `run_template`,
-`run_workflow`, `switch_comfyui_version`, `install_node`, `update_comfyui` when
-`target="all"`, and the `launch_comfyui` / `restart_comfyui` pair when
-`extra_args` would publish ComfyUI to the network. comfy-cli owns the
+third-party code, kill a process, or expose the machine: `partner_generate`,
+`run_template`, `run_workflow`, `switch_comfyui_version`, `install_node`,
+`update_comfyui` when `target="all"`, the `launch_comfyui` / `restart_comfyui`
+pair when `extra_args` would publish ComfyUI to the network, and
+`restart_comfyui` again when it would stop an untracked server holding the port.
+comfy-cli owns the
 credit-spend interlock and the durable "always proceed" (`comfy generate consent
 always`); this server only raises the confirmation over MCP **elicitation** —
 the protocol's y/N prompt — then forwards the answer as `--yes` /
-`--allow-spend`, or (for the four the CLI does not gate at all) refuses to run
+`--allow-spend`, or (for the five the CLI does not gate at all) refuses to run
 the command. It stores no consent of its own, and all share one fail-closed body,
 `_elicit_approval`; give a new gate its own `_ApprovalWording` rather than a
 second copy. Adding *product* behavior here is still a guardrail breach;
@@ -87,8 +94,13 @@ danger being the argument and not the verb: the launch pair prompts only for
 `update_comfyui` only for `target="all"`, which pip-installs every third-party
 pack (`comfy`/`cli` never prompt). `install_node` is NOT one — it prompts on
 EVERY call, its `names` argument being a RESTRICTION to registry slugs refusing a
-URL, as the prompt promises a REGISTRY pack. Mirror the engine's contract per
-tool; never generalize one gate onto another.
+URL, as the prompt promises a REGISTRY pack. `restart_comfyui`'s kill gate is
+scoped by neither: it is STATE-scoped, fired only once a launch has already lost
+the port to a server comfy-cli did not start, so the prompt necessarily comes
+MID-sequence — safe because the stop half was a no-op, and raised from the
+worker thread (`_kill_consent_from_thread`) rather than by dropping the
+lifecycle slot to ask. Mirror the engine's contract per tool; never generalize
+one gate onto another.
 
 The local differentiator: discovery (`search_nodes`, `get_node`, `search_models`)
 reads the **user's live install** — custom nodes included — not a static catalog.
