@@ -15,6 +15,7 @@ MCP progress notifications, and still returns the final envelope's data.
 from __future__ import annotations
 
 import asyncio
+import copy
 import enum
 import json
 import os
@@ -1903,6 +1904,10 @@ def test_validate_workflow_bounds_and_masks_the_valid_path_too(patched_run):
     A valid workflow can still carry warnings, and those quote inputs exactly as
     errors do — a report that is masked when the verdict is negative and leaky
     when it is positive would be the worse of both.
+
+    The credential warning goes FIRST, inside the finding cap: appended after
+    the filler it would be clipped before the mask ever saw it, and the
+    assertion would pass with success-path masking deleted entirely.
     """
     patched_run(
         envelope(
@@ -1911,11 +1916,9 @@ def test_validate_workflow_bounds_and_masks_the_valid_path_too(patched_run):
                 "valid": True,
                 "errors": [],
                 "warnings": [
-                    {"code": "non_node_key", "message": f"key {i}"} for i in range(80)
-                ]
-                + [
                     {"code": "note", "message": "https://<user>:<pass>@example.invalid"}
-                ],
+                ]
+                + [{"code": "non_node_key", "message": f"key {i}"} for i in range(80)],
             },
         )
     )
@@ -1925,7 +1928,169 @@ def test_validate_workflow_bounds_and_masks_the_valid_path_too(patched_run):
     assert result["valid"] is True
     assert len(result["warnings"]) == server._VALIDATE_MAX_FINDINGS
     assert result["warnings_truncated"] is True
+    # The masked finding is one of the ones that SURVIVED the clip.
+    assert "example.invalid" in result["warnings"][0]["message"]
     assert "<pass>" not in json.dumps(result)
+
+
+def test_validate_workflow_bounds_a_huge_string(patched_run):
+    """A cap on list length alone is not a wire bound: strings are clipped too.
+
+    comfy-cli renders `hint` from the same live catalog that motivated capping
+    `valid_options`, so a report whose lists are all within the caps can still
+    carry the whole install in one string.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            data={
+                "valid": False,
+                "errors": [{"node_id": "1", "hint": "x" * 20_000}],
+            },
+        )
+    )
+
+    hint = server.validate_workflow("broken.json")["errors"][0]["hint"]
+
+    assert len(hint) == server._MAX_ERROR_FIELD_CHARS + 1
+    assert hint.endswith("…")
+
+
+def test_validate_workflow_bounds_deep_nesting(patched_run):
+    """A pathologically nested payload is bounded, not a RecursionError.
+
+    The walk costs two frames per level, so a payload deep enough to survive
+    `json.loads` could still exhaust the stack and escape as an uncaught crash
+    instead of a result.
+    """
+    deep = {"next": "leaf"}
+    for _ in range(400):
+        deep = {"next": deep}
+    patched_run(
+        envelope(
+            ok=False,
+            data={"valid": False, "errors": [{"node_id": "1", "extra": deep}]},
+        )
+    )
+
+    result = server.validate_workflow("broken.json")
+
+    assert result["valid"] is False
+    assert json.dumps(result).count("next") <= server._VALIDATE_MAX_DEPTH
+    assert server._VALIDATE_TOO_DEEP in json.dumps(result)
+
+
+def test_validate_workflow_bounds_any_other_list(patched_run):
+    """The generic bound covers lists the two named caps never look at."""
+    patched_run(
+        envelope(
+            ok=False,
+            data={
+                "valid": False,
+                "errors": [{"node_id": "1", "known_models": ["m"] * 500}],
+            },
+        )
+    )
+
+    models = server.validate_workflow("broken.json")["errors"][0]["known_models"]
+
+    assert len(models) == server._VALIDATE_MAX_LIST_ITEMS
+
+
+def test_validate_workflow_drops_a_stale_truncation_marker(patched_run):
+    """A `_truncated` marker this relay did not set is not passed on.
+
+    The marker is a claim about THIS clip. Relaying an upstream one sends a
+    caller re-running the check for findings that were already complete.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            data={
+                "valid": False,
+                "errors": [{"node_id": "1", "valid_options_truncated": True}],
+                "errors_truncated": True,
+            },
+        )
+    )
+
+    result = server.validate_workflow("broken.json")
+
+    assert "errors_truncated" not in result
+    assert "valid_options_truncated" not in result["errors"][0]
+
+
+def test_validate_workflow_raises_for_an_empty_verdict_beside_a_real_error(
+    patched_run,
+):
+    """`valid: false` with NO findings, next to an error code, is not a verdict.
+
+    `error` is null on a real verdict, so a structured code alongside an empty
+    finding list is a stale or default-initialised payload riding on the actual
+    failure. Relaying it would trade `comfyui_unreachable` for an authoritative
+    "your workflow is invalid" backed by nothing — the wrong denial that is
+    worse than "could not check".
+    """
+    patched_run(
+        {
+            **envelope(ok=False, data={"valid": False, "error_count": 0, "errors": []}),
+            "error": {"code": "comfyui_unreachable", "message": "no object_info"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="comfyui_unreachable"):
+        server.validate_workflow("broken.json")
+
+
+def test_validate_workflow_relays_an_empty_verdict_with_no_error_named(patched_run):
+    """…but with no error named, an empty negative verdict is comfy-cli's answer.
+
+    `_local_template_check` has a branch for exactly this "listed no specific
+    problem" case, so it is a shape the engine really produces.
+    """
+    patched_run(
+        envelope(ok=False, data={"valid": False, "error_count": 0, "errors": []})
+    )
+
+    assert server.validate_workflow("broken.json") == {
+        "valid": False,
+        "error_count": 0,
+        "errors": [],
+    }
+
+
+def test_validate_workflow_masks_a_drifted_success_payload(patched_run):
+    """A payload whose shape drifted still gets the mask and the bounds.
+
+    Drift is exactly when the leak would reopen, so the walk is shape-agnostic:
+    it does not need to recognise a report to bound one.
+    """
+    patched_run(
+        envelope(
+            ok=True,
+            data={"note": "https://<user>:<pass>@example.invalid", "opts": ["a"] * 500},
+        )
+    )
+
+    result = server.validate_workflow("wf.json")
+
+    assert "<pass>" not in json.dumps(result)
+    assert "example.invalid" in result["note"]
+    assert len(result["opts"]) == server._VALIDATE_MAX_LIST_ITEMS
+
+
+def test_validate_workflow_does_not_mutate_the_engine_payload(patched_run):
+    """The relay copies; it never writes back into comfy-cli's own payload."""
+    payload = {
+        "valid": False,
+        "errors": [{"node_id": "1", "valid_options": [f"o{i}" for i in range(500)]}],
+    }
+    original = copy.deepcopy(payload)
+    patched_run(envelope(ok=False, data=payload))
+
+    server.validate_workflow("broken.json")
+
+    assert payload == original
 
 
 def test_wait_for_job_returns_terminal_status(monkeypatch):
