@@ -1785,6 +1785,149 @@ def test_validate_workflow_raises_when_the_payload_is_not_a_report(
         server.validate_workflow("broken.json")
 
 
+def test_validate_workflow_raises_rather_than_relay_a_pass_from_a_failure(patched_run):
+    """A failed envelope claiming `valid: true` must never come back as a PASS.
+
+    `ok` mirrors the verdict, so this combination is a contradiction — a stale
+    or partly-populated payload riding along with the real error. Its shape is a
+    perfectly good report, which is exactly the trap: relaying it would convert
+    `comfyui_unreachable` into "your workflow is fine" at the gate agents are
+    told to trust before `run_workflow`. A genuine pass only ever arrives on the
+    success path.
+    """
+    patched_run(
+        {
+            **envelope(ok=False, data={"valid": True, "errors": []}),
+            "error": {"code": "comfyui_unreachable", "message": "no object_info"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="comfyui_unreachable"):
+        server.validate_workflow("broken.json")
+
+
+def test_validate_workflow_bounds_a_huge_report(patched_run):
+    """Findings and their option lists are clipped, with the counts left whole.
+
+    `valid_options` enumerates every option the live catalog has for a field, so
+    a wildly mismatched workflow on a big install can build a response that
+    trips the MCP client's tool-output cap and truncates mid-JSON — losing every
+    diagnostic this relay exists to preserve. Clipping keeps the head verbatim
+    and says so.
+    """
+    findings = [
+        {
+            "node_id": str(n),
+            "field": "ckpt_name",
+            "code": "unknown_enum_value",
+            "valid_options": [f"model_{i}.safetensors" for i in range(400)],
+        }
+        for n in range(80)
+    ]
+    patched_run(
+        envelope(
+            ok=False,
+            data={
+                "valid": False,
+                "error_count": 80,
+                "errors": findings,
+                "warnings": findings[:40],
+            },
+        )
+    )
+
+    result = server.validate_workflow("broken.json")
+
+    assert len(result["errors"]) == server._VALIDATE_MAX_FINDINGS
+    assert result["errors_truncated"] is True
+    assert len(result["warnings"]) == server._VALIDATE_MAX_FINDINGS
+    assert result["warnings_truncated"] is True
+    first = result["errors"][0]
+    assert len(first["valid_options"]) == server._VALIDATE_MAX_OPTIONS
+    assert first["valid_options_truncated"] is True
+    # What survived is verbatim, and comfy-cli's own count stays the true total
+    # — that is how a caller sees anything was dropped.
+    assert first["valid_options"][0] == "model_0.safetensors"
+    assert first["node_id"] == "0"
+    assert result["error_count"] == 80
+
+
+def test_validate_workflow_leaves_a_report_that_fits_alone(patched_run):
+    """Under the caps nothing is clipped and no truncation marker appears."""
+    patched_run(envelope(ok=False, data=_INVALID_REPORT))
+
+    result = server.validate_workflow("broken.json")
+
+    assert result == _INVALID_REPORT
+    assert "errors_truncated" not in result
+    assert "valid_options_truncated" not in result["errors"][0]
+
+
+def test_validate_workflow_masks_credentials_in_a_finding(patched_run):
+    """A credential-bearing widget value quoted by a finding is masked.
+
+    Validator findings quote the offending input, and a workflow input can be a
+    URL with userinfo in it. The report goes straight to the MCP client and into
+    the model's transcript, so it gets the same mask `_scrub_deps_manifest`
+    applies to Manager's repo-URL keys for the same reason.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            data={
+                "valid": False,
+                "errors": [
+                    {
+                        "node_id": "4",
+                        "field": "url",
+                        "message": (
+                            "'https://<user>:<pass>@example.invalid/a.safetensors' "
+                            "is not reachable"
+                        ),
+                    }
+                ],
+            },
+        )
+    )
+
+    message = server.validate_workflow("broken.json")["errors"][0]["message"]
+
+    assert "<pass>" not in message
+    # The mask removes the credential, not the diagnostic.
+    assert "example.invalid" in message
+
+
+def test_validate_workflow_bounds_and_masks_the_valid_path_too(patched_run):
+    """One tool, one return shape: a PASSING report gets the same treatment.
+
+    A valid workflow can still carry warnings, and those quote inputs exactly as
+    errors do — a report that is masked when the verdict is negative and leaky
+    when it is positive would be the worse of both.
+    """
+    patched_run(
+        envelope(
+            ok=True,
+            data={
+                "valid": True,
+                "errors": [],
+                "warnings": [
+                    {"code": "non_node_key", "message": f"key {i}"} for i in range(80)
+                ]
+                + [
+                    {"code": "note", "message": "https://<user>:<pass>@example.invalid"}
+                ],
+            },
+        )
+    )
+
+    result = server.validate_workflow("wf.json")
+
+    assert result["valid"] is True
+    assert len(result["warnings"]) == server._VALIDATE_MAX_FINDINGS
+    assert result["warnings_truncated"] is True
+    assert "<pass>" not in json.dumps(result)
+
+
 def test_wait_for_job_returns_terminal_status(monkeypatch):
     """wait_for_job polls until a terminal status and returns that final payload."""
     statuses = iter(
