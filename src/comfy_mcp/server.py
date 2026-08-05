@@ -77,7 +77,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple, TypeVar
 from urllib.parse import urlparse
@@ -2930,19 +2930,81 @@ _NODE_INSTALL_FAILURE_GATE = "installing"
 # was not rendered, so a pattern that REQUIRED it would fail to match at all on a
 # rendered run, and one that stopped at any `[` would truncate this very message
 # at its `[<channel>, <mode>]` suffix. The tag is trimmed off the window below.
+#
+# Two things the window does NOT do, both load-bearing:
+#
+# * It never runs into the NEXT failure. The window is TEMPERED against the
+#   sentence's own opening literal, because `finditer`'s scan resumes at the end
+#   of the whole match: an untempered 200-character window over two consecutive
+#   per-pack failures (the folded remainder of the first is well under 200
+#   characters for typical ids) would swallow the second one, leaving that pack
+#   inside `installed` with `restart_required: true` — the exact false success
+#   this parse exists to remove. Tempering also keeps `_PACK_NOT_FOUND_RE` off a
+#   NEIGHBOURING pack's `Node '…' not found in` line, which cm-cli only ever
+#   prints as the `res.msg` following that pack's own failure sentence. The
+#   optional `ERROR: ` in that lookahead is cm-cli's own prefix on the line, cut
+#   so a reason does not end with the first crumb of the next failure.
+# * It does not require the quoted id to be CAPTURABLE. The opening quote is
+#   still required — the sentence is only cm-cli's when it names something — but
+#   the id and its closing quote are one optional group, so a quoted value longer
+#   than the capture bound leaves `pack` empty and pushes the id into `reason`
+#   instead of making the whole sentence unmatchable, which would drop the failure
+#   entirely and keep `ok: True`. Same one-directional bias as everything else
+#   here: an unnamed failure is still a failure.
 _NODE_INSTALL_FAILURE_RE = re.compile(
-    r"An error occurred while installing '(?P<pack>[^']{0,160})'\.?(?P<reason>.{0,200})"
+    r"An error occurred while installing '(?:(?P<pack>[^']{0,160})'\.?)?"
+    r"(?P<reason>(?:(?!(?:ERROR: )?An error occurred while installing).){0,200})"
 )
 
 # rich's closing markup tag, which a piped child emits literally. Trimmed off the
-# reason window above; `[/` rather than the full `[/bold red]` because cm-cli
-# styles this line and only this repo's own reading of it depends on the colour.
-_RICH_CLOSE_TAG = "[/"
+# reason window above. Matched as a TAG (`[/bold red]`, `[/red]`) rather than as a
+# bare `[/`: cm-cli's own message can carry a bracketed absolute path — `not found
+# in [/srv/channels/local, local]`, `pip install failed in [/home/u/venv]` — and
+# trimming at the first `[/` anywhere would cut that message off mid-sentence, or
+# to nothing at all when it opens with one. A tag is `[/` plus a word, so the two
+# cannot be confused: no rich style name contains a `/`. `[/]` — rich's "close the
+# last style" spelling — is matched too, since it is a tag by the same reasoning.
+_RICH_CLOSE_TAG_RE = re.compile(r"\[/(?:[A-Za-z][\w ]*)?\]")
 
 # Ceiling on reported failures. One record per pack cm-cli names, and a call can
 # name at most `_MAX_NODE_PACK_NAMES` packs, so anything past this is a runaway
 # (or a pack's own output quoting the sentence) rather than a real result.
 _MAX_INSTALL_FAILURES = 32
+
+
+def _dedupe_install_failures(
+    failures: Iterable[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Distinct failure records, first spelling wins, capped.
+
+    Dedup is not tidiness: the same sentence reaches this parse twice routinely —
+    a pack's own install log echoing it, or rich writing to both streams — and the
+    cap is what makes that dangerous. Capping a CONCATENATION (what the two
+    streams used to be) lets ``_MAX_INSTALL_FAILURES`` copies of one echoed
+    sentence evict every genuine record, and the packs the engine really rejected
+    then come back inside ``installed``. Deduping first spends the ceiling on
+    distinct failures, which is the only thing it was ever meant to bound.
+
+    The cap is enforced here rather than by the caller so it can stop consuming
+    the (lazy) scan behind it, and so no path can reach the payload uncapped.
+    """
+    unique: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for failure in failures:
+        key = (failure["pack"], failure["reason"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(failure)
+        if len(unique) >= _MAX_INSTALL_FAILURES:
+            break
+    return unique
+
+
+def _trim_install_reason(reason: str) -> str:
+    """cm-cli's message, with rich's closing tag taken off. See :data:`_RICH_CLOSE_TAG_RE`."""
+    closed = _RICH_CLOSE_TAG_RE.search(reason)
+    return (reason[: closed.start()] if closed else reason).strip()
 
 
 def _extract_install_failures(text: str) -> list[dict[str, str]]:
@@ -2974,7 +3036,12 @@ def _extract_install_failures(text: str) -> list[dict[str, str]]:
 
     Both fields are scrubbed (:func:`failure_log._scrub_text`) before they are
     returned: ``reason`` relays cm-cli's own message, which for a pack installed
-    from a private channel can quote a repository URL carrying credentials.
+    from a private channel can quote a repository URL carrying credentials. The
+    scrub runs after the window is taken, which is safe in the one direction that
+    matters: the window is cut at its END, and ``_URL_RE`` anchors on the
+    ``https://`` at a URL's HEAD, so a credential URL cut short by the cap is
+    still matched (and its remaining tail is not credential material).
+
     ``pack`` may be ``""`` when the quoted value did not survive the capture
     bound — the failure is still reported, because "something failed and we could
     not name it" must not read as success.
@@ -2987,21 +3054,17 @@ def _extract_install_failures(text: str) -> list[dict[str, str]]:
     # defeat the match. Not lowercased — the pack id is compared against the
     # caller's own names, and the reason is relayed verbatim.
     folded = _PANEL_NOISE_RE.sub(" ", _ANSI_RE.sub("", text))
-    failures: list[dict[str, str]] = []
-    for match in _NODE_INSTALL_FAILURE_RE.finditer(folded):
-        if len(failures) >= _MAX_INSTALL_FAILURES:
-            break
-        reason = match.group("reason")
-        closed_at = reason.find(_RICH_CLOSE_TAG)
-        if closed_at >= 0:
-            reason = reason[:closed_at]
-        failures.append(
-            {
-                "pack": failure_log._scrub_text(match.group("pack").strip()),
-                "reason": failure_log._scrub_text(reason.strip()),
-            }
-        )
-    return failures
+    # A generator, so `_dedupe_install_failures`' cap stops the scan rather than
+    # trimming a list that was already built.
+    return _dedupe_install_failures(
+        {
+            "pack": failure_log._scrub_text((match.group("pack") or "").strip()),
+            "reason": failure_log._scrub_text(
+                _trim_install_reason(match.group("reason"))
+            ),
+        }
+        for match in _NODE_INSTALL_FAILURE_RE.finditer(folded)
+    )
 
 
 def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) -> dict:
@@ -3092,11 +3155,18 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
     # tail, and in a multi-pack install the pack that failed FIRST is pushed out
     # of it by everything the later packs print — which is exactly the partial
     # failure a caller most needs to be told about.
+    # stdout first, and deduped across the two: cm-cli writes this sentence to
+    # whichever stream rich holds, and a pack's own install log can echo it to the
+    # other — so the same failure arrives twice, and `_MAX_INSTALL_FAILURES`
+    # applied to the raw concatenation would let those copies evict the genuine
+    # records. See `_dedupe_install_failures`.
     if tuple(action_parts[:2]) == _NODE_INSTALL_ACTION:
-        failures = _extract_install_failures(stderr) + _extract_install_failures(stdout)
+        failures = _dedupe_install_failures(
+            _extract_install_failures(stdout) + _extract_install_failures(stderr)
+        )
         if failures:
             result["ok"] = False
-            result["failures"] = failures[:_MAX_INSTALL_FAILURES]
+            result["failures"] = failures
             result["note"] = (
                 "comfy-cli emitted no JSON envelope for this command and exited "
                 "0, but its output names packs that FAILED to install — for this "
@@ -9905,6 +9975,20 @@ _INSTALL_FAILED_CODE = "install_failed"
 # rather than to a missed failure.
 _PACK_NOT_FOUND_RE = re.compile(r"Node '[^']{0,160}' not found in", re.IGNORECASE)
 
+# Whitespace, removed from BOTH sides of the attribution compare below. A pack id
+# is a registry slug (`_REGISTRY_ID_RE`: letters, digits, `.`, `_`, `-`), so it
+# never carries whitespace of its own and this can only ever remove whitespace
+# that was not in the id — which is exactly the case it exists for: rich hard-wraps
+# a long id at the console width, `_extract_install_failures`' fold turns that
+# break into a SPACE, and an exact compare would then miss a pack the caller
+# named, leave it inside `installed`, and keep `restart_required` true.
+_PACK_KEY_NOISE_RE = re.compile(r"\s+")
+
+
+def _install_pack_key(value: str) -> str:
+    """A pack id reduced to what attribution compares. See :data:`_PACK_KEY_NOISE_RE`."""
+    return _PACK_KEY_NOISE_RE.sub("", value).lower()
+
 
 def _classify_install_result(names: list[str], result: Any) -> dict[str, Any]:
     """``install_node``'s payload, with the engine's own per-pack verdict applied.
@@ -9924,8 +10008,10 @@ def _classify_install_result(names: list[str], result: Any) -> dict[str, Any]:
     parse is bypassed, and the engine's own structured verdict is what the caller
     sees). Hence the defensive ``isinstance`` rather than a bare ``.get``.
 
-    Attribution is by NAME against the caller's own ``names``, compared
-    case-insensitively because cm-cli echoes back whatever spelling it resolved.
+    Attribution is by NAME against the caller's own ``names``, compared through
+    :func:`_install_pack_key` — case-insensitively because cm-cli echoes back
+    whatever spelling it resolved, and whitespace-insensitively because rich may
+    have wrapped a long id and the fold upstream turned that break into a space.
     A failure whose pack matches none of them — an unparseable name, or a
     dependency pack cm-cli pulled in and named itself — is still reported, under
     cm-cli's own spelling and without removing anything from ``installed``. That
@@ -9943,9 +10029,10 @@ def _classify_install_result(names: list[str], result: Any) -> dict[str, Any]:
     failures = result.get("failures") if isinstance(result, dict) else None
     if not isinstance(failures, list) or not failures:
         return {"installed": names, "result": result, "restart_required": True}
-    requested = {name.lower(): name for name in names}
+    requested = {_install_pack_key(name): name for name in names}
     failed: list[dict[str, str]] = []
     failed_keys: set[str] = set()
+    attributed = 0
     for failure in failures:
         # Every field is checked rather than assumed for the second reason above:
         # the moment comfy-cli grows a real envelope for this verb, `result` is
@@ -9959,9 +10046,10 @@ def _classify_install_result(names: list[str], result: Any) -> dict[str, Any]:
         reason = failure.get("reason")
         pack = pack if isinstance(pack, str) else ""
         reason = reason if isinstance(reason, str) else ""
-        key = pack.lower()
+        key = _install_pack_key(pack)
         if key in requested:
             failed_keys.add(key)
+            attributed += 1
             reported = requested[key]
         else:
             # Not one of ours, or not parseable. Report it verbatim; `""` is left
@@ -9985,13 +10073,27 @@ def _classify_install_result(names: list[str], result: Any) -> dict[str, Any]:
         # emit "0 of N pack(s) failed to install" alongside an empty `failed`,
         # which is a worse lie than the one this function was written to remove.
         return {"installed": names, "result": result, "restart_required": True}
-    installed = [name for name in names if name.lower() not in failed_keys]
+    installed = [name for name in names if _install_pack_key(name) not in failed_keys]
+    # The ratio counts only the failures attributed to a pack the caller ASKED
+    # for, because `len(names)` is its denominator: a record can name a pack
+    # outside `names` (a dependency cm-cli resolved itself, or a sentence whose id
+    # did not survive), and counting those against the requested total reads as
+    # "2 of 1 pack(s) failed" — or claims one of them failed while that very pack
+    # is still listed in `installed`. The rest are reported, in their own clause.
+    unattributed = len(failed) - attributed
     return {
         "installed": installed,
         "failed": failed,
         "error": (
-            f"install_node: {len(failed)} of {len(names)} pack(s) failed to "
-            "install. comfy-cli exited 0 anyway — for `comfy node install` the "
+            f"install_node: {len(failed_keys)} of {len(names)} requested pack(s) "
+            "failed to install"
+            + (
+                f", and the engine reported {unattributed} further failure(s) it "
+                "did not attribute to any of them"
+                if unattributed
+                else ""
+            )
+            + ". comfy-cli exited 0 anyway — for `comfy node install` the "
             "exit status is not the verdict — so `installed` lists only the packs "
             "it did NOT report as failed. See `failed` for the engine's own "
             "message per pack; a `pack_not_found` code means the id is not in "

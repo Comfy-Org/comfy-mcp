@@ -494,6 +494,190 @@ def test_a_wrapped_failure_sentence_is_still_matched(patched_plain_run):
     assert result["failed"][0]["code"] == "pack_not_found"
 
 
+def test_two_consecutive_failures_are_both_reported(patched_plain_run):
+    """A second failure must not be swallowed by the first one's reason window.
+
+    `finditer` resumes at the END of each match, so an untempered fixed-width
+    window would consume the next failure sentence whole and report only one of
+    the two — leaving the second pack inside `installed` with
+    `restart_required: true`, the exact false success this parse removes.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "[bold red]ERROR: An error occurred while installing 'pack-a-xyz'.\n"
+            "Node 'pack-a-xyz@unknown' not found in [default, remote]\n"
+            "ERROR: An error occurred while installing 'pack-b-xyz'.\n"
+            "Failed to clone repository[/bold red]\n"
+        ),
+    )
+
+    result = _install(["pack-a-xyz", "pack-b-xyz"], ctx=_FakeCtx())
+
+    assert result["installed"] == []
+    assert result["failed"] == [
+        {
+            "name": "pack-a-xyz",
+            "code": "pack_not_found",
+            "error": "Node 'pack-a-xyz@unknown' not found in [default, remote]",
+        },
+        {
+            "name": "pack-b-xyz",
+            "code": "install_failed",
+            "error": "Failed to clone repository",
+        },
+    ]
+
+
+def test_a_rendered_run_does_not_borrow_the_next_packs_message(patched_plain_run):
+    """With markup RENDERED there is no literal `[/` to trim the window at.
+
+    The reason window then runs on into whatever was printed next, so without the
+    tempering a neighbouring pack's `Node '…' not found in` line would be read as
+    this pack's — mislabelling a clone failure as `pack_not_found` ("retrying the
+    same id will not help") and relaying the wrong pack's text as its `error`.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "ERROR: An error occurred while installing 'pack-a-xyz'.\n"
+            "Failed to clone repository\n"
+            "ERROR: An error occurred while installing 'pack-b-xyz'.\n"
+            "Node 'pack-b-xyz@unknown' not found in [default, remote]\n"
+        ),
+    )
+
+    result = _install(["pack-a-xyz", "pack-b-xyz"], ctx=_FakeCtx())
+
+    codes = {entry["name"]: entry["code"] for entry in result["failed"]}
+    assert codes == {"pack-a-xyz": "install_failed", "pack-b-xyz": "pack_not_found"}
+    assert result["failed"][0]["error"] == "Failed to clone repository"
+
+
+def test_an_uncapturable_quoted_id_still_reports_the_failure(patched_plain_run):
+    """A quoted value past the capture bound must not make the sentence unmatchable.
+
+    The `'<pack>'` group is optional for exactly this: a required one would drop
+    the failure entirely and leave `ok: True` — the failure mode this whole parse
+    exists to remove — where an unnamed record still says something went wrong.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "ERROR: An error occurred while installing '" + ("x" * 200) + "'.\n"
+            "Failed to clone repository\n"
+        ),
+    )
+
+    result = _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+    assert result["result"]["ok"] is False
+    assert [entry["name"] for entry in result["failed"]] == [""]
+    # Unattributed, so nothing is subtracted from what the caller asked for — and
+    # the ratio counts the REQUESTED packs, not the records.
+    assert result["installed"] == ["comfyui-impact-pack"]
+    assert "0 of 1 requested pack(s) failed to install" in result["error"]
+    assert "1 further failure(s)" in result["error"]
+
+
+def test_the_sentence_still_has_to_name_something():
+    """Uncapturable is not the same as absent: the opening quote stays required.
+
+    Dropping it to catch the over-long id would make every prose line a pack's own
+    pip log prints about "installing" a wheel flip an install to `ok: False`.
+    """
+    assert (
+        server._extract_install_failures(
+            "ERROR: An error occurred while installing the wheel for torch\n"
+        )
+        == []
+    )
+
+
+def test_the_same_failure_on_both_streams_is_reported_once(patched_plain_run):
+    """rich writes to one stream and a pack's own log can echo it to the other."""
+    patched_plain_run(0, stdout=_NOT_FOUND_OUTPUT, stderr=_NOT_FOUND_OUTPUT)
+
+    result = _install(["no-such-pack-xyz"], ctx=_FakeCtx())
+
+    assert len(result["result"]["failures"]) == 1
+    assert [entry["name"] for entry in result["failed"]] == ["no-such-pack-xyz"]
+
+
+def test_a_flood_on_one_stream_cannot_evict_the_real_failure(patched_plain_run):
+    """The ceiling is spent on DISTINCT failures, and stdout goes in first.
+
+    Capping the raw concatenation let a stream carrying `_MAX_INSTALL_FAILURES`
+    copies of the sentence — a pack's own install log quoting it — push out every
+    genuine record, and the packs the engine really rejected came back inside
+    `installed`.
+    """
+    flood = "".join(
+        f"ERROR: An error occurred while installing 'noise-{index}'.\n"
+        "Failed to clone repository\n"
+        for index in range(server._MAX_INSTALL_FAILURES * 2)
+    )
+    patched_plain_run(0, stdout=_NOT_FOUND_OUTPUT, stderr=flood)
+
+    result = _install(["no-such-pack-xyz"], ctx=_FakeCtx())
+
+    assert len(result["result"]["failures"]) == server._MAX_INSTALL_FAILURES
+    assert result["installed"] == []
+    assert result["failed"][0]["name"] == "no-such-pack-xyz"
+
+
+def test_a_bracketed_path_in_the_reason_is_not_trimmed(patched_plain_run):
+    """The trim is rich's closing TAG, not the first `[/` in cm-cli's message.
+
+    A local channel is an absolute path, so the message this parse most wants to
+    relay is also the one a bare `[/` test truncates.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "[bold red]ERROR: An error occurred while installing 'no-such-pack-xyz'."
+            "\nNode 'no-such-pack-xyz@unknown' not found in "
+            "[/srv/comfy/channels/local, local][/bold red]\n"
+        ),
+    )
+
+    result = _install(["no-such-pack-xyz"], ctx=_FakeCtx())
+
+    assert result["failed"] == [
+        {
+            "name": "no-such-pack-xyz",
+            "code": "pack_not_found",
+            "error": (
+                "Node 'no-such-pack-xyz@unknown' not found in "
+                "[/srv/comfy/channels/local, local]"
+            ),
+        }
+    ]
+
+
+def test_an_id_rich_wrapped_mid_token_is_still_attributed(patched_plain_run):
+    """The fold turns rich's break INSIDE a long id into a space.
+
+    A registry id never carries whitespace of its own, so attribution compares
+    with it removed — otherwise the pack the caller named stays in `installed`
+    with `restart_required` true, which is the false success again.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "[bold red]ERROR: An error occurred while installing 'a-very-long-pa\n"
+            "ck-id-that-wrapped'.\nFailed to clone repository[/bold red]\n"
+        ),
+    )
+
+    result = _install(["a-very-long-pack-id-that-wrapped"], ctx=_FakeCtx())
+
+    assert result["installed"] == []
+    assert result["restart_required"] is False
+    # Reported under the caller's own spelling, not the wrapped one.
+    assert result["failed"][0]["name"] == "a-very-long-pack-id-that-wrapped"
+
+
 def test_a_credential_in_a_relayed_failure_is_masked(patched_plain_run):
     """cm-cli quotes the repo URL it tried, and a private channel carries auth."""
     patched_plain_run(
