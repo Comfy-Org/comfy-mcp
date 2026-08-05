@@ -539,6 +539,39 @@ def test_fetch_template_warns_when_the_install_lacks_a_model_option(
     assert result["path"] == str(out)
 
 
+def test_fetch_template_masks_credentials_in_a_local_check_finding(
+    monkeypatch, tmp_path
+):
+    """A finding quoting a credential-bearing input is masked in `local_check`.
+
+    Same findings, same client, same mask as `validate_workflow`'s own relay:
+    the validator quotes the offending widget value, and a workflow input can
+    carry userinfo in a URL.
+    """
+    out = tmp_path / "wf.json"
+    error = {
+        "node_id": "4",
+        "code": "invalid_value",
+        "message": "'https://<user>:<pass>@example.invalid/a.safetensors' is not valid",
+    }
+
+    def handler(args):
+        if args[0] != "validate":
+            return None
+        raise server.ComfyCliError(
+            "comfy validate --workflow x failed [unknown]: ",
+            data=_report(valid=False, errors=[error], converted_from_ui=True),
+        )
+
+    _fake_comfy(monkeypatch, handler)
+    line = server.fetch_template("flux_dev", str(out))["local_check"]["errors"][0]
+
+    assert "<pass>" not in line
+    # The mask removes the credential, not the diagnostic.
+    assert "example.invalid" in line
+    assert line.startswith("node 4: ")
+
+
 def test_fetch_template_does_not_deny_when_the_check_cannot_run(monkeypatch, tmp_path):
     """No live object_info (ComfyUI down) is `checked: false`, NOT `runnable: false`.
 

@@ -171,7 +171,14 @@ flows:
   `definitions.subgraphs` — tweak it through `set_workflow_slot` /
   `run_template(params=...)` like any other template.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
-  before running. A missing node PACK is not a dead end: `install_node(names=[...])`
+  before running. It RETURNS its verdict rather than raising it, so read
+  `.get("valid")` — a successful call is not a pass — and act on the per-node
+  `errors` (each names a `node_id`, the offending `field`, and often
+  `suggestions` / `valid_options` naming what this install actually has; read
+  those keys with `.get()` — they are optional). An exception from it means no
+  verdict came back at all — usually the check could not run because ComfyUI is
+  not up — so it is never a pass, and not per-node detail either.
+  A missing node PACK is not a dead end: `install_node(names=[...])`
   installs it from the registry (registry pack ids, never URLs; the USER is asked
   to confirm every call because it runs third-party code), and the flow is
   `install_node` -> `restart_comfyui` -> `validate_workflow` again, since a running
@@ -10359,13 +10366,103 @@ def _validation_report(result: Any) -> dict | None:
     return result
 
 
-def _finding_line(finding: Any) -> str:
-    """Render one validator error/warning as a single readable clause."""
+# Caps on a `comfy validate` report relayed WHOLE to the MCP client (see
+# `validate_workflow`, the one caller — `_local_template_check` renders its own
+# one-line summaries and is already bounded by `_TEMPLATE_CHECK_MAX_FINDINGS`).
+# Such a report grows in two directions at once: one finding per mismatched
+# input, and inside each finding a `valid_options` enumerating EVERY option the
+# live catalog offers for that field — on a large install, every checkpoint or
+# LoRA by filename. A wildly mismatched workflow can therefore build a
+# multi-megabyte result that trips the client's tool-output cap and truncates
+# mid-JSON, losing every diagnostic the relay exists to preserve. Clipping drops
+# whole list ELEMENTS and never cuts a string, so what survives stays verbatim
+# and comfy-cli's own `error_count` / `warning_count` remain the true totals —
+# which is how a caller sees that anything was dropped.
+_VALIDATE_MAX_FINDINGS = 25
+_VALIDATE_MAX_OPTIONS = 25
+
+
+def _capped_finding(finding: Any) -> Any:
+    """One validator finding with its option lists bounded."""
     if not isinstance(finding, dict):
-        return str(finding)[:_MAX_ERROR_FIELD_CHARS]
-    message = str(finding.get("message") or finding.get("code") or "")[
-        :_MAX_ERROR_FIELD_CHARS
-    ]
+        return finding
+    capped = finding
+    for key in ("valid_options", "suggestions"):
+        options = capped.get(key)
+        if isinstance(options, list) and len(options) > _VALIDATE_MAX_OPTIONS:
+            capped = {
+                **capped,
+                key: options[:_VALIDATE_MAX_OPTIONS],
+                f"{key}_truncated": True,
+            }
+    return capped
+
+
+def _scrubbed_report_value(value: Any) -> Any:
+    """*value* with :func:`failure_log._scrub_text` applied to every string in it."""
+    if isinstance(value, str):
+        return failure_log._scrub_text(value)
+    if isinstance(value, list):
+        return [_scrubbed_report_value(item) for item in value]
+    if isinstance(value, dict):
+        # Keys are comfy-cli's field names, never data — only values can quote
+        # a workflow's inputs, so only values are masked.
+        return {key: _scrubbed_report_value(item) for key, item in value.items()}
+    return value
+
+
+def _relayed_validation_report(report: dict) -> dict:
+    """A ``comfy validate`` report on its way back to the MCP client.
+
+    The verdict stays comfy-cli's: ``valid``, the counts and every field are its
+    own, and nothing here decides anything about the workflow. Two MCP-side
+    concerns ride on top, both about the WIRE rather than about the answer:
+
+    * **Bounded** — findings clipped to ``_VALIDATE_MAX_FINDINGS`` and each
+      finding's option lists to ``_VALIDATE_MAX_OPTIONS``, each clip flagged with
+      a ``<key>_truncated`` marker so a caller never mistakes a clipped list for
+      the whole story. ``error_count`` / ``warning_count`` are untouched, so they
+      stay the real totals.
+    * **Masked** — every string goes through :func:`failure_log._scrub_text`, the
+      same mask ``_scrub_deps_manifest`` applies for the same reason: findings
+      quote the offending widget VALUE, and a workflow input can be a URL with
+      userinfo in it. This report goes straight into the model's transcript. The
+      mask anchors on ``https?://``, so it is a no-op on the ordinary finding —
+      and where it does fire it also drops the URL's query string, the same
+      CivitAI-``?token=`` trade every other masked path here already makes.
+
+    Order is safe either way here and clipping runs first only to save work: it
+    removes whole elements, never a partial token, so it cannot leave a URL
+    split where the scrubber can no longer anchor on it (the hazard
+    :func:`failure_log._scrubbed_stream_tail` documents for character clipping).
+    """
+    relayed = dict(report)
+    for key in ("errors", "warnings"):
+        findings = relayed.get(key)
+        if not isinstance(findings, list):
+            continue
+        if len(findings) > _VALIDATE_MAX_FINDINGS:
+            findings = findings[:_VALIDATE_MAX_FINDINGS]
+            relayed[f"{key}_truncated"] = True
+        relayed[key] = [_capped_finding(finding) for finding in findings]
+    return _scrubbed_report_value(relayed)
+
+
+def _finding_line(finding: Any) -> str:
+    """Render one validator error/warning as a single readable clause.
+
+    The message quotes the offending widget VALUE, which can be a URL with
+    userinfo in it, and this line goes to the MCP client inside a template's
+    ``local_check`` — so it gets the same mask the same findings get on
+    ``validate_workflow``'s own path. Masking runs BEFORE the clip, never after:
+    clipping mid-URL would leave the scrubber no ``https://`` to anchor on
+    (the ordering :func:`failure_log._scrubbed_stream_tail` documents).
+    """
+    if not isinstance(finding, dict):
+        return failure_log._scrub_text(str(finding))[:_MAX_ERROR_FIELD_CHARS]
+    message = failure_log._scrub_text(
+        str(finding.get("message") or finding.get("code") or "")
+    )[:_MAX_ERROR_FIELD_CHARS]
     node_id = finding.get("node_id")
     line = f"node {node_id}: {message}" if node_id else message
     suggestions = finding.get("suggestions")
@@ -10628,7 +10725,10 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     ComfyUI is not running) and is NOT a verdict — it leaves step 4 UNDONE, so
     treat it like ``check_local=False``: run ``validate_workflow(result["path"])``
     yourself once ComfyUI is up, and do not call ``run_workflow`` until something
-    has actually validated the file. That block has no ``runnable`` key, so read
+    has actually validated the file. ``validate_workflow`` RETURNS its verdict —
+    an invalid workflow comes back as ``{"valid": false, "errors": [...]}`` and
+    raises nothing — so the gate is reading its ``valid``, not the call merely
+    succeeding. That ``local_check`` block has no ``runnable`` key, so read
     it with ``.get("runnable")`` and treat a missing value as "not cleared". The
     file is written either way; passing ``check_local=False`` moves the gate onto
     you, it does not remove it.
@@ -12793,11 +12893,46 @@ def validate_workflow(workflow_path: str) -> Any:
     Wraps ``comfy validate --workflow <path>``; call it as
     ``validate_workflow(workflow_path=...)``. Checks the workflow's
     class_types, input shapes, enum values and wiring against the running
-    ComfyUI's ``object_info`` and returns the validation result — cheap
-    insurance before a slow ``run_workflow``. On an invalid workflow this
-    raises :class:`ComfyCliError` carrying comfy-cli's structured error code
-    (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
-    missing-model problem stays actionable instead of failing deep inside a run.
+    ComfyUI's ``object_info`` — cheap insurance before a slow ``run_workflow``.
+
+    **An invalid workflow is a normal RETURN, not an error.** "Does this fit my
+    install?" answered with "no, and here is why" is this tool working, so the
+    result is comfy-cli's own report either way::
+
+        {"valid": false, "error_count": 4, "warning_count": 0,
+         "errors": [{"node_id": "105:11", "field": "vae_name",
+                     "code": "unknown_enum_value",
+                     "message": "'…_vae_fp16.safetensors' not in 1 known options",
+                     "hint": "valid options include: pixel_space",
+                     "suggestions": ["pixel_space"],
+                     "valid_options": ["pixel_space"]}, …],
+         "warnings": [...], "converted_from_ui": true, "converted_node_count": 20}
+
+    Each finding names the offending ``node_id`` (subgraph-qualified as
+    ``105:11`` — instance node 105, interior node 11), the ``field``, a machine
+    ``code``, and — where comfy-cli can compute them — ``suggestions`` /
+    ``valid_options`` naming what this install actually has. That is the
+    actionable half of a missing-node or missing-model problem; relay it rather
+    than a bare "invalid". Every one of those keys is OPTIONAL — a graph-level
+    warning (``non_node_key``) has no node metadata and an unknown-node error
+    may carry no ``field`` — so index a finding with ``.get()``, never ``[]``.
+
+    Long reports are clipped for the wire: findings past the first 25, and
+    options past the first 25 inside one finding, are dropped with a
+    ``<key>_truncated: true`` marker next to what survived (``error_count`` /
+    ``warning_count`` stay comfy-cli's real totals, so they can exceed the list
+    you get). Fix what you were given and re-run the check for the rest.
+
+    So **read ``valid`` before you run anything** (``.get("valid")``, and treat a
+    missing key as "not cleared"): a successful return is NOT a pass. Raising
+    :class:`ComfyCliError` now means NO VERDICT came back — either the check
+    could not run (no ComfyUI up so no live ``object_info``, an unreadable
+    workflow file, no ``comfy`` binary) or comfy-cli failed the command without
+    producing a report (e.g. a ``workflow_unknown_nodes`` error carrying no
+    payload). So an exception is never a clean bill of health, and usually not a
+    per-node verdict either: read the error's ``code``, and where it points at
+    the server being down, start ComfyUI with ``launch_comfyui`` and re-check
+    rather than reporting the workflow as broken.
 
     Known blind spots (upstream comfy-cli, fixes in progress): a passing result
     does NOT currently guarantee the server will accept the workflow.
@@ -12829,7 +12964,38 @@ def validate_workflow(workflow_path: str) -> Any:
     # `filename` make. A dash-leading path reaches comfy-cli as a usage error (or
     # prints `--help`) that fails envelope parsing; a named error is better.
     _guard_workflow_path(workflow_path)
-    return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+    try:
+        result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+    except ComfyCliError as exc:
+        # `comfy validate` sets the envelope's `ok` to the VERDICT and leaves
+        # `error` null, carrying its full `{valid, errors, warnings}` report in
+        # `data` — so "this workflow does not fit your install" arrives here as
+        # a failure whose payload is the answer that was asked for. Relaying it
+        # is the whole point of the call: the per-node findings live in `data`
+        # and `error` holds NONE of them, so raising rendered an unknown-coded,
+        # empty-messaged error and discarded 100% of the diagnostics.
+        # Same discriminator `_local_template_check` already uses on the same
+        # verb: only a real report (a boolean `valid` plus an `errors` list)
+        # counts. Anything else — the `None` a load failure raises with, an
+        # unreachable node catalog, a drifted payload — never compared the
+        # workflow against anything, so it stays a raise rather than becoming
+        # an invented verdict.
+        report = _validation_report(exc.data)
+        # …and the shape alone is not enough: this path relays a NEGATIVE verdict
+        # only. `ok` mirrors `valid`, so a failed envelope claiming `valid: true`
+        # is a contradiction — drift, or a stale/partial payload riding along
+        # with a real error like `comfyui_unreachable` — and relaying it would
+        # turn that failure into an affirmative PASS at the gate this docstring
+        # tells agents to trust before `run_workflow`. A genuine pass can only
+        # arrive down the success path below, so here it stays a raise.
+        if report is None or report["valid"]:
+            raise
+        return _relayed_validation_report(report)
+    # Bounded and credential-masked on BOTH paths: one tool, one return shape.
+    # A drifted success payload is passed through untouched, as before — there
+    # is nothing here that knows what to bound in it.
+    report = _validation_report(result)
+    return result if report is None else _relayed_validation_report(report)
 
 
 @mcp.tool()
