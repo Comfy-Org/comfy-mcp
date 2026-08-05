@@ -170,7 +170,13 @@ flows:
   `definitions.subgraphs` — tweak it through `set_workflow_slot` /
   `run_template(params=...)` like any other template.
 - When custom nodes or models may be missing, pre-flight with `validate_workflow`
-  before running. A missing node PACK is not a dead end: `install_node(names=[...])`
+  before running. It RETURNS its verdict rather than raising it, so read
+  `.get("valid")` — a successful call is not a pass — and act on the per-node
+  `errors` (each names a `node_id`, the offending `field`, and often
+  `suggestions` / `valid_options` naming what this install actually has). An
+  exception from it means the check could not run at all (usually: ComfyUI is
+  not up), which is not a verdict about the workflow.
+  A missing node PACK is not a dead end: `install_node(names=[...])`
   installs it from the registry (registry pack ids, never URLs; the USER is asked
   to confirm every call because it runs third-party code), and the flow is
   `install_node` -> `restart_comfyui` -> `validate_workflow` again, since a running
@@ -10224,7 +10230,10 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     ComfyUI is not running) and is NOT a verdict — it leaves step 4 UNDONE, so
     treat it like ``check_local=False``: run ``validate_workflow(result["path"])``
     yourself once ComfyUI is up, and do not call ``run_workflow`` until something
-    has actually validated the file. That block has no ``runnable`` key, so read
+    has actually validated the file. ``validate_workflow`` RETURNS its verdict —
+    an invalid workflow comes back as ``{"valid": false, "errors": [...]}`` and
+    raises nothing — so the gate is reading its ``valid``, not the call merely
+    succeeding. That ``local_check`` block has no ``runnable`` key, so read
     it with ``.get("runnable")`` and treat a missing value as "not cleared". The
     file is written either way; passing ``check_local=False`` moves the gate onto
     you, it does not remove it.
@@ -12378,11 +12387,34 @@ def validate_workflow(workflow_path: str) -> Any:
     Wraps ``comfy validate --workflow <path>``; call it as
     ``validate_workflow(workflow_path=...)``. Checks the workflow's
     class_types, input shapes, enum values and wiring against the running
-    ComfyUI's ``object_info`` and returns the validation result — cheap
-    insurance before a slow ``run_workflow``. On an invalid workflow this
-    raises :class:`ComfyCliError` carrying comfy-cli's structured error code
-    (e.g. ``workflow_unknown_nodes``) and message, so a missing-node or
-    missing-model problem stays actionable instead of failing deep inside a run.
+    ComfyUI's ``object_info`` — cheap insurance before a slow ``run_workflow``.
+
+    **An invalid workflow is a normal RETURN, not an error.** "Does this fit my
+    install?" answered with "no, and here is why" is this tool working, so the
+    result is comfy-cli's own report either way::
+
+        {"valid": false, "error_count": 4, "warning_count": 0,
+         "errors": [{"node_id": "105:11", "field": "vae_name",
+                     "code": "unknown_enum_value",
+                     "message": "'…_vae_fp16.safetensors' not in 1 known options",
+                     "hint": "valid options include: pixel_space",
+                     "suggestions": ["pixel_space"],
+                     "valid_options": ["pixel_space"]}, …],
+         "warnings": [...], "converted_from_ui": true, "converted_node_count": 20}
+
+    Each finding names the offending ``node_id`` (subgraph-qualified as
+    ``105:11`` — instance node 105, interior node 11), the ``field``, a machine
+    ``code``, and — where comfy-cli can compute them — ``suggestions`` /
+    ``valid_options`` naming what this install actually has. That is the
+    actionable half of a missing-node or missing-model problem; relay it rather
+    than a bare "invalid".
+
+    So **read ``valid`` before you run anything** (``.get("valid")``, and treat a
+    missing key as "not cleared"): a successful return is NOT a pass. Raising
+    :class:`ComfyCliError` now means the CHECK COULD NOT RUN — no ComfyUI up so
+    no live ``object_info``, an unreadable workflow file, no ``comfy`` binary.
+    That is not a verdict about the workflow: start ComfyUI with
+    ``launch_comfyui`` and re-check instead of reporting the workflow as broken.
 
     Known blind spots (upstream comfy-cli, fixes in progress): a passing result
     does NOT currently guarantee the server will accept the workflow.
@@ -12414,7 +12446,26 @@ def validate_workflow(workflow_path: str) -> Any:
     # `filename` make. A dash-leading path reaches comfy-cli as a usage error (or
     # prints `--help`) that fails envelope parsing; a named error is better.
     _guard_workflow_path(workflow_path)
-    return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+    try:
+        return _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+    except ComfyCliError as exc:
+        # `comfy validate` sets the envelope's `ok` to the VERDICT and leaves
+        # `error` null, carrying its full `{valid, errors, warnings}` report in
+        # `data` — so "this workflow does not fit your install" arrives here as
+        # a failure whose payload is the answer that was asked for. Relaying it
+        # is the whole point of the call: the per-node findings live in `data`
+        # and `error` holds NONE of them, so raising rendered an unknown-coded,
+        # empty-messaged error and discarded 100% of the diagnostics.
+        # Same discriminator `_local_template_check` already uses on the same
+        # verb: only a real report (a boolean `valid` plus an `errors` list)
+        # counts. Anything else — the `None` a load failure raises with, an
+        # unreachable node catalog, a drifted payload — never compared the
+        # workflow against anything, so it stays a raise rather than becoming
+        # an invented verdict.
+        report = _validation_report(exc.data)
+        if report is None:
+            raise
+        return report
 
 
 @mcp.tool()

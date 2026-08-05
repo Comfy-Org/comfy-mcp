@@ -1675,7 +1675,12 @@ def test_validate_workflow_returns_results_for_valid(patched_run):
 
 
 def test_validate_workflow_raises_with_error_code(patched_run):
-    """An invalid workflow surfaces comfy-cli's structured error code, not a swallow."""
+    """A failure with NO report payload keeps raising comfy-cli's error code.
+
+    The complement of the invalid-workflow case below: `error` populated and no
+    `data` is comfy-cli saying the command failed, not that the workflow is
+    invalid — there is no verdict to relay, so the structured code must survive.
+    """
     patched_run(
         {
             "type": "envelope",
@@ -1688,6 +1693,95 @@ def test_validate_workflow_raises_with_error_code(patched_run):
     )
 
     with pytest.raises(server.ComfyCliError, match="workflow_unknown_nodes"):
+        server.validate_workflow("broken.json")
+
+
+# comfy-cli's real `validate` failure shape: `ok` mirrors the VERDICT, `error`
+# is null, and the whole report rides in `data` — findings and all.
+_INVALID_REPORT = {
+    "valid": False,
+    "error_count": 1,
+    "warning_count": 0,
+    "errors": [
+        {
+            "node_id": "105:11",
+            "field": "vae_name",
+            "code": "unknown_enum_value",
+            "message": "'other_vae.safetensors' not in 1 known options for vae_name",
+            "hint": "valid options include: pixel_space",
+            "suggestions": ["pixel_space"],
+            "valid_options": ["pixel_space"],
+        }
+    ],
+    "warnings": [],
+    "converted_from_ui": True,
+    "converted_node_count": 20,
+}
+
+
+def test_validate_workflow_returns_the_report_for_an_invalid_workflow(patched_run):
+    """`valid: false` comes back as a RESULT, with every finding intact.
+
+    "This workflow does not fit your install" is the answer the tool was asked
+    for, not a CLI failure. Raising discarded the whole report — the envelope's
+    `error` is null here, so the raise rendered `[unknown]` with an empty
+    message and 100% of the diagnostics were lost.
+    """
+    calls = patched_run(envelope(ok=False, data=_INVALID_REPORT))
+
+    result = server.validate_workflow("broken.json")
+
+    assert result == _INVALID_REPORT
+    # The per-node detail an agent acts on has to survive verbatim.
+    assert result["errors"][0]["node_id"] == "105:11"
+    assert result["errors"][0]["suggestions"] == ["pixel_space"]
+    assert calls[0]["cmd"][4:] == ["validate", "--workflow", "broken.json"]
+
+
+def test_validate_workflow_prefers_the_report_over_an_error_object(patched_run):
+    """A report in `data` wins even when `error` is also populated.
+
+    The report is strictly the richer answer — same verdict, plus the per-node
+    findings the error object has no room for — so it is what gets relayed.
+    """
+    patched_run(
+        {
+            **envelope(ok=False, data=_INVALID_REPORT),
+            "error": {"code": "workflow_unknown_nodes", "message": "Unknown node"},
+        }
+    )
+
+    assert server.validate_workflow("broken.json") == _INVALID_REPORT
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, "nope", {"errors": []}, {"valid": False}, {"valid": "false", "errors": []}],
+    ids=[
+        "no-payload-at-all",
+        "payload-is-not-a-dict",
+        "no-boolean-valid",
+        "no-errors-list",
+        "valid-is-a-string",
+    ],
+)
+def test_validate_workflow_raises_when_the_payload_is_not_a_report(
+    patched_run, payload
+):
+    """Only a REAL report is relayed; anything else stays a failure.
+
+    A drifted or absent payload means comfy-cli never compared the workflow
+    against the live catalog, and inventing `valid: false` out of that would
+    tell a user their workflow is broken when the truth is "could not check".
+    """
+    patched_run(
+        {
+            **envelope(ok=False, data=payload),
+            "error": {"code": "comfyui_unreachable", "message": "no object_info"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError, match="comfyui_unreachable"):
         server.validate_workflow("broken.json")
 
 
