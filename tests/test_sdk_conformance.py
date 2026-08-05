@@ -34,6 +34,7 @@ import test_partner_generate
 import test_run_template
 import test_run_workflow_spend
 import test_switch_version
+import test_untracked_kill
 import test_update_consent
 from mcp.server.mcpserver import Context
 from mcp.server.session import ServerSession
@@ -68,8 +69,9 @@ def _params(func) -> list[tuple[str, bool]]:
 
 
 # Every fake standing in for the real `Context.elicit`. One per consent gate: the
-# three spend gates, the version switch, `update_comfyui`'s node-pack gate, and
-# the network-exposure gate on the launch pair. Each entry is the class itself —
+# three spend gates, the version switch, `update_comfyui`'s node-pack gate, the
+# network-exposure gate on the launch pair, and `restart_comfyui`'s
+# untracked-server kill. Each entry is the class itself —
 # `_label` says where it lives.
 _ELICIT_FAKES = [
     test_install_node._FakeCtx,
@@ -78,13 +80,15 @@ _ELICIT_FAKES = [
     test_run_template._FakeCtx,
     test_run_workflow_spend._FakeCtx,
     test_switch_version._FakeCtx,
+    test_untracked_kill._FakeCtx,
     test_update_consent._FakeCtx,
 ]
 
 # Only the doubles that stand in for a context which also carries progress: the
 # two STREAMING run verbs hand the same object to the prompt and to the run. The
-# `switch_version` / `update_consent` / `install_node` / `network_exposure`
-# fakes have no `report_progress` because none of those tools stream, so
+# `switch_version` / `update_consent` / `install_node` / `network_exposure` /
+# `untracked_kill` fakes have no `report_progress` because none of those tools
+# stream, so
 # registering them here would assert a method their production path never calls.
 _PROGRESS_FAKES = [
     conftest._RecordingCtx,
@@ -99,6 +103,7 @@ _SESSION_FAKES = [
     test_run_template._FakeSession,
     test_run_workflow_spend._FakeSession,
     test_switch_version._FakeSession,
+    test_untracked_kill._FakeSession,
     test_update_consent._FakeSession,
 ]
 

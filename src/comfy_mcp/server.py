@@ -8263,6 +8263,12 @@ def _lifecycle_slot(action: str):
     caller cannot see (up to 180s for a launch, ~240s for a restart) and present
     as a hang, and a launch that waited its turn would only go on to lose the
     port anyway. Naming what is happening lets the caller decide.
+
+    A restart that hits the untracked-server gate holds the slot for longer than
+    its subprocesses: it stops mid-sequence to ask the USER, bounded by
+    :data:`_KILL_CONSENT_WAIT`. That is deliberate — dropping the slot to ask is
+    exactly the gap a concurrent ``stop_comfyui`` slips into — and it is why the
+    refusal below quotes the longer worst case rather than the subprocess one.
     """
     if not _LIFECYCLE_LOCK.acquire(blocking=False):
         raise ComfyCliError(
@@ -8270,8 +8276,9 @@ def _lifecycle_slot(action: str):
             "or restart is already in flight in this server. They share "
             "comfy-cli's single recorded server and the ComfyUI port, so running "
             "two at once can leave a server comfy-cli cannot stop. Wait for the "
-            "in-flight call to return (up to ~4 minutes for a restart) and call "
-            "again; `server_info` reports what is running meanwhile."
+            "in-flight call to return (up to ~4 minutes for a restart, or ~10 if "
+            "it is waiting for you to answer a confirmation) and call again; "
+            "`server_info` reports what is running meanwhile."
         )
     try:
         yield
@@ -8499,14 +8506,30 @@ def _suggested_relaunch_args(extra_args: list[str] | None, port: int) -> list[st
     return [*kept, "--port", str(port)]
 
 
-def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
+def _untracked_server_guidance(
+    extra_args: list[str] | None = None,
+    listener: _UntrackedListener | None = None,
+    refusal: str = "",
+) -> str:
     """Explain a port clash that followed a stop with nothing recorded to stop.
 
     Together those two facts identify a server that is running but was not
     started by comfy-cli, which the bare "port already in use" text does not
-    explain on its own. comfy-cli will not kill a process it did not start
-    (``stop_comfyui``'s ownership semantics), so the way out is the user's own
-    shell or a different port — this server exposes no stop-by-port/pid tool.
+    explain on its own.
+
+    Two shapes, and which one is used says how much this server actually KNOWS:
+
+    * ``listener is None`` — nothing identified what is on the port (comfy-cli
+      predates ``comfy stop --port``, refused to vouch for the listener, or a
+      remote target rules the probe out). The message hedges, because it is a
+      guess: something is serving the port and comfy-cli did not start it.
+    * ``listener`` present — ``comfy stop --port <p> --dry-run`` positively
+      identified a ComfyUI, so the message NAMES it (pid, port, command line)
+      and points at the two routes that can actually recycle it: approving the
+      confirmation prompt on a retry, or running ``comfy stop --port <p>``
+      directly. ``refusal`` says why this call did not, and is the only part
+      that varies between a decline, an unanswered prompt, and a client that
+      could not be asked.
     """
     suggested = _ALT_PORT_SUGGESTION
     if _requested_port(extra_args) == suggested:
@@ -8514,19 +8537,346 @@ def _untracked_server_guidance(extra_args: list[str] | None = None) -> str:
     rendered = json.dumps(_suggested_relaunch_args(extra_args, suggested))
     if len(rendered) > _MAX_SUGGESTED_ARGS_LEN:
         rendered = json.dumps(["--port", str(suggested)])
-    return (
-        "Something is already serving this port, but comfy-cli has no record of "
-        "launching it — so there was nothing for the restart to stop, and the fresh "
-        "launch then hit the occupied port. That server was almost certainly started "
-        "outside comfy-cli (a foreground `comfy launch`, the ComfyUI desktop app, or "
-        "`python main.py`), and comfy-cli only ever stops a server it started itself. "
-        "Either stop it the way you started it and retry, or bring one up alongside it "
-        f"on some free port, e.g. restart_comfyui(extra_args={rendered}). "
+    alongside = (
+        "bring one up alongside it on some free port, e.g. "
+        f"restart_comfyui(extra_args={rendered}). "
         "`server_info` shows what is answering right now."
+    )
+    if listener is None:
+        return (
+            "Something is already serving this port, but comfy-cli has no record of "
+            "launching it — so there was nothing for the restart to stop, and the fresh "
+            "launch then hit the occupied port. That server was almost certainly started "
+            "outside comfy-cli (a foreground `comfy launch`, the ComfyUI desktop app, or "
+            "`python main.py`), and comfy-cli only ever stops a server it started itself. "
+            f"Either stop it the way you started it and retry, or {alongside}"
+        )
+    trailer = f"{refusal} " if refusal else ""
+    return (
+        f"Port {listener.port} is held by pid {listener.pid}, which comfy-cli "
+        f"identified as a ComfyUI it did not start: `{listener.display_cmdline()}`. "
+        "That is why there was nothing for the restart to stop and the fresh launch "
+        f"then hit the occupied port. {trailer}"
+        "To recycle that server, call restart_comfyui again and approve the "
+        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        f"Otherwise {alongside}"
     )
 
 
-def _restart_comfyui_sync(extra_args: list[str]) -> Any:
+# --- the gated kill of a VERIFIED untracked server --------------------------
+#
+# The composition `restart_comfyui` reaches for once its port-clash signature
+# fires. It is still two `_run_comfy` passthroughs and nothing else: comfy-cli's
+# `stop --port <p> --dry-run` decides WHETHER the listener is a ComfyUI and WHO
+# it is, and `stop --port <p>` does the killing. What lives here is only the MCP
+# half comfy-cli cannot express — raising its y/N over elicitation — plus the
+# decision to ask at all.
+
+
+class _UntrackedListener(NamedTuple):
+    """The process ``comfy stop --port <p> --dry-run`` vouched for.
+
+    Its identity is the entire point of the gate: today's error can only say
+    "something" is on the port, so a user routed to a shell reaches for `kill`
+    with nothing verified at all. A prompt naming the pid, the port, and the
+    command line is the stronger safety property, and every field here comes
+    from comfy-cli's own verdict rather than from anything derived in this repo.
+    """
+
+    pid: int
+    port: int
+    #: The listener's argv joined for display. Raw, foreign-process text — see
+    #: :meth:`display_cmdline` before putting it in front of a user.
+    cmdline: str
+
+    def display_cmdline(self) -> str:
+        """The command line, neutralized for a markdown code span.
+
+        This is another process's argv, so it is exactly the untrusted text
+        :func:`_display_caller_text` exists for: a backtick in it would close
+        the span in the confirmation prompt and let the rest render as markdown,
+        redressing the very question the user is answering.
+        """
+        return (
+            _display_caller_text(self.cmdline, _ELICIT_CMDLINE_DISPLAY_MAX)
+            or "<unreadable command line>"
+        )
+
+
+# `comfy stop --port` walks the process table, HTTP-probes the listener, and then
+# kills a tree — far more than the recorded-pid `comfy stop`, but still nothing
+# like a launch. The dry run shares the bound: it does all of that work except the
+# kill.
+_STOP_PORT_TIMEOUT = 60.0
+
+# Cap on how much of the listener's command line is echoed into the prompt. Longer
+# than a model name or a path because a ComfyUI argv legitimately carries several
+# flags, and the flags are part of "is this the server I think it is?".
+_ELICIT_CMDLINE_DISPLAY_MAX = 160
+
+
+def _remote_target_configured() -> bool:
+    """Whether this session points at a ComfyUI somewhere other than the default.
+
+    The kill gate is skipped entirely when it does. The lifecycle verbs are
+    local-only (``comfy stop`` / ``launch`` take no ``--host``), so a session
+    configured with ``COMFYUI_URL`` / ``COMFYUI_HOST`` is one where the port the
+    user has in mind and the port ``restart_comfyui`` is fighting over are not
+    obviously the same thing — and "obviously" is the bar for killing someone's
+    process. Falling back to the guidance error costs an explanation; guessing
+    wrong costs a running server.
+
+    Fails CLOSED: a set-but-malformed value raises out of :func:`_comfy_target`,
+    and that is read as "configured", not as "local".
+    """
+    try:
+        return _comfy_target() is not None
+    except Exception:  # noqa: BLE001 - unreadable config must not unlock a kill
+        return True
+
+
+def _kill_target_port(extra_args: list[str] | None) -> int | None:
+    """The port this may offer to recycle, or ``None`` when it is not pinned down.
+
+    :func:`_requested_port` is best-effort and answers ``None`` in two different
+    situations: no ``--port`` was passed at all — where comfy-cli's own default
+    is the right answer and the clash really was on 8188 — and a ``--port`` that
+    was passed but could not be read. Only the first may fall back to the
+    default. Guessing 8188 for the second would show the user a process on a port
+    they never asked about, and an approval would kill it.
+    """
+    port = _requested_port(extra_args)
+    if port is not None:
+        return port
+    asked = any(
+        isinstance(arg, str) and (arg == "--port" or arg.startswith("--port="))
+        for arg in extra_args or []
+    )
+    return None if asked else DEFAULT_COMFYUI_PORT
+
+
+def _verified_untracked_listener(port: int) -> _UntrackedListener | None:
+    """Ask comfy-cli what is on ``port``, or ``None`` if it will not vouch for it.
+
+    Thin read of ``comfy stop --port <p> --dry-run``, which reports the process
+    it WOULD stop and exits 0 without stopping it. Every judgment stays in the
+    engine: this never looks at the process table, and a payload that does not
+    positively assert ``verified`` **and** ``dry_run`` is treated as no answer.
+
+    ``None`` on any failure, deliberately, because this is also the capability
+    probe. A comfy-cli predating ``comfy stop --port`` rejects the option while
+    parsing, which arrives here as a :class:`ComfyCliError` like any other
+    refusal — so an older engine simply never offers the kill and the caller
+    falls back to the guidance error it has always raised. There is nothing to
+    special-case and no version to compare.
+    """
+    try:
+        data = _run_comfy(
+            "stop", "--port", str(port), "--dry-run", timeout=_STOP_PORT_TIMEOUT
+        )
+    except (ComfyCliError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # `dry_run` is checked alongside `verified` so a payload that is NOT a dry
+    # run can never be read as one: this branch is reached only after a launch
+    # already failed, and mistaking a real stop's envelope for a dry run would
+    # have us prompt about a process that is already dead.
+    if data.get("verified") is not True or data.get("dry_run") is not True:
+        return None
+    pid = data.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    raw = data.get("cmdline")
+    cmdline = " ".join(part for part in raw if isinstance(part, str)) if raw else ""
+    return _UntrackedListener(pid=pid, port=port, cmdline=cmdline)
+
+
+class KillUntrackedApproval(BaseModel):
+    """What the client returns from the untracked-server confirmation prompt.
+
+    Same affirmative-answer design as :class:`SpendApproval` and
+    :class:`VersionSwitchApproval`, for the same reason: an accept that never
+    actually answered lands on the ``False`` default and is treated as a refusal.
+    """
+
+    approve: bool = Field(
+        default=False,
+        title="Stop the server already on this port?",
+        description=(
+            "Yes stops the process you were shown and then restarts ComfyUI on "
+            "that port. No leaves it running and cancels the restart."
+        ),
+    )
+
+
+_KILL_UNTRACKED_APPROVAL_WORDING = _ApprovalWording(
+    subject="stopping the untracked server",
+    what="stopping the server holding the port",
+    # The reassurance this gate needs is unusually specific, because the prompt
+    # is raised MID-SEQUENCE: a restart's stop half has already run. It was a
+    # no-op — comfy-cli had nothing recorded to stop, which is half of the
+    # signature that got us here — so the running server really is untouched.
+    nothing_done="Nothing was stopped; the server holding the port is still running.",
+    # Filled in per call by `_kill_untracked_wording` so the command names the
+    # real port. This default is the honest fallback if it ever is not.
+    escape_hatch=(
+        " If this client cannot show prompts, run `comfy stop --port <PORT>` in a "
+        "terminal instead."
+    ),
+)
+
+
+def _kill_untracked_wording(port: int) -> _ApprovalWording:
+    """:data:`_KILL_UNTRACKED_APPROVAL_WORDING` with the port in its escape hatch.
+
+    The other gates' escape hatches name a command whose argument the user
+    already knows (the version they asked for). Here the port is something this
+    server worked out, so spelling it into the command is the difference between
+    a route and a homework problem. ``port`` is an int, so nothing caller-shaped
+    reaches the string.
+    """
+    return _KILL_UNTRACKED_APPROVAL_WORDING._replace(
+        escape_hatch=(
+            " If this client cannot show prompts, run "
+            f"`comfy stop --port {port}` in a terminal instead."
+        )
+    )
+
+
+class _KillDecision(NamedTuple):
+    """Whether the untracked server may be stopped, and why not when it may not.
+
+    ``reason`` exists because this gate's refusal is not a raise: a declined kill
+    falls back to the guidance error the restart has always produced, and that
+    error is more useful for saying which refusal it was (a "no", an unanswered
+    prompt, a client that could not be asked).
+    """
+
+    approved: bool
+    reason: str
+
+
+async def _elicit_kill_untracked_consent(
+    ctx: Context, listener: _UntrackedListener
+) -> bool:
+    """Ask the USER to approve stopping this one process. True = approved."""
+    return await _elicit_approval(
+        ctx,
+        (
+            f"Stop the ComfyUI already running on port {listener.port} and restart "
+            f"it? Process {listener.pid}: `{listener.display_cmdline()}`. "
+            "comfy-cli did not start that server and has no record of it, so the "
+            "restart could not stop it the usual way — approving KILLS that "
+            "process (and anything it started) and then launches a fresh ComfyUI "
+            "on the same port. Any work in progress on it is lost. Approve only if "
+            "that process is yours to stop. Declining leaves it running and "
+            "cancels the restart."
+        ),
+        KillUntrackedApproval,
+        _kill_untracked_wording(listener.port),
+    )
+
+
+async def _resolve_kill_untracked_consent(
+    listener: _UntrackedListener,
+    confirm_kill_untracked: bool,
+    ctx: Context | None,
+) -> _KillDecision:
+    """Decide whether this call may stop ``listener``. Never raises.
+
+    :func:`_resolve_switch_consent`'s shape, and it keeps both of that function's
+    load-bearing properties:
+
+    1. **Elicitation wins, and is raised even when
+       ``confirm_kill_untracked=True``.** The agent host's permission to CALL
+       ``restart_comfyui`` is a different question from the user's consent to
+       kill a process this server did not start, and an "always allow this tool"
+       toggle answers only the first.
+    2. **An unknown capability counts as CAPABLE.** ``None`` from
+       :func:`_client_elicitation_support` is the probe failing, not a "no";
+       guessing "cannot elicit" would silently demote a real client onto the
+       caller's own say-so. Being wrong the other way costs a prompt that lapses
+       into a refusal at :data:`_ELICIT_TIMEOUT`, having killed nothing.
+
+    What it does NOT keep is the raise: :func:`_elicit_approval`'s fail-closed
+    errors (an unanswered prompt, a client that errored) are folded into
+    ``reason`` instead, so every refusal — decline included — surfaces as the
+    enriched guidance error rather than three differently-shaped failures.
+    """
+    if _client_elicitation_support(ctx) is not False:
+        try:
+            approved = await _elicit_kill_untracked_consent(ctx, listener)
+        except ComfyCliError as exc:
+            return _KillDecision(False, str(exc))
+        if approved:
+            return _KillDecision(True, "")
+        return _KillDecision(
+            False,
+            f"You declined to stop pid {listener.pid}, so it is still running.",
+        )
+    # Client cannot be prompted: `confirm_kill_untracked` is the documented
+    # fallback, and its `False` default is why a bare call from such a client
+    # kills nothing.
+    if confirm_kill_untracked:
+        return _KillDecision(True, "")
+    return _KillDecision(
+        False,
+        "This client cannot show a confirmation prompt, so stopping pid "
+        f"{listener.pid} requires confirm_kill_untracked=True. Ask the USER "
+        "first — it kills that process and anything it started — and pass it "
+        "only once they have actually agreed, never just to clear this error.",
+    )
+
+
+# Ceiling on how long the restart's worker thread waits for the event loop to
+# answer the consent prompt. `_elicit_approval` already bounds the prompt itself
+# at `_ELICIT_TIMEOUT`; this is the outer guard for the case where the loop never
+# runs the coroutine at all (a client that vanished, a cancelled request), which
+# would otherwise park a worker thread AND the lifecycle lock indefinitely.
+_KILL_CONSENT_WAIT = _ELICIT_TIMEOUT + 30.0
+
+
+def _kill_consent_from_thread(
+    loop: asyncio.AbstractEventLoop,
+    ctx: Context | None,
+    confirm_kill_untracked: bool,
+    listener: _UntrackedListener,
+) -> _KillDecision:
+    """Run the consent coroutine on ``loop`` from the restart's worker thread.
+
+    The one place this server asks a question from off the event loop, and it is
+    structural rather than a shortcut: the clash is only DISCOVERABLE after the
+    stop half has run, the whole stop-then-launch sequence holds
+    :func:`_lifecycle_slot` — a per-thread reentrant lock — and hopping back to
+    the loop to ask would mean dropping that slot mid-sequence, which is exactly
+    the gap a concurrent ``stop_comfyui`` slips into. So the worker keeps the
+    slot and blocks here while the loop, which is idle awaiting this very
+    ``to_thread`` call, raises the prompt.
+
+    Fails CLOSED, like every other consent path: a loop that will not take the
+    coroutine, or one that never answers, is "not approved" with the reason said
+    out loud, not an approval and not a crash on top of the port error.
+    """
+    coro = _resolve_kill_untracked_consent(listener, confirm_kill_untracked, ctx)
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+    except RuntimeError as exc:  # loop already closed / not running
+        coro.close()
+        return _KillDecision(False, f"The confirmation could not be raised ({exc}).")
+    try:
+        return future.result(timeout=_KILL_CONSENT_WAIT)
+    except Exception as exc:  # noqa: BLE001 - any failure here is a refusal
+        future.cancel()
+        return _KillDecision(
+            False, f"The confirmation prompt could not be completed ({exc})."
+        )
+
+
+def _restart_comfyui_sync(
+    extra_args: list[str],
+    kill_approver: Callable[[_UntrackedListener], _KillDecision] | None = None,
+) -> Any:
     """The stop-then-launch sequence, with no consent gate of its own.
 
     Runs on ONE worker thread so the two blocking subprocess calls stay off the
@@ -8538,13 +8888,20 @@ def _restart_comfyui_sync(extra_args: list[str]) -> Any:
     same reentrant lock, which on this thread is already held.
 
     Like :func:`_launch_comfyui_sync` it trusts its caller to have guarded
-    ``extra_args`` and resolved consent first.
+    ``extra_args`` and resolved consent first — except for the ONE consent that
+    cannot be resolved first, the untracked-server kill, whose trigger is only
+    discoverable after the stop half has run. ``kill_approver`` is how that gate
+    is raised from in here without leaving the slot; ``None`` disables the kill
+    path entirely and restores the pre-existing stop-then-launch behavior.
     """
     with _lifecycle_slot("restart"):
-        return _restart_comfyui_locked(extra_args)
+        return _restart_comfyui_locked(extra_args, kill_approver)
 
 
-def _restart_comfyui_locked(extra_args: list[str]) -> Any:
+def _restart_comfyui_locked(
+    extra_args: list[str],
+    kill_approver: Callable[[_UntrackedListener], _KillDecision] | None = None,
+) -> Any:
     """The stop-then-launch body, run with the lifecycle slot already held."""
     nothing_to_stop = False
     try:
@@ -8562,8 +8919,83 @@ def _restart_comfyui_locked(extra_args: list[str]) -> Any:
         # second ComfyUI), so it keeps its original message untouched.
         if not nothing_to_stop or not _PORT_IN_USE_TEXT_RE.search(str(exc)):
             raise
+        return _offer_untracked_kill(exc, extra_args, kill_approver)
+
+
+def _offer_untracked_kill(
+    clash: ComfyCliError,
+    extra_args: list[str],
+    kill_approver: Callable[[_UntrackedListener], _KillDecision] | None,
+) -> Any:
+    """Identify the server holding the port, ask, and on a yes recycle it.
+
+    Runs with the lifecycle slot still held (see
+    :func:`_kill_consent_from_thread` for why that matters) and only after
+    :func:`_restart_comfyui_locked` has matched both halves of the untracked
+    signature. Every exit that does not kill anything raises ``clash`` with the
+    guidance appended, which is what this whole branch did before it could ask.
+    """
+    port = _kill_target_port(extra_args)
+    listener = None
+    refusal = ""
+    if kill_approver is not None and port is not None:
+        if not _remote_target_configured():
+            listener = _verified_untracked_listener(port)
+    if listener is not None:
+        decision = kill_approver(listener)
+        if decision.approved:
+            return _recycle_untracked_server(clash, extra_args, listener)
+        refusal = decision.reason
+    raise ComfyCliError(
+        f"{clash}\n\n{_untracked_server_guidance(extra_args, listener, refusal)}",
+        code=clash.code,
+        no_envelope=clash.no_envelope,
+        returncode=clash.returncode,
+        timed_out=clash.timed_out,
+    ) from clash
+
+
+def _recycle_untracked_server(
+    clash: ComfyCliError, extra_args: list[str], listener: _UntrackedListener
+) -> Any:
+    """Stop the approved listener, then retry the launch ONCE.
+
+    Once, not until-it-works: ``comfy stop --port`` already confirms the port
+    came free before reporting success, so a second clash is a different problem
+    (something else grabbed the port, a supervisor restarted the server) and
+    looping on it would keep killing processes the user approved once.
+
+    The pid the user approved is NOT what gets killed — the port is. That closes
+    the window between the dry run and here, in which the listener could have
+    exited and its pid been recycled onto something else: ``comfy stop --port``
+    re-finds and re-verifies the listener itself, so a port that has changed
+    hands since the prompt is refused by the engine (``unverified_process``)
+    rather than killed on a stale identity.
+    """
+    try:
+        _run_comfy("stop", "--port", str(listener.port), timeout=_STOP_PORT_TIMEOUT)
+    except (ComfyCliError, OSError, UnicodeDecodeError) as exc:
         raise ComfyCliError(
-            f"{exc}\n\n{_untracked_server_guidance(extra_args)}",
+            f"{clash}\n\nYou approved stopping pid {listener.pid} on port "
+            f"{listener.port}, but comfy-cli could not stop it: {exc} Nothing was "
+            "restarted, and that server is most likely still running — "
+            "`server_info` shows what is answering right now.",
+            code=getattr(exc, "code", None),
+            no_envelope=getattr(exc, "no_envelope", False),
+            returncode=getattr(exc, "returncode", None),
+            timed_out=getattr(exc, "timed_out", False),
+        ) from exc
+    try:
+        return _launch_comfyui_sync(extra_args)
+    except ComfyCliError as exc:
+        # The kill is not undoable, so the retry's failure must say it happened.
+        # Silently re-raising the launch error would leave a user believing the
+        # server they approved stopping is still up.
+        raise ComfyCliError(
+            f"{exc}\n\nThe untracked ComfyUI on port {listener.port} (pid "
+            f"{listener.pid}) WAS stopped first, as you approved — it is gone. "
+            "This is the fresh launch failing on its own; retry "
+            "restart_comfyui once the cause is cleared.",
             code=exc.code,
             no_envelope=exc.no_envelope,
             returncode=exc.returncode,
@@ -8575,6 +9007,7 @@ def _restart_comfyui_locked(extra_args: list[str]) -> Any:
 async def restart_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
+    confirm_kill_untracked: bool = False,
     ctx: Context | None = None,
 ) -> Any:
     """Restart the LOCAL ComfyUI server: stop the running one, then launch a fresh one.
@@ -8605,17 +9038,40 @@ async def restart_comfyui(
     permission error, a comfy-cli malfunction) is re-raised rather than silently
     masked behind the launch.
 
-    When that benign stop is followed by a launch that loses the port, the port
-    error is re-raised with an explanation of the combined situation: a server is
-    running that comfy-cli did not start and therefore cannot stop.
+    When that benign stop is followed by a launch that loses the port, a server
+    is running that comfy-cli did not start. This asks comfy-cli what that server
+    is — ``comfy stop --port <p> --dry-run``, which reports the process it WOULD
+    stop without stopping it — and if it can positively identify a ComfyUI, it
+    offers to recycle it: the USER is shown that process's **pid, command line
+    and port** and asked, and only on a yes is it stopped (``comfy stop --port
+    <p>``) and the launch retried once. Declining, an engine that will not vouch
+    for the listener, and a comfy-cli too old to have ``comfy stop --port`` all
+    land on the same port error as before — enriched with whatever identity the
+    dry run did establish.
+
+    That confirmation necessarily comes MID-SEQUENCE, since the clash is only
+    discoverable after the stop. It is safe to decline there because the stop
+    half was a no-op — comfy-cli had nothing recorded to stop, which is half of
+    what identifies this situation — so a "no" leaves the running server exactly
+    as it was. ``confirm_kill_untracked`` is the fallback for a client that
+    cannot show prompts; like every other confirm flag it grants nothing on a
+    client that CAN be prompted, and its ``False`` default is why a bare call
+    kills nothing. The equivalent outside this server is ``comfy stop --port
+    <p>`` in a terminal.
+
+    Sessions pointed at a remote ComfyUI (``COMFYUI_URL`` / ``COMFYUI_HOST``)
+    never reach that path: the lifecycle verbs are local-only, so which machine's
+    port is in question stops being obvious, and the kill gate is skipped rather
+    than guessed at.
 
     **One lifecycle call at a time.** The stop and the launch run inside a single
     ``_LIFECYCLE_LOCK`` slot, so a ``launch_comfyui`` / ``stop_comfyui`` /
     ``restart_comfyui`` arriving while this one is mid-sequence is refused
     immediately (rather than slipping into the gap between the two halves and
     racing comfy-cli's single recorded server). The whole sequence is bounded by
-    its two subprocess timeouts — ~240s worst case — so a refusal is never
-    permanent.
+    its subprocess timeouts — ~240s worst case, or ~10 minutes if it stops to ask
+    about an untracked server, since the confirmation is raised without dropping
+    the slot — so a refusal is never permanent.
     """
     guarded = _guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
@@ -8624,7 +9080,12 @@ async def restart_comfyui(
         ctx,
         action="restart",
     )
-    return await asyncio.to_thread(_restart_comfyui_sync, guarded)
+    loop = asyncio.get_running_loop()
+    return await asyncio.to_thread(
+        _restart_comfyui_sync,
+        guarded,
+        functools.partial(_kill_consent_from_thread, loop, ctx, confirm_kill_untracked),
+    )
 
 
 # The exact targets `comfy update` accepts (comfy-cli `cmdline.py`:
