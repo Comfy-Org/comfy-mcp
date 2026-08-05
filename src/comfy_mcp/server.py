@@ -3473,8 +3473,8 @@ async def _run_comfy_async(
     asyncio process, so the ``finally`` below reaps the whole tree on every exit
     path — cancellation included. Use this for a LONG-LIVED plain-JSON call (the
     legacy foreground ``model download``, ``workflow_deps``'s 300s
-    network-backed resolve); short metadata calls are fine on the thread-pool
-    path.
+    network-backed resolve, ``upload_file``'s 300s transfer); short metadata
+    calls are fine on the thread-pool path.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -13738,7 +13738,7 @@ _MAX_UPLOAD_PATHS_TOTAL_BYTES = 128 * 1024
 
 
 @mcp.tool()
-def upload_file(paths: list[str], overwrite: bool = False) -> Any:
+async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     """Upload local files into the LOCAL ComfyUI ``input`` directory.
 
     Wraps ``comfy upload <files...> [--overwrite]``. Use this to stage source
@@ -13841,7 +13841,16 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     args = ["upload", *paths]
     if overwrite:
         args.append("--overwrite")
-    return _run_comfy(*args, timeout=300.0)
+    # `_run_comfy_async`, not the thread-pool path, for the same 300s reason as
+    # `workflow_deps`: this is the other longest-lived child in the server, and
+    # `asyncio.to_thread(_run_comfy, …)`'s cancellation never reaches the
+    # thread — an MCP client that cancels or disconnects would leave the
+    # `comfy` child transferring with nobody waiting. The async runner's
+    # `finally` kills the whole process tree on every exit path, cancellation
+    # included, and killing mid-transfer is safe here: uploads are retryable
+    # (`--overwrite` exists) and a partial is just what the next attempt
+    # replaces. The result contract is `_run_comfy`'s own.
+    return await _run_comfy_async(*args, timeout=300.0)
 
 
 @mcp.tool()

@@ -175,8 +175,9 @@ event loop, enforced by ruff's `ASYNC` select. Two async runners live there:
 `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON
 twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is non-blocking,
 but cancellation never reaches the thread, so a client giving up left the
-child running. It carries the legacy foreground `model download` and
-`workflow_deps`' 300s resolve; short metadata calls stay on the thread pool. It
+child running. It carries the legacy foreground `model download`,
+`workflow_deps`' 300s resolve, and `upload_file`'s 300s transfer; short
+metadata calls stay on the thread pool. It
 caps each captured stream to `_STDERR_MAX_CHARS` (`_drain_capped_into`)
 instead of retaining everything like `communicate()`. `auth_login` is a third
 async spawn site (`_start_login`), with its own browser flow.
