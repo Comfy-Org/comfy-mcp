@@ -1371,8 +1371,9 @@ def test_cancel_download_unknown_id_raises_error_envelope(patched_run):
 
 
 # Click's usage error for a verb the installed comfy-cli does not have: exit 2,
-# no envelope. The background-download verb group ships only in releases after
-# 1.13.0, while this repo's floor is 1.12.0, so this is the COMMON path today.
+# no envelope. The background-download verb group ships in 1.14.0, which is also
+# this repo's floor, so a compliant install has all of it — this is the path a
+# build that slipped past the fail-OPEN version guard takes.
 _NO_DOWNLOAD_STATUS = (
     2,
     "",

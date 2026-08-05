@@ -486,7 +486,7 @@ def test_missing_binary_install_advice_names_the_version_floor(monkeypatch):
     assert f'pip install "comfy-cli>={server._MIN_COMFY_CLI_STR}"' in message
     # The bare form is what left users one call away from the "too old" error.
     assert "pip install comfy-cli`" not in message
-    # The single-quoted form leaves cmd.exe users with a stray `=1.13.0'` file.
+    # The single-quoted form leaves cmd.exe users with a stray `=1.14.0'` file.
     assert "'comfy-cli" not in message
 
 
@@ -551,7 +551,7 @@ def test_version_guard_raises_on_old_comfy_cli(monkeypatch):
     fake, calls = _fake_version("comfy-cli, version 1.11.0")
     monkeypatch.setattr(server.subprocess, "run", fake)
 
-    with pytest.raises(server.ComfyCliError, match=r"too old.*1\.13\.0"):
+    with pytest.raises(server.ComfyCliError, match=r"too old.*1\.14\.0"):
         server._check_comfy_version()
 
     assert calls[0] == [server.COMFY_BIN, "--version"]
@@ -573,7 +573,7 @@ def test_version_guard_blocks_run_comfy_on_old_cli(monkeypatch):
 def test_version_guard_allows_new_comfy_cli_and_memoizes(monkeypatch):
     """A comfy-cli at/above the floor passes and shells out only once."""
     monkeypatch.setattr(server, "_version_checked", False)
-    fake, calls = _fake_version("comfy-cli, version 1.13.0")
+    fake, calls = _fake_version("comfy-cli, version 1.14.0")
     monkeypatch.setattr(server.subprocess, "run", fake)
 
     server._check_comfy_version()
@@ -583,37 +583,49 @@ def test_version_guard_allows_new_comfy_cli_and_memoizes(monkeypatch):
     assert len(calls) == 1
 
 
-def test_version_guard_floor_is_exactly_the_login_url_release(monkeypatch):
-    """Pin the boundary: 1.12.0 is rejected, 1.13.0 is accepted.
+def test_version_guard_floor_is_exactly_the_tool_surface_release(monkeypatch):
+    """Pin the boundary: 1.12.0 and 1.13.0 are rejected, 1.14.0 is accepted.
 
-    1.13.0 is the first published comfy-cli carrying the machine-readable
-    `login_url` event `auth_login` blocks on (1.12.0 has no `login_url` anywhere
-    in the wheel). Without this floor, a 1.12.0 install sails past the guard and
-    only learns it cannot log in after `auth_login` burns its whole
-    `_LOGIN_URL_WAIT_S` budget spawning and reaping a child process. Pinning
-    both sides of the boundary is what stops the constant drifting back to the
-    version that gives that slow, late "no".
+    The floor started at 1.13.0, the first published comfy-cli carrying the
+    machine-readable `login_url` event `auth_login` blocks on (1.12.0 has no
+    `login_url` anywhere in the wheel) — without a floor at all, a 1.12.0 install
+    sails past the guard and only learns it cannot log in after `auth_login`
+    burns its whole `_LOGIN_URL_WAIT_S` budget spawning and reaping a child.
+
+    It moved to 1.14.0 because that is the release carrying the verbs a large
+    slice of the tool surface calls — `node deps`, `system-stats` / `free`,
+    `workflow notes`, `logs --port`, the background-download group, `models
+    search`'s cross-folder walk, the gallery TTL, and `comfy run --allow-spend`.
+    On 1.13.0 those tools are inert, so the server reads as broken rather than as
+    out-of-date, which is a worse first contact than an upgrade refusal.
+
+    Pinning every side of the boundary — including 1.13.0, the release the floor
+    used to BE — is what stops the constant drifting back to a version that gives
+    a half-working server or that slow, late "no".
     """
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
 
-    # The immediately-prior release: rejected, up front, with the upgrade line.
-    monkeypatch.setattr(server, "_version_checked", False)
-    prior, _ = _fake_version("comfy-cli, version 1.12.0")
-    monkeypatch.setattr(server.subprocess, "run", prior)
-    with pytest.raises(server.ComfyCliError) as excinfo:
-        server._check_comfy_version()
-    assert "1.12.0 is too old" in str(excinfo.value)
-    assert "comfy-cli>=1.13.0" in str(excinfo.value)
+    # Both releases below the floor: rejected, up front, with the upgrade line.
+    for below in ("1.12.0", "1.13.0"):
+        monkeypatch.setattr(server, "_version_checked", False)
+        prior, _ = _fake_version(f"comfy-cli, version {below}")
+        monkeypatch.setattr(server.subprocess, "run", prior)
+        with pytest.raises(server.ComfyCliError) as excinfo:
+            server._check_comfy_version()
+        assert f"{below} is too old" in str(excinfo.value)
+        assert "comfy-cli>=1.14.0" in str(excinfo.value)
+        # A too-old verdict is never latched, so the next iteration re-checks.
+        assert server._version_checked is False
 
     # The floor itself: accepted.
     monkeypatch.setattr(server, "_version_checked", False)
-    floor, _ = _fake_version("comfy-cli, version 1.13.0")
+    floor, _ = _fake_version("comfy-cli, version 1.14.0")
     monkeypatch.setattr(server.subprocess, "run", floor)
     server._check_comfy_version()  # no raise
     assert server._version_checked is True
 
-    assert server._MIN_COMFY_CLI == (1, 13, 0)
-    assert server._MIN_COMFY_CLI_STR == "1.13.0"
+    assert server._MIN_COMFY_CLI == (1, 14, 0)
+    assert server._MIN_COMFY_CLI_STR == "1.14.0"
 
 
 def test_auth_login_is_refused_up_front_on_a_cli_without_login_url(monkeypatch):
@@ -639,7 +651,7 @@ def test_auth_login_is_refused_up_front_on_a_cli_without_login_url(monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", never)
 
-    with pytest.raises(server.ComfyCliError, match=r"too old.*1\.13\.0"):
+    with pytest.raises(server.ComfyCliError, match=r"too old.*1\.14\.0"):
         asyncio.run(server.auth_login())
 
     assert spawned == []  # refused before any `comfy cloud login` spawn
@@ -719,14 +731,14 @@ def test_both_version_probes_go_through_the_shared_spawn(monkeypatch):
         return subprocess.CompletedProcess(
             [server.COMFY_BIN, "--version"],
             0,
-            stdout="comfy-cli, version 1.13.0\n",
+            stdout="comfy-cli, version 1.14.0\n",
             stderr="",
         )
 
     monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
 
     server._check_comfy_version()  # no raise: at the floor
-    assert server._detect_comfy_cli_version() == "1.13.0"
+    assert server._detect_comfy_cli_version() == "1.14.0"
     assert len(calls) == 2
 
 

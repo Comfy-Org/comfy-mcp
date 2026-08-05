@@ -349,7 +349,7 @@ def test_version_guard_ignores_a_healthy_comfy_cli(on_macos, monkeypatch):
         server.subprocess,
         "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(
-            cmd, 0, stdout="comfy-cli, version 1.13.0\n", stderr=""
+            cmd, 0, stdout="comfy-cli, version 1.14.0\n", stderr=""
         ),
     )
     server._check_comfy_version()
