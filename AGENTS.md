@@ -154,14 +154,15 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   `asyncio.StreamReader`s, built by conftest's `stream_reader(text, limit)`
   helper; reuse that rather than hand-rolling an awaitable, so a fake still
   exercises the reader's buffer-limit behavior.
-- `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…) -> procs` — the
-  plain-JSON *async* path (`_run_comfy_async`): same
+- `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) ->
+  procs` — the plain-JSON *async* path (`_run_comfy_async`): same
   `asyncio.create_subprocess_exec` spawn and the same real `StreamReader` pipes,
   but the capture is parsed once at the end instead of read line-by-line.
   `hang=True` leaves those pipes OPEN so the fake child never finishes, for the
   timeout/cancellation cases; its `kill()` closes them, mirroring the process-group
   kill that lets a post-kill drain reach EOF, and records `killed` so a test can
-  assert it fired.
+  assert it fired. `on_spawn(cmd)` fires at spawn, exactly as `patched_run`'s
+  does, so the one verb whose answer is a FILE writes its `--output` here too.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
@@ -174,7 +175,8 @@ contract. The twin exists for CANCELLATION, not for the event loop —
 `asyncio.to_thread(_run_comfy, …)` is already non-blocking but its cancellation
 never reaches the thread, so a long-lived call left the `comfy` child running
 when a client gave up. It carries the legacy foreground `model download` (the
-`--background`-less fallback); short metadata calls stay on the thread-pool path.
+`--background`-less fallback) and `workflow_deps` (a 300s network-backed
+resolve); short metadata calls stay on the thread-pool path.
 Reserved for the longest-lived children, it bounds each captured stream to its
 trailing `_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining
 everything `communicate()` does — the one place its contract is narrower.

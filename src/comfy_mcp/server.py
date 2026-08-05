@@ -3472,8 +3472,9 @@ async def _run_comfy_async(
     running unattended with its partial output on disk. Here the child is a real
     asyncio process, so the ``finally`` below reaps the whole tree on every exit
     path — cancellation included. Use this for a LONG-LIVED plain-JSON call (the
-    legacy foreground ``model download``); short metadata calls are fine on the
-    thread-pool path.
+    legacy foreground ``model download``, ``workflow_deps``'s 300s
+    network-backed resolve); short metadata calls are fine on the thread-pool
+    path.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -11843,8 +11844,66 @@ def _scrub_deps_manifest(manifest: dict) -> dict:
     return {**manifest, "custom_nodes": scrubbed}
 
 
+def _read_deps_manifest_bytes(out_path: str, plain: Any) -> bytes:
+    """Read the manifest ``comfy node deps-in-workflow`` wrote, bounded.
+
+    Deliberately SYNC, for ``workflow_deps`` to call through
+    ``asyncio.to_thread``: the tool is async (its 300s network-backed child rides
+    :func:`_run_comfy_async` so a cancelling client kills it), and a bare
+    ``open()`` / blocking ``read()`` in an async def is exactly what ruff's
+    ``ASYNC`` ruleset exists to reject — same offload as
+    :func:`_check_comfy_version` gets there. The three failure branches live
+    here WITH their reads because each names the operation that failed, and
+    ``plain`` rides along because two of them quote comfy-cli's printed output —
+    the only place the actual reason survives (see each branch).
+    """
+    try:
+        handle = open(out_path, "rb")
+    except OSError as exc:
+        # Exit 0 and no file is the SHAPE a failed cm-cli run arrives in, not
+        # an exotic edge: comfy-cli's `execute_cm_cli` catches a
+        # `CalledProcessError` with status 1 or 2 from Manager's `cm-cli`,
+        # prints "Execution error: …", and RETURNS — so `deps-in-workflow`
+        # finishes and exits 0 having written nothing. An unreadable workflow
+        # file and an unreachable channel both land here. cm-cli's own stderr
+        # is relayed through comfy-cli's, which is what the plain result
+        # carries, so quote that rather than reporting only the absence — it
+        # is the only place the actual reason survives.
+        raise ComfyCliError(
+            "comfy node deps-in-workflow reported success but wrote no "
+            f"dependency manifest ({exc}). comfy-cli's own output: "
+            f"{_plain_message(plain) or '<empty>'}"
+        ) from exc
+    try:
+        with handle:
+            # Read the ceiling PLUS ONE byte rather than sizing the file and
+            # reopening it. A `getsize` describes the file at a moment that
+            # is not the read: a `cm-cli` grandchild still writing, or a
+            # delayed flush, can grow it in between, so the cap would bound
+            # a number nobody acted on instead of the bytes this process
+            # actually consumes. One over the ceiling is what makes "at the
+            # limit" distinguishable from "past it" without reading more.
+            # BINARY, so the ceiling counts bytes as its name says — a text
+            # read would count decoded characters — and `json.loads` does
+            # the utf-8 decode itself.
+            raw = handle.read(_MAX_DEPS_MANIFEST_BYTES + 1)
+    except OSError as exc:
+        raise ComfyCliError(
+            "comfy node deps-in-workflow wrote a dependency manifest this "
+            f"server could not read: {exc}. comfy-cli's own output: "
+            f"{_plain_message(plain) or '<empty>'}"
+        ) from exc
+    if len(raw) > _MAX_DEPS_MANIFEST_BYTES:
+        raise ComfyCliError(
+            "comfy node deps-in-workflow wrote a dependency manifest over "
+            f"the {_MAX_DEPS_MANIFEST_BYTES}-byte maximum this server will "
+            "read back."
+        )
+    return raw
+
+
 @mcp.tool()
-def workflow_deps(workflow_path: str) -> Any:
+async def workflow_deps(workflow_path: str) -> Any:
     """Map a workflow's node classes to the node PACKS that provide them (read-only).
 
     Wraps ``comfy node deps-in-workflow``, which resolves every class the graph
@@ -11962,7 +12021,17 @@ def workflow_deps(workflow_path: str) -> Any:
             # 300s: resolving classes can make Manager fetch its node map over
             # the network on a cold cache, which is slower than the 60s the other
             # `node` tools use but nowhere near an install.
-            plain = _run_comfy(
+            #
+            # `_run_comfy_async`, not the thread-pool path, for that same 300s:
+            # this is one of the longest-lived children in the server, and
+            # `asyncio.to_thread(_run_comfy, …)`'s cancellation never reaches
+            # the thread — an MCP client that cancels or disconnects would
+            # leave the `comfy` child and its `cm-cli` grandchild fetching
+            # Manager's node map with nobody waiting. The async runner's
+            # `finally` kills the whole process tree on every exit path,
+            # cancellation included, and its result contract (including the
+            # `plain_ok` synthesis) is `_run_comfy`'s own.
+            plain = await _run_comfy_async(
                 "node",
                 "deps-in-workflow",
                 "--workflow",
@@ -11999,53 +12068,16 @@ def workflow_deps(workflow_path: str) -> Any:
                     "unsupported": True,
                 }
             raise
-        try:
-            handle = open(out_path, "rb")
-        except OSError as exc:
-            # Exit 0 and no file is the SHAPE a failed cm-cli run arrives in, not
-            # an exotic edge: comfy-cli's `execute_cm_cli` catches a
-            # `CalledProcessError` with status 1 or 2 from Manager's `cm-cli`,
-            # prints "Execution error: …", and RETURNS — so `deps-in-workflow`
-            # finishes and exits 0 having written nothing. An unreadable workflow
-            # file and an unreachable channel both land here. cm-cli's own stderr
-            # is relayed through comfy-cli's, which is what the plain result
-            # carries, so quote that rather than reporting only the absence — it
-            # is the only place the actual reason survives.
-            raise ComfyCliError(
-                "comfy node deps-in-workflow reported success but wrote no "
-                f"dependency manifest ({exc}). comfy-cli's own output: "
-                f"{_plain_message(plain) or '<empty>'}"
-            ) from exc
-        try:
-            with handle:
-                # Read the ceiling PLUS ONE byte rather than sizing the file and
-                # reopening it. A `getsize` describes the file at a moment that
-                # is not the read: a `cm-cli` grandchild still writing, or a
-                # delayed flush, can grow it in between, so the cap would bound
-                # a number nobody acted on instead of the bytes this process
-                # actually consumes. One over the ceiling is what makes "at the
-                # limit" distinguishable from "past it" without reading more.
-                # BINARY, so the ceiling counts bytes as its name says — a text
-                # read would count decoded characters — and `json.loads` does
-                # the utf-8 decode itself.
-                raw = handle.read(_MAX_DEPS_MANIFEST_BYTES + 1)
-        except OSError as exc:
-            raise ComfyCliError(
-                "comfy node deps-in-workflow wrote a dependency manifest this "
-                f"server could not read: {exc}. comfy-cli's own output: "
-                f"{_plain_message(plain) or '<empty>'}"
-            ) from exc
-        if len(raw) > _MAX_DEPS_MANIFEST_BYTES:
-            raise ComfyCliError(
-                "comfy node deps-in-workflow wrote a dependency manifest over "
-                f"the {_MAX_DEPS_MANIFEST_BYTES}-byte maximum this server will "
-                "read back."
-            )
+        # Off the event loop, because this function is async and the read is
+        # blocking I/O — the branches themselves (and why two of them quote the
+        # plain result) live with the reads in `_read_deps_manifest_bytes`.
+        raw = await asyncio.to_thread(_read_deps_manifest_bytes, out_path, plain)
         try:
             manifest = json.loads(raw)
         # `ValueError` covers `json.JSONDecodeError` AND the two well-formed-input
         # failures a bare decode-error tuple would miss, both of which fit far
-        # under the cap above: nesting deeper than this interpreter's stack
+        # under `_read_deps_manifest_bytes`' cap: nesting deeper than this
+        # interpreter's stack
         # (`RecursionError`, a `RuntimeError`) and an integer literal over
         # `sys.get_int_max_str_digits` (a plain `ValueError` since 3.11). Same
         # pair `_parse_slot_value` catches, for the same reason — the difference

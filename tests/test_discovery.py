@@ -1,12 +1,15 @@
 """Mocked tests for the discovery tools (search_nodes / get_node / search_models).
 
 These assert the exact ``comfy`` argv each tool composes (the thin-passthrough
-contract) against a stubbed ``subprocess.run``, plus one error-envelope path
+contract) against a stubbed ``subprocess.run`` — except ``workflow_deps``, whose
+300s child rides the cancellable async runner and is stubbed at
+``asyncio.create_subprocess_exec`` instead — plus one error-envelope path
 (local server not running) that must surface as ``ComfyCliError``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -758,10 +761,25 @@ def test_node_tools_reject_embedded_nul(monkeypatch):
 # workflow_deps — `comfy node deps-in-workflow`
 #
 # The one verb here whose answer is a FILE rather than stdout, so every test
-# below drives it through `patched_run`'s `on_spawn` hook: the fake writes the
-# manifest to the `--output` path it was handed, exactly as ComfyUI-Manager
-# does. `_writes(...)` is that fake.
+# below drives it through `patched_async_run`'s `on_spawn` hook: the fake writes
+# the manifest to the `--output` path it was handed, exactly as ComfyUI-Manager
+# does. `_writes(...)` is that fake. `patched_async_run` rather than
+# `patched_run`, because the tool rides `_run_comfy_async` — its 300s
+# network-backed child must die with a cancelling client — and both runners
+# build the same `[COMFY_BIN, "--json", "--where", "local", *args]` argv, so
+# the assertions themselves are the thread-pool path's, unchanged.
 # ---------------------------------------------------------------------------
+
+
+def _workflow_deps(*args, **kwargs):
+    """Drive the async ``workflow_deps`` tool from a sync test.
+
+    Matches the ``asyncio.run`` convention the other async tools' tests use; the
+    tool went async so a cancelling client kills the ``comfy`` child instead of
+    orphaning it on the sync-tool worker pool.
+    """
+    return asyncio.run(server.workflow_deps(*args, **kwargs))
+
 
 # The manifest ComfyUI-Manager's `deps-in-workflow` writes: a pack map keyed by
 # registry id / repo URL with an install `state` each, plus the classes it could
@@ -798,16 +816,16 @@ def _writes(payload, *, encode=json.dumps):
     return write
 
 
-def test_workflow_deps_argv_and_manifest(patched_run):
+def test_workflow_deps_argv_and_manifest(patched_async_run):
     """The passthrough's argv, and the manifest read back off `--output`."""
-    calls = patched_run(
+    procs = patched_async_run(
         "Workflow dependencies are being saved into /tmp/x.json.",
         on_spawn=_writes(_DEPS_MANIFEST),
     )
 
-    assert server.workflow_deps("/tmp/flux.json") == _DEPS_MANIFEST
+    assert _workflow_deps("/tmp/flux.json") == _DEPS_MANIFEST
 
-    cmd = calls[0]["cmd"]
+    cmd = procs[0].cmd
     assert cmd[:8] == [
         server.COMFY_BIN,
         "--json",
@@ -825,32 +843,32 @@ def test_workflow_deps_argv_and_manifest(patched_run):
     assert "comfy-mcp-deps-" in cmd[9]
 
 
-def test_workflow_deps_removes_its_temp_file(patched_run):
+def test_workflow_deps_removes_its_temp_file(patched_async_run):
     """The round-trip through disk leaves nothing behind — file AND directory."""
-    calls = patched_run("saved", on_spawn=_writes(_DEPS_MANIFEST))
+    procs = patched_async_run("saved", on_spawn=_writes(_DEPS_MANIFEST))
 
-    server.workflow_deps("/tmp/flux.json")
+    _workflow_deps("/tmp/flux.json")
 
-    out_path = _output_path(calls[0]["cmd"])
+    out_path = _output_path(procs[0].cmd)
     assert not os.path.exists(out_path)
     assert not os.path.exists(os.path.dirname(out_path))
 
 
-def test_workflow_deps_removes_its_temp_file_when_the_call_fails(patched_run):
+def test_workflow_deps_removes_its_temp_file_when_the_call_fails(patched_async_run):
     """…including on the raising paths: cleanup is the context manager's, not a
     trailing statement only the success path reaches."""
-    calls = patched_run(
+    procs = patched_async_run(
         envelope(ok=False, error={"code": "not_in_workspace", "message": "nope"}),
         returncode=1,
     )
 
     with pytest.raises(server.ComfyCliError):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
-    assert not os.path.exists(os.path.dirname(_output_path(calls[0]["cmd"])))
+    assert not os.path.exists(os.path.dirname(_output_path(procs[0].cmd)))
 
 
-def test_workflow_deps_degrades_without_comfyui_manager(patched_run):
+def test_workflow_deps_degrades_without_comfyui_manager(patched_async_run):
     """A missing ComfyUI-Manager reports as a capability gap, not a usage dump.
 
     The verb resolves classes through Manager's map, so without Manager
@@ -858,9 +876,9 @@ def test_workflow_deps_degrades_without_comfyui_manager(patched_run):
     that predates its verb, and for the same reason: the agent needs "install
     this prerequisite", not comfy-cli's stderr.
     """
-    patched_run("", returncode=1, stderr=_MANAGER_MISSING_STDERR)
+    patched_async_run("", returncode=1, stderr=_MANAGER_MISSING_STDERR)
 
-    result = server.workflow_deps("/tmp/flux.json")
+    result = _workflow_deps("/tmp/flux.json")
 
     assert result["unsupported"] is True
     assert "ComfyUI-Manager" in result["error"]
@@ -878,13 +896,13 @@ def test_workflow_deps_degrades_without_comfyui_manager(patched_run):
     assert "Installing ComfyUI-Manager into the workspace" in result["error"]
 
 
-def test_workflow_deps_degrades_through_a_rich_panel(patched_run):
+def test_workflow_deps_degrades_through_a_rich_panel(patched_async_run):
     """Rich frames and width-wraps the message; the match must survive both.
 
     `_normalize_cli_text` folds the box glyphs and the wrap away, so the degrade
     cannot depend on the terminal width the child happened to render at.
     """
-    patched_run(
+    patched_async_run(
         "",
         returncode=1,
         stderr=(
@@ -896,10 +914,10 @@ def test_workflow_deps_degrades_through_a_rich_panel(patched_run):
         ),
     )
 
-    assert server.workflow_deps("/tmp/flux.json")["unsupported"] is True
+    assert _workflow_deps("/tmp/flux.json")["unsupported"] is True
 
 
-def test_workflow_deps_echoed_phrase_is_not_unsupported(patched_run):
+def test_workflow_deps_echoed_phrase_is_not_unsupported(patched_async_run):
     """A caller cannot forge the degrade through its own `workflow_path`.
 
     This path is exit 1 from the command BODY, so unlike `node deps` there is no
@@ -909,19 +927,19 @@ def test_workflow_deps_echoed_phrase_is_not_unsupported(patched_run):
     is missing" from becoming "your install has no ComfyUI-Manager".
     """
     forged = "ComfyUI-Manager not found. 'cm-cli' command is not available."
-    patched_run("", returncode=1, stderr=f"File not found: {forged}")
+    patched_async_run("", returncode=1, stderr=f"File not found: {forged}")
 
     with pytest.raises(server.ComfyCliError):
-        server.workflow_deps(forged)
+        _workflow_deps(forged)
 
 
-def test_workflow_deps_keeps_a_real_error_raw(patched_run):
+def test_workflow_deps_keeps_a_real_error_raw(patched_async_run):
     """A failure comfy-cli reported STRUCTURALLY is never a capability gap.
 
     No workspace is the case that matters: the fix is `comfy install`, not
     installing ComfyUI-Manager, and the agent has to see which.
     """
-    patched_run(
+    patched_async_run(
         envelope(
             ok=False,
             error={
@@ -932,17 +950,17 @@ def test_workflow_deps_keeps_a_real_error_raw(patched_run):
     )
 
     with pytest.raises(server.ComfyCliError, match="not_in_workspace"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_relayed_phrase_is_not_unsupported(patched_run):
+def test_workflow_deps_relayed_phrase_is_not_unsupported(patched_async_run):
     """A failure that merely QUOTES the phrase, inside an envelope, stays raw.
 
     An envelope means comfy-cli got far enough to report structurally, which the
     Manager abort never does — so a nested error relaying Manager's own sentence
     (a pack hook, a subprocess comfy-cli shelled out to) is not this gap.
     """
-    patched_run(
+    patched_async_run(
         envelope(
             ok=False,
             error={
@@ -957,18 +975,18 @@ def test_workflow_deps_relayed_phrase_is_not_unsupported(patched_run):
     )
 
     with pytest.raises(server.ComfyCliError, match="manager_call_failed"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_reports_a_manifest_that_was_never_written(patched_run):
+def test_workflow_deps_reports_a_manifest_that_was_never_written(patched_async_run):
     """Exit 0 with no file is a contract break, named rather than left as OSError."""
-    patched_run("saved")  # no `on_spawn`: nothing writes the output path
+    patched_async_run("saved")  # no `on_spawn`: nothing writes the output path
 
     with pytest.raises(server.ComfyCliError, match="wrote no dependency manifest"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_quotes_comfy_cli_when_no_manifest_was_written(patched_run):
+def test_workflow_deps_quotes_comfy_cli_when_no_manifest_was_written(patched_async_run):
     """A FAILED cm-cli run arrives as exit 0 + no file, and only stderr says why.
 
     comfy-cli's `execute_cm_cli` catches Manager's non-zero status, prints the
@@ -976,18 +994,18 @@ def test_workflow_deps_quotes_comfy_cli_when_no_manifest_was_written(patched_run
     error that reported only the missing file would drop the one line naming the
     cause (here: the workflow file could not be read).
     """
-    patched_run(
+    patched_async_run(
         "",
         stderr="Execution error: cm-cli deps-in-workflow\nFile not found: /tmp/flux.json",
     )
 
     with pytest.raises(server.ComfyCliError, match="File not found") as excinfo:
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
     assert "wrote no dependency manifest" in str(excinfo.value)
 
 
-def test_workflow_deps_reports_an_unreadable_manifest(patched_run):
+def test_workflow_deps_reports_an_unreadable_manifest(patched_async_run):
     """Unparseable JSON is comfy-cli's/Manager's problem, reported as such.
 
     And it quotes comfy-cli's printed output for the same reason the
@@ -995,14 +1013,14 @@ def test_workflow_deps_reports_an_unreadable_manifest(patched_run):
     mid-write lands HERE, and its "Execution error: …" line is still the only
     place the cause survives.
     """
-    patched_run(
+    patched_async_run(
         "",
         stderr="Execution error: cm-cli deps-in-workflow\nchannel unreachable",
         on_spawn=_writes("{not json", encode=str),
     )
 
     with pytest.raises(server.ComfyCliError, match="could not read") as excinfo:
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
     assert "channel unreachable" in str(excinfo.value)
 
@@ -1021,7 +1039,7 @@ def test_workflow_deps_reports_an_unreadable_manifest(patched_run):
     ids=["deeply-nested", "huge-int-literal"],
 )
 def test_workflow_deps_reports_a_manifest_this_interpreter_cannot_build(
-    patched_run, payload
+    patched_async_run, payload
 ):
     """Never an UNCONVERTED interpreter error, on any supported interpreter.
 
@@ -1033,46 +1051,46 @@ def test_workflow_deps_reports_a_manifest_this_interpreter_cannot_build(
     wrong-shape error on the one that succeeds — and never a bare
     `RecursionError` / `ValueError` surfacing as an internal error.
     """
-    patched_run("saved", on_spawn=_writes(payload, encode=str))
+    patched_async_run("saved", on_spawn=_writes(payload, encode=str))
 
     with pytest.raises(server.ComfyCliError, match="dependency manifest"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_reports_a_manifest_that_is_not_utf8(patched_run):
+def test_workflow_deps_reports_a_manifest_that_is_not_utf8(patched_async_run):
     """A non-utf-8 manifest is a read failure, not an unconverted decode error."""
 
     def write_latin1(cmd):
         with open(_output_path(cmd), "wb") as handle:
             handle.write(b'{"custom_nodes": {"caf\xe9": {}}}')
 
-    patched_run("saved", on_spawn=write_latin1)
+    patched_async_run("saved", on_spawn=write_latin1)
 
     with pytest.raises(server.ComfyCliError, match="could not read"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_says_empty_when_the_child_printed_nothing(patched_run):
+def test_workflow_deps_says_empty_when_the_child_printed_nothing(patched_async_run):
     """A silent child reads as `<empty>`, never as the wrapper's own placeholder.
 
     `_synthesize_plain_result` INVENTS "comfy … completed (exit 0)." when both
     streams are empty, so quoting it under "comfy-cli's own output" would pass a
     wrapper line off as the engine's and hide that there was nothing to say.
     """
-    patched_run("", stderr="")  # no `on_spawn`: nothing writes the output path
+    patched_async_run("", stderr="")  # no `on_spawn`: nothing writes the output path
 
     with pytest.raises(server.ComfyCliError, match="wrote no dependency manifest"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_masks_credentials_in_repo_url_keys(patched_run):
+def test_workflow_deps_masks_credentials_in_repo_url_keys(patched_async_run):
     """A private channel can key a pack by a URL carrying userinfo — mask it.
 
     The manifest reaches the MCP client and the model transcript, which is the
     same path `failure_log._scrub_text` already guards everywhere else here.
     Slug keys are untouched: the scrubber anchors on `https?://`.
     """
-    patched_run(
+    patched_async_run(
         "saved",
         on_spawn=_writes(
             {
@@ -1087,32 +1105,32 @@ def test_workflow_deps_masks_credentials_in_repo_url_keys(patched_run):
         ),
     )
 
-    packs = server.workflow_deps("/tmp/flux.json")["custom_nodes"]
+    packs = _workflow_deps("/tmp/flux.json")["custom_nodes"]
 
     assert "comfyui-kjnodes" in packs
     assert not any("<pass>" in key for key in packs)
     assert any("example.invalid/pack.git" in key for key in packs)
 
 
-def test_workflow_deps_leaves_a_credential_free_manifest_identical(patched_run):
+def test_workflow_deps_leaves_a_credential_free_manifest_identical(patched_async_run):
     """The ordinary case is not copied or reordered — same object back."""
-    patched_run("saved", on_spawn=_writes(_DEPS_MANIFEST))
+    patched_async_run("saved", on_spawn=_writes(_DEPS_MANIFEST))
 
-    assert server.workflow_deps("/tmp/flux.json") == _DEPS_MANIFEST
+    assert _workflow_deps("/tmp/flux.json") == _DEPS_MANIFEST
 
 
-def test_workflow_deps_reports_a_manifest_of_the_wrong_shape(patched_run):
+def test_workflow_deps_reports_a_manifest_of_the_wrong_shape(patched_async_run):
     """A non-object manifest cannot carry the documented keys — say so.
 
     Passing it through would hand an agent a payload it will index blindly.
     """
-    patched_run("saved", on_spawn=_writes(["comfyui-impact-pack"]))
+    patched_async_run("saved", on_spawn=_writes(["comfyui-impact-pack"]))
 
     with pytest.raises(server.ComfyCliError, match="unexpected shape"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_refuses_an_oversized_manifest(patched_run):
+def test_workflow_deps_refuses_an_oversized_manifest(patched_async_run):
     """The read-back is bounded: a pathological file never lands in the response.
 
     The bound is on bytes this process actually CONSUMES — one read of
@@ -1120,19 +1138,19 @@ def test_workflow_deps_refuses_an_oversized_manifest(patched_run):
     file that grows between the two cannot slip past.
     """
     oversized = {"custom_nodes": {"x" * (server._MAX_DEPS_MANIFEST_BYTES + 1): {}}}
-    patched_run("saved", on_spawn=_writes(oversized))
+    patched_async_run("saved", on_spawn=_writes(oversized))
 
     with pytest.raises(server.ComfyCliError, match="maximum"):
-        server.workflow_deps("/tmp/flux.json")
+        _workflow_deps("/tmp/flux.json")
 
 
-def test_workflow_deps_reads_a_manifest_exactly_at_the_ceiling(patched_run):
+def test_workflow_deps_reads_a_manifest_exactly_at_the_ceiling(patched_async_run):
     """…and the ceiling itself is INSIDE the bound, not one byte outside it."""
     pad = "y" * (server._MAX_DEPS_MANIFEST_BYTES - len('{"custom_nodes": {"": {}}}'))
     at_limit = {"custom_nodes": {pad: {}}}
-    patched_run("saved", on_spawn=_writes(at_limit))
+    patched_async_run("saved", on_spawn=_writes(at_limit))
 
-    assert server.workflow_deps("/tmp/flux.json") == at_limit
+    assert _workflow_deps("/tmp/flux.json") == at_limit
 
 
 def test_workflow_deps_rejects_an_empty_path(no_spawn):
@@ -1143,7 +1161,7 @@ def test_workflow_deps_rejects_an_empty_path(no_spawn):
     `--workflow ""`. `run_workflow` guards this the same way.
     """
     with pytest.raises(server.ComfyCliError, match="empty"):
-        server.workflow_deps("   ")
+        _workflow_deps("   ")
 
 
 @pytest.mark.parametrize("workflow_path", ["-flux.json", "--workflow=x"])
@@ -1151,16 +1169,56 @@ def test_workflow_deps_rejects_a_leading_dash_path(workflow_path, no_spawn):
     """Input hygiene shared with `validate_workflow`: a dash-leading `--workflow`
     value reaches comfy-cli as a usage error, and a named one beats that."""
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        server.workflow_deps(workflow_path)
+        _workflow_deps(workflow_path)
 
 
 def test_workflow_deps_rejects_an_embedded_nul(no_spawn):
     """A NUL cannot ride in argv at all — ComfyCliError, not subprocess's ValueError."""
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
-        server.workflow_deps("/tmp/fl\0ux.json")
+        _workflow_deps("/tmp/fl\0ux.json")
 
 
 def test_workflow_deps_rejects_an_oversized_path(no_spawn):
     """Length is checked ahead of the value guards — see `_guard_workflow_path`."""
     with pytest.raises(server.ComfyCliError, match="exceeds"):
-        server.workflow_deps("/tmp/" + "f" * server._MAX_PATH_ARG_LEN)
+        _workflow_deps("/tmp/" + "f" * server._MAX_PATH_ARG_LEN)
+
+
+def test_workflow_deps_cancellation_reaps_the_resolver(patched_async_run, monkeypatch):
+    """Cancelling the tool call must kill the resolve, not orphan it.
+
+    This is why the tool rides `_run_comfy_async` at all: on the sync path a
+    client's cancel (or disconnect) never reached the worker thread, so the
+    `comfy` child and its `cm-cli` grandchild kept fetching Manager's node map
+    for up to 300s with nobody waiting. Same proof as `download_model`'s legacy
+    fallback: the async runner's `finally` fires on `CancelledError`.
+    """
+    procs = patched_async_run(hang=True)
+
+    async def drive():
+        # Wrap the fixture's fake so the cancel fires at a DETERMINISTIC point —
+        # once the child exists. Cancelling on a fixed number of loop turns
+        # would race the `to_thread` hop the version guard makes first.
+        spawned = asyncio.Event()
+        fake_exec = server.asyncio.create_subprocess_exec
+
+        async def notifying_exec(*args, **kwargs):
+            proc = await fake_exec(*args, **kwargs)
+            spawned.set()
+            return proc
+
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", notifying_exec)
+        task = asyncio.ensure_future(server.workflow_deps("/tmp/flux.json"))
+        await spawned.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+
+    assert len(procs) == 1
+    assert procs[0].killed is True  # the `finally` fired and the tree died
+    # And the temp output directory went with it: `CancelledError` propagates
+    # through the `with tempfile.TemporaryDirectory(...)`, so nothing is left
+    # in the system temp directory on the cancellation path either.
+    assert not os.path.exists(os.path.dirname(_output_path(procs[0].cmd)))
