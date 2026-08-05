@@ -35,27 +35,30 @@ rather than in new logic — `fetch_template` runs `templates fetch` then
 `validate`, telling the caller whether the template it just wrote can actually
 run here, and `download_model` submits `model download --background` then polls
 `model download-status` so a multi-GB transfer does not hold the MCP request
-open. That stays inside the rule: every call still goes through `_run_comfy`,
-the verdict is comfy-cli's own, and this repo adds no product behavior of its
-own. What would breach it is deriving the answer here (parsing the graph,
-keeping a table of what is "supported") instead of asking the engine — for
-`download_model` that would mean sizing the file on disk to decide whether it
-finished, rather than reading comfy-cli's `status`. `install_node` composes
-for a different reason: `comfy node install` runs Manager's `cm-cli`, which a
-legacy clone under `custom_nodes/` cannot provide, so it reads `comfy env`'s
-manager fields BEFORE the consent prompt rather than ask a user to authorize
-third-party code on a call that cannot succeed. It fails OPEN, and shares
-`workflow_deps`' two helpers so the two cannot drift. `workflow_deps` reads
-its answer off DISK because the engine leaves no choice — `comfy node
-deps-in-workflow` emits no envelope and REQUIRES an `--output` path — so the
-temp-file round trip is that contract, and Manager's manifest goes back as
-written bar `failure_log._scrub_text` masking credentials in its repo-URL keys.
+open. That stays inside the rule: every call goes through `_run_comfy`, the
+verdict is comfy-cli's own, and no product behavior is added here. What would
+breach it is deriving the answer here (parsing the graph, keeping a table of what
+is "supported") instead of asking the engine — for `download_model`, sizing the
+file on disk to decide it finished rather than reading its `status`.
+`install_node` composes for a different reason: `comfy node install` runs
+Manager's `cm-cli`, which a legacy clone under `custom_nodes/` cannot provide, so
+it reads `comfy env`'s manager fields BEFORE the consent prompt rather than ask a
+user to authorize third-party code on a call that cannot succeed. It fails OPEN,
+and shares `workflow_deps`' two helpers so the two cannot drift. It also reads
+its VERDICT from the printed text (`_extract_install_failures`) — cm-cli prints a
+pack's failure before it consults `--exit-on-fail`, so a pack that never
+installed came back as `ok: true` — on the standing of `_extract_saved_paths`: no
+envelope, so the text is the only channel and the verdict is cm-cli's own
+sentence, matched one-directionally so a wording change regresses rather than
+fails every install. `workflow_deps` reads its answer off DISK because the engine
+leaves none — `comfy node deps-in-workflow` emits no envelope and REQUIRES an
+`--output` path — so the temp-file round trip is that contract, and the manifest
+goes back as written bar `failure_log._scrub_text` masking repo-URL credentials.
 
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
-protocol surface** — capabilities that exist only between this server and its
-client, which comfy-cli has no way to express. Today that is the per-call
-confirmation on the tools that can spend money, destroy local state, run
-third-party code, or expose the machine: `partner_generate`, `run_template`,
+protocol surface** — capabilities comfy-cli has no way to express. Today that is
+the per-call confirmation on the tools that can spend money, destroy local state,
+run third-party code, or expose the machine: `partner_generate`, `run_template`,
 `run_workflow`, `switch_comfyui_version`, `install_node`, `update_comfyui` when
 `target="all"`, and the `launch_comfyui` / `restart_comfyui` pair when
 `extra_args` would publish ComfyUI to the network. comfy-cli owns the
@@ -64,9 +67,9 @@ always`); this server only raises the confirmation over MCP **elicitation** —
 the protocol's y/N prompt — then forwards the answer as `--yes` /
 `--allow-spend`, or (for the four the CLI does not gate at all) refuses to run
 the command. It stores no consent of its own, and all share one fail-closed body,
-`_elicit_approval`; give a new gate its own `_ApprovalWording` rather than a
-second copy. Adding *product* behavior here is still a guardrail breach;
-adapting comfy-cli's contract to an MCP primitive is this repo's job.
+`_elicit_approval`; give a new gate its own `_ApprovalWording`, not a second
+copy. Adding *product* behavior here is still a guardrail breach; adapting
+comfy-cli's contract to an MCP primitive is this repo's job.
 
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` —
 differ where the engine's own shape differs, and those differences are
@@ -78,17 +81,17 @@ always-proceed as granting nothing. That shared opt-in policy is one body,
 `_resolve_optin_spend_consent`, whose per-verb wording is an argument the way
 `_ApprovalWording` is `_elicit_approval`'s. What still differs is the capability
 SIGNAL: `run_template` can trust the verb, `run_workflow` must PROBE `comfy run
---help` for the flag — its docstring says why, and what an engine without it
-means. `switch_comfyui_version`, `install_node` and `update_comfyui` sit outside
-that axis: none spends credits and the CLI gates none, so their prompt is this
-server's only gate, with no always-proceed to read. TWO are ARGUMENT-scoped, the
-danger being the argument and not the verb: the launch pair prompts only for
-`extra_args` publishing an unauthenticated ComfyUI (`_network_exposing_args`),
-`update_comfyui` only for `target="all"`, which pip-installs every third-party
-pack (`comfy`/`cli` never prompt). `install_node` is NOT one — it prompts on
-EVERY call, its `names` argument being a RESTRICTION to registry slugs refusing a
-URL, as the prompt promises a REGISTRY pack. Mirror the engine's contract per
-tool; never generalize one gate onto another.
+--help` for the flag — its docstring says why. `switch_comfyui_version`,
+`install_node` and `update_comfyui` sit outside that axis: none spends credits
+and the CLI gates none, so their prompt is this server's only gate, with no
+always-proceed to read. TWO are ARGUMENT-scoped, the danger being the argument
+and not the verb: the launch pair prompts only for `extra_args` publishing an
+unauthenticated ComfyUI (`_network_exposing_args`), `update_comfyui` only for
+`target="all"`, which pip-installs every third-party pack (`comfy`/`cli` never
+prompt). `install_node` is NOT one — it prompts on EVERY call, its `names`
+argument being a RESTRICTION to registry slugs refusing a URL, as the prompt
+promises a REGISTRY pack. Mirror the engine's contract per tool; never
+generalize one gate onto another.
 
 The local differentiator: discovery (`search_nodes`, `get_node`, `search_models`)
 reads the **user's live install** — custom nodes included — not a static catalog.
@@ -110,14 +113,12 @@ edges only ever point one way:
 `failure_log._log_failure(...)`) and re-exports nothing — deliberately: a test
 patching a moved name on `server` would otherwise silently patch a name nothing
 reads. **Patch the owning module** — `monkeypatch.setattr(failure_log,
-"_FAILURE_LOG_PATH", …)`, not `server`; the wrong one now raises `AttributeError`
-rather than passing while testing nothing.
+"_FAILURE_LOG_PATH", …)`, not `server`; the wrong one now raises `AttributeError`.
 
 ## Toolchain
 
-Python ≥ 3.10. Everything runs through pip + setuptools (there is no `uv.lock`
-in this repo — comfy-cli bundles `uv` and may write a stray `uv.lock` into the
-working directory; it is gitignored and is not ours).
+Python ≥ 3.10; pip + setuptools (there is no `uv.lock` here — comfy-cli bundles
+`uv` and may write a stray one into the working directory; it is gitignored).
 
 ```bash
 pip install -e '.[dev]'   # install with dev extras (pytest, ruff)
@@ -133,10 +134,9 @@ report on every PR, and the workflow already no-ops on Markdown-only changes.
 
 ## Tests
 
-Tests live in `tests/` and mock comfy-cli — they never require a real ComfyUI or
-the `comfy` binary. `_run_comfy` and the envelope parser are exercised directly
-(`test_wrapper.py`, `test_parser.py`); each tool group has its own file
-(`test_discovery.py`, `test_templates.py`). Add or update a tool's test with it.
+Tests live in `tests/` and mock comfy-cli — no real ComfyUI, no `comfy` binary.
+`_run_comfy` and the parser are exercised directly (`test_wrapper.py`,
+`test_parser.py`); each tool group has its own file. Add a tool's test with it.
 
 **Mock comfy-cli through the shared fixtures in `tests/conftest.py`, never a
 hand-rolled stub.** They are the single place that mirrors how `server` spawns
@@ -160,26 +160,26 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   but the capture is parsed once at the end instead of read line-by-line.
   `hang=True` leaves those pipes OPEN so the fake child never finishes, for the
   timeout/cancellation cases; its `kill()` closes them, mirroring the process-group
-  kill that is what lets a post-kill drain reach EOF. Each `_FakeAsyncRunProc`
-  records `killed`, so a test can assert the process-tree kill actually fired.
+  kill that lets a post-kill drain reach EOF, and records `killed` so a test can
+  assert it fired.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
 async callers), while every path that STREAMS or is otherwise long-lived spawns
 with `asyncio.create_subprocess_exec` — nothing blocking may run on the event
 loop, and ruff's `select` enables `ASYNC` to enforce that. Two async runners sit
-on that side, not one: `_run_comfy_streaming` (NDJSON + progress notifications)
-and `_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the same result
+on that side: `_run_comfy_streaming` (NDJSON + progress notifications) and
+`_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the same result
 contract. The twin exists for CANCELLATION, not for the event loop —
 `asyncio.to_thread(_run_comfy, …)` is already non-blocking but its cancellation
 never reaches the thread, so a long-lived call left the `comfy` child running
-when a client gave up. Today it carries the legacy foreground `model download`
-(the `--background`-less fallback); short metadata calls stay on the thread-pool
-path. Being reserved for the longest-lived children, it bounds each captured
-stream to its trailing `_STDERR_MAX_CHARS` (via `_drain_capped_into`) rather than
-retaining everything the way `communicate()` does — the one place its contract is
-narrower than `_run_comfy`'s. `auth_login` is a third async spawn site
-(`_start_login`) for the same reason, but drives its own browser flow.
+when a client gave up. It carries the legacy foreground `model download` (the
+`--background`-less fallback); short metadata calls stay on the thread-pool path.
+Reserved for the longest-lived children, it bounds each captured stream to its
+trailing `_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining
+everything `communicate()` does — the one place its contract is narrower.
+`auth_login` is a third async spawn site (`_start_login`) for the same reason,
+but drives its own browser flow.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.
