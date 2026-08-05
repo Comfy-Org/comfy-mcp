@@ -35,17 +35,16 @@ rather than in new logic — `fetch_template` runs `templates fetch` then
 `validate`, telling the caller whether the template it just wrote can actually
 run here, and `download_model` submits `model download --background` then polls
 `model download-status` so a multi-GB transfer does not hold the MCP request
-open. That stays inside the rule: every call still goes through `_run_comfy`,
-the verdict is comfy-cli's own, and this repo adds no product behavior of its
-own. What would breach it is deriving the answer here (parsing the graph,
-keeping a table of what is "supported") instead of asking the engine — for
-`download_model` that would mean sizing the file on disk to decide whether it
-finished, rather than reading comfy-cli's `status`. `install_node` composes
-for a different reason: `comfy node install` runs Manager's `cm-cli`, which a
-legacy clone under `custom_nodes/` cannot provide, so it reads `comfy env`'s
-manager fields BEFORE the consent prompt rather than ask a user to authorize
-third-party code on a call that cannot succeed. It fails OPEN, and shares
-`workflow_deps`' two helpers so the two cannot drift. It also reads
+open. That stays inside the rule: every call goes through `_run_comfy`, the
+verdict is comfy-cli's own, and no product behavior is added here. What would
+breach it is deriving the answer here (parsing the graph, keeping a table of what
+is "supported") instead of asking the engine — for `download_model`, sizing the
+file on disk to decide it finished rather than reading its `status`.
+`install_node` composes for a different reason: `comfy node install` runs
+Manager's `cm-cli`, which a legacy clone under `custom_nodes/` cannot provide, so
+it reads `comfy env`'s manager fields BEFORE the consent prompt rather than ask a
+user to authorize third-party code on a call that cannot succeed. It fails OPEN,
+and shares `workflow_deps`' two helpers so the two cannot drift. It also reads
 its VERDICT from the printed text (`_extract_install_failures`) — cm-cli prints a
 pack's failure before it consults `--exit-on-fail`, so a pack that never
 installed came back as `ok: true` — on the standing of `_extract_saved_paths`: no
@@ -55,22 +54,18 @@ fails every install. `workflow_deps` reads its answer off DISK because the engin
 leaves none — `comfy node deps-in-workflow` emits no envelope and REQUIRES an
 `--output` path — so the temp-file round trip is that contract, and the manifest
 goes back as written bar `failure_log._scrub_text` masking repo-URL credentials.
-`restart_comfyui` composes a THIRD pair on one branch only: when its stop found
-nothing recorded and its launch then lost the port, `comfy stop --port <p>
---dry-run` says WHO holds it and `comfy stop --port <p>` recycles it. Whether
-that listener is a ComfyUI is comfy-cli's verdict, never a check here — a
-`psutil` walk or an HTTP probe in this repo would be the breach.
+`restart_comfyui` composes a THIRD pair: `comfy stop --port <p> --dry-run` /
+`comfy stop --port <p>` say who holds a leftover port and recycle it — never a
+`psutil`/HTTP check here, since that verdict stays comfy-cli's.
 
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
-protocol surface** — capabilities that exist only between this server and its
-client, which comfy-cli has no way to express. Today that is the per-call
-confirmation on the tools that can spend money, destroy local state, run
-third-party code, kill a process, or expose the machine: `partner_generate`,
+protocol surface** — capabilities comfy-cli has no way to express. Today that is
+the per-call confirmation on the tools that can spend money, destroy local state,
+run third-party code, kill a process, or expose the machine: `partner_generate`,
 `run_template`, `run_workflow`, `switch_comfyui_version`, `install_node`,
 `update_comfyui` when `target="all"`, the `launch_comfyui` / `restart_comfyui`
-pair when `extra_args` would publish ComfyUI to the network, and
-`restart_comfyui` again when it would stop an untracked server holding the port.
-comfy-cli owns the
+pair when `extra_args` would publish ComfyUI to the network, and again to kill
+an untracked server. comfy-cli owns the
 credit-spend interlock and the durable "always proceed" (`comfy generate consent
 always`); this server only raises the confirmation over MCP **elicitation** —
 the protocol's y/N prompt — then forwards the answer as `--yes` /
@@ -90,22 +85,18 @@ always-proceed as granting nothing. That shared opt-in policy is one body,
 `_resolve_optin_spend_consent`, whose per-verb wording is an argument the way
 `_ApprovalWording` is `_elicit_approval`'s. What still differs is the capability
 SIGNAL: `run_template` can trust the verb, `run_workflow` must PROBE `comfy run
---help` for the flag — its docstring says why, and what an engine without it
-means. `switch_comfyui_version`, `install_node` and `update_comfyui` sit outside
-that axis: none spends credits and the CLI gates none, so their prompt is this
-server's only gate, with no always-proceed to read. TWO are ARGUMENT-scoped, the
-danger being the argument and not the verb: the launch pair prompts only for
-`extra_args` publishing an unauthenticated ComfyUI (`_network_exposing_args`),
-`update_comfyui` only for `target="all"`, which pip-installs every third-party
-pack (`comfy`/`cli` never prompt). `install_node` is NOT one — it prompts on
-EVERY call, its `names` argument being a RESTRICTION to registry slugs refusing a
-URL, as the prompt promises a REGISTRY pack. `restart_comfyui`'s kill gate is
-scoped by neither: it is STATE-scoped, fired only once a launch has already lost
-the port to a server comfy-cli did not start, so the prompt necessarily comes
-MID-sequence — safe because the stop half was a no-op, and raised from the
-worker thread (`_kill_consent_from_thread`) rather than by dropping the
-lifecycle slot to ask. Mirror the engine's contract per tool; never generalize
-one gate onto another.
+--help` for the flag — its docstring says why. `switch_comfyui_version`,
+`install_node` and `update_comfyui` sit outside that axis: none spends credits
+and the CLI gates none, so their prompt is this server's only gate, with no
+always-proceed to read. TWO are ARGUMENT-scoped, the danger being the argument
+and not the verb: the launch pair prompts only for `extra_args` publishing an
+unauthenticated ComfyUI (`_network_exposing_args`), `update_comfyui` only for
+`target="all"`, which pip-installs every third-party pack (`comfy`/`cli` never
+prompt). `install_node` is NOT one — it prompts on EVERY call, its `names`
+argument being a RESTRICTION to registry slugs refusing a URL, as the prompt
+promises a REGISTRY pack. `restart_comfyui`'s kill gate is STATE-scoped
+instead, firing mid-sequence once a launch loses the port. Mirror the engine's
+contract per tool; never generalize one gate onto another.
 
 The local differentiator: discovery (`search_nodes`, `get_node`, `search_models`)
 reads the **user's live install** — custom nodes included — not a static catalog.
@@ -170,30 +161,25 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   exercises the reader's buffer-limit behavior.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…) -> procs` — the
   plain-JSON *async* path (`_run_comfy_async`): same
-  `asyncio.create_subprocess_exec` spawn and the same real `StreamReader` pipes,
-  but the capture is parsed once at the end instead of read line-by-line.
-  `hang=True` leaves those pipes OPEN so the fake child never finishes, for the
-  timeout/cancellation cases; its `kill()` closes them, mirroring the process-group
-  kill that lets a post-kill drain reach EOF, and records `killed` so a test can
-  assert it fired.
+  `asyncio.create_subprocess_exec` spawn and real `StreamReader` pipes, but the
+  capture is parsed once at the end, not line-by-line. `hang=True` leaves the
+  pipes OPEN so the fake child never finishes, for the timeout/cancellation
+  cases; `kill()` closes them (mirroring the process-group kill that lets a post-
+  kill drain reach EOF) and records `killed` so a test can assert it fired.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
-(`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
-async callers), while every path that STREAMS or is otherwise long-lived spawns
-with `asyncio.create_subprocess_exec` — nothing blocking may run on the event
-loop, and ruff's `select` enables `ASYNC` to enforce that. Two async runners sit
-on that side: `_run_comfy_streaming` (NDJSON + progress notifications) and
-`_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the same result
-contract. The twin exists for CANCELLATION, not for the event loop —
-`asyncio.to_thread(_run_comfy, …)` is already non-blocking but its cancellation
-never reaches the thread, so a long-lived call left the `comfy` child running
-when a client gave up. It carries the legacy foreground `model download` (the
-`--background`-less fallback); short metadata calls stay on the thread-pool path.
-Reserved for the longest-lived children, it bounds each captured stream to its
-trailing `_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining
-everything `communicate()` does — the one place its contract is narrower.
-`auth_login` is a third async spawn site (`_start_login`) for the same reason,
-but drives its own browser flow.
+(`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by
+async callers), while anything that STREAMS or is long-lived spawns via
+`asyncio.create_subprocess_exec` — nothing blocking may run on the event loop,
+enforced by ruff's `ASYNC` select. Two async runners live there:
+`_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON
+twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is already non-
+blocking, but cancellation never reaches the thread, leaving the `comfy` child
+running after a client gives up. It carries the legacy foreground `model
+download`; short metadata calls stay on the thread pool. It bounds each
+captured stream to `_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than
+retaining everything like `communicate()`. `auth_login` is a third async spawn
+site (`_start_login`) for the same reason, with its own browser flow.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.
