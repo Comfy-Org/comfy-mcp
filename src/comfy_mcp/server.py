@@ -9360,14 +9360,25 @@ _MANAGER_DETECTED_LEGACY_CLONE = "legacy-clone"
 _MANAGER_DETECTED_NONE = "none"
 
 # `workspace.manager_mode`'s two cm-cli-less values — the FALLBACK signal only,
-# for an engine that reports a mode but no `manager_detected`. The mode is a
-# per-user CONFIG key that comfy-cli reconciles against what is on disk, and the
-# reconciliation deliberately leaves `"disable"` and any unrecognised string
+# for an engine that reports a mode but no `manager_detected` at all. The mode is
+# a per-user CONFIG key that comfy-cli reconciles against what is on disk, and
+# the reconciliation deliberately leaves `"disable"` and any unrecognised string
 # ALONE as user intent — so a mode can be silent about a Manager that is missing.
 # `manager_detected` is that reconciliation's INPUT rather than its output, which
-# is why it is read first and why it wins where the two disagree.
+# is why it is read first and why its answer is taken WHOLE: an engine that
+# reports the field has already decided, and the mode gets no vote (see
+# `_cm_cli_unavailable_reason`).
 _MANAGER_MODE_NOT_INSTALLED = "not-installed"
 _MANAGER_MODE_LEGACY = "legacy"
+
+# What the MODE fallback can honestly conclude, and no more. Neither mode value
+# identifies the SHAPE of the gap: `server_info`'s own docstring records that a
+# legacy clone under `custom_nodes/` also reports `"not-installed"` here, and
+# `"legacy"` is a config string a user can set. So both map to this — cm-cli
+# cannot run, which of the two shapes it is unknown — and `_manager_state_clause`
+# gives it the same both-shapes wording it gives a caller holding no reason at
+# all. Refusing on this signal is right; naming the cause on it is not.
+_MANAGER_UNUSABLE_UNSPECIFIED = "unspecified"
 
 
 def _workspace_report() -> dict | None:
@@ -9388,9 +9399,12 @@ def _workspace_report() -> dict | None:
     """
     try:
         info = _run_comfy("env", timeout=60.0)
-    # `ComfyCliError` for a failed or unparseable `comfy env`; `OSError` for a
-    # spawn failure; `UnicodeDecodeError` for a workspace path that is not UTF-8
-    # (`_run_comfy` decodes strictly). None is grounds to refuse an install.
+    # `ComfyCliError` for a failed or unparseable `comfy env` — a TIMEOUT is one
+    # of these, because `_run_comfy_raw` kills the tree and re-raises
+    # `subprocess.TimeoutExpired` as `ComfyCliError(timed_out=True)`, so it never
+    # reaches this frame as itself; `OSError` for a spawn failure;
+    # `UnicodeDecodeError` for a workspace path that is not UTF-8 (`_run_comfy`
+    # decodes strictly). NONE OF THESE is grounds to refuse an install.
     except (ComfyCliError, OSError, UnicodeDecodeError):
         return None
     workspace = info.get("workspace") if isinstance(info, dict) else None
@@ -9400,12 +9414,17 @@ def _workspace_report() -> dict | None:
 def _cm_cli_unavailable_reason() -> str | None:
     """Why cm-cli cannot run on this install per ``comfy env``, or ``None``.
 
-    Returns :data:`_MANAGER_DETECTED_LEGACY_CLONE` or
-    :data:`_MANAGER_DETECTED_NONE` when comfy-cli's own environment report says
-    Manager's ``cm_cli`` is not importable from the workspace venv, and ``None``
-    when it is — or when the answer cannot be read. No new detection logic lives
-    here: both fields are comfy-cli's, computed by comfy-cli, and this only maps
-    them onto "would a cm-cli verb run".
+    Returns :data:`_MANAGER_DETECTED_LEGACY_CLONE`,
+    :data:`_MANAGER_DETECTED_NONE`, or :data:`_MANAGER_UNUSABLE_UNSPECIFIED` when
+    comfy-cli's own environment report says Manager's ``cm_cli`` is not
+    importable from the workspace venv, and ``None`` when it is — or when the
+    answer cannot be read. No new detection logic lives here: both fields are
+    comfy-cli's, computed by comfy-cli, and this only maps them onto "would a
+    cm-cli verb run".
+
+    The three refusals differ only in how much of the CAUSE is known, and that is
+    a property of which field answered: ``manager_detected`` names the shape, the
+    ``manager_mode`` fallback cannot and says so with the unspecified value.
 
     **Fails OPEN**, which is deliberately the OPPOSITE of
     :func:`_local_comfyui_running` and worth stating because the two sit in the
@@ -9414,9 +9433,9 @@ def _cm_cli_unavailable_reason() -> str | None:
     This one only improves an error message: the install still has comfy-cli's
     own refusal behind it, so an unreadable answer must NOT invent a refusal of
     its own and block an install that would have worked. Every uncertain path —
-    the probe failing, a missing ``workspace`` block, an unrecognised value, an
-    old engine reporting neither field — returns ``None`` and lets the engine
-    answer.
+    the probe failing, a missing ``workspace`` block, an unrecognised
+    ``manager_detected``, an old engine reporting neither field — returns
+    ``None`` and lets the engine answer.
 
     Advisory in TIME as well, like the ``_UPDATE_LOCK`` peek above it: a user who
     pip-installs Manager between this probe and the install simply gets an
@@ -9425,20 +9444,37 @@ def _cm_cli_unavailable_reason() -> str | None:
     workspace = _workspace_report()
     if workspace is None:
         return None
-    detected = workspace.get("manager_detected")
-    if detected == _MANAGER_DETECTED_VENV_PACKAGE:
+    if "manager_detected" in workspace:
+        # The authoritative field ANSWERED, so it is the whole answer — the
+        # membership test rather than a truthiness or `!= None` one, because a
+        # present `null` is still the engine having reported. Its two cm-cli-less
+        # values refuse; anything else, INCLUDING a value this server does not
+        # know or a non-string the engine should never emit, is unreadable, and
+        # the fail-open contract answers `None`. Falling through to
+        # `manager_mode` here is what the contract forbids: the mode is stale
+        # per-user config, so a future vocabulary for a perfectly USABLE Manager
+        # would be overruled by a `"legacy"` string nobody has corrected, and the
+        # install refused for a reason that is not true of this workspace.
+        detected = workspace["manager_detected"]
+        # The two `return None`s below are different answers that happen to
+        # coincide: "cm-cli runs" and "this value means nothing to us". Both let
+        # the install proceed, and keeping them apart is what makes the
+        # trichotomy — and which branch a future value lands in — legible.
+        if detected == _MANAGER_DETECTED_VENV_PACKAGE:
+            return None
+        if detected in (_MANAGER_DETECTED_LEGACY_CLONE, _MANAGER_DETECTED_NONE):
+            return detected
         return None
-    if detected in (_MANAGER_DETECTED_LEGACY_CLONE, _MANAGER_DETECTED_NONE):
-        return detected
-    # No `manager_detected` (or a value this server does not know): fall back to
+    # No `manager_detected` field at all — an engine older than it. Fall back to
     # the mode, whose two cm-cli-less values comfy-cli derives from the very same
     # probe. Only those two refuse — every other mode, including `"disable"`,
-    # says nothing about whether `cm_cli` imports.
-    mode = workspace.get("manager_mode")
-    if mode == _MANAGER_MODE_LEGACY:
-        return _MANAGER_DETECTED_LEGACY_CLONE
-    if mode == _MANAGER_MODE_NOT_INSTALLED:
-        return _MANAGER_DETECTED_NONE
+    # says nothing about whether `cm_cli` imports — and they refuse WITHOUT
+    # naming a shape, for the reason `_MANAGER_UNUSABLE_UNSPECIFIED` records.
+    if workspace.get("manager_mode") in (
+        _MANAGER_MODE_LEGACY,
+        _MANAGER_MODE_NOT_INSTALLED,
+    ):
+        return _MANAGER_UNUSABLE_UNSPECIFIED
     return None
 
 
@@ -9464,6 +9500,10 @@ def _manager_state_clause(reason: str | None) -> str:
     hand — ``ComfyUI-Manager not found. 'cm-cli' command is not available.`` is
     printed identically for both shapes, so a caller reacting to it after the
     fact genuinely cannot tell which it hit and must not claim to.
+
+    :data:`_MANAGER_UNUSABLE_UNSPECIFIED` lands on that same both-shapes clause
+    by falling through, and deliberately: a mode-fallback refusal knows no more
+    about the cause than an after-the-fact one does.
     """
     if reason == _MANAGER_DETECTED_LEGACY_CLONE:
         return (
@@ -9480,7 +9520,15 @@ def _manager_state_clause(reason: str | None) -> str:
         "either it is not installed at all, or it is a legacy clone under "
         "`custom_nodes/`, which is fully functional for ComfyUI itself but "
         "leaves `cm_cli` unimportable in the workspace venv. `server_info`'s "
-        "`workspace.manager_detected` reports which of the two this is."
+        # Named as a `workspace` block rather than as one field: this clause is
+        # emitted exactly where `manager_detected` may be ABSENT (an engine old
+        # enough to report only `manager_mode` is one of the two ways to reach
+        # it), so pointing at that field alone would send the user to a key that
+        # is not there. `manager_mode` is the older, weaker answer — hence the
+        # hedge, which is the honest one for a clause that means "unknown".
+        "`workspace` block distinguishes the two where it can: "
+        "`manager_detected` says which outright, and on an engine that predates "
+        "it `manager_mode` is the only, weaker hint."
     )
 
 
@@ -9499,13 +9547,27 @@ def _install_node_unavailable(reason: str | None) -> dict[str, Any]:
     terminal: it is the identical command through the identical ``cm-cli``, so
     sending the user there would be a second guaranteed failure, exactly the
     dead-end ``workflow_deps`` refuses to send them into in the other direction.
+
+    A refusal that does NOT know the shape — :data:`_MANAGER_UNUSABLE_UNSPECIFIED`
+    or ``None`` — still offers that route, CONDITIONALLY. It is the only working
+    route out of one of the two environments this refusal covers, and withholding
+    it because the probe could not tell them apart would hand a legacy-clone user
+    a dead end on a path that works. The conditional phrasing is what keeps that
+    from becoming a claim about which environment this is.
     """
-    routes = (
-        "Manager's own UI in the running ComfyUI can still install packs — that "
-        "half of a legacy clone works. "
-        if reason == _MANAGER_DETECTED_LEGACY_CLONE
-        else ""
-    )
+    if reason == _MANAGER_DETECTED_LEGACY_CLONE:
+        routes = (
+            "Manager's own UI in the running ComfyUI can still install packs — "
+            "that half of a legacy clone works. "
+        )
+    elif reason == _MANAGER_DETECTED_NONE:
+        routes = ""
+    else:
+        routes = (
+            "If this install is a legacy clone rather than no Manager at all, "
+            "Manager's own UI in the running ComfyUI can still install packs — "
+            "that half of a clone works. "
+        )
     return {
         "error": (
             f"install_node unavailable: {_manager_state_clause(reason)} "
@@ -9657,12 +9719,14 @@ async def install_node(
     degrades on the same environment, and with the same description of it. No
     prompt is raised and no install is spawned: a user must not be asked to
     approve running third-party code on a call that cannot succeed. The check
-    fails OPEN, so an engine that cannot answer simply installs and lets
-    comfy-cli's own error stand.
+    fails OPEN, so an engine that cannot answer simply installs — and if that
+    install then hits the same gap, comfy-cli's own refusal is mapped to the SAME
+    ``unsupported`` degrade rather than raising. One environment therefore always
+    answers in one shape, whether or not the probe could read it.
 
-    A pack id that does not exist, an unreachable registry, a dependency
-    conflict, or any cm-cli failure the pre-flight could not predict fails inside
-    comfy-cli and raises :class:`ComfyCliError` carrying its message.
+    A pack id that does not exist, an unreachable registry, or a dependency
+    conflict fails inside comfy-cli and raises :class:`ComfyCliError` carrying
+    its message.
 
     Returns ``{"installed", "result", "restart_required"}`` —
     ``restart_required`` is always ``True``, because a running ComfyUI will not
@@ -9684,10 +9748,18 @@ async def install_node(
     # worse than the failure it precedes. `switch_comfyui_version` orders its
     # running-server check ahead of its prompt for the same reason. Fails OPEN —
     # an unreadable answer proceeds and lets comfy-cli's own error stand.
-    # `server_info` is sync and spawns children, so it runs off the event loop.
+    # `_cm_cli_unavailable_reason` is sync and spawns a `comfy env` child (it
+    # bypasses `server_info` — see `_workspace_report`), so it runs off the loop.
     cm_cli_gap = await asyncio.to_thread(_cm_cli_unavailable_reason)
     if cm_cli_gap is not None:
         return _install_node_unavailable(cm_cli_gap)
+    # Re-peek: the probe above is a subprocess that can take up to a minute, and
+    # an update that starts DURING it would otherwise be discovered only by the
+    # authoritative acquire below — i.e. after the user has already approved
+    # running third-party code. Re-checking here restores the window the first
+    # peek was written to give, which is the whole point of peeking at all.
+    if _UPDATE_LOCK.locked():
+        raise ComfyCliError(_INSTALL_UPDATE_BUSY)
     await _resolve_install_consent(names_display, confirm_install, ctx)
     # Refuse rather than queue, exactly as `update_comfyui` does and for the same
     # reason — see its comment. Acquired AFTER consent so a declined call never
@@ -9707,7 +9779,28 @@ async def install_node(
     # against the same venv. A done-callback ties the release to the job's own
     # lifetime, and still fires if the job is cancelled before it ever starts.
     job.add_done_callback(lambda _job: _UPDATE_LOCK.release())
-    result = await asyncio.wrap_future(job)
+    try:
+        result = await asyncio.wrap_future(job)
+    except ComfyCliError as exc:
+        # The pre-flight failed OPEN and the install then hit the very gap it
+        # could not read — the probe timed out, or the engine reported no
+        # `manager_detected` and a mode that says nothing. Without this, ONE
+        # environment answers in two shapes depending on whether a subprocess
+        # happened to succeed: the degrade dict when the probe read it, a raw
+        # `ComfyCliError` when it did not. Callers are told to check
+        # `unsupported` before indexing `["installed"]`; that contract has to
+        # hold on every path to the same install, so map it here too.
+        #
+        # `reason=None` is the honest argument: this is comfy-cli's own refusal,
+        # which prints identically for a missing Manager and for a legacy clone,
+        # so the shape is genuinely unknown here — exactly `workflow_deps`'
+        # position. `guarded` is passed for the echoed-argument check even though
+        # `_guard_node_names` already makes a name that carries the sentence
+        # unreachable: the door stays shut from both sides rather than one tool's
+        # guard being the other's precondition.
+        if _is_manager_missing_error(exc, *guarded):
+            return _install_node_unavailable(None)
+        raise
     return {"installed": guarded, "result": result, "restart_required": True}
 
 

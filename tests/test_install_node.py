@@ -695,6 +695,31 @@ def test_every_cm_cli_less_report_refuses(patched_plain_run, monkeypatch, worksp
     assert calls == []
 
 
+@pytest.mark.parametrize("mode", ["legacy", "not-installed"])
+def test_the_mode_fallback_refuses_without_naming_a_shape(
+    patched_plain_run, monkeypatch, mode
+):
+    """Neither mode value identifies WHICH cm-cli-less shape this install is.
+
+    `server_info`'s own docstring records that a legacy clone under
+    `custom_nodes/` also reports `manager_mode: "not-installed"` — and this
+    fallback runs only on engines old enough to lack `manager_detected`, which is
+    exactly where that conflation is likeliest. So a clone user must not be told
+    they have no Manager and denied the Manager-UI route that still works for
+    them. The refusal is right; naming the cause on this signal is not.
+    """
+    patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(server, "_workspace_report", _env(manager_mode=mode))
+
+    message = _install(["comfyui-impact-pack"], ctx=_FakeCtx())["error"]
+
+    assert "either it is not installed at all, or it is a legacy clone" in message
+    assert "does not have ComfyUI-Manager at all" not in message
+    # …and the route out of the shape it MIGHT be is still offered, conditionally.
+    assert "If this install is a legacy clone" in message
+    assert "Manager's own UI in the running ComfyUI can still install packs" in message
+
+
 @pytest.mark.parametrize(
     "workspace",
     [
@@ -708,6 +733,22 @@ def test_every_cm_cli_less_report_refuses(patched_plain_run, monkeypatch, worksp
         {"manager_mode": "disable"},
         {"manager_mode": "disable-gui"},
         {"manager_detected": "a-shape-from-a-later-comfy-cli"},
+        # The combination that made the fail-open contract a lie: a vocabulary
+        # from a LATER comfy-cli — which may well name a perfectly usable Manager
+        # — alongside a stale config mode. An unrecognised detection must not
+        # fall through to the mode; the field ANSWERED, and a `"legacy"` string
+        # nobody has corrected does not get to overrule it and refuse an install
+        # that works. Non-string shapes fail open by the same rule.
+        {
+            "manager_detected": "a-shape-from-a-later-comfy-cli",
+            "manager_mode": "legacy",
+        },
+        {
+            "manager_detected": "a-shape-from-a-later-comfy-cli",
+            "manager_mode": "not-installed",
+        },
+        {"manager_detected": ["not", "a", "string"], "manager_mode": "not-installed"},
+        {"manager_detected": None, "manager_mode": "legacy"},
         {},
     ],
 )
@@ -804,19 +845,84 @@ def test_the_preflight_reads_comfy_env_and_never_spawns_the_install(
     assert not any("install" in call["cmd"] for call in calls)
 
 
-def test_a_cm_cli_failure_the_preflight_missed_is_still_relayed_raw(patched_plain_run):
+def test_a_failure_the_preflight_cannot_predict_is_still_relayed_raw(
+    patched_plain_run,
+):
     """The pre-flight is an addition, not a replacement, for comfy-cli's error.
 
     An install can still fail inside `cm-cli` for reasons `comfy env` cannot
-    predict — a Manager removed between the probe and the install, an unreachable
-    channel, a broken pack. comfy-cli's own message is what the caller gets.
+    predict — an unreachable channel, a broken pack, a dependency conflict.
+    comfy-cli's own message is what the caller gets.
     """
-    patched_plain_run(
+    patched_plain_run(1, stderr="\nFailed to install: dependency conflict.\n")
+
+    with pytest.raises(server.ComfyCliError, match="dependency conflict"):
+        _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+
+def test_a_cm_cli_gap_the_preflight_failed_open_on_degrades_the_same_way(
+    patched_plain_run, monkeypatch
+):
+    """ONE environment must not answer in TWO shapes.
+
+    The pre-flight fails open, so an unreadable `comfy env` — a probe that timed
+    out, an engine reporting neither field — lets the install run and hit the very
+    gap the probe could not see. Callers are told to check `unsupported` before
+    indexing `["installed"]`; if that path raised a raw `ComfyCliError` instead,
+    the contract would hold only when a subprocess happened to succeed. So
+    comfy-cli's own refusal maps to the same degrade, and — since that message
+    reads identically for a missing Manager and for a clone — claims no shape.
+    """
+    calls = patched_plain_run(
         1, stderr="\nComfyUI-Manager not found. 'cm-cli' command is not available.\n"
     )
+    monkeypatch.setattr(server, "_workspace_report", lambda: None)
+    ctx = _FakeCtx()
 
-    with pytest.raises(server.ComfyCliError, match="cm-cli"):
-        _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+    result = _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert result["unsupported"] is True
+    assert "installed" not in result
+    assert server._MANAGER_VENV_REMEDY in result["error"]
+    assert (
+        "either it is not installed at all, or it is a legacy clone" in result["error"]
+    )
+    # It failed open, so the user WAS prompted and the install WAS spawned — this
+    # degrade is after the fact, not instead of the attempt.
+    assert len(ctx.elicitations) == 1
+    assert len(calls) == 1
+
+
+def test_an_update_that_starts_during_the_probe_refuses_before_the_prompt(
+    patched_plain_run, monkeypatch
+):
+    """The peek is re-taken after the probe, because the probe is SLOW.
+
+    The pre-flight is a subprocess with a 60-second ceiling, sitting between the
+    first `_UPDATE_LOCK` peek and the prompt. An update that starts inside that
+    window would otherwise be discovered only by the authoritative acquire — i.e.
+    after the user had already approved running third-party code, which is the
+    outcome the peek exists to prevent.
+    """
+    calls = patched_plain_run(0, stderr="installed")
+
+    def _probe_during_which_an_update_starts():
+        server._UPDATE_LOCK.acquire()
+        return {"manager_detected": "venv-package"}
+
+    monkeypatch.setattr(
+        server, "_workspace_report", _probe_during_which_an_update_starts
+    )
+    ctx = _FakeCtx()
+
+    try:
+        with pytest.raises(server.ComfyCliError, match="already running"):
+            _install(["comfyui-impact-pack"], ctx=ctx)
+    finally:
+        server._UPDATE_LOCK.release()
+
+    assert ctx.elicitations == []
+    assert calls == []
 
 
 def test_both_cm_cli_tools_describe_the_same_install_the_same_way(
