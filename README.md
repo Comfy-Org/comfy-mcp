@@ -62,7 +62,7 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 51 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 52 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -819,7 +819,7 @@ MCP client config today, it keeps working unchanged.
 
 ## Tools
 
-51 tools, grouped below by what they do. Every tool runs `comfy` with the global
+52 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
@@ -887,6 +887,7 @@ handle is `prompt_id`.
 | `nodes_path(from_type, to_type, max_depth=6, max_paths=10)` | `comfy nodes path <FROM> <TO> --max-depth N --max-paths N` | Node chains routing a value between two connection types (e.g. `MODEL` → `IMAGE`). Reads the **live install**. |
 | `nodes_types()` | `comfy nodes types` | All connection types (`MODEL`, `IMAGE`, …) ranked by connectivity. Reads the **live install**. |
 | `nodes_categories()` | `comfy nodes categories` | The node category tree. Reads the **live install**. |
+| `workflow_deps(workflow_path)` | `comfy node deps-in-workflow --workflow <path> --output <tmp>` | Which node **packs** a workflow needs, resolved from the node classes it references — the **diagnosis** half of the missing-node story, and the only tool here that can go from a class name to a pack id. `search_nodes` / `get_node` read the running install's live `object_info`, so by construction they only ever find classes you already have; this reads ComfyUI-Manager's node→pack map, which covers packs that are not installed. Returns Manager's manifest verbatim: `{"custom_nodes": {"<pack-id-or-repo-url>": {"state": "installed" | "not-installed" | "disabled" | "invalid-installation", …}}, "unknown_nodes": ["SomeClass", …]}` — the `not-installed` keys are the `install_node` list, and `unknown_nodes` are classes Manager could attribute to no pack at all (a hand-written node, or a typo in the graph). So the full loop is `validate_workflow` → `workflow_deps` → `install_node` → `restart_comfyui`. Read-only: it installs and downloads nothing. Accepts the same `.json` (API or UI export) file `run_workflow` takes, plus a `.png` with an embedded workflow. **Requires ComfyUI-Manager** — the verb resolves through Manager's `cm-cli`, so an install without it gets `{"error": …, "unsupported": true}` rather than a raw usage dump. comfy-cli emits no envelope for this verb and writes its answer to a `--output` file, so this server supplies a temporary path of its own, reads the manifest back, and removes it. |
 | `node_dependencies(pack="", registry_id="")` | `comfy node deps [<pack>] [--registry <id>]` | A custom node **pack**'s declared Python requirements (its `requirements.txt` / `pyproject.toml`) against the versions actually installed in the workspace venv — each requirement carrying a `satisfied` / `mismatch` / `missing` / `unparseable` / `unknown` status, plus per-pack counts. This is what tells you whether a pack's imports are failing because a dependency is absent, or whether installing one pack would conflict with another. `pack` empty reports every installed pack; `registry_id` pre-checks a **not-yet-installed** registry pack against the same venv before you install it (its latest published version — the registry exposes no per-version endpoint). The two are additive, so naming the same id both ways yields an installed row and a registry row to compare. Read-only: nothing is installed or changed. Pack-level filesystem + venv introspection, so it is deliberately separate from `get_node` / `search_nodes`, which introspect node **classes** over the live `object_info`. Needs a comfy-cli newer than v1.13.0; on an older one it returns `{"error": …, "unsupported": true}` rather than a raw usage dump. |
 | `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
 | `list_partner_models(style="", partner="", query="", limit=100, offset=0)` | `comfy generate list [--style S] [--partner P] [--query Q]` | The catalog of hosted **partner** models `partner_generate` can run — the only place that list exists (nothing in `discover` / `search_nodes` / `search_templates` carries the partner aliases). One record per model: `alias` (what you pass as `model`), `id`, `partner`, `category` (the model's style, and the axis `style` filters on — `text-to-image`, `image-edit`, `image-to-image`, `text-to-video`, `image-to-video`, `video-extend`, `controlnet`, `inpaint`, `outpaint`, `upscale`, `background`, `lipsync`, `vectorize` as this is written; comfy-cli owns that set, so read it off an unfiltered call), `mode` (`sync`/`async`, the partner's protocol — `partner_generate` waits either way) and the model's full, untruncated `summary`. Filters are forwarded to comfy-cli: `style` is exact and **case-sensitive**, `partner` exact and case-insensitive, `query` a substring over `id` + `summary`. `limit` (default 100, capped at 200) / `offset` page the result (`{total, shown, offset, filters, models}`) so a growing catalog can't trip the client's tool-output cap; 52 models as this is written, so the default returns all of them — check `shown` against `total` rather than assuming that stays true. |
@@ -913,6 +914,7 @@ Node introspection (`search_nodes` / `get_node` / `list_nodes` / `nodes_upstream
 read the **user's live install** (custom nodes included), not a static catalog — that's the
 local differentiator from the cloud MCP's equivalents. The graph-wiring verbs (`upstream` /
 `downstream` / `path`) are what an agent authoring a workflow uses to find compatible nodes.
+`workflow_deps` is the one node tool that does NOT read the live install: it resolves a workflow's classes against ComfyUI-Manager's node→pack map, which is what lets it name a pack that is not installed — precisely the question the live-catalog tools cannot answer.
 `node_dependencies` reads that same live install from the other side — the **packs** on disk and
 the venv they installed into, rather than the node classes ComfyUI loaded from them — which is how
 an agent tells "this pack's nodes are missing from `object_info`" apart from "this pack's Python

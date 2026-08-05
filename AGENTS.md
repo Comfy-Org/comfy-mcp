@@ -1,15 +1,13 @@
 # Agent Guidelines — comfy-mcp
 
-A short guide for AI agents (and humans) contributing to this repo. **Keep it in
-sync:** if a PR changes the architecture rule, the toolchain, or the tool set,
-update the relevant section in the same PR.
+A short guide for AI agents (and humans) here. **Keep it in sync:** a PR that
+changes the architecture rule, the toolchain or the tool set updates it too.
 
 ## What this repo is
 
-`comfy-mcp` is a small, standalone [MCP](https://modelcontextprotocol.io)
-server that lets an agent drive a user's **local** ComfyUI. It is a **thin
-wrapper over [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli)** — comfy-cli
-is the engine; this repo is just the MCP surface over it.
+`comfy-mcp` is a small, standalone [MCP](https://modelcontextprotocol.io) server
+that lets an agent drive a user's **local** ComfyUI: a **thin wrapper over
+[`comfy-cli`](https://github.com/Comfy-Org/comfy-cli)**, which is the engine.
 
 ## The architecture rule — thin wrapper only (read this first)
 
@@ -45,7 +43,11 @@ MCP request open. That stays inside the rule: every call still goes through
 behavior of its own. What would breach it is deriving the answer here (parsing
 the graph, keeping a table of what is "supported") instead of asking the engine
 — for `download_model` that would mean sizing the file on disk to decide whether
-it finished, rather than reading comfy-cli's `status`.
+it finished, rather than reading comfy-cli's `status`. `workflow_deps` reads its
+answer off DISK because the engine leaves no choice — `comfy node
+deps-in-workflow` emits no envelope and REQUIRES an `--output` path — so the
+temp-file round trip is that contract, and Manager's manifest goes back as
+written bar `failure_log._scrub_text` masking credentials in its repo-URL keys.
 
 The one thing that legitimately lives here rather than in comfy-cli is **MCP
 protocol surface** — capabilities that only exist between this server and its
@@ -87,9 +89,8 @@ is NOT one: it prompts on EVERY call, and its argument is a RESTRICTION — `nam
 pinned to registry slugs, refusing a URL, as the prompt promises a REGISTRY pack.
 Mirror the engine's contract per tool; never generalize one gate onto another.
 
-The local differentiator: discovery tools (`search_nodes`, `get_node`,
-`search_models`) read the **user's live install** — custom nodes included — via
-comfy-cli, not a bundled static catalog.
+The local differentiator: discovery (`search_nodes`, `get_node`, `search_models`)
+reads the **user's live install** — custom nodes included — not a static catalog.
 
 ## Module layout
 
@@ -119,7 +120,6 @@ working directory; it is gitignored and is not ours).
 
 ```bash
 pip install -e '.[dev]'   # install with dev extras (pytest, ruff)
-
 pytest -q                 # run the tests
 ruff check .              # lint
 ruff format --check .     # format check (run `ruff format .` to fix)
@@ -143,9 +143,10 @@ hand-rolled stub.** They are the single place that mirrors how `server` spawns
 the CLI, so a change to the spawn signature is one edit rather than a sweep:
 
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
-- `patched_run(stdout=…, returncode=…, stderr=…, raises=…) -> calls` — the plain
-  `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/
-  `encoding` per invocation for exact-argv assertions.
+- `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) -> calls`
+  — the plain `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/
+  `timeout`/`encoding` per call for exact-argv assertions, and `on_spawn(cmd)`
+  fires at spawn so the one verb whose answer is a FILE writes its `--output`.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for the verbs
   that print human text and emit no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
@@ -166,20 +167,19 @@ The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
 async callers), while every path that STREAMS or is otherwise long-lived spawns
 with `asyncio.create_subprocess_exec` — nothing blocking may run on the event
-loop. `ASYNC` is enabled in ruff's `select` to enforce that. There are two async
-runners on that side, not one: `_run_comfy_streaming` (NDJSON + progress
-notifications) and `_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the
-same result contract. `_run_comfy_async` exists for CANCELLATION, not for the
-event loop — `asyncio.to_thread(_run_comfy, …)` is already non-blocking but its
-cancellation never reaches the thread, so a long-lived call left the `comfy` child
-running when a client gave up. Today it carries the legacy foreground `model
-download` (the `--background`-less fallback); short metadata calls stay on the
-thread-pool path. Because it is reserved for the longest-lived children, it bounds
-each captured stream to its trailing `_STDERR_MAX_CHARS` (via `_drain_capped_into`)
-rather than retaining everything the way `communicate()` does — the one place its
-contract is narrower than `_run_comfy`'s. `auth_login` is a third async spawn site (`_start_login`) for the
-same long-lived reason, but it drives its own browser flow rather than either
-runner.
+loop, and ruff's `select` enables `ASYNC` to enforce that. Two async runners sit
+on that side, not one: `_run_comfy_streaming` (NDJSON + progress notifications)
+and `_run_comfy_async`, a plain-JSON twin of `_run_comfy` with the same result
+contract. The twin exists for CANCELLATION, not for the event loop —
+`asyncio.to_thread(_run_comfy, …)` is already non-blocking but its cancellation
+never reaches the thread, so a long-lived call left the `comfy` child running
+when a client gave up. Today it carries the legacy foreground `model download`
+(the `--background`-less fallback); short metadata calls stay on the thread-pool
+path. Being reserved for the longest-lived children, it bounds each captured
+stream to its trailing `_STDERR_MAX_CHARS` (via `_drain_capped_into`) rather than
+retaining everything the way `communicate()` does — the one place its contract is
+narrower than `_run_comfy`'s. `auth_login` is a third async spawn site
+(`_start_login`) for the same reason, but drives its own browser flow.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.

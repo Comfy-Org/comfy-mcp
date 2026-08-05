@@ -285,7 +285,7 @@ class _FakeRunProc:
         self.returncode = -9
 
 
-def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
+def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_spawn):
     """The one ``subprocess.Popen`` stand-in for the plain (non-streaming) path.
 
     Its parameter list mirrors ``_run_comfy_raw``'s exact ``subprocess.Popen``
@@ -300,6 +300,13 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
     the argv it blew up on. ``timeout`` is filled in by ``communicate``, which
     is where the bound now lands, and ``proc`` is the spawned
     :class:`_FakeRunProc` (absent when the spawn itself raised).
+
+    ``on_spawn(cmd)`` models the SIDE EFFECT of a verb whose real answer is not
+    its stdout: ``comfy node deps-in-workflow`` writes its manifest to the
+    ``--output`` path it was handed, and a fake that only cans stdout would
+    exercise a code path that can never find the file. It fires only once the
+    child has actually started — after the spawn-time ``raises`` check — because
+    a ``Popen`` that never returned wrote nothing either.
     """
     canned_stdout, canned_stderr = stdout, stderr
 
@@ -315,6 +322,8 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
         calls.append(record)
         if raises is not None and _raises_at_spawn(raises):
             raise raises
+        if on_spawn is not None:
+            on_spawn(cmd)
         return _FakeRunProc(
             cmd,
             record,
@@ -331,7 +340,8 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises):
 def patched_run(monkeypatch):
     """Patch ``shutil.which`` + ``subprocess.Popen`` for the plain ``--json`` path.
 
-    Returns ``setup(stdout=…, returncode=…, stderr=…, raises=…) -> calls``:
+    Returns ``setup(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) ->
+    calls``:
 
     * ``stdout`` — a dict (JSON-encoded for you, the common case: pass an
       :func:`envelope`) or a raw string; defaults to an empty-``data`` success
@@ -340,12 +350,22 @@ def patched_run(monkeypatch):
       from the spawn or from the wait per :func:`_raises_at_spawn`. A
       ``TimeoutExpired`` comes out of the wait, and the fake then plays out the
       kill → reap → drain the handler runs against it.
+    * ``on_spawn`` — a callable handed the spawned argv, for a verb whose real
+      output is a FILE rather than stdout (``node deps-in-workflow`` writes to
+      its ``--output`` path). See :func:`_canonical_run`.
 
     ``calls`` is the live list every invocation is recorded into, for the exact
     argv assertions this suite is built on.
     """
 
-    def setup(stdout=None, *, returncode: int = 0, stderr: str = "", raises=None):
+    def setup(
+        stdout=None,
+        *,
+        returncode: int = 0,
+        stderr: str = "",
+        raises=None,
+        on_spawn=None,
+    ):
         if stdout is None:
             stdout = envelope()
         if isinstance(stdout, dict):
@@ -361,6 +381,7 @@ def patched_run(monkeypatch):
                 returncode=returncode,
                 stderr=stderr,
                 raises=raises,
+                on_spawn=on_spawn,
             ),
         )
         return calls
