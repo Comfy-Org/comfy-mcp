@@ -13,6 +13,7 @@ dependency. These lock in the runtime checks that guard it:
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 from pathlib import Path
@@ -828,12 +829,24 @@ def test_server_info_docstring_teaches_freshness_and_update_commands():
 # --- floor-vs-prose consistency (the desync that outlives a floor raise) -----
 
 # Matches a capability claim that hedges a version: "requires a comfy-cli NEWER
-# than 1.13.0", "the verb landed after comfy-cli 1.13.0", "ships in releases
-# after 1.13.0". The captured version is what the prose says you need to be
-# ABOVE, so it is a bug whenever it is at or below the floor.
+# than 1.13.0", "the verb landed after comfy-cli 1.13.0", "landed in comfy-cli
+# after 1.13.0", "ships in releases after 1.13.0". The captured version is what
+# the prose says you need to be ABOVE, so it is a bug whenever it is at or below
+# the floor.
+#
+# The `comfy-cli` prefix stays OPTIONAL because the live offenders mostly omit it
+# ("the verb ships in releases after 1.14.0" named no product at all). The cost
+# of that reach is a false positive on a hedge about some OTHER component's
+# version — ComfyUI's own, which `switch_comfyui_version` discusses in 0.x
+# numbers that trivially sort below the 1.14.0 floor — so `lead` captures the
+# sentence fragment in front of the hedge and `_hedged_versions` drops a match
+# whose subject is ComfyUI rather than comfy-cli. A spurious failure here blocks
+# unrelated PRs, so the guard has to be able to tell the two apart.
 _HEDGE_RE = re.compile(
-    r"(?:newer than|landed after|ships? in releases after|releases after)"
-    r"\s+(?:comfy-cli\s+)?v?(\d+)\.(\d+)(?:\.(\d+))?",
+    r"(?P<lead>[^.\n]{0,80}?)"
+    r"(?:newer than|(?:landed|shipped|ships?)\s+(?:in\s+)?(?:comfy-cli\s+)?"
+    r"(?:releases\s+)?after|releases after)"
+    r"\s+(?:comfy-cli\s+)?v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?",
     re.IGNORECASE,
 )
 
@@ -843,9 +856,59 @@ _MIN_STR_INTERPOLATION_LEAKED = f"NEWER than {server._MIN_COMFY_CLI_STR}"
 
 def _hedged_versions(text: str) -> list[tuple[int, int, int]]:
     """Every version a "you need something newer than this" phrase names."""
+    found = []
+    for match in _HEDGE_RE.finditer(text):
+        subject = f"{match.group('lead')}{match.group(0)}".lower()
+        # "a ComfyUI newer than 0.24.0" is a claim about the app, not the CLI.
+        if "comfyui" in subject and "comfy-cli" not in subject:
+            continue
+        found.append(
+            (
+                int(match.group("major")),
+                int(match.group("minor")),
+                int(match.group("patch") or 0),
+            )
+        )
+    return found
+
+
+def _rendered_strings(source: str) -> list[str]:
+    """Every string literal in ``source`` as PYTHON will build it at runtime.
+
+    The raw-source scan below cannot see the shape that actually shipped the bug
+    this guard exists for. A degrade message is written as several adjacent
+    literals — implicit concatenation — with the floor interpolated:
+
+        "... (the verb ships in releases "
+        f"after {_MIN_COMFY_CLI_STR}). Nothing else is affected. "
+
+    In the source text there are no digits after "releases after" (just a brace),
+    and the phrase is split across a ``" \\n f"`` seam that no ``\\s+`` can
+    bridge — so the regex is structurally blind to it while the caller reads
+    "ships in releases after 1.14.0". Parsing instead of grepping fixes both at
+    once: the parser joins implicit concatenation for us, and a
+    ``{_MIN_COMFY_CLI_STR}`` placeholder is resolved to the floor it renders as.
+    Any other interpolation becomes ``{…}``, which no version pattern matches —
+    this guard only claims to catch the floor leaking into a hedge.
+    """
+
+    def render(node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            return "".join(render(part) for part in node.values)
+        if isinstance(node, ast.FormattedValue):
+            expr = node.value
+            if isinstance(expr, ast.Name) and expr.id == "_MIN_COMFY_CLI_STR":
+                return server._MIN_COMFY_CLI_STR
+            return "{…}"
+        return "{…}"
+
     return [
-        (int(major), int(minor), int(patch or 0))
-        for major, minor, patch in _HEDGE_RE.findall(text)
+        render(node)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.JoinedStr)
+        or (isinstance(node, ast.Constant) and isinstance(node.value, str))
     ]
 
 
@@ -853,8 +916,34 @@ def test_the_hedge_detector_actually_detects():
     """Self-test: a clean sweep below must mean "clean", not "regex rotted"."""
     assert _hedged_versions("requires a comfy-cli NEWER than 1.13.0") == [(1, 13, 0)]
     assert _hedged_versions("the verb landed after comfy-cli 1.13.0") == [(1, 13, 0)]
+    assert _hedged_versions("landed in comfy-cli after 1.13.0") == [(1, 13, 0)]
     assert _hedged_versions("ships in releases after 1.9") == [(1, 9, 0)]
     assert _hedged_versions("the TTL shipped in v1.14.0") == []
+    # A hedge about ComfyUI's own version is not a comfy-cli claim, and its 0.x
+    # numbering would otherwise sort below the floor and fail CI for nothing.
+    assert _hedged_versions("pin a ComfyUI newer than 0.24.0") == []
+    assert _hedged_versions("needs comfy-cli newer than 1.13.0 to drive ComfyUI") == [
+        (1, 13, 0)
+    ]
+
+
+def test_the_rendered_string_reader_sees_through_concat_and_interpolation():
+    """Self-test for the renderer: the blind spot must actually be covered.
+
+    Both halves matter. Joining without resolving leaves a brace where the
+    version goes; resolving without joining leaves the phrase split at the seam.
+    Only doing both reproduces what the caller reads.
+    """
+    source = (
+        'x = ("the verb ships in releases "\n'
+        '     f"after {_MIN_COMFY_CLI_STR}). Nothing else is affected.")\n'
+    )
+    rendered = _rendered_strings(source)
+    joined = [s for s in rendered if "releases after" in s]
+    assert joined, f"implicit concatenation not joined: {rendered}"
+    assert _hedged_versions(joined[0]) == [server._MIN_COMFY_CLI]
+    # Any other interpolation stays opaque rather than being guessed at.
+    assert "{…}" in "".join(_rendered_strings('y = f"ships after {some_other_var}"'))
 
 
 def test_no_capability_claim_hedges_a_version_the_floor_already_covers():
@@ -873,9 +962,21 @@ def test_no_capability_claim_hedges_a_version_the_floor_already_covers():
     so interpolating it re-creates exactly this contradiction), and to say what
     the degrade really protects against now: a build that slipped past the
     fail-OPEN version guard, or a dependency outside comfy-cli.
+
+    Two passes, because the offenders come in two shapes. The RAW source pass
+    covers prose that is literally in the file — comments and docstrings, which
+    the parser does not reassemble. The RENDERED pass (`_rendered_strings`)
+    covers the shape that actually ships to a caller: a degrade message built
+    from adjacent literals with the floor interpolated, which the raw pass is
+    structurally blind to (no digits in the source, and the phrase split across
+    the concatenation seam). Without the second pass this test asserted only
+    that nobody typed the contradiction by hand.
     """
     source = Path(server.__file__).read_text(encoding="utf-8")
-    offenders = [v for v in _hedged_versions(source) if v <= server._MIN_COMFY_CLI]
+    hedged = _hedged_versions(source)
+    for rendered in _rendered_strings(source):
+        hedged.extend(_hedged_versions(rendered))
+    offenders = [v for v in hedged if v <= server._MIN_COMFY_CLI]
     assert offenders == [], (
         f"{len(offenders)} capability claim(s) in server.py hedge a comfy-cli "
         f"version at or below the {server._MIN_COMFY_CLI_STR} floor "
@@ -900,3 +1001,30 @@ def test_the_spelled_out_upgrade_hints_name_a_release_the_floor_guarantees():
         assert "1.14.0" in hint
         assert _MIN_STR_INTERPOLATION_LEAKED not in hint
         assert _hedged_versions(hint) == []
+
+
+def test_the_degrade_messages_name_the_release_that_carries_their_verb():
+    """The two version-naming degrade payloads are pinned for the same reason.
+
+    Neither is a module constant, so the test above cannot reach them — they are
+    built inline where the degrade returns. Both are read ONLY by an install that
+    got past the fail-OPEN version guard from BELOW the floor, so each has to
+    name the release that actually carries its verb rather than the floor.
+
+    They point in OPPOSITE directions from that floor, which is precisely why no
+    single interpolated constant can serve both: `workflow notes` ships AT the
+    floor (1.14.0), while `comfy outdated` shipped one release BELOW it (1.13.0),
+    and a 1.13.x source build reading "upgrade to >= 1.14.0" for `outdated` is
+    being told to clear a bar it does not need to. The hedge guard above catches
+    neither mistake — ">= 1.14.0" hedges nothing — so pin the versions here.
+    """
+    rendered = _rendered_strings(Path(server.__file__).read_text(encoding="utf-8"))
+    for prefix, expected in (
+        ("workflow notes unavailable", "1.14.0 and newer"),
+        ("freshness unavailable", "comfy-cli 1.13.0 and newer"),
+    ):
+        matches = [text for text in rendered if text.startswith(prefix)]
+        assert matches, f"no {prefix!r} degrade message found in server.py"
+        # `ast.walk` yields the joined string AND the leading fragment it was
+        # concatenated from, so take the longest — the fully assembled message.
+        assert expected in max(matches, key=len)

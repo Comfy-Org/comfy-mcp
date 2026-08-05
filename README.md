@@ -768,8 +768,8 @@ breaking the call.
 resolves the local address by the same rules, so the server URL it reports *is* the resolved
 address. Seeing `:8189` there (and the server reported running) confirms the override is live.
 
-**Requires comfy-cli ≥ 1.13.0.** `COMFY_LOCAL_URL` landed after the 1.12.0 release and first
-shipped in 1.13.0 — below this server's enforced floor (1.14.0), so every *published* comfy-cli
+**Requires comfy-cli ≥ 1.14.0 (this server's floor).** `COMFY_LOCAL_URL` itself landed after the
+1.12.0 release and first shipped in 1.13.0 — below the enforced floor, so every *published* comfy-cli
 this server accepts honors the variable. The floor is not a guarantee, though: the version guard
 fails OPEN on a `--version` it can't parse, that errors, or that times out, so a source build or
 fork older than 1.13.0 can still slip past it and silently ignore the variable. On any comfy-cli

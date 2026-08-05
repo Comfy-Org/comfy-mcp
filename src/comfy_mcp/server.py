@@ -3792,7 +3792,13 @@ def _freshness_report() -> Any:
             return {
                 "error": (
                     "freshness unavailable: the installed comfy-cli does not support "
-                    f"'comfy outdated' (the verb ships in comfy-cli >= {_MIN_COMFY_CLI_STR}). "
+                    # "1.13.0" spelled out rather than interpolated from
+                    # `_MIN_COMFY_CLI_STR`: `outdated` landed in 1.13.0, BELOW
+                    # the floor, and the only reader of this message is an
+                    # install that got past the fail-open version guard from
+                    # below the floor — for which 1.13.0 is the true
+                    # requirement. Interpolating the floor would overstate it.
+                    "'comfy outdated' (the verb ships in comfy-cli 1.13.0 and newer). "
                     "Workflows are unaffected; update checks were skipped."
                 ),
                 "unsupported": True,
@@ -12519,8 +12525,14 @@ def list_workflow_notes(workflow_path: str) -> Any:
         return {
             "error": (
                 "workflow notes unavailable: the installed comfy-cli does not "
-                "support 'comfy workflow notes' (the verb ships in releases "
-                f"after {_MIN_COMFY_CLI_STR}). Nothing else is affected. The "
+                "support 'comfy workflow notes' (the verb ships in "
+                # "1.14.0" spelled out rather than interpolated from
+                # `_MIN_COMFY_CLI_STR`: that constant is the FLOOR, which is now
+                # the release carrying this verb, so interpolating it into a
+                # "releases after …" hedge told the caller to upgrade past the
+                # very release that introduced the verb. Same reasoning as
+                # `node_dependencies` / `_download_verb_unsupported`.
+                "1.14.0 and newer). Nothing else is affected. The "
                 "notes are still readable without it: they live in the "
                 "frontend-format workflow JSON that `fetch_template` wrote to "
                 f"{workflow_path!r}, as the `Note` / `MarkdownNote` entries of "
