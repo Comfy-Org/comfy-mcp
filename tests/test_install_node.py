@@ -23,7 +23,13 @@ third-party code by accident:
 5. The result contract, including ``restart_required: True`` — this tool never
    restarts anything, which is what lets a user say "install it, I'll restart the
    server myself".
-6. The async plumbing that posture required, mirroring ``test_update_consent``'s:
+6. The cm-cli PRE-FLIGHT, which is the second half of that consent posture: on an
+   install whose ``cm_cli`` does not import — an absent ComfyUI-Manager, or one
+   present only as a legacy clone under ``custom_nodes/`` — the call is refused
+   BEFORE the prompt, because being asked to authorize third-party code that
+   cannot be downloaded is worse than the failure it precedes. It fails OPEN, so
+   an unreadable ``comfy env`` still installs and lets comfy-cli answer.
+7. The async plumbing that posture required, mirroring ``test_update_consent``'s:
    the install keeps its OWN worker thread rather than asyncio's shared pool, it
    forwards the 30-minute timeout, and the lock it holds belongs to the SUBPROCESS
    rather than to the request. Without those three, replacing the done-callback
@@ -40,6 +46,7 @@ import threading
 from unittest import mock
 
 import pytest
+from conftest import envelope
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -48,10 +55,41 @@ from mcp.server.elicitation import (
 
 from comfy_mcp import server
 
+# Captured before any test patches it, so the one test that wants the REAL
+# `comfy env` pre-flight can put it back and drive the probe end to end through
+# `patched_run`. Every other test runs with the stub the fixture below installs.
+_REAL_WORKSPACE_REPORT = server._workspace_report
+
 
 def _install(*args, **kwargs):
     """Drive the async ``install_node`` tool from a sync test."""
     return asyncio.run(server.install_node(*args, **kwargs))
+
+
+def _env(**workspace):
+    """A ``_workspace_report`` stand-in — the pre-flight's whole input."""
+    return lambda: dict(workspace)
+
+
+@pytest.fixture(autouse=True)
+def manager_is_usable(monkeypatch):
+    """Every test in this file runs on an install whose ``cm-cli`` works.
+
+    `install_node` pre-flights `comfy env` before its prompt, so without this
+    every test here would spawn a second child and read whatever the CLI fake was
+    canned with. Stubbing the `comfy env` READ (rather than the classification
+    that consumes it) keeps the real decision in the path — a test that expects an
+    install to proceed is still asserting that a `venv-package` install is allowed
+    to — while leaving `calls` to hold only the argv each test is actually about.
+
+    Individual tests below re-patch `_workspace_report` to describe a different
+    install; the last `setattr` wins, so overriding is just doing it again.
+    """
+    monkeypatch.setattr(
+        server,
+        "_workspace_report",
+        _env(manager_mode="enable-gui", manager_detected="venv-package"),
+    )
 
 
 class _FakeSession:
@@ -548,6 +586,374 @@ def test_the_busy_refusal_names_every_lock_sharer(patched_plain_run):
     message = str(excinfo.value)
     assert "version switch" in message
     assert "Nothing was installed." in message
+
+
+# --- the cm-cli pre-flight --------------------------------------------------
+#
+# `comfy node install` shells out to ComfyUI-Manager's `cm-cli`, and comfy-cli's
+# `execute_cm_cli` refuses outright — before it downloads anything — when
+# `cm_cli` does not import from the workspace Python. A LEGACY CLONE of Manager
+# under `custom_nodes/` is exactly that install: fully functional for ComfyUI
+# itself, and unusable by every cm-cli-backed verb. Verified against comfy-cli
+# 1.14.0 (this server's floor) on a workspace of that shape: `comfy env` reports
+# `manager_detected: "legacy-clone"`, and `comfy node install <pack>
+# --exit-on-fail` exits 1 with "ComfyUI-Manager not found. 'cm-cli' command is
+# not available." having installed nothing.
+#
+# What these lock in is the ORDER: the refusal happens before the elicitation, so
+# a user is never asked to approve downloading and running third-party code on a
+# call that cannot succeed.
+
+
+def test_a_legacy_clone_refuses_before_the_prompt(patched_plain_run, monkeypatch):
+    """The ticket case: Manager on disk, `cm_cli` not importable in the venv."""
+    calls = patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(
+        server,
+        "_workspace_report",
+        _env(manager_mode="legacy", manager_detected="legacy-clone"),
+    )
+    ctx = _FakeCtx()
+
+    result = _install(["comfyui-impact-pack"], ctx=ctx)
+
+    # No prompt, and no `comfy node install`: the two halves of "never authorize
+    # an impossible operation".
+    assert ctx.elicitations == []
+    assert calls == []
+    assert result["unsupported"] is True
+    message = result["error"]
+    assert "LEGACY CLONE" in message
+    assert "Nothing was installed" in message
+    # The remedy is the venv package, not "install ComfyUI-Manager" unqualified —
+    # the user demonstrably HAS Manager, which is why the old raw cm-cli error
+    # read as nonsense on this install.
+    assert "workspace VENV" in message
+    assert "comfyui_manager" in message
+
+
+def test_no_manager_at_all_refuses_and_says_so(patched_plain_run, monkeypatch):
+    """The other cm-cli-less shape, described as itself rather than as a clone."""
+    calls = patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(
+        server,
+        "_workspace_report",
+        _env(manager_mode="not-installed", manager_detected="none"),
+    )
+    ctx = _FakeCtx()
+
+    result = _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert ctx.elicitations == []
+    assert calls == []
+    assert result["unsupported"] is True
+    assert "does not have ComfyUI-Manager at all" in result["error"]
+    assert "LEGACY CLONE" not in result["error"]
+
+
+def test_the_refusal_routes_instead_of_dead_ending(patched_plain_run, monkeypatch):
+    """A denial must send the user somewhere that WORKS, and nowhere that does not.
+
+    Manager's own UI keeps serving from a legacy clone, so it is named. A terminal
+    `comfy node install` is the identical command through the identical `cm-cli`,
+    so it is named as NOT a way around this rather than offered as the escape
+    hatch — sending the user there would be a second guaranteed failure.
+    """
+    patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(
+        server, "_workspace_report", _env(manager_detected="legacy-clone")
+    )
+
+    message = _install(["comfyui-impact-pack"], ctx=_FakeCtx())["error"]
+
+    assert "Manager's own UI in the running ComfyUI can still install packs" in message
+    assert "is NOT a way around this" in message
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        # No `manager_detected` at all — an engine that reports only the mode.
+        {"manager_mode": "legacy"},
+        {"manager_mode": "not-installed"},
+        # `manager_detected` wins where the two disagree: the mode is a per-user
+        # CONFIG key comfy-cli leaves alone when it reads `disable` or anything
+        # it does not recognise, so it can stay silent about a Manager that is
+        # missing. The detection is the reconciliation's input, not its output.
+        {"manager_mode": "disable", "manager_detected": "legacy-clone"},
+        {"manager_mode": "enable-gui", "manager_detected": "none"},
+    ],
+)
+def test_every_cm_cli_less_report_refuses(patched_plain_run, monkeypatch, workspace):
+    """Both fields are read, and the authoritative one is read first."""
+    calls = patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(server, "_workspace_report", _env(**workspace))
+    ctx = _FakeCtx()
+
+    assert _install(["comfyui-impact-pack"], ctx=ctx)["unsupported"] is True
+    assert ctx.elicitations == []
+    assert calls == []
+
+
+@pytest.mark.parametrize("mode", ["legacy", "not-installed"])
+def test_the_mode_fallback_refuses_without_naming_a_shape(
+    patched_plain_run, monkeypatch, mode
+):
+    """Neither mode value identifies WHICH cm-cli-less shape this install is.
+
+    `server_info`'s own docstring records that a legacy clone under
+    `custom_nodes/` also reports `manager_mode: "not-installed"` — and this
+    fallback runs only on engines old enough to lack `manager_detected`, which is
+    exactly where that conflation is likeliest. So a clone user must not be told
+    they have no Manager and denied the Manager-UI route that still works for
+    them. The refusal is right; naming the cause on this signal is not.
+    """
+    patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(server, "_workspace_report", _env(manager_mode=mode))
+
+    message = _install(["comfyui-impact-pack"], ctx=_FakeCtx())["error"]
+
+    assert "either it is not installed at all, or it is a legacy clone" in message
+    assert "does not have ComfyUI-Manager at all" not in message
+    # …and the route out of the shape it MIGHT be is still offered, conditionally.
+    assert "If this install is a legacy clone" in message
+    assert "Manager's own UI in the running ComfyUI can still install packs" in message
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        # cm-cli is usable — the ordinary case, and the one `manager_detected`
+        # answers outright whatever the stale config mode says.
+        {"manager_detected": "venv-package"},
+        {"manager_detected": "venv-package", "manager_mode": "not-installed"},
+        # …and every report that is merely UNINFORMATIVE. None of these is
+        # evidence the install would fail, so none may block it.
+        {"manager_mode": "enable-gui"},
+        {"manager_mode": "disable"},
+        {"manager_mode": "disable-gui"},
+        {"manager_detected": "a-shape-from-a-later-comfy-cli"},
+        # The combination that made the fail-open contract a lie: a vocabulary
+        # from a LATER comfy-cli — which may well name a perfectly usable Manager
+        # — alongside a stale config mode. An unrecognised detection must not
+        # fall through to the mode; the field ANSWERED, and a `"legacy"` string
+        # nobody has corrected does not get to overrule it and refuse an install
+        # that works. Non-string shapes fail open by the same rule.
+        {
+            "manager_detected": "a-shape-from-a-later-comfy-cli",
+            "manager_mode": "legacy",
+        },
+        {
+            "manager_detected": "a-shape-from-a-later-comfy-cli",
+            "manager_mode": "not-installed",
+        },
+        {"manager_detected": ["not", "a", "string"], "manager_mode": "not-installed"},
+        {"manager_detected": None, "manager_mode": "legacy"},
+        {},
+    ],
+)
+def test_an_uninformative_or_healthy_report_installs_anyway(
+    patched_plain_run, monkeypatch, workspace
+):
+    """The pre-flight FAILS OPEN — the opposite of the version switch's check.
+
+    That check guards against DOING something destructive, so it refuses when it
+    cannot tell. This one only improves an error message, and comfy-cli's own
+    refusal is still behind it, so inventing a refusal here would block installs
+    that work. Every uncertain answer proceeds.
+    """
+    calls = patched_plain_run(0, stderr="installed")
+    monkeypatch.setattr(server, "_workspace_report", _env(**workspace))
+
+    result = _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+    assert result["installed"] == ["comfyui-impact-pack"]
+    assert len(calls) == 1
+    assert calls[0]["cmd"][-3:] == ["install", "comfyui-impact-pack", "--exit-on-fail"]
+
+
+@pytest.mark.parametrize(
+    "run_kwargs",
+    [
+        # `comfy env` failed outright, or answered something that is not an
+        # envelope. Both raise `ComfyCliError` out of `_run_comfy`.
+        {"stdout": "not json at all", "returncode": 1},
+        {"stdout": envelope(ok=False, error={"code": "boom", "message": "no"})},
+        # It succeeded, but said nothing this probe can use.
+        {"stdout": envelope(data={"server": {"running": False}})},
+        {"stdout": envelope(data={"workspace": None})},
+        {"stdout": envelope(data=["not a mapping at all"])},
+        # The spawn itself failed.
+        {"raises": OSError("no such binary")},
+    ],
+)
+def test_a_probe_that_cannot_answer_reads_as_no_gap(
+    patched_run, monkeypatch, run_kwargs
+):
+    """`_workspace_report` swallows every failure — it exists to word an error.
+
+    Driven at the probe rather than through the tool because these are the shapes
+    the tool's stub short-circuits: an unparseable body, an error envelope, a
+    payload with no `workspace`, a spawn that never started.
+    """
+    patched_run(**run_kwargs)
+    monkeypatch.setattr(server, "_workspace_report", _REAL_WORKSPACE_REPORT)
+
+    assert server._workspace_report() is None
+    assert server._cm_cli_unavailable_reason() is None
+
+
+def test_the_preflight_reads_comfy_env_and_never_spawns_the_install(
+    patched_run, monkeypatch
+):
+    """End to end through the real probe: comfy-cli's own `env` payload refuses.
+
+    The stub above short-circuits the `comfy env` read, which is what keeps the
+    rest of this file about the install. This one puts the real one back, so
+    `workspace.manager_detected` is read off an actual `envelope/1` body the way
+    it arrives from `comfy env` — and asserts the thing the ordering exists for:
+    `node install` is never spawned.
+    """
+    calls = patched_run(
+        envelope(
+            data={
+                "server": {"running": False, "url": None},
+                "workspace": {
+                    "path": "/ws",
+                    "manager_mode": "legacy",
+                    "manager_detected": "legacy-clone",
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(server, "_workspace_report", _REAL_WORKSPACE_REPORT)
+    ctx = _FakeCtx()
+
+    assert _install(["comfyui-impact-pack"], ctx=ctx)["unsupported"] is True
+
+    assert ctx.elicitations == []
+    assert calls, "the pre-flight must actually ask comfy-cli"
+    assert calls[0]["cmd"][:5] == [
+        server.COMFY_BIN,
+        "--json",
+        "--where",
+        "local",
+        "env",
+    ]
+    # The probe may run more than one child (`comfy env` plus `server_info`'s own
+    # freshness probe); what must never appear is the install.
+    assert not any("install" in call["cmd"] for call in calls)
+
+
+def test_a_failure_the_preflight_cannot_predict_is_still_relayed_raw(
+    patched_plain_run,
+):
+    """The pre-flight is an addition, not a replacement, for comfy-cli's error.
+
+    An install can still fail inside `cm-cli` for reasons `comfy env` cannot
+    predict — an unreachable channel, a broken pack, a dependency conflict.
+    comfy-cli's own message is what the caller gets.
+    """
+    patched_plain_run(1, stderr="\nFailed to install: dependency conflict.\n")
+
+    with pytest.raises(server.ComfyCliError, match="dependency conflict"):
+        _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+
+def test_a_cm_cli_gap_the_preflight_failed_open_on_degrades_the_same_way(
+    patched_plain_run, monkeypatch
+):
+    """ONE environment must not answer in TWO shapes.
+
+    The pre-flight fails open, so an unreadable `comfy env` — a probe that timed
+    out, an engine reporting neither field — lets the install run and hit the very
+    gap the probe could not see. Callers are told to check `unsupported` before
+    indexing `["installed"]`; if that path raised a raw `ComfyCliError` instead,
+    the contract would hold only when a subprocess happened to succeed. So
+    comfy-cli's own refusal maps to the same degrade, and — since that message
+    reads identically for a missing Manager and for a clone — claims no shape.
+    """
+    calls = patched_plain_run(
+        1, stderr="\nComfyUI-Manager not found. 'cm-cli' command is not available.\n"
+    )
+    monkeypatch.setattr(server, "_workspace_report", lambda: None)
+    ctx = _FakeCtx()
+
+    result = _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert result["unsupported"] is True
+    assert "installed" not in result
+    assert server._MANAGER_VENV_REMEDY in result["error"]
+    assert (
+        "either it is not installed at all, or it is a legacy clone" in result["error"]
+    )
+    # It failed open, so the user WAS prompted and the install WAS spawned — this
+    # degrade is after the fact, not instead of the attempt.
+    assert len(ctx.elicitations) == 1
+    assert len(calls) == 1
+
+
+def test_an_update_that_starts_during_the_probe_refuses_before_the_prompt(
+    patched_plain_run, monkeypatch
+):
+    """The peek is re-taken after the probe, because the probe is SLOW.
+
+    The pre-flight is a subprocess with a 60-second ceiling, sitting between the
+    first `_UPDATE_LOCK` peek and the prompt. An update that starts inside that
+    window would otherwise be discovered only by the authoritative acquire — i.e.
+    after the user had already approved running third-party code, which is the
+    outcome the peek exists to prevent.
+    """
+    calls = patched_plain_run(0, stderr="installed")
+
+    def _probe_during_which_an_update_starts():
+        server._UPDATE_LOCK.acquire()
+        return {"manager_detected": "venv-package"}
+
+    monkeypatch.setattr(
+        server, "_workspace_report", _probe_during_which_an_update_starts
+    )
+    ctx = _FakeCtx()
+
+    try:
+        with pytest.raises(server.ComfyCliError, match="already running"):
+            _install(["comfyui-impact-pack"], ctx=ctx)
+    finally:
+        server._UPDATE_LOCK.release()
+
+    assert ctx.elicitations == []
+    assert calls == []
+
+
+def test_both_cm_cli_tools_describe_the_same_install_the_same_way(
+    patched_run, monkeypatch
+):
+    """`install_node` and `workflow_deps` fail on ONE environment — one story.
+
+    They reach the verdict differently — this tool pre-flights `comfy env`, that
+    one reads comfy-cli's refusal after the fact — which is exactly how two
+    messages drift into describing the same machine as two different machines.
+    Sharing the remedy makes that structural rather than a matter of keeping two
+    literals in step.
+    """
+    monkeypatch.setattr(
+        server, "_workspace_report", _env(manager_detected="legacy-clone")
+    )
+    install_message = _install(["comfyui-impact-pack"], ctx=_FakeCtx())["error"]
+
+    patched_run(
+        "",
+        returncode=1,
+        stderr="\nComfyUI-Manager not found. 'cm-cli' command is not available.\n",
+    )
+    deps_message = server.workflow_deps("/tmp/flux.json")["error"]
+
+    assert server._MANAGER_VENV_REMEDY in install_message
+    assert server._MANAGER_VENV_REMEDY in deps_message
+    # And neither claims more than it knows: the pre-flight saw the clone, the
+    # post-hoc read cannot tell a clone from an absent Manager and says so.
+    assert "LEGACY CLONE" in install_message
+    assert "either it is not installed at all, or it is a legacy clone" in deps_message
 
 
 # --- discoverability --------------------------------------------------------
