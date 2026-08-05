@@ -9348,6 +9348,178 @@ def _guard_node_names(names: Any) -> list[str]:
     return guarded
 
 
+# How `comfy env` reports the ComfyUI-Manager install it found
+# (`detect_manager_installation`, comfy-cli 1.14.0 — this server's floor, so a
+# compliant install always reports it). Exactly ONE of the three means cm-cli
+# works, and the equivalence is tight rather than inferred: `"venv-package"` IS
+# `find_cm_cli()` returning True, and `find_cm_cli()` is the same call
+# `execute_cm_cli` gates EVERY cm-cli-backed verb on — `node install` included.
+# So anything else here is the same False the install would hit for itself.
+_MANAGER_DETECTED_VENV_PACKAGE = "venv-package"
+_MANAGER_DETECTED_LEGACY_CLONE = "legacy-clone"
+_MANAGER_DETECTED_NONE = "none"
+
+# `workspace.manager_mode`'s two cm-cli-less values — the FALLBACK signal only,
+# for an engine that reports a mode but no `manager_detected`. The mode is a
+# per-user CONFIG key that comfy-cli reconciles against what is on disk, and the
+# reconciliation deliberately leaves `"disable"` and any unrecognised string
+# ALONE as user intent — so a mode can be silent about a Manager that is missing.
+# `manager_detected` is that reconciliation's INPUT rather than its output, which
+# is why it is read first and why it wins where the two disagree.
+_MANAGER_MODE_NOT_INSTALLED = "not-installed"
+_MANAGER_MODE_LEGACY = "legacy"
+
+
+def _workspace_report() -> dict | None:
+    """``comfy env``'s ``workspace`` block, or ``None`` if it cannot be read.
+
+    Shells out to ``comfy env`` DIRECTLY rather than composing
+    :func:`server_info` the way :func:`_local_comfyui_running` does, and the
+    difference is worth stating because that sibling is the obvious model. Its
+    reason for going through the tool is the compatibility gate ``server_info``
+    carries — which matters when the answer decides whether to do something
+    destructive. This probe only decides how to WORD a failure and fails open, so
+    it would swallow that gate's verdict rather than act on it, while paying for
+    ``server_info``'s other half: a ``comfy outdated`` freshness probe that
+    reaches the NETWORK and whose answer is then discarded. One local subprocess
+    is the whole cost this check should have.
+
+    Every failure is ``None``: this exists to improve a message, never to block.
+    """
+    try:
+        info = _run_comfy("env", timeout=60.0)
+    # `ComfyCliError` for a failed or unparseable `comfy env`; `OSError` for a
+    # spawn failure; `UnicodeDecodeError` for a workspace path that is not UTF-8
+    # (`_run_comfy` decodes strictly). None is grounds to refuse an install.
+    except (ComfyCliError, OSError, UnicodeDecodeError):
+        return None
+    workspace = info.get("workspace") if isinstance(info, dict) else None
+    return workspace if isinstance(workspace, dict) else None
+
+
+def _cm_cli_unavailable_reason() -> str | None:
+    """Why cm-cli cannot run on this install per ``comfy env``, or ``None``.
+
+    Returns :data:`_MANAGER_DETECTED_LEGACY_CLONE` or
+    :data:`_MANAGER_DETECTED_NONE` when comfy-cli's own environment report says
+    Manager's ``cm_cli`` is not importable from the workspace venv, and ``None``
+    when it is — or when the answer cannot be read. No new detection logic lives
+    here: both fields are comfy-cli's, computed by comfy-cli, and this only maps
+    them onto "would a cm-cli verb run".
+
+    **Fails OPEN**, which is deliberately the OPPOSITE of
+    :func:`_local_comfyui_running` and worth stating because the two sit in the
+    same position — a pre-flight ahead of a consent prompt. That one guards
+    against DOING something destructive, so an unreadable answer must refuse.
+    This one only improves an error message: the install still has comfy-cli's
+    own refusal behind it, so an unreadable answer must NOT invent a refusal of
+    its own and block an install that would have worked. Every uncertain path —
+    the probe failing, a missing ``workspace`` block, an unrecognised value, an
+    old engine reporting neither field — returns ``None`` and lets the engine
+    answer.
+
+    Advisory in TIME as well, like the ``_UPDATE_LOCK`` peek above it: a user who
+    pip-installs Manager between this probe and the install simply gets an
+    install that works. The window costs nothing in either direction.
+    """
+    workspace = _workspace_report()
+    if workspace is None:
+        return None
+    detected = workspace.get("manager_detected")
+    if detected == _MANAGER_DETECTED_VENV_PACKAGE:
+        return None
+    if detected in (_MANAGER_DETECTED_LEGACY_CLONE, _MANAGER_DETECTED_NONE):
+        return detected
+    # No `manager_detected` (or a value this server does not know): fall back to
+    # the mode, whose two cm-cli-less values comfy-cli derives from the very same
+    # probe. Only those two refuse — every other mode, including `"disable"`,
+    # says nothing about whether `cm_cli` imports.
+    mode = workspace.get("manager_mode")
+    if mode == _MANAGER_MODE_LEGACY:
+        return _MANAGER_DETECTED_LEGACY_CLONE
+    if mode == _MANAGER_MODE_NOT_INSTALLED:
+        return _MANAGER_DETECTED_NONE
+    return None
+
+
+# The remedy, written ONCE and shared by both cm-cli-backed tools. `install_node`
+# and `workflow_deps` fail on the same install for the same reason, so the two
+# must not describe that environment — or the way out of it — differently; this
+# constant and `_manager_state_clause` below are what make that structural rather
+# than a matter of keeping two message literals in step.
+_MANAGER_VENV_REMEDY = (
+    "Installing ComfyUI-Manager into the workspace VENV — the `comfyui_manager` "
+    "package, importable by the workspace Python — is what restores this tool; "
+    "that is the install `comfy install` performs, and in a terminal it is "
+    "`<workspace-python> -m pip install -r manager_requirements.txt` from the "
+    "ComfyUI directory."
+)
+
+
+def _manager_state_clause(reason: str | None) -> str:
+    """Describe the Manager install cm-cli cannot use, per what is KNOWN of it.
+
+    ``reason`` is a :func:`_cm_cli_unavailable_reason` value for a caller that
+    pre-flighted, or ``None`` for one that only has comfy-cli's own refusal in
+    hand — ``ComfyUI-Manager not found. 'cm-cli' command is not available.`` is
+    printed identically for both shapes, so a caller reacting to it after the
+    fact genuinely cannot tell which it hit and must not claim to.
+    """
+    if reason == _MANAGER_DETECTED_LEGACY_CLONE:
+        return (
+            "this workspace has ComfyUI-Manager only as a LEGACY CLONE under "
+            "`custom_nodes/` — which is fully functional for ComfyUI itself, so "
+            "Manager's own UI keeps working in the running server, but leaves "
+            "`cm_cli` unimportable in the workspace venv, and every cm-cli-backed "
+            "comfy-cli verb fails here."
+        )
+    if reason == _MANAGER_DETECTED_NONE:
+        return "this ComfyUI install does not have ComfyUI-Manager at all."
+    return (
+        "this ComfyUI install has no ComfyUI-Manager that comfy-cli can drive — "
+        "either it is not installed at all, or it is a legacy clone under "
+        "`custom_nodes/`, which is fully functional for ComfyUI itself but "
+        "leaves `cm_cli` unimportable in the workspace venv. `server_info`'s "
+        "`workspace.manager_detected` reports which of the two this is."
+    )
+
+
+def _install_node_unavailable(reason: str | None) -> dict[str, Any]:
+    """``install_node``'s degrade for an install whose cm-cli cannot run.
+
+    Same shape and same environment description as ``workflow_deps``' — see
+    :func:`_manager_state_clause`. What differs is only the ROUTING, because the
+    two tools have different ways out: a class this install already has is still
+    described by ``get_node``, whereas a pack it does not have cannot be
+    installed by any tool on this server.
+
+    The route named for a legacy clone is ComfyUI-Manager's own UI, which is a
+    path that genuinely still WORKS there — the clone serves it from the running
+    ComfyUI. What is deliberately NOT offered is ``comfy node install`` in a
+    terminal: it is the identical command through the identical ``cm-cli``, so
+    sending the user there would be a second guaranteed failure, exactly the
+    dead-end ``workflow_deps`` refuses to send them into in the other direction.
+    """
+    routes = (
+        "Manager's own UI in the running ComfyUI can still install packs — that "
+        "half of a legacy clone works. "
+        if reason == _MANAGER_DETECTED_LEGACY_CLONE
+        else ""
+    )
+    return {
+        "error": (
+            f"install_node unavailable: {_manager_state_clause(reason)} "
+            "`comfy node install` runs Manager's `cm-cli`, so it refuses here "
+            "before it downloads anything. Nothing was installed and nothing on "
+            f"this install was changed. {_MANAGER_VENV_REMEDY} {routes}"
+            "Running `comfy node install` in a terminal is NOT a way around "
+            "this — it is the same command through the same `cm-cli`, and it "
+            "fails identically."
+        ),
+        "unsupported": True,
+    }
+
+
 def _run_node_install(names: list[str]) -> Any:
     """Run the install. ``--exit-on-fail`` is NOT optional.
 
@@ -9473,9 +9645,24 @@ async def install_node(
     them is in flight is refused immediately rather than queued behind a job that
     may run for half an hour.
 
-    A pack id that does not exist, an unreachable registry, a dependency conflict,
-    or a missing ComfyUI-Manager all fail inside comfy-cli and raise
-    :class:`ComfyCliError` carrying its message.
+    **Requires a ComfyUI-Manager comfy-cli can drive**, and says so BEFORE
+    prompting: ``comfy node install`` runs Manager's ``cm-cli``, which needs the
+    ``comfyui_manager`` package importable in the workspace venv. An install that
+    has Manager only as a LEGACY CLONE under ``custom_nodes/`` — functional for
+    ComfyUI itself, and a common shape — cannot run it, and neither can one
+    without Manager at all. ``comfy env`` already reports both
+    (``workspace.manager_detected`` / ``manager_mode``), so that case returns
+    ``{"error": ..., "unsupported": True}`` INSTEAD of installing — check for
+    that key before indexing ``["installed"]``, exactly as ``workflow_deps``
+    degrades on the same environment, and with the same description of it. No
+    prompt is raised and no install is spawned: a user must not be asked to
+    approve running third-party code on a call that cannot succeed. The check
+    fails OPEN, so an engine that cannot answer simply installs and lets
+    comfy-cli's own error stand.
+
+    A pack id that does not exist, an unreachable registry, a dependency
+    conflict, or any cm-cli failure the pre-flight could not predict fails inside
+    comfy-cli and raises :class:`ComfyCliError` carrying its message.
 
     Returns ``{"installed", "result", "restart_required"}`` —
     ``restart_required`` is always ``True``, because a running ComfyUI will not
@@ -9490,6 +9677,17 @@ async def install_node(
     # prompt the user answered.
     if _UPDATE_LOCK.locked():
         raise ComfyCliError(_INSTALL_UPDATE_BUSY)
+    # The other half of that question, and the reason it runs HERE rather than
+    # after the prompt: on an install whose `cm_cli` does not import, this call
+    # cannot succeed no matter what the user answers, and being asked to
+    # authorize downloading and running third-party code that will not happen is
+    # worse than the failure it precedes. `switch_comfyui_version` orders its
+    # running-server check ahead of its prompt for the same reason. Fails OPEN —
+    # an unreadable answer proceeds and lets comfy-cli's own error stand.
+    # `server_info` is sync and spawns children, so it runs off the event loop.
+    cm_cli_gap = await asyncio.to_thread(_cm_cli_unavailable_reason)
+    if cm_cli_gap is not None:
+        return _install_node_unavailable(cm_cli_gap)
     await _resolve_install_consent(names_display, confirm_install, ctx)
     # Refuse rather than queue, exactly as `update_comfyui` does and for the same
     # reason — see its comment. Acquired AFTER consent so a declined call never
@@ -10952,8 +11150,12 @@ def workflow_deps(workflow_path: str) -> Any:
     userinfo in it, and this payload reaches the model's transcript (see
     :func:`_scrub_deps_manifest`); nothing else is rewritten.
 
-    Requires ComfyUI-Manager: the verb runs Manager's ``cm-cli``, and without it
-    comfy-cli refuses. That case returns ``{"error": ..., "unsupported": True}``
+    Requires a ComfyUI-Manager comfy-cli can drive: the verb runs Manager's
+    ``cm-cli``, which needs the ``comfyui_manager`` package importable in the
+    workspace venv — so a Manager present only as a legacy clone under
+    ``custom_nodes/`` refuses here exactly as an absent one does, and
+    ``install_node`` is unavailable on that same install for the same reason.
+    That case returns ``{"error": ..., "unsupported": True}``
     INSTEAD of the manifest — check for that key before indexing
     ``["custom_nodes"]`` — rather than the raw usage dump, the same way
     ``node_dependencies`` degrades on a comfy-cli that predates its verb. Any
@@ -11030,14 +11232,21 @@ def workflow_deps(workflow_path: str) -> Any:
             if _is_manager_missing_error(exc, workflow_path):
                 return {
                     "error": (
-                        "workflow_deps unavailable: this ComfyUI install does not "
-                        "have ComfyUI-Manager, and 'comfy node deps-in-workflow' "
-                        "resolves node classes to packs through Manager's map. "
-                        "Installing ComfyUI-Manager into the workspace is what "
-                        "restores this tool. Until then a class this install "
-                        "already has is still described by "
-                        "`get_node`/`search_nodes`, which read the running "
-                        "ComfyUI directly and never touch Manager. "
+                        # `reason=None`: this tool learns of the gap from
+                        # comfy-cli's refusal, which reads the same for a missing
+                        # Manager and for a legacy clone, so the shared clause
+                        # names both rather than asserting the one that used to
+                        # be claimed here. `install_node` pre-flights `comfy env`
+                        # and passes what it actually found; the environment and
+                        # the remedy are described by the same two helpers either
+                        # way, so the two tools cannot drift.
+                        "workflow_deps unavailable: "
+                        f"{_manager_state_clause(None)} 'comfy node "
+                        "deps-in-workflow' resolves node classes to packs "
+                        f"through Manager's map. {_MANAGER_VENV_REMEDY} Until "
+                        "then a class this install already has is still "
+                        "described by `get_node`/`search_nodes`, which read the "
+                        "running ComfyUI directly and never touch Manager. "
                         "`install_node` is NOT a way around this, though: "
                         "`comfy node install` goes through the same `cm-cli`, "
                         "so it fails on this install too — installing Manager "

@@ -43,7 +43,16 @@ MCP request open. That stays inside the rule: every call still goes through
 behavior of its own. What would breach it is deriving the answer here (parsing
 the graph, keeping a table of what is "supported") instead of asking the engine
 — for `download_model` that would mean sizing the file on disk to decide whether
-it finished, rather than reading comfy-cli's `status`. `workflow_deps` reads its
+it finished, rather than reading comfy-cli's `status`. `install_node` composes
+the same way for a different reason: it reads `comfy env`'s
+`workspace.manager_detected` / `manager_mode` BEFORE its consent prompt, because
+`comfy node install` runs Manager's `cm-cli` and an install that has Manager only
+as a legacy clone under `custom_nodes/` cannot run it — so the user would be
+asked to authorize third-party code on a call guaranteed to fail. The verdict is
+comfy-cli's own field, not a scan this repo performs, and the check fails OPEN:
+an unreadable answer installs anyway and lets the engine's error stand.
+`workflow_deps` describes that same environment through the same two helpers
+(`_manager_state_clause` / `_MANAGER_VENV_REMEDY`) so the two cannot drift. `workflow_deps` reads its
 answer off DISK because the engine leaves no choice — `comfy node
 deps-in-workflow` emits no envelope and REQUIRES an `--output` path — so the
 temp-file round trip is that contract, and Manager's manifest goes back as
