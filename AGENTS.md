@@ -163,25 +163,23 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   procs` — the plain-JSON *async* path (`_run_comfy_async`): same
   `asyncio.create_subprocess_exec` spawn and real `StreamReader` pipes, but the
   capture is parsed once at the end, not line-by-line. `hang=True` leaves the
-  pipes OPEN so the fake child never finishes, for the timeout/cancellation
-  cases; `kill()` closes them (mirroring the process-group kill that lets a post-
-  kill drain reach EOF) and records `killed` so a test can assert it fired.
-  `on_spawn(cmd)` fires at spawn, exactly as `patched_run`'s does.
+  pipes OPEN so the fake child never finishes, for timeout/cancellation cases;
+  `kill()` closes them (mirroring the process-group kill that lets a post-kill
+  drain reach EOF), records `killed`, and fires `on_spawn(cmd)` like `patched_run`'s.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by
-async callers), while anything that STREAMS or is long-lived spawns via
-`asyncio.create_subprocess_exec` — nothing blocking may run on the event loop,
-enforced by ruff's `ASYNC` select. Two async runners live there:
+async callers); anything STREAMING or long-lived spawns via
+`asyncio.create_subprocess_exec` instead — nothing blocking may run on the
+event loop, enforced by ruff's `ASYNC` select. Two async runners live there:
 `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON
-twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is already non-
-blocking, but cancellation never reaches the thread, leaving the `comfy` child
-running after a client gives up. It carries the legacy foreground `model
-download` and `workflow_deps`' 300s network-backed resolve; short metadata
-calls stay on the thread pool. It bounds each captured stream to
-`_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining everything
-like `communicate()`. `auth_login` is a third async spawn site
-(`_start_login`) for the same reason, with its own browser flow.
+twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is non-blocking,
+but cancellation never reaches the thread, so a client giving up left the
+child running. It carries the legacy foreground `model download` and
+`workflow_deps`' 300s resolve; short metadata calls stay on the thread pool. It
+caps each captured stream to `_STDERR_MAX_CHARS` (`_drain_capped_into`)
+instead of retaining everything like `communicate()`. `auth_login` is a third
+async spawn site (`_start_login`), with its own browser flow.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.
