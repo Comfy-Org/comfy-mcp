@@ -1,0 +1,160 @@
+name: Publish to PyPI
+
+# Publishing is driven by a GitHub Release, not by a push to a branch: the
+# release is the human act, and the tag it carries is the only input. There is
+# deliberately no `workflow_dispatch` — a hand-triggered publish could ship a
+# version no tag points at, and a PyPI version number can never be reused.
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  # The version lives in TWO places in this repo — `pyproject.toml` and
+  # `src/comfy_mcp/__init__.py` — so a release can disagree with the package it
+  # would publish in two different ways. Check both against the tag BEFORE
+  # building, in a job that needs no credentials: an unpublishable release
+  # should fail here, cheaply, rather than after the OIDC exchange.
+  #
+  # (comfy-cli needs no equivalent check because it keeps `version = "0.0.0"` in
+  # the repo and its workflow rewrites it from the tag. This repo carries a real
+  # version instead, which is friendlier to `pip install -e .` and to
+  # `__version__` at runtime, and the cost is exactly this guard.)
+  check-version:
+    name: Tag matches the packaged version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # The whole check is one Python program fed through a QUOTED heredoc, so
+      # the shell performs no expansion on it at all. Both version strings need
+      # quote characters to parse, and nesting those inside `python -c "…"` is a
+      # quoting puzzle whose failure mode is a workflow that breaks at release
+      # time — the worst possible moment to debug escaping. The tag arrives via
+      # the environment instead of being interpolated into the source.
+      - name: Compare the tag against pyproject.toml and __init__.py
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, pathlib, re, sys, tomllib
+
+          tag = os.environ["TAG"]
+          version = tag[1:] if tag.startswith("v") else tag
+          print(f"tag={tag} -> version={version}")
+
+          # Read the authoritative value rather than grepping for it. tomllib is
+          # stdlib from 3.11, so this needs no dependency.
+          with open("pyproject.toml", "rb") as fh:
+              project = tomllib.load(fh)["project"]["version"]
+
+          # Parse `__version__` instead of importing the package: an import
+          # would pull in `mcp` and every runtime dependency to read a string.
+          src = pathlib.Path("src/comfy_mcp/__init__.py").read_text()
+          match = re.search(r"""^__version__\s*=\s*["']([^"']+)""", src, re.M)
+          dunder = match.group(1) if match else None
+          print(f"pyproject.toml={project} __init__.py={dunder}")
+
+          problems = []
+          if project != version:
+              problems.append(f"pyproject.toml version {project!r} != tag {tag!r}")
+          if dunder != version:
+              problems.append(
+                  f"src/comfy_mcp/__init__.py __version__ {dunder!r} != tag {tag!r}"
+              )
+          for problem in problems:
+              print(f"::error::{problem}")
+          if problems:
+              print(
+                  f"::error::Set the version to {version} in BOTH files, then "
+                  "re-cut the release. Nothing was published."
+              )
+              sys.exit(1)
+          print("Versions agree.")
+          PY
+
+  build-and-publish:
+    name: Build and publish to PyPI
+    needs: check-version
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Mandatory for PyPI trusted publishing (OIDC). No API token is stored:
+      # PyPI is configured to trust this repository + this workflow filename,
+      # so there is no long-lived credential to leak or rotate.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build
+        run: python -m pip install --upgrade pip build
+
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel --outdir dist/
+
+      - name: Check the built metadata
+        run: |
+          python -m pip install --upgrade twine
+          # Catches a README that renders on GitHub but breaks PyPI's stricter
+          # parser — worth knowing before the upload, since the version cannot
+          # be republished afterwards.
+          python -m twine check dist/*
+
+      # Pinned to the same commit comfy-cli's publish workflow already trusts,
+      # rather than a floating tag: a mutable ref on the action that uploads
+      # your package is the supply-chain edge worth nailing down, and matching
+      # the sibling repo means one SHA to review when it is bumped.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+
+  verify-install:
+    name: Install from PyPI and smoke-test
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # The floor this package declares, so the published wheel is proven
+          # installable on the oldest interpreter it claims to support.
+          python-version: '3.10'
+
+      - name: Install the published version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          # PyPI's index can lag a successful upload by a minute or two, so
+          # retry rather than fail the job on propagation delay.
+          for i in 1 2 3 4 5 6 7 8; do
+            pip install --no-cache-dir "comfy-mcp==${VERSION}" && exit 0
+            echo "Attempt ${i}: not on the index yet, waiting 15s..."
+            sleep 15
+          done
+          echo "::error::comfy-mcp==${VERSION} did not install after 8 attempts."
+          exit 1
+
+      - name: Import the package and confirm the version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          # Import rather than run the server: starting it would look for
+          # comfy-cli, which is the USER's dependency and deliberately not
+          # bundled (see AGENTS.md), so its absence is not a packaging failure.
+          INSTALLED=$(python -c "import comfy_mcp; print(comfy_mcp.__version__)")
+          echo "imported comfy_mcp ${INSTALLED}"
+          test "${INSTALLED}" = "${VERSION}"
