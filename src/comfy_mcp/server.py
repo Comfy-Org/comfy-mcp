@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import functools
 import ipaddress
 import json
@@ -1970,6 +1971,92 @@ def _timeout_failure(
     return ComfyCliError(message, timed_out=True)
 
 
+def _spawn_failure(
+    cmd: list[str],
+    args: tuple[str, ...],
+    exc: BaseException,
+) -> ComfyCliError:
+    """Format + log a failure to START comfy-cli, and RETURN it for the caller to raise.
+
+    The BACKSTOP under every pre-spawn guard, shared by all four spawn sites
+    (:func:`_run_comfy_raw`, :func:`_run_comfy_async`,
+    :func:`_run_comfy_streaming`, :func:`_start_login`) so a spawn that never
+    happened reports identically wherever it was attempted. Returning rather than
+    raising is :func:`_timeout_failure`'s rationale verbatim: the
+    ``raise ... from exc`` stays at the call site, so each runner remains visibly
+    the thing that failed and the chaining sits where the originating exception is
+    bound.
+
+    It exists because the spawn call sits OUTSIDE the ``try`` that each runner
+    opens around ``communicate()`` / the drain — everything after a successful
+    spawn already has a handler, and a spawn that raised has no child to reap. An
+    exception from the constructor therefore escaped as an unconverted internal
+    error: no :class:`ComfyCliError`, no failure-log line. Reachable in practice
+    because MCP tool arguments cross the wire uncapped for the free-form values
+    (``search_models``'s ``query``, a ``partner_generate`` param), and a big
+    enough one trips the OS limit on ``execve`` — measured on macOS, a ~2 MiB
+    argument raises ``OSError: [Errno 7] Argument list too long``.
+
+    The message names the failure CLASS and the rendered command, and adds
+    nothing else — in particular no separate echo of the offending value, which
+    is by definition the oversized or unencodable one. The rendering is
+    :func:`_cmd_for_message`, the same one :func:`_timeout_failure` uses, so the
+    argv is credential-scrubbed and head-clipped to
+    :data:`_MAX_ERROR_FIELD_CHARS`: a megabyte-long "query" cannot come back
+    whole, while the identifying ``comfy --json --where local <subcommand>``
+    prefix still tells a reader WHICH call could not be started. A value short
+    enough to fit inside that clip does appear, exactly as it does in the timeout
+    and error-envelope messages — the bound is the contract, not omission.
+
+    Four classes, and the isinstance order is load-bearing:
+    :class:`UnicodeEncodeError` is a :class:`ValueError` SUBCLASS, so it has to be
+    tested before the bare-``ValueError`` case that names an embedded NUL, or an
+    unencodable argument would be reported as the wrong mistake.
+
+    This does NOT replace :func:`_reject_nul` / :func:`_guard_arg_len`, which
+    still run first and still produce the better, argument-NAMING error. What
+    lands here is what those cannot see: a value shape they do not cover, an
+    environment that pushes the total over ``ARG_MAX``, or the binary vanishing
+    between :func:`_require_comfy_bin` and the spawn.
+    """
+    rendered = _cmd_for_message(cmd)
+    if isinstance(exc, OSError) and exc.errno == errno.E2BIG:
+        message = (
+            "could not start comfy-cli: the argument list and environment exceed "
+            "this system's limit — shorten the oversized argument and retry: "
+            f"{rendered}"
+        )
+    elif isinstance(exc, UnicodeEncodeError):
+        # Same wording as `_encode_argv`'s refusal, for the same reason it gives:
+        # `os.fsencode` uses the interpreter's filesystem encoding, so under a
+        # non-UTF-8 locale an ordinary multibyte value raises this too. Name the
+        # encoding and offer the usual cause rather than asserting one.
+        message = (
+            "could not start comfy-cli: an argument cannot be encoded with this "
+            f"system's filesystem encoding ({sys.getfilesystemencoding()}), so it "
+            "cannot be passed to comfy-cli as a command-line argument — usually an "
+            "unpaired surrogate, or a character the current locale cannot "
+            f"represent: {rendered}"
+        )
+    elif isinstance(exc, OSError):
+        # `FileNotFoundError` if the binary vanished between `_require_comfy_bin`
+        # and here, `EACCES` if it lost its exec bit, and whatever else the OS
+        # reports. `strerror` is None for an `OSError` raised without one, hence
+        # the fallbacks — an empty diagnosis is worse than a class name.
+        detail = exc.strerror or str(exc) or type(exc).__name__
+        message = f"could not start comfy-cli: {detail}: {rendered}"
+    else:
+        message = (
+            "could not start comfy-cli: an argument contains an embedded NUL: "
+            f"{rendered}"
+        )
+    # No streams and no exit code: there is no child. `args` is still logged (the
+    # subcommand and its flags, scrubbed by `_log_failure`) so a reader can tell
+    # WHICH call could not be started.
+    failure_log._log_failure("spawn_failed", args, message=message)
+    return ComfyCliError(message)
+
+
 def _run_comfy_raw(
     *args: str, timeout: float | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
@@ -1993,38 +2080,44 @@ def _run_comfy_raw(
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        # This process speaks JSON-RPC over stdio, so the parent's stdin IS
-        # the protocol channel. A child that inherits it (the subprocess
-        # default) can consume request bytes the client sent us — silently
-        # corrupting the session — or block on a prompt nobody can answer.
-        # No comfy-cli invocation here is interactive, so close it outright;
-        # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
-        # child that WOULD have prompted fails fast instead of hanging.
-        stdin=subprocess.DEVNULL,
-        text=True,
-        # Pin the parent-side decode to UTF-8 so it matches what the child
-        # is forced to emit (_comfy_env). Without this, text=True decodes
-        # the pipe with the system locale (cp1252 on a default Windows
-        # console) and the non-ASCII catalog output raises UnicodeDecodeError
-        # or yields mojibake before _unwrap_envelope — the exact crash this
-        # fix targets, just moved to the reader.
-        encoding="utf-8",
-        env=env,
-        # Own process group so a timeout can kill the whole TREE, exactly as the
-        # streaming path has since BE-3343. comfy-cli's long verbs fork real
-        # work — `update` runs `git pull` and then a multi-GB
-        # `pip install -r requirements.txt`, `model download` streams a large
-        # file — and `subprocess.run` (which this used to be) kills only the
-        # direct `comfy` child on a timeout, so those grandchildren kept
-        # mutating the ComfyUI workspace and Python environment long after the
-        # tool reported failure. `Popen` is what exposes the pid the group kill
-        # needs. See `_kill_proc_tree`.
-        start_new_session=True,
-    )
+    # ONLY the spawn is wrapped: `communicate()` and everything after it already
+    # has the timeout and BaseException handlers below, and a spawn that raised
+    # has no child to reap. See `_spawn_failure`.
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # This process speaks JSON-RPC over stdio, so the parent's stdin IS
+            # the protocol channel. A child that inherits it (the subprocess
+            # default) can consume request bytes the client sent us — silently
+            # corrupting the session — or block on a prompt nobody can answer.
+            # No comfy-cli invocation here is interactive, so close it outright;
+            # `_comfy_env` also sets GIT_TERMINAL_PROMPT=0 / PIP_NO_INPUT=1 so a
+            # child that WOULD have prompted fails fast instead of hanging.
+            stdin=subprocess.DEVNULL,
+            text=True,
+            # Pin the parent-side decode to UTF-8 so it matches what the child
+            # is forced to emit (_comfy_env). Without this, text=True decodes
+            # the pipe with the system locale (cp1252 on a default Windows
+            # console) and the non-ASCII catalog output raises UnicodeDecodeError
+            # or yields mojibake before _unwrap_envelope — the exact crash this
+            # fix targets, just moved to the reader.
+            encoding="utf-8",
+            env=env,
+            # Own process group so a timeout can kill the whole TREE, exactly as
+            # the streaming path has since BE-3343. comfy-cli's long verbs fork
+            # real work — `update` runs `git pull` and then a multi-GB
+            # `pip install -r requirements.txt`, `model download` streams a large
+            # file — and `subprocess.run` (which this used to be) kills only the
+            # direct `comfy` child on a timeout, so those grandchildren kept
+            # mutating the ComfyUI workspace and Python environment long after the
+            # tool reported failure. `Popen` is what exposes the pid the group
+            # kill needs. See `_kill_proc_tree`.
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise _spawn_failure(cmd, args, exc) from exc
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -3187,21 +3280,27 @@ async def _run_comfy_async(
     # a trailing --json errors with "No such option".
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        # Same reason as both other spawn sites: this process speaks JSON-RPC
-        # over stdio, so a child that inherits the parent's stdin can eat request
-        # bytes the client sent us. See _run_comfy_raw.
-        stdin=asyncio.subprocess.DEVNULL,
-        env=env,
-        # Own process group so one kill reaps the whole TREE (child +
-        # grandchildren) and closes every inherited copy of the pipes — otherwise
-        # a grandchild holding an fd keeps the drain from ever seeing EOF. See
-        # _kill_proc_tree_async. (BE-3343)
-        start_new_session=True,
-    )
+    # Only the spawn, for the reason `_run_comfy_raw` gives: the `finally` below
+    # already reaps everything a STARTED child needs reaped, and a spawn that
+    # raised produced none. See `_spawn_failure`.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # Same reason as both other spawn sites: this process speaks JSON-RPC
+            # over stdio, so a child that inherits the parent's stdin can eat
+            # request bytes the client sent us. See _run_comfy_raw.
+            stdin=asyncio.subprocess.DEVNULL,
+            env=env,
+            # Own process group so one kill reaps the whole TREE (child +
+            # grandchildren) and closes every inherited copy of the pipes —
+            # otherwise a grandchild holding an fd keeps the drain from ever
+            # seeing EOF. See _kill_proc_tree_async. (BE-3343)
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise _spawn_failure(cmd, args, exc) from exc
     # Owned by THIS frame, not by the reader coroutines, so a bound that fires
     # mid-transfer still leaves the tail each stream had reached — see
     # `_drain_capped_into`.
@@ -3307,23 +3406,29 @@ async def _run_comfy_streaming(
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
     env = _comfy_env()
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        # Same reason as the plain path: never let a child inherit the stdio
-        # transport's stdin and eat JSON-RPC request bytes. See _run_comfy_raw.
-        stdin=asyncio.subprocess.DEVNULL,
-        env=env,
-        # Own process group so a timeout can kill the whole tree (child +
-        # grandchildren) and close every copy of the stderr pipe — otherwise a
-        # grandchild that inherited the fd keeps the stderr drain from ever
-        # seeing EOF. See _kill_proc_tree_async. (BE-3343)
-        start_new_session=True,
-        # Read granularity, not a maximum line length: `_readline_unbounded`
-        # stitches an over-long line back together rather than raising.
-        limit=_STREAM_LINE_LIMIT,
-    )
+    # Only the spawn — the pump, the drain and the timeout below all belong to a
+    # child that actually started. See `_spawn_failure`.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # Same reason as the plain path: never let a child inherit the stdio
+            # transport's stdin and eat JSON-RPC request bytes. See
+            # _run_comfy_raw.
+            stdin=asyncio.subprocess.DEVNULL,
+            env=env,
+            # Own process group so a timeout can kill the whole tree (child +
+            # grandchildren) and close every copy of the stderr pipe — otherwise
+            # a grandchild that inherited the fd keeps the stderr drain from ever
+            # seeing EOF. See _kill_proc_tree_async. (BE-3343)
+            start_new_session=True,
+            # Read granularity, not a maximum line length: `_readline_unbounded`
+            # stitches an over-long line back together rather than raising.
+            limit=_STREAM_LINE_LIMIT,
+        )
+    except (OSError, ValueError) as exc:
+        raise _spawn_failure(cmd, args, exc) from exc
     lines: list[str] = []
     tracker = _StreamProgress()
 
@@ -4242,25 +4347,33 @@ async def _start_login() -> tuple[_LoginChild | None, dict]:
     # block the event loop.
     await asyncio.to_thread(_check_comfy_version)
     args = ("cloud", "login", "--no-browser", "--timeout", str(_LOGIN_TIMEOUT_S))
-    proc = await asyncio.create_subprocess_exec(
-        COMFY_BIN,
-        # Global flags precede the subcommand, as everywhere else. `--json` is
-        # what makes comfy-cli emit the machine `login_url` event (it upgrades
-        # itself to the NDJSON stream to do so); `--where` is deliberately not
-        # forwarded — this verb targets the cloud by definition.
-        "--json",
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        # Never let a child inherit the stdio transport's stdin and eat JSON-RPC
-        # request bytes. Same reason as both synchronous spawn sites.
-        stdin=asyncio.subprocess.DEVNULL,
-        env=_comfy_env(),
-        # Own process group so `_kill_proc_tree_async` can take the whole tree
-        # and close every copy of the stderr pipe.
-        start_new_session=True,
-        limit=_LOGIN_LINE_LIMIT,
-    )
+    # Materialized rather than spelled inline at the spawn so `_spawn_failure`
+    # can render the same argv the other three sites hand it. Global flags
+    # precede the subcommand, as everywhere else. `--json` is what makes
+    # comfy-cli emit the machine `login_url` event (it upgrades itself to the
+    # NDJSON stream to do so); `--where` is deliberately not forwarded — this
+    # verb targets the cloud by definition.
+    cmd = [COMFY_BIN, "--json", *args]
+    # Nothing here is caller-supplied — the argv is constants only — so this wrap
+    # is for uniformity plus the two failures that reach a constant argv anyway:
+    # an environment that pushes the total over `ARG_MAX`, and the binary
+    # vanishing between `_require_comfy_bin` and the spawn. See `_spawn_failure`.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # Never let a child inherit the stdio transport's stdin and eat
+            # JSON-RPC request bytes. Same reason as both synchronous spawn sites.
+            stdin=asyncio.subprocess.DEVNULL,
+            env=_comfy_env(),
+            # Own process group so `_kill_proc_tree_async` can take the whole tree
+            # and close every copy of the stderr pipe.
+            start_new_session=True,
+            limit=_LOGIN_LINE_LIMIT,
+        )
+    except (OSError, ValueError) as exc:
+        raise _spawn_failure(cmd, tuple(args), exc) from exc
     prefix: list[str] = []
     stderr_task = asyncio.ensure_future(
         _drain_capped_async(proc.stderr, _LOGIN_STREAM_MAX_CHARS)
