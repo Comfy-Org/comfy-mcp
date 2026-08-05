@@ -24,7 +24,7 @@ copy per test file:
   of both pipes) — ``patched_async_run``, for ``server._run_comfy_async``. Same
   spawn and same real ``StreamReader`` pipes as the streaming fake, but the output
   is parsed once at the end rather than read line-by-line;
-  ``download_model``'s legacy foreground fallback drives it.
+  ``download_model``'s legacy foreground fallback and ``workflow_deps`` drive it.
 
 Every path spawns with ``start_new_session=True`` so a timeout can kill the whole
 process group; the fakes model that too (see ``_FakeRunProc``).
@@ -624,14 +624,19 @@ def patched_async_run(monkeypatch):
 
     The plain-JSON counterpart to :func:`patched_stream`, for
     ``server._run_comfy_async``. Returns
-    ``setup(stdout=…, returncode=…, stderr=…, hang=…, raises=…) -> procs`` — the
-    live list of spawned :class:`_FakeAsyncRunProc` objects, so a test can assert
-    the argv, the spawn kwargs, and (on the timeout / cancellation cases) that
-    ``killed`` fired.
+    ``setup(stdout=…, returncode=…, stderr=…, hang=…, raises=…, on_spawn=…) ->
+    procs`` — the live list of spawned :class:`_FakeAsyncRunProc` objects, so a
+    test can assert the argv, the spawn kwargs, and (on the timeout /
+    cancellation cases) that ``killed`` fired.
 
     ``stdout`` accepts a dict (JSON-encoded for you — pass an :func:`envelope`), a
     string, or bytes, matching :func:`patched_run`'s ergonomics. ``raises`` is the
-    same spawn-failure injection :func:`patched_stream` documents.
+    same spawn-failure injection :func:`patched_stream` documents. ``on_spawn`` is
+    a callable handed the spawned argv, for a verb whose real output is a FILE
+    rather than stdout (``node deps-in-workflow`` writes to its ``--output``
+    path) — same hook, same firing point as :func:`_canonical_run`'s: once the
+    child has actually started, after the ``raises`` check, because a spawn that
+    never returned wrote nothing either.
     """
 
     def setup(
@@ -641,6 +646,7 @@ def patched_async_run(monkeypatch):
         stderr: str = "",
         hang: bool = False,
         raises=None,
+        on_spawn=None,
     ) -> list[_FakeAsyncRunProc]:
         if stdout is None:
             stdout = ""
@@ -658,6 +664,8 @@ def patched_async_run(monkeypatch):
             if raises is not None:
                 raise raises
             _encode_argv_like_posix(cmd)
+            if on_spawn is not None:
+                on_spawn(list(cmd))
             proc = _FakeAsyncRunProc(
                 list(cmd),
                 stdout=canned_stdout,

@@ -1358,7 +1358,7 @@ def test_an_update_that_starts_during_the_probe_refuses_before_the_prompt(
 
 
 def test_both_cm_cli_tools_describe_the_same_install_the_same_way(
-    patched_run, monkeypatch
+    patched_async_run, monkeypatch
 ):
     """`install_node` and `workflow_deps` fail on ONE environment — one story.
 
@@ -1373,12 +1373,14 @@ def test_both_cm_cli_tools_describe_the_same_install_the_same_way(
     )
     install_message = _install(["comfyui-impact-pack"], ctx=_FakeCtx())["error"]
 
-    patched_run(
+    # `patched_async_run`, not `patched_run`: `workflow_deps` rides
+    # `_run_comfy_async` so a cancelling client kills its 300s child.
+    patched_async_run(
         "",
         returncode=1,
         stderr="\nComfyUI-Manager not found. 'cm-cli' command is not available.\n",
     )
-    deps_message = server.workflow_deps("/tmp/flux.json")["error"]
+    deps_message = asyncio.run(server.workflow_deps("/tmp/flux.json"))["error"]
 
     assert server._MANAGER_VENV_REMEDY in install_message
     assert server._MANAGER_VENV_REMEDY in deps_message
