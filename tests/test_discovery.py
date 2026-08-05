@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 
 import pytest
 from conftest import envelope
@@ -1221,4 +1222,54 @@ def test_workflow_deps_cancellation_reaps_the_resolver(patched_async_run, monkey
     # And the temp output directory went with it: `CancelledError` propagates
     # through the `with tempfile.TemporaryDirectory(...)`, so nothing is left
     # in the system temp directory on the cancellation path either.
+    assert not os.path.exists(os.path.dirname(_output_path(procs[0].cmd)))
+
+
+def test_workflow_deps_cancel_mid_read_waits_for_the_reader(
+    patched_async_run, monkeypatch
+):
+    """A cancel landing during the manifest read waits the reader THREAD out.
+
+    `asyncio.to_thread` cannot interrupt a worker, so if the tool unwound the
+    moment the cancel arrived, `TemporaryDirectory.__exit__` would delete the
+    manifest out from under the still-live read — on Windows the open handle
+    fails the unlink and `ignore_cleanup_errors=True` silently leaks the
+    directory. The tool shields the read and awaits its completion before
+    re-raising, so teardown always runs AFTER the thread is done.
+    """
+    procs = patched_async_run("saved", on_spawn=_writes(_DEPS_MANIFEST))
+    release = threading.Event()
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        real_parse = server._parse_deps_manifest
+
+        def blocking_parse(out_path, plain):
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=30), "the tool never released the reader"
+            return real_parse(out_path, plain)
+
+        monkeypatch.setattr(server, "_parse_deps_manifest", blocking_parse)
+        task = asyncio.ensure_future(server.workflow_deps("/tmp/flux.json"))
+        await entered.wait()
+        task.cancel()
+        # The reader thread is still parked on `release`: the tool must be
+        # blocked waiting it out, not unwound. Give the loop real turns —
+        # if the shield-and-wait were missing, the task would finish
+        # cancelled within one or two.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not task.done()
+        # The manifest is still on disk under the reader — teardown has not
+        # raced it. (Off the loop, as ruff's ASYNC240 asks even of tests.)
+        assert await asyncio.to_thread(os.path.exists, _output_path(procs[0].cmd))
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+
+    # The cancellation still landed, and the temp directory was removed —
+    # after the thread finished, not under it.
     assert not os.path.exists(os.path.dirname(_output_path(procs[0].cmd)))

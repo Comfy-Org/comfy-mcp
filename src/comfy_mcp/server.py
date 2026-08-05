@@ -11844,18 +11844,23 @@ def _scrub_deps_manifest(manifest: dict) -> dict:
     return {**manifest, "custom_nodes": scrubbed}
 
 
-def _read_deps_manifest_bytes(out_path: str, plain: Any) -> bytes:
-    """Read the manifest ``comfy node deps-in-workflow`` wrote, bounded.
+def _parse_deps_manifest(out_path: str, plain: Any) -> dict:
+    """Read, decode, and scrub the manifest ``comfy node deps-in-workflow`` wrote.
 
-    Deliberately SYNC, for ``workflow_deps`` to call through
+    Deliberately SYNC, for ``workflow_deps`` to call once through
     ``asyncio.to_thread``: the tool is async (its 300s network-backed child rides
     :func:`_run_comfy_async` so a cancelling client kills it), and a bare
     ``open()`` / blocking ``read()`` in an async def is exactly what ruff's
     ``ASYNC`` ruleset exists to reject — same offload as
-    :func:`_check_comfy_version` gets there. The three failure branches live
-    here WITH their reads because each names the operation that failed, and
-    ``plain`` rides along because two of them quote comfy-cli's printed output —
-    the only place the actual reason survives (see each branch).
+    :func:`_check_comfy_version` gets there. The DECODE and the scrub live here
+    with the read rather than back on the event loop: ``json.loads`` plus
+    :func:`_scrub_deps_manifest`'s per-key pass over up to
+    ``_MAX_DEPS_MANIFEST_BYTES`` of Manager-shaped input is CPU work, and on
+    the loop it would stall every other in-flight MCP call — including the
+    cancel notification the async migration exists to honor. The failure
+    branches live here WITH the operations they describe, and ``plain`` rides
+    along because three of them quote comfy-cli's printed output — the only
+    place the actual reason survives (see each branch).
     """
     try:
         handle = open(out_path, "rb")
@@ -11899,7 +11904,36 @@ def _read_deps_manifest_bytes(out_path: str, plain: Any) -> bytes:
             f"the {_MAX_DEPS_MANIFEST_BYTES}-byte maximum this server will "
             "read back."
         )
-    return raw
+    try:
+        manifest = json.loads(raw)
+    # `ValueError` covers `json.JSONDecodeError` AND the two well-formed-input
+    # failures a bare decode-error tuple would miss, both of which fit far
+    # under the byte cap above: nesting deeper than this interpreter's stack
+    # (`RecursionError`, a `RuntimeError`) and an integer literal over
+    # `sys.get_int_max_str_digits` (a plain `ValueError` since 3.11). Same
+    # pair `_parse_slot_value` catches, for the same reason — the difference
+    # is only what to do about it: there the engine gets to be the verdict,
+    # here the manifest is the answer and an unreadable one is a named error
+    # rather than an unconverted internal one. `UnicodeDecodeError` is a
+    # `ValueError` too, which is how a non-utf-8 manifest lands here.
+    except (ValueError, RecursionError) as exc:
+        raise ComfyCliError(
+            "comfy node deps-in-workflow wrote a dependency manifest this "
+            f"server could not read: {exc}. comfy-cli's own output: "
+            f"{_plain_message(plain) or '<empty>'}"
+        ) from exc
+    # Manager writes a JSON OBJECT. Anything else means the format changed
+    # under us, and passing it through would hand the caller a payload whose
+    # documented keys it cannot have — better to say so than to return a bare
+    # list an agent will index blindly.
+    if not isinstance(manifest, dict):
+        raise ComfyCliError(
+            "comfy node deps-in-workflow wrote a dependency manifest of an "
+            f"unexpected shape (got {type(manifest).__name__}, expected an "
+            "object); comfy-cli's or ComfyUI-Manager's output format may have "
+            "changed."
+        )
+    return _scrub_deps_manifest(manifest)
 
 
 @mcp.tool()
@@ -12068,41 +12102,34 @@ async def workflow_deps(workflow_path: str) -> Any:
                     "unsupported": True,
                 }
             raise
-        # Off the event loop, because this function is async and the read is
-        # blocking I/O — the branches themselves (and why two of them quote the
-        # plain result) live with the reads in `_read_deps_manifest_bytes`.
-        raw = await asyncio.to_thread(_read_deps_manifest_bytes, out_path, plain)
-        try:
-            manifest = json.loads(raw)
-        # `ValueError` covers `json.JSONDecodeError` AND the two well-formed-input
-        # failures a bare decode-error tuple would miss, both of which fit far
-        # under `_read_deps_manifest_bytes`' cap: nesting deeper than this
-        # interpreter's stack
-        # (`RecursionError`, a `RuntimeError`) and an integer literal over
-        # `sys.get_int_max_str_digits` (a plain `ValueError` since 3.11). Same
-        # pair `_parse_slot_value` catches, for the same reason — the difference
-        # is only what to do about it: there the engine gets to be the verdict,
-        # here the manifest is the answer and an unreadable one is a named error
-        # rather than an unconverted internal one. `UnicodeDecodeError` is a
-        # `ValueError` too, which is how a non-utf-8 manifest lands here.
-        except (ValueError, RecursionError) as exc:
-            raise ComfyCliError(
-                "comfy node deps-in-workflow wrote a dependency manifest this "
-                f"server could not read: {exc}. comfy-cli's own output: "
-                f"{_plain_message(plain) or '<empty>'}"
-            ) from exc
-    # Manager writes a JSON OBJECT. Anything else means the format changed under
-    # us, and passing it through would hand the caller a payload whose documented
-    # keys it cannot have — better to say so than to return a bare list an agent
-    # will index blindly.
-    if not isinstance(manifest, dict):
-        raise ComfyCliError(
-            "comfy node deps-in-workflow wrote a dependency manifest of an "
-            f"unexpected shape (got {type(manifest).__name__}, expected an "
-            "object); comfy-cli's or ComfyUI-Manager's output format may have "
-            "changed."
+        # Read, decode, and scrub off the event loop — this function is async,
+        # the read is blocking I/O, and the decode of an up-to-8-MiB manifest
+        # is CPU work that would stall every other in-flight call. The failure
+        # branches (and why they quote the plain result) live with the
+        # operations in `_parse_deps_manifest`. The thread is SHIELDED from
+        # cancellation and then waited out: `to_thread` has no way to
+        # interrupt a worker, so unwinding on a cancel delivered mid-read
+        # would let `TemporaryDirectory.__exit__` delete the manifest out from
+        # under the live thread — POSIX shrugs, but on Windows the open handle
+        # fails the unlink and `ignore_cleanup_errors=True` turns that into a
+        # silently leaked directory. The wait is bounded: one open and at most
+        # `_MAX_DEPS_MANIFEST_BYTES` + 1 bytes of a LOCAL file, with no
+        # network anywhere under it.
+        read_task = asyncio.ensure_future(
+            asyncio.to_thread(_parse_deps_manifest, out_path, plain)
         )
-    return _scrub_deps_manifest(manifest)
+        try:
+            manifest = await asyncio.shield(read_task)
+        except asyncio.CancelledError:
+            # Suppress everything the reader ends on, its own failures
+            # included — this path answers with the cancellation, and the
+            # await exists only to hold the temp directory open under the
+            # thread. A second cancel lands on this await; the suppress
+            # swallows it and the re-raise below still delivers the first.
+            with contextlib.suppress(BaseException):
+                await read_task
+            raise
+    return manifest
 
 
 @mcp.tool()

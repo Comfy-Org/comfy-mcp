@@ -150,10 +150,9 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for the verbs
   that print human text and emit no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
-  (`asyncio.create_subprocess_exec`). Its fake pipes are real
-  `asyncio.StreamReader`s, built by conftest's `stream_reader(text, limit)`
-  helper; reuse that rather than hand-rolling an awaitable, so a fake still
-  exercises the reader's buffer-limit behavior.
+  (`asyncio.create_subprocess_exec`); its fake pipes are real `StreamReader`s,
+  built by conftest's `stream_reader(text, limit)` — reuse it rather than
+  hand-rolling an awaitable, so a fake still exercises buffer-limit behavior.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) ->
   procs` — the plain-JSON *async* path (`_run_comfy_async`): same
   `asyncio.create_subprocess_exec` spawn and the same real `StreamReader` pipes,
@@ -161,8 +160,7 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   `hang=True` leaves those pipes OPEN so the fake child never finishes, for the
   timeout/cancellation cases; its `kill()` closes them, mirroring the process-group
   kill that lets a post-kill drain reach EOF, and records `killed` so a test can
-  assert it fired. `on_spawn(cmd)` fires at spawn, exactly as `patched_run`'s
-  does, so the one verb whose answer is a FILE writes its `--output` here too.
+  assert it fired. `on_spawn(cmd)` fires at spawn, exactly as `patched_run`'s does.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by its
@@ -175,8 +173,8 @@ contract. The twin exists for CANCELLATION, not for the event loop —
 `asyncio.to_thread(_run_comfy, …)` is already non-blocking but its cancellation
 never reaches the thread, so a long-lived call left the `comfy` child running
 when a client gave up. It carries the legacy foreground `model download` (the
-`--background`-less fallback) and `workflow_deps` (a 300s network-backed
-resolve); short metadata calls stay on the thread-pool path.
+`--background`-less fallback) and `workflow_deps`' 300s network-backed resolve;
+short metadata calls stay on the thread-pool path.
 Reserved for the longest-lived children, it bounds each captured stream to its
 trailing `_STDERR_MAX_CHARS` (`_drain_capped_into`) rather than retaining
 everything `communicate()` does — the one place its contract is narrower.
