@@ -24,7 +24,8 @@ copy per test file:
   of both pipes) — ``patched_async_run``, for ``server._run_comfy_async``. Same
   spawn and same real ``StreamReader`` pipes as the streaming fake, but the output
   is parsed once at the end rather than read line-by-line;
-  ``download_model``'s legacy foreground fallback and ``workflow_deps`` drive it.
+  ``download_model``'s legacy foreground fallback, ``workflow_deps`` and
+  ``upload_file`` drive it.
 
 Every path spawns with ``start_new_session=True`` so a timeout can kill the whole
 process group; the fakes model that too (see ``_FakeRunProc``).

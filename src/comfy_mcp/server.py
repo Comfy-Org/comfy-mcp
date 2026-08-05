@@ -3440,7 +3440,10 @@ async def _drain_timed_out_async(
 
 
 async def _run_comfy_async(
-    *args: str, timeout: float | None = None, plain_ok: bool = False
+    *args: str,
+    timeout: float | None = None,
+    plain_ok: bool = False,
+    stdout_cap: int | None = None,
 ) -> Any:
     """Async twin of :func:`_run_comfy`: same result contract, cancellable child.
 
@@ -3462,7 +3465,12 @@ async def _run_comfy_async(
     :data:`_STDERR_MAX_CHARS` was introduced to prevent for the streaming path.
     Keeping the TAIL loses nothing either consumer needs: comfy-cli's envelope is
     the LAST JSON object it prints and :func:`_synthesize_plain_result` already
-    reports only the tail of the printed text.
+    reports only the tail of the printed text. That holds only while the
+    envelope itself FITS the tail, so ``stdout_cap`` widens the stdout bound for
+    a caller whose envelope scales with its input — ``upload_file``'s echoes
+    every staged path back (see :data:`_UPLOAD_STDOUT_MAX_CHARS`). ``None``
+    (the default) reads :data:`_STDERR_MAX_CHARS` at call time, so a test
+    patching the module constant is still honored.
 
     That difference is the entire point, and it is about CANCELLATION rather
     than about the event loop. ``asyncio.to_thread(_run_comfy, …)`` is perfectly
@@ -3473,8 +3481,8 @@ async def _run_comfy_async(
     asyncio process, so the ``finally`` below reaps the whole tree on every exit
     path — cancellation included. Use this for a LONG-LIVED plain-JSON call (the
     legacy foreground ``model download``, ``workflow_deps``'s 300s
-    network-backed resolve); short metadata calls are fine on the thread-pool
-    path.
+    network-backed resolve, ``upload_file``'s 300s transfer); short metadata
+    calls are fine on the thread-pool path.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -3515,6 +3523,8 @@ async def _run_comfy_async(
     # `_drain_capped_into`.
     stdout_sink: list[bytes] = [b""]
     stderr_sink: list[bytes] = [b""]
+    if stdout_cap is None:
+        stdout_cap = _STDERR_MAX_CHARS
 
     async def _collect() -> None:
         # BOTH pipes concurrently, then the exit status — exactly what
@@ -3522,7 +3532,7 @@ async def _run_comfy_async(
         # after the other would wedge the child on whichever full pipe it is
         # writing to while we block on the other.
         await asyncio.gather(
-            _drain_capped_into(proc.stdout, _STDERR_MAX_CHARS, stdout_sink),
+            _drain_capped_into(proc.stdout, stdout_cap, stdout_sink),
             _drain_capped_into(proc.stderr, _STDERR_MAX_CHARS, stderr_sink),
         )
         await proc.wait()
@@ -13736,37 +13746,28 @@ def cancel_download(download_id: str) -> Any:
 _MAX_UPLOAD_PATHS = 4096
 _MAX_UPLOAD_PATHS_TOTAL_BYTES = 128 * 1024
 
+# `comfy upload`'s envelope echoes every file it staged — the resolved local
+# path plus the server-assigned name per entry — so its size scales with the
+# argv the caps above allow: `_MAX_UPLOAD_PATHS_TOTAL_BYTES` of path text
+# appearing twice per entry, worst-case sextupled by JSON `\uXXXX` string
+# escaping, plus keys and punctuation for each of up to `_MAX_UPLOAD_PATHS`
+# entries — past 2 MiB, and far past the `_STDERR_MAX_CHARS` tail
+# `_run_comfy_async` keeps by default. Clipping the FRONT of that one-line
+# envelope would misreport a SUCCESSFUL full-batch upload as "comfy-cli
+# returned no JSON", so `upload_file` widens its stdout bound to this instead:
+# comfortably above the derivation, still a bound.
+_UPLOAD_STDOUT_MAX_CHARS = 4 * 1024 * 1024
 
-@mcp.tool()
-def upload_file(paths: list[str], overwrite: bool = False) -> Any:
-    """Upload local files into the LOCAL ComfyUI ``input`` directory.
 
-    Wraps ``comfy upload <files...> [--overwrite]``. Use this to stage source
-    images/masks a workflow references by filename before running it — it is
-    what unlocks img2img / inpaint workflows on a local ComfyUI. Pass
-    ``overwrite=True`` to replace files that already exist in the input dir
-    (otherwise comfy-cli skips or errors on collisions).
+def _validate_upload_paths(paths: Any) -> None:
+    """Every list-level and per-entry guard for :func:`upload_file`.
 
-    **Every entry must already exist on this filesystem, and should be
-    ABSOLUTE.** comfy-cli runs with the ComfyUI workspace as its working
-    directory, so a relative path resolves against the workspace rather than
-    against the agent's own cwd — which is a quiet way for a correct-looking
-    call to fail.
-
-    **If the user attached the image in chat, look for a path before giving
-    up.** An MCP server never receives an attachment's BYTES: the protocol has
-    no client-to-server path for them, so there is no argument here that could
-    take them and no tool anywhere in this server that accepts inline image
-    data. What several clients DO provide is the attachment saved to disk with
-    its absolute path placed in the agent's context (Claude Code, for one,
-    injects an ``[Image: source: <absolute path>]`` line) — that path is an
-    ordinary local file, so pass it straight to ``paths`` and this works today.
-
-    Do not hardcode any client's cache location: it is an undocumented internal
-    that clients rotate and clean up. Use the path the client actually gave you
-    for this conversation, and if there is none, ask the user to save the file
-    and tell you where — that is the portable flow, and on clients that
-    deliberately withhold the path it is the only one.
+    Synchronous ON PURPOSE: the tool is async, and these guards scan up to
+    :data:`_MAX_UPLOAD_PATHS` entries of :data:`_MAX_PATH_ARG_LEN` characters
+    each (including an ``os.fsencode`` per entry) before the first await —
+    inline, that stalls every other in-flight call and progress notification on
+    the event loop. :func:`upload_file` runs this through ``asyncio.to_thread``,
+    the same offload `_parse_deps_manifest` gets for the same class of work.
     """
     # Each path is splatted in as a positional, so a leading-dash entry is read
     # by comfy-cli as a flag instead — `paths=["--overwrite"]` would silently
@@ -13838,10 +13839,71 @@ def upload_file(paths: list[str], overwrite: bool = False) -> Any:
             "(the paths are forwarded to comfy-cli as command-line arguments) — "
             "upload in batches."
         )
+
+
+@mcp.tool()
+async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
+    """Upload local files into the LOCAL ComfyUI ``input`` directory.
+
+    Wraps ``comfy upload <files...> --overwrite/--no-overwrite``. Use this to
+    stage source images/masks a workflow references by filename before running
+    it — it is what unlocks img2img / inpaint workflows on a local ComfyUI.
+    Pass ``overwrite=True`` to replace files that already exist in the input
+    dir; with the default ``overwrite=False`` the server keeps an existing file
+    untouched and stores the new upload under a deduplicated name instead —
+    read the envelope's per-file name for where each upload actually landed.
+
+    A cancelled or timed-out call kills the ``comfy`` child mid-batch: files it
+    had already staged remain in the input dir, the rest were never sent.
+    Re-run the same call to finish — with ``overwrite=True`` if the
+    already-staged files should be replaced outright (a default re-run keeps
+    them and stores the re-sent copies under new names).
+
+    **Every entry must already exist on this filesystem, and should be
+    ABSOLUTE.** comfy-cli runs with the ComfyUI workspace as its working
+    directory, so a relative path resolves against the workspace rather than
+    against the agent's own cwd — which is a quiet way for a correct-looking
+    call to fail.
+
+    **If the user attached the image in chat, look for a path before giving
+    up.** An MCP server never receives an attachment's BYTES: the protocol has
+    no client-to-server path for them, so there is no argument here that could
+    take them and no tool anywhere in this server that accepts inline image
+    data. What several clients DO provide is the attachment saved to disk with
+    its absolute path placed in the agent's context (Claude Code, for one,
+    injects an ``[Image: source: <absolute path>]`` line) — that path is an
+    ordinary local file, so pass it straight to ``paths`` and this works today.
+
+    Do not hardcode any client's cache location: it is an undocumented internal
+    that clients rotate and clean up. Use the path the client actually gave you
+    for this conversation, and if there is none, ask the user to save the file
+    and tell you where — that is the portable flow, and on clients that
+    deliberately withhold the path it is the only one.
+    """
+    # Off the event loop: see `_validate_upload_paths` for why its scan must not
+    # run inline in an async tool.
+    await asyncio.to_thread(_validate_upload_paths, paths)
     args = ["upload", *paths]
-    if overwrite:
-        args.append("--overwrite")
-    return _run_comfy(*args, timeout=300.0)
+    # BOTH legs explicit: comfy-cli's `--overwrite/--no-overwrite` pair DEFAULTS
+    # TO OVERWRITE, so merely omitting the flag would make `overwrite=False` a
+    # silent no-op that still replaces existing files.
+    args.append("--overwrite" if overwrite else "--no-overwrite")
+    # `_run_comfy_async`, not the thread-pool path, for the same 300s reason as
+    # `workflow_deps`: this is the other longest-lived child in the server, and
+    # `asyncio.to_thread(_run_comfy, …)`'s cancellation never reaches the
+    # thread — an MCP client that cancels or disconnects would leave the
+    # `comfy` child transferring with nobody waiting. The async runner's
+    # `finally` kills the whole process tree on every exit path, cancellation
+    # included. That kill cannot truncate a file under its final name: comfy-cli
+    # stages the batch ONE FILE AT A TIME through ComfyUI's HTTP upload
+    # endpoint, so what a kill strands is a partial BATCH — staged files kept,
+    # the rest never sent — and the docstring's re-run note covers recovering
+    # it. The result contract is `_run_comfy`'s own; `stdout_cap` is widened
+    # because the envelope echoes every staged path back and a full batch's
+    # would lose its front to the default tail (see `_UPLOAD_STDOUT_MAX_CHARS`).
+    return await _run_comfy_async(
+        *args, timeout=300.0, stdout_cap=_UPLOAD_STDOUT_MAX_CHARS
+    )
 
 
 @mcp.tool()
