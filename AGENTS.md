@@ -160,12 +160,12 @@ the CLI, so a change to the spawn signature is one edit rather than a sweep:
   helper; reuse that rather than hand-rolling an awaitable, so a fake still
   exercises the reader's buffer-limit behavior.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) ->
-  procs` — the plain-JSON *async* path (`_run_comfy_async`): same
-  `asyncio.create_subprocess_exec` spawn and real `StreamReader` pipes, but the
-  capture is parsed once at the end, not line-by-line. `hang=True` leaves the
-  pipes OPEN so the fake child never finishes, for timeout/cancellation cases;
-  `kill()` closes them (mirroring the process-group kill that lets a post-kill
-  drain reach EOF), records `killed`, and fires `on_spawn(cmd)` like `patched_run`'s.
+  procs` — the plain-JSON *async* path (`_run_comfy_async`): same spawn and
+  real `StreamReader` pipes as `patched_stream`, but the capture is parsed
+  once at the end, not line-by-line. `hang=True` leaves the pipes OPEN so the
+  fake child never finishes, for timeout/cancellation cases; `kill()` closes
+  them (mirroring the process-group kill that lets a post-kill drain reach
+  EOF), records `killed`, and fires `on_spawn(cmd)` like `patched_run`'s.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool by
@@ -176,11 +176,10 @@ event loop, enforced by ruff's `ASYNC` select. Two async runners live there:
 twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is non-blocking,
 but cancellation never reaches the thread, so a client giving up left the
 child running. It carries the legacy foreground `model download`,
-`workflow_deps`' 300s resolve, and `upload_file`'s 300s transfer; short
-metadata calls stay on the thread pool. It
-caps each captured stream to `_STDERR_MAX_CHARS` (`_drain_capped_into`)
-instead of retaining everything like `communicate()`. `auth_login` is a third
-async spawn site (`_start_login`), with its own browser flow.
+`workflow_deps`' 300s resolve, and `upload_file`'s 300s transfer. Each
+stream keeps only a `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers
+widen stdout via `stdout_cap=`), never `communicate()`'s full capture.
+`auth_login` (`_start_login`) is a third spawn site with its own browser flow.
 
 A local stub is justified only where the call genuinely differs — the
 `comfy --version` probe (its own kwargs) and multi-call sequenced replies.

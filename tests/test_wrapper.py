@@ -1400,14 +1400,18 @@ def test_upload_file_passes_paths_and_overwrite(patched_async_run):
     assert cmd[4:] == ["upload", "a.png", "b.png", "--overwrite"]
 
 
-def test_upload_file_omits_overwrite_by_default(patched_async_run):
-    """Without overwrite the flag must be absent, not passed as False."""
+def test_upload_file_forwards_no_overwrite_by_default(patched_async_run):
+    """overwrite=False must SAY so — comfy-cli's flag pair defaults to overwrite.
+
+    `--overwrite/--no-overwrite` is True when omitted, so leaving the flag off
+    entirely would make `overwrite=False` a silent no-op that still replaces
+    existing files; the False leg has to spell out `--no-overwrite`.
+    """
     procs = patched_async_run(envelope(data={"uploaded": 1}))
 
     _upload_file(["only.png"])
 
-    assert procs[0].cmd[4:] == ["upload", "only.png"]
-    assert "--overwrite" not in procs[0].cmd
+    assert procs[0].cmd[4:] == ["upload", "only.png", "--no-overwrite"]
 
 
 def test_upload_file_rejects_option_like_path():
@@ -1565,7 +1569,7 @@ def test_upload_file_counts_undecodable_filename_bytes_as_subprocess_would(
 
     _upload_file(paths)
 
-    assert procs[0].cmd[4:] == ["upload", *paths]
+    assert procs[0].cmd[4:] == ["upload", *paths, "--no-overwrite"]
 
 
 def test_upload_file_reports_a_bad_entry_ahead_of_the_aggregate(no_spawn):
@@ -1599,7 +1603,7 @@ def test_upload_file_allows_a_full_batch_of_real_paths(patched_async_run):
 
     _upload_file(paths)
 
-    assert procs[0].cmd[4:] == ["upload", *paths]
+    assert procs[0].cmd[4:] == ["upload", *paths, "--no-overwrite"]
 
 
 def test_upload_file_allows_a_path_at_the_ceiling(patched_async_run):
@@ -1610,7 +1614,7 @@ def test_upload_file_allows_a_path_at_the_ceiling(patched_async_run):
 
     _upload_file(["/tmp/ok.png", at_ceiling])
 
-    assert procs[0].cmd[4:] == ["upload", "/tmp/ok.png", at_ceiling]
+    assert procs[0].cmd[4:] == ["upload", "/tmp/ok.png", at_ceiling, "--no-overwrite"]
 
 
 def test_upload_file_rejects_embedded_nul_path():
@@ -1628,9 +1632,9 @@ def test_upload_file_cancellation_reaps_the_transfer(patched_async_run, monkeypa
     This is what the synchronous path could not do: cancellation never lands on
     the worker pool sync tools run on, so an MCP client that cancelled (or
     disconnected) mid-upload left the `comfy upload` child transferring with
-    nobody waiting. Killing mid-transfer is safe here — uploads are retryable
-    (`--overwrite` exists), and a partial is just what the next attempt
-    replaces.
+    nobody waiting. The kill strands at most a partial BATCH (comfy-cli stages
+    one file at a time through the server's HTTP endpoint), which re-running
+    the same call recovers — the tool's docstring owns that story.
     """
     procs = patched_async_run(hang=True)
 
@@ -1657,6 +1661,52 @@ def test_upload_file_cancellation_reaps_the_transfer(patched_async_run, monkeypa
 
     assert len(procs) == 1
     assert procs[0].killed is True  # the `finally` fired
+
+
+def test_run_comfy_async_default_tail_clips_an_oversized_envelope(patched_async_run):
+    """Pins the default bound, so the widened-cap tests below are not vacuous.
+
+    An envelope longer than `_STDERR_MAX_CHARS` loses its FRONT to the default
+    trailing cap, so a run that actually SUCCEEDED surfaces as "returned no
+    JSON" — exactly the misreport `upload_file` widens its bound to avoid.
+    """
+    big = envelope(data={"pad": "x" * (2 * server._STDERR_MAX_CHARS)})
+    patched_async_run(big)
+
+    with pytest.raises(server.ComfyCliError, match="returned no JSON"):
+        asyncio.run(server._run_comfy_async("upload", "/tmp/a.png"))
+
+
+def test_run_comfy_async_stdout_cap_widens_the_bound(patched_async_run):
+    """A caller-supplied `stdout_cap` keeps an envelope the default would clip."""
+    pad = "x" * (2 * server._STDERR_MAX_CHARS)
+    patched_async_run(envelope(data={"pad": pad}))
+
+    result = asyncio.run(
+        server._run_comfy_async(
+            "upload", "/tmp/a.png", stdout_cap=server._UPLOAD_STDOUT_MAX_CHARS
+        )
+    )
+
+    assert result == {"pad": pad}
+
+
+def test_upload_file_parses_an_envelope_past_the_default_tail(patched_async_run):
+    """A full batch's envelope must reach the caller whole, not clipped.
+
+    comfy-cli's upload envelope echoes every staged path back, so its size
+    scales with the argv the caps allow — past `_STDERR_MAX_CHARS`. The tool
+    passes `_UPLOAD_STDOUT_MAX_CHARS` so the LAST JSON object is still the
+    whole envelope and a successful upload is reported as one.
+    """
+    uploads = {
+        "uploads": [
+            {"local_path": "/tmp/a.png", "cloud_name": "x" * server._STDERR_MAX_CHARS}
+        ]
+    }
+    patched_async_run(envelope(data=uploads))
+
+    assert _upload_file(["/tmp/a.png"]) == uploads
 
 
 @pytest.mark.parametrize(
