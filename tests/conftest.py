@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 import pytest
 
@@ -227,6 +228,27 @@ def _raises_at_spawn(exc: BaseException) -> bool:
     )
 
 
+def _encode_argv_like_posix(cmd) -> None:
+    """Raise what a real POSIX spawn would for an argv entry it cannot encode.
+
+    ``subprocess.Popen`` and ``asyncio.create_subprocess_exec`` both render POSIX
+    argv with :func:`os.fsencode`, so an unencodable entry — a lone surrogate, or
+    under a non-UTF-8 locale ordinary multibyte text — raises
+    :class:`UnicodeEncodeError` from the spawn CALL, before any child exists.
+    Every fake below reproduces that instead of accepting any ``str``, so a test
+    can drive that refusal end-to-end rather than injecting the exception and
+    then asserting its own premise.
+
+    A no-op off POSIX, where ``subprocess`` builds a UTF-16 command line for
+    ``CreateProcessW`` and never calls :func:`os.fsencode` at all — the same
+    platform split ``server._encode_argv`` documents.
+    """
+    if os.name != "posix":
+        return
+    for arg in cmd:
+        os.fsencode(arg)
+
+
 class _FakeRunProc:
     """A ``Popen`` stand-in for the plain path: one canned result, no real pipes.
 
@@ -322,6 +344,7 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
         calls.append(record)
         if raises is not None and _raises_at_spawn(raises):
             raise raises
+        _encode_argv_like_posix(cmd)
         if on_spawn is not None:
             on_spawn(cmd)
         return _FakeRunProc(
@@ -494,16 +517,26 @@ class _RecordingCtx:
 def patched_stream(monkeypatch):
     """Patch ``shutil.which`` + ``asyncio.create_subprocess_exec`` for streaming.
 
-    Returns ``setup(stdout_text) -> procs`` — the list capturing each spawned
-    ``_FakeProc`` (so the test can assert the command line that was run).
+    Returns ``setup(stdout_text, raises=…) -> procs`` — the list capturing each
+    spawned ``_FakeProc`` (so the test can assert the command line that was run).
+
+    ``raises`` is an exception instance the fake raises INSTEAD of returning a
+    child, for the spawn-failure cases (``OSError``, the bare ``ValueError`` an
+    embedded NUL produces) — the streaming counterpart of :func:`patched_run`'s
+    same-named argument. It fires from the spawn call because that is where the
+    real constructor fails; there is no wait-side half here, since a child that
+    started is modelled by the canned stream instead.
     """
 
-    def setup(stdout_text: str) -> list[_FakeProc]:
+    def setup(stdout_text: str, *, raises=None) -> list[_FakeProc]:
         procs: list[_FakeProc] = []
 
         async def fake_exec(
             *cmd, stdout, stderr, env, stdin=None, limit=None, **kwargs
         ):
+            if raises is not None:
+                raise raises
+            _encode_argv_like_posix(cmd)
             proc = _FakeProc(list(cmd), stdout_text, env=env, stdin=stdin, limit=limit)
             procs.append(proc)
             return proc
@@ -591,12 +624,14 @@ def patched_async_run(monkeypatch):
 
     The plain-JSON counterpart to :func:`patched_stream`, for
     ``server._run_comfy_async``. Returns
-    ``setup(stdout=…, returncode=…, stderr=…, hang=…) -> procs`` — the live list of
-    spawned :class:`_FakeAsyncRunProc` objects, so a test can assert the argv, the
-    spawn kwargs, and (on the timeout / cancellation cases) that ``killed`` fired.
+    ``setup(stdout=…, returncode=…, stderr=…, hang=…, raises=…) -> procs`` — the
+    live list of spawned :class:`_FakeAsyncRunProc` objects, so a test can assert
+    the argv, the spawn kwargs, and (on the timeout / cancellation cases) that
+    ``killed`` fired.
 
     ``stdout`` accepts a dict (JSON-encoded for you — pass an :func:`envelope`), a
-    string, or bytes, matching :func:`patched_run`'s ergonomics.
+    string, or bytes, matching :func:`patched_run`'s ergonomics. ``raises`` is the
+    same spawn-failure injection :func:`patched_stream` documents.
     """
 
     def setup(
@@ -605,6 +640,7 @@ def patched_async_run(monkeypatch):
         returncode: int = 0,
         stderr: str = "",
         hang: bool = False,
+        raises=None,
     ) -> list[_FakeAsyncRunProc]:
         if stdout is None:
             stdout = ""
@@ -619,6 +655,9 @@ def patched_async_run(monkeypatch):
         async def fake_exec(
             *cmd, stdout, stderr, env, stdin=None, start_new_session=None
         ):
+            if raises is not None:
+                raise raises
+            _encode_argv_like_posix(cmd)
             proc = _FakeAsyncRunProc(
                 list(cmd),
                 stdout=canned_stdout,
