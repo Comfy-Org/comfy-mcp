@@ -45,7 +45,16 @@ for a different reason: `comfy node install` runs Manager's `cm-cli`, which a
 legacy clone under `custom_nodes/` cannot provide, so it reads `comfy env`'s
 manager fields BEFORE the consent prompt rather than ask a user to authorize
 third-party code on a call that cannot succeed. It fails OPEN, and shares
-`workflow_deps`' two helpers so the two cannot drift. `workflow_deps` reads
+`workflow_deps`' two helpers so the two cannot drift. It also reads its VERDICT
+out of the printed text (`_extract_install_failures`), because `comfy node
+install`'s exit status is not one: Manager's `cm-cli` prints a pack's failure
+before it consults `--exit-on-fail`, so a pack that was never installed exited 0
+and came back inside `installed` with `ok: true`. That stays inside the rule for
+the same reason `_extract_saved_paths` does — the verb emits no envelope, so its
+text is not a second-best channel but the only one, and the verdict returned is
+still cm-cli's own sentence rather than a judgement made here. Detection is
+one-directional (a pack is failed only when the engine said so), so an upstream
+wording change regresses to the old behaviour instead of failing every install. `workflow_deps` reads
 its answer off DISK because the engine leaves no choice — `comfy node
 deps-in-workflow` emits no envelope and REQUIRES an `--output` path — so the
 temp-file round trip is that contract, and Manager's manifest goes back as

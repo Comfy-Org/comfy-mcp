@@ -15,9 +15,13 @@ third-party code by accident:
    around that prompt, and a refusal is enforced here with no child spawned. Only
    a client that cannot be prompted falls back to the explicit argument, whose
    ``False`` default means a bare call installs nothing.
-3. ``--exit-on-fail`` is always forwarded. Without it comfy-cli swallows a failed
-   install and exits 0, so the flag is what makes a failure reach the caller at
-   all rather than being reported as success.
+3. The VERDICT. ``--exit-on-fail`` is always forwarded — without it comfy-cli
+   swallows a failed install outright — but it is not sufficient, because
+   ComfyUI-Manager decides the outcome one layer below where the flag is read and
+   prints its failure before consulting it. So a failed install can still exit 0,
+   and the wrapper reads the engine's own printed verdict rather than its status:
+   a pack the engine reported as failed never appears in ``installed``, and never
+   comes back as ``ok: true``.
 4. The shared ``_UPDATE_LOCK``: an install pip-installs into the same environment
    an update or a version switch does, so it is refused rather than queued.
 5. The result contract, including ``restart_required: True`` — this tool never
@@ -336,6 +340,250 @@ def test_a_failed_install_still_raises(patched_plain_run):
 
     with pytest.raises(server.ComfyCliError):
         _install(["no-such-pack"], ctx=_FakeCtx())
+
+
+# --- the verdict comes from the OUTPUT, not the exit status -----------------
+#
+# `comfy node install` can print cm-cli's per-pack failure and still exit 0, so
+# `--exit-on-fail` above is necessary but not sufficient. ComfyUI-Manager decides
+# the outcome one layer below where the flag is read: `cm-cli.py`'s
+# `for_each_nodes` swallows a per-pack exception, and its `install_node` prints
+# the failure sentence BEFORE it consults `exit_on_fail`. These lock in that a
+# pack the engine reported as failed never appears in `installed` and never comes
+# back as `ok: true` — a false success is worse than a plain error, because
+# nothing downstream has a reason to doubt it.
+
+# cm-cli's real output for a pack id that is not in the registry channel: the
+# failure sentence, then `install_by_id`'s `res.msg` on the next line.
+_NOT_FOUND_OUTPUT = (
+    "install_node exit on fail:True...\n"
+    "[bold red]ERROR: An error occurred while installing 'no-such-pack-xyz'.\n"
+    "Node 'no-such-pack-xyz@unknown' not found in [default, remote][/bold red]\n"
+)
+
+
+def test_a_failed_install_that_exits_zero_is_not_reported_as_success(
+    patched_plain_run,
+):
+    """The reported bug: exit 0 + a printed failure used to return ok/installed."""
+    patched_plain_run(0, stdout=_NOT_FOUND_OUTPUT)
+
+    result = _install(["no-such-pack-xyz"], ctx=_FakeCtx())
+
+    assert result["installed"] == []
+    assert result["result"]["ok"] is False
+    assert result["failed"] == [
+        {
+            "name": "no-such-pack-xyz",
+            "code": "pack_not_found",
+            "error": "Node 'no-such-pack-xyz@unknown' not found in [default, remote]",
+        }
+    ]
+    # The structured signal an agent actually reads, not prose in `message`.
+    assert "failed to install" in result["error"]
+    # Nothing landed, so there is nothing for a restart to pick up — telling the
+    # user to restart is exactly the bad advice the false success produced.
+    assert result["restart_required"] is False
+
+
+def test_a_partial_failure_reports_each_pack_separately(patched_plain_run):
+    """`names` is a list, so a per-pack verdict is the whole point."""
+    patched_plain_run(
+        0,
+        stdout=(
+            "1/2 [INSTALLED] comfyui-impact-pack\n" + _NOT_FOUND_OUTPUT + "2/2 done\n"
+        ),
+    )
+
+    result = _install(["comfyui-impact-pack", "no-such-pack-xyz"], ctx=_FakeCtx())
+
+    assert result["installed"] == ["comfyui-impact-pack"]
+    assert [entry["name"] for entry in result["failed"]] == ["no-such-pack-xyz"]
+    # Something DID land, so the restart advice is still correct.
+    assert result["restart_required"] is True
+
+
+def test_a_failure_buried_before_a_megabyte_of_pip_output_is_still_seen(
+    patched_plain_run,
+):
+    """The parse reads the UNCAPPED streams, not the 1000-char `message` tail.
+
+    In a multi-pack install the pack that failed FIRST is pushed out of that tail
+    by everything the later packs print — which is precisely the partial failure a
+    caller most needs to be told about.
+    """
+    patched_plain_run(0, stdout=_NOT_FOUND_OUTPUT + ("Collecting torch\n" * 5000))
+
+    result = _install(["no-such-pack-xyz"], ctx=_FakeCtx())
+
+    assert "no-such-pack-xyz" not in result["result"]["message"]  # gone from the tail
+    assert [entry["name"] for entry in result["failed"]] == ["no-such-pack-xyz"]
+
+
+def test_a_non_registry_failure_gets_the_generic_code(patched_plain_run):
+    """`pack_not_found` is claimed only for the message that means it.
+
+    A clone or dependency failure is a different problem with a different remedy
+    — a retry can work — so it must not be labelled with the code that says the id
+    itself is wrong.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "[bold red]ERROR: An error occurred while installing "
+            "'comfyui-impact-pack'.\nFailed to clone repository[/bold red]\n"
+        ),
+    )
+
+    result = _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+    assert result["failed"] == [
+        {
+            "name": "comfyui-impact-pack",
+            "code": "install_failed",
+            "error": "Failed to clone repository",
+        }
+    ]
+
+
+def test_a_failure_naming_a_pack_we_did_not_ask_for_is_still_reported(
+    patched_plain_run,
+):
+    """A dependency pack cm-cli named itself must not vanish, or drop ours.
+
+    Reporting it without subtracting anything from `installed` is the
+    one-directional choice: it can neither silently drop a pack the caller asked
+    for nor silently swallow a failure.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "1/1 [INSTALLED] comfyui-impact-pack\n"
+            "[bold red]ERROR: An error occurred while installing 'some-dependency'."
+            "\nNode 'some-dependency@unknown' not found in [default, remote]"
+            "[/bold red]\n"
+        ),
+    )
+
+    result = _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+    assert result["installed"] == ["comfyui-impact-pack"]
+    assert [entry["name"] for entry in result["failed"]] == ["some-dependency"]
+
+
+def test_a_wrapped_failure_sentence_is_still_matched(patched_plain_run):
+    """rich wraps at the console width, so the sentence can span two lines.
+
+    A pack id long enough to push the sentence past that width would otherwise
+    put a newline between the words and defeat the match — the same folding
+    `_normalize_cli_text` does for every other phrase this server reads.
+    """
+    patched_plain_run(
+        0,
+        stdout=(
+            "[bold red]ERROR: An error occurred while\n"
+            "installing 'a-very-long-pack-id-that-wrapped'.\n"
+            "Node 'a-very-long-pack-id-that-wrapped@unknown' not found in "
+            "[default, remote][/bold red]\n"
+        ),
+    )
+
+    result = _install(["a-very-long-pack-id-that-wrapped"], ctx=_FakeCtx())
+
+    assert result["installed"] == []
+    assert result["failed"][0]["code"] == "pack_not_found"
+
+
+def test_a_credential_in_a_relayed_failure_is_masked(patched_plain_run):
+    """cm-cli quotes the repo URL it tried, and a private channel carries auth."""
+    patched_plain_run(
+        0,
+        stdout=(
+            "[bold red]ERROR: An error occurred while installing 'private-pack'.\n"
+            "Failed to clone https://<user>:<pass>@example.invalid/private-pack.git"
+            "[/bold red]\n"
+        ),
+    )
+
+    result = _install(["private-pack"], ctx=_FakeCtx())
+
+    error = result["failed"][0]["error"]
+    assert "<pass>" not in error
+    assert "example.invalid" in error  # the useful half survives
+
+
+def test_a_clean_install_keeps_the_original_payload(patched_plain_run):
+    """No failure sentence -> nothing changes, including the absent `failed` key."""
+    patched_plain_run(0, stdout="1/1 [INSTALLED] comfyui-impact-pack\n")
+
+    result = _install(["comfyui-impact-pack"], ctx=_FakeCtx())
+
+    assert result["installed"] == ["comfyui-impact-pack"]
+    assert result["restart_required"] is True
+    assert result["result"]["ok"] is True
+    assert "failed" not in result
+    assert "error" not in result
+
+
+@pytest.mark.parametrize(
+    "failures",
+    [
+        ["a bare string, not a record"],  # a shape this wrapper never writes
+        [],  # present but empty
+        "not a list at all",
+    ],
+)
+def test_an_unreadable_failures_field_degrades_to_the_success_payload(failures):
+    """The day comfy-cli grows a real envelope, `result` is the ENGINE's data.
+
+    A `failures` key in it would then be whatever shape the engine chose, so every
+    field is checked rather than assumed: an `AttributeError` here would turn a
+    reportable install into an unhandled internal error, and emitting "0 of 1
+    pack(s) failed" alongside an empty list would be a worse lie than the one this
+    replaced.
+    """
+    result = server._classify_install_result(
+        ["comfyui-impact-pack"], {"ok": True, "failures": failures}
+    )
+
+    assert result["installed"] == ["comfyui-impact-pack"]
+    assert result["restart_required"] is True
+    assert "failed" not in result
+
+
+def test_a_record_with_unusable_fields_still_counts_as_a_failure():
+    """Unnamed is not the same as absent, and must not read as success.
+
+    A record whose fields did not survive still says something failed, so it is
+    reported (with an empty name) rather than dropped — the same one-directional
+    choice the extractor makes when cm-cli's sentence carried no usable name.
+    """
+    result = server._classify_install_result(
+        ["comfyui-impact-pack"],
+        {"ok": False, "failures": [{"pack": 7, "reason": None}]},
+    )
+
+    assert result["failed"] == [{"name": "", "code": "install_failed", "error": ""}]
+    # Nothing was attributed to the requested pack, so it is not subtracted.
+    assert result["installed"] == ["comfyui-impact-pack"]
+
+
+def test_another_plain_verb_is_never_flipped_by_the_same_sentence(patched_plain_run):
+    """The scan is scoped to `node install`, not to every no-envelope verb.
+
+    A custom node's own output can quote anything, and `launch` relays all of it —
+    so a nested pack printing this sentence must not turn a successful launch into
+    a failure.
+    """
+    calls = patched_plain_run(
+        0, stderr="ERROR: An error occurred while installing 'something'."
+    )
+
+    result = asyncio.run(server.launch_comfyui())
+
+    assert calls[0]["cmd"][4] == "launch"
+    assert result["ok"] is True
+    assert "failures" not in result
 
 
 # --- consent: a client that CAN be prompted ---------------------------------
