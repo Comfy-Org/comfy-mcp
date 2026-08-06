@@ -124,14 +124,33 @@ def _scrub_url(url: str) -> str:
 
 
 # A URL ANYWHERE in a recorded string — deliberately not anchored to the start.
-# argv is not all bare URLs: `_render_param_args` emits combined-flag tokens
-# (`--image_url=https://<user>:<pass>@host/x?token=…`, `--param=k={"https://…"}`)
-# whose URL sits mid-token, so a start-anchored test would wave the credential
-# straight through into `args`. Anchoring on the literal scheme still lets the
-# engine skip ahead to a candidate rather than re-scan from every offset, and
-# `\S+` is a possessive-free single-pass match — no backtracking risk on a
-# multi-KB message.
-_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# argv is not all bare URLs: `_run_template_param_args` / `_generate_param_args`
+# emit combined-flag tokens (`--image_url=https://<user>:<pass>@host/x?token=…`,
+# `--param=k={"https://…"}`) whose URL sits mid-token, so a start-anchored test
+# would wave the credential straight through into `args`. Anchoring on the
+# literal scheme still lets the engine skip ahead to a candidate rather than
+# re-scan from every offset.
+#
+# The body is `\S`-equivalent but TEMPERED: a match ENDS where the next
+# `https?://` begins, so two URLs glued together with no whitespace between them
+# — a comma/semicolon-separated list inside one `--param=` token, a manifest
+# value, a validator hint — are scrubbed INDEPENDENTLY. A plain `\S+` swallowed
+# the pair as ONE match, and `_scrub_url_match` then masked only the first
+# URL's userinfo while the second's went to the client and to disk verbatim.
+# Tempering costs one bounded lookahead per character consumed and still
+# consumes each character exactly once, so the match stays single-pass and
+# linear — no backtracking risk on a multi-KB message.
+#
+# The tempering STOPS at the first `?`/`#`, after which the rest of the token is
+# taken untempered: past that delimiter `_scrub_url` deletes everything anyway,
+# so splitting there would REVIVE text the scrubber drops today. The case that
+# bites is a query whose value is itself an absolute URL
+# (`?next=https://h2/y&token=…`) — split there, the trailing `&token=…` lands in
+# a second match with no `?` of its own to cut on, and a secret this scrubber
+# masks today would start leaking. Over-redacting a second host out of a debug
+# tail is the right side to err on; the comma-separated list above is
+# unaffected, its delimiter not being `?`.
+_URL_RE = re.compile(r"https?://(?:(?!https?://)[^\s?#])*(?:[?#]\S*)?", re.IGNORECASE)
 
 # The first whitespace-delimited token of a clipped stream window — the one
 # place a URL can appear with its `https://` already sliced off, so the one
@@ -140,8 +159,8 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _LEADING_TOKEN_RE = re.compile(r"\S*")
 
 # Closing punctuation, peeled off the END of a `_URL_RE` match before scrubbing
-# and re-attached after. `\S+` cannot tell a URL from the character that merely
-# FOLLOWS it, and `_scrub_url` deletes everything from the first `?` — so
+# and re-attached after. `_URL_RE` cannot tell a URL from the character that
+# merely FOLLOWS it, and `_scrub_url` deletes everything from the first `?` — so
 # without this, comfy-cli's `Invalid value for '--url': 'https://h/x?q=1'`
 # comes back having lost its closing quote and the rest of the sentence glued
 # to it, and `_render_error_details`' `", "`-joined entries merge into one

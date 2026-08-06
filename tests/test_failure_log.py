@@ -433,8 +433,9 @@ def test_scrub_arg_cases(arg, expected):
 @pytest.mark.parametrize(
     ("arg", "expected"),
     [
-        # `_render_param_args` emits combined-flag tokens, so the URL is not at
-        # the token's start — a start-anchored test would log the credential.
+        # `_run_template_param_args` / `_generate_param_args` emit combined-flag
+        # tokens, so the URL is not at the token's start — a start-anchored test
+        # would log the credential.
         (
             "--image_url=https://<user>:<tok>@host/x?token=abc",
             "--image_url=https://***@host/x",
@@ -454,9 +455,9 @@ def test_scrub_arg_finds_a_url_anywhere_in_the_token(arg, expected):
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        # Click quotes the offending value; `\S+` swallows the closing quote and
-        # `_scrub_url` cuts from the `?`, so the rest of the sentence went with
-        # the query. These messages reach the MCP CLIENT now, not just the log.
+        # Click quotes the offending value; `_URL_RE` swallows the closing quote
+        # and `_scrub_url` cuts from the `?`, so the rest of the sentence went
+        # with the query. These messages reach the MCP CLIENT, not just the log.
         (
             "Invalid value for '--url': 'https://h/x?q=1' is not reachable.",
             "Invalid value for '--url': 'https://h/x' is not reachable.",
@@ -472,16 +473,81 @@ def test_scrub_arg_finds_a_url_anywhere_in_the_token(arg, expected):
         ("'https://<u>:<p>@h/p'", "'https://***@h/p'"),
         # Punctuation INSIDE the URL is still dropped with the rest of the query.
         ("https://h/x?a=1,2,3 next", "https://h/x next"),
+        # Userinfo, a query AND a closing quote at once — the shape the split
+        # below has to leave alone, since a quote is not a scheme boundary.
+        (
+            "quoted 'https://<u>:<p>@h/x?q=1' tail",
+            "quoted 'https://***@h/x' tail",
+        ),
     ],
 )
 def test_scrub_text_keeps_the_punctuation_glued_to_a_url(text, expected):
-    """`_URL_RE`'s `\\S+` cannot tell a URL from what merely FOLLOWS it.
+    """`_URL_RE` cannot tell a URL from what merely FOLLOWS it.
 
     None of the peeled characters is credential material, so restoring them
     gives nothing back — and without them a scrubbed message loses the quote,
     comma or full stop that made it a sentence.
     """
     assert failure_log._scrub_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Two URLs glued by a comma are ONE whitespace-delimited token. Under a
+        # plain `\S+` they matched as one, and only the FIRST one's userinfo was
+        # masked — the second went to the client and to disk verbatim.
+        (
+            "opts: https://<u1>:<p1>@a.invalid/x,https://<u2>:<p2>@b.invalid/y",
+            "opts: https://***@a.invalid/x,https://***@b.invalid/y",
+        ),
+        # Three deep, semicolon-separated: every match ends at the next scheme,
+        # so the run is scrubbed pairwise rather than first-one-wins.
+        (
+            "https://<u1>:<p1>@a.invalid/x;https://<u2>:<p2>@b.invalid/y"
+            ";https://<u3>:<p3>@c.invalid/z",
+            "https://***@a.invalid/x;https://***@b.invalid/y;https://***@c.invalid/z",
+        ),
+        # The second URL keeps its own query cut — the delimiter it anchors on
+        # is inside its own match, not the first URL's.
+        (
+            "https://<u1>:<p1>@a.invalid/x,https://<u2>:<p2>@b.invalid/y?token=s3cret",
+            "https://***@a.invalid/x,https://***@b.invalid/y",
+        ),
+        # …and where the FIRST carries the query, its cut still takes the whole
+        # query with it, second URL included: tempering stops at the `?`.
+        ("https://h/a?token=1,https://h2/b?token=2", "https://h/a"),
+        # The case that keeps the tempering query-bounded: a query VALUE that is
+        # itself an absolute URL. Splitting there would strand `&token=…` in a
+        # second match with no `?` left to cut on, leaking a secret the plain
+        # `\S+` dropped. Over-redacting the nested host is the safe direction.
+        ("https://<u>:<p>@h/x?next=https://h2/y&token=s3cret", "https://***@h/x"),
+        # Regression: one URL with userinfo AND a query is unchanged, and a
+        # string with no URL at all comes back byte-for-byte.
+        ("https://<u>:<p>@h/x?token=s3cret", "https://***@h/x"),
+        (
+            "comfy run wf.json failed: node 3 has no input",
+            "comfy run wf.json failed: node 3 has no input",
+        ),
+    ],
+)
+def test_scrub_text_masks_every_url_in_a_token_not_just_the_first(text, expected):
+    """Adjacent URLs with no whitespace between them scrub independently."""
+    assert failure_log._scrub_text(text) == expected
+
+
+def test_scrub_arg_masks_both_urls_of_a_combined_flag_list():
+    """The argv shape the split exists for: a URL list inside one `--param=`.
+
+    `_run_template_param_args` renders the whole value into a single token, so a
+    caller passing two source images hands the scrubber one `\\S+` run holding
+    two credentials.
+    """
+    arg = '--param=src="https://<u1>:<p1>@a.invalid/x,https://<u2>:<p2>@b.invalid/y"'
+
+    assert failure_log._scrub_arg(arg) == (
+        '--param=src="https://***@a.invalid/x,https://***@b.invalid/y"'
+    )
 
 
 def test_message_is_scrubbed_before_it_is_capped(log_path):
@@ -607,6 +673,42 @@ def test_stream_tail_drops_a_head_fragment_clipped_past_its_query_marker(log_pat
     assert len(entry["stderr_tail"]) <= limit  # it DID take the early return
     assert "SECRETVALUE" not in log_path.read_text()
     assert entry["stderr_tail"].startswith("... https://h/a ")
+
+
+def test_stream_tail_masks_adjacent_urls_around_a_dropped_head_fragment(log_path):
+    """The URL-split and the head-fragment contract hold at the same time.
+
+    Two things share this window: a leading token that is a scheme-shorn URL
+    fragment with a SECOND, full-schemed URL glued to it, and — past the first
+    whitespace, where the head drop cannot reach — a comma-joined pair of full
+    URLs. The pair is what a plain ``\\S+`` matched as one token, masking only
+    the first credential; here both must come out masked. The head fragment
+    keeps today's contract regardless: dropped outright, second URL and all.
+    """
+    limit = failure_log._FAILURE_LOG_TAIL_CHARS
+    head = "user:tok@a.invalid/x,https://<u2>:<p2>@b.invalid/y "
+    pair = "https://<u3>:<p3>@c.invalid/x,https://<u4>:<p4>@d.invalid/y "
+    # Same shrink-to-under-`limit` packing as the tests above: it is the early
+    # return that carries the head fragment (and the pair) out to disk.
+    unit = "https://h/a?token=" + "A" * 100 + " "
+    filler = unit * ((limit * 2 - len(head) - len(pair)) // len(unit))
+    body = head + pair + filler
+    # Exactly `limit * 2` after the scheme, so the window's cut lands right
+    # after `https://` and `head` arrives scheme-shorn.
+    stderr = "Z" * 10_000 + "https://" + body.ljust(limit * 2, "B")
+
+    failure_log._log_failure("no_json", ("run",), stderr=stderr)
+
+    (entry,) = _entries(log_path)
+    assert len(entry["stderr_tail"]) <= limit  # it DID take the early return
+    written = log_path.read_text()
+    for secret in ("user:tok", "<p2>", "<p3>", "<p4>"):
+        assert secret not in written
+    # The head fragment is dropped whole; the pair behind it survives, masked on
+    # BOTH sides of the comma.
+    assert entry["stderr_tail"].startswith(
+        "... https://***@c.invalid/x,https://***@d.invalid/y "
+    )
 
 
 def test_stream_tail_keeps_a_whitespace_free_window_rather_than_emptying_it(log_path):
