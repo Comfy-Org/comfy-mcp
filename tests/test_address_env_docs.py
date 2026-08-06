@@ -119,8 +119,9 @@ def test_section_warns_against_setting_both(section: str):
 def test_target_aware_tools_do_not_claim_to_be_local_only():
     """The run/job tools FOLLOW ``COMFYUI_URL``; their summaries must not deny it.
 
-    ``_TARGET_AWARE_SUBCOMMANDS`` is ``{"run", "run-template", "jobs"}``, so
-    exactly these tools are diverted to a configured remote. Their one-line
+    ``_TARGET_AWARE_SUBCOMMANDS`` is
+    ``{"run", "run-template", "jobs", "upload"}``, so exactly these tools are
+    diverted to a configured remote. Their one-line
     summaries used to open with "LOCAL", which is the one place the local/remote
     distinction is load-bearing and was simply wrong. The tools that genuinely
     stay on this machine (lifecycle, ``fetch_outputs``, discovery, …) keep saying
@@ -131,6 +132,8 @@ def test_target_aware_tools_do_not_claim_to_be_local_only():
     did stay local, and both halves moved together — forwarding the flags without
     correcting the summary would leave the one sentence a caller reads before
     deciding which machine a job lands on saying the opposite of what happens.
+    ``upload_file`` is the same pairing for ``upload``: its summary said LOCAL
+    while it staged a remote run's inputs onto the wrong disk.
     """
     for tool in (
         server.run_workflow,
@@ -141,6 +144,7 @@ def test_target_aware_tools_do_not_claim_to_be_local_only():
         server.watch_job,
         server.cancel_job,
         server.get_queue,
+        server.upload_file,
     ):
         lines = (tool.__doc__ or "").strip().splitlines()
         # Report a missing docstring as itself: under `python -OO` (or if one is

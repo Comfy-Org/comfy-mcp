@@ -3,13 +3,13 @@
 The run/queue tools normally target the implicit local 127.0.0.1:8188. Setting
 ``COMFYUI_URL`` — or the ``COMFYUI_HOST`` / ``COMFYUI_PORT`` pair — points them
 at a ComfyUI running elsewhere by forwarding ``--host`` / ``--port`` to the
-comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, and
-every ``comfy jobs`` subcommand). These lock in:
+comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, every
+``comfy jobs`` subcommand, and ``comfy upload``). These lock in:
 
 1. ``_comfy_target`` env parsing (URL, host/port, defaults, malformed values).
 2. ``--host`` / ``--port`` forwarded into the SUBCOMMAND (not the global prefix)
-   for ``run`` / ``run-template`` / ``jobs``, and NOT for verbs that don't accept
-   them (``env`` / ``download`` / ``upload`` / …).
+   for ``run`` / ``run-template`` / ``jobs`` / ``upload``, and NOT for verbs that
+   don't accept them (``env`` / ``download`` / …).
 3. Byte-identical local behavior when nothing is configured.
 4. ``server_info`` surfacing the configured ``comfy_target``.
 5. Submit and poll agreeing on ONE server: a ``generate_image`` / ``run_template``
@@ -359,16 +359,20 @@ def test_env_is_not_forwarded_host_port(patched_run, monkeypatch):
     assert calls[0]["cmd"][4:] == ["env"]  # untouched even with a remote configured
 
 
-def test_download_and_upload_not_forwarded(patched_run, monkeypatch):
-    """download / upload verbs don't accept --host/--port -> stay local-only."""
+def test_download_not_forwarded(patched_run, monkeypatch):
+    """`comfy download` doesn't accept --host/--port -> stays local-only.
+
+    It used to be asserted alongside ``upload``, which has since GAINED the
+    options (comfy-cli 1.14.0) and is forwarded — see the upload tests below.
+    ``download`` reaching a remote job's files anyway is
+    ``test_fetch_outputs_docs_do_not_deny_remote_retrieval``.
+    """
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     calls = patched_run(envelope())
 
     server._run_comfy("download", "abc", "-o", "/tmp/out")
-    server._run_comfy("upload", "a.png")
 
     assert calls[0]["cmd"][4:] == ["download", "abc", "-o", "/tmp/out"]
-    assert calls[1]["cmd"][4:] == ["upload", "a.png"]
 
 
 def test_fetch_outputs_docs_do_not_deny_remote_retrieval():
@@ -462,6 +466,148 @@ def test_run_template_malformed_config_fails_like_run_does(patched_run, monkeypa
         asyncio.run(server.generate_image("a cat", wait=False))
 
     assert calls == []  # neither verb ever spawned comfy-cli
+
+
+# --- forwarding into upload (the async plain-JSON path) --------------------
+
+
+def _upload_file(*args, **kwargs):
+    """Drive the async ``upload_file`` tool from a sync test (see test_wrapper)."""
+    return asyncio.run(server.upload_file(*args, **kwargs))
+
+
+def test_upload_forwards_host_port_into_subcommand(patched_run, monkeypatch):
+    """`comfy upload` accepts --host/--port (comfy-cli 1.14.0), so it is forwarded.
+
+    Driven through the raw wrapper rather than the tool so this asserts the
+    allowlist entry itself, the way the ``run-template`` test above does; the
+    tool-level argv is the next test.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"uploads": []}))
+
+    server._run_comfy("upload", "a.png")
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global prefix unchanged
+    assert cmd[4:] == ["upload", "a.png", "--host", "gpu.example", "--port", "9001"]
+
+
+def test_upload_file_forwards_host_port(patched_async_run, monkeypatch):
+    """The whole ticket: staged inputs land on the machine that runs the workflow.
+
+    While ``upload`` was off the allowlist, a session with a remote configured
+    staged images into the LOCAL install's ``input`` dir and the remote run then
+    failed on a filename it could not see. The flags go AFTER the positionals —
+    Click parses options wherever they appear, and a dash-leading path is refused
+    up front, so the variadic file list cannot swallow them.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    procs = patched_async_run(envelope(data={"uploaded": 2}))
+
+    assert _upload_file(["a.png", "b.png"], overwrite=True) == {"uploaded": 2}
+
+    cmd = procs[0].cmd
+    assert cmd[1:4] == ["--json", "--where", "local"]  # global prefix unchanged
+    assert cmd[4:] == [
+        "upload",
+        "a.png",
+        "b.png",
+        "--overwrite",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
+def test_upload_file_local_default_is_byte_identical(patched_async_run):
+    """Adding `upload` to the allowlist changes NOTHING with no remote set."""
+    procs = patched_async_run(envelope(data={"uploaded": 1}))
+
+    _upload_file(["only.png"])
+
+    assert procs[0].cmd[4:] == ["upload", "only.png", "--no-overwrite"]
+
+
+def test_upload_file_old_comfy_cli_gets_an_upgrade_instruction(
+    patched_async_run, monkeypatch
+):
+    """A comfy-cli below the floor rejects the forwarded --host — say so, don't retry.
+
+    ``comfy upload`` is far older than its ``--host`` / ``--port`` options, so an
+    install that slipped past the fail-OPEN version guard has the verb and
+    rejects only the flags, with Click's usage dump (exit 2, no envelope).
+    Retrying without them would upload into THIS machine's input dir — the exact
+    wrong-machine bug the forward exists to fix — so exactly one spawn happens
+    and it carried the flags.
+
+    It must not read as a DEAD END, though, and that half is asserted too: such
+    a comfy-cli can still reach the remote, because its ``upload`` resolves the
+    address through ``local_address.resolve_local_host_port``, which honors
+    ``COMFY_LOCAL_URL`` for any host (verified against comfy-cli 1.13.0's
+    ``target.resolve_target`` / ``local_address``). The error names that route
+    alongside the upgrade, so a refusal never talks a user out of a path that
+    works.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    procs = patched_async_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy upload [OPTIONS] FILES...\n"
+            "Try 'comfy upload --help' for help.\n\n"
+            "Error: No such option: --host"
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _upload_file(["a.png"])
+
+    message = str(excinfo.value)
+    assert "1.14.0" in message
+    assert "comfy update cli" in message
+    assert "Nothing was uploaded" in message
+    assert "COMFY_LOCAL_URL" in message  # the route that works without upgrading
+    assert len(procs) == 1  # it really did try, and did NOT retry locally
+    assert "--host" in procs[0].cmd
+
+
+def test_upload_file_real_failure_keeps_its_own_message(patched_async_run, monkeypatch):
+    """The translation is narrow: a genuine failure is not relabelled a version gap."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    patched_async_run(
+        envelope(
+            ok=False, error={"code": "server_not_running", "message": "no server"}
+        ),
+        returncode=1,
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _upload_file(["a.png"])
+
+    message = str(excinfo.value)
+    assert "no server" in message
+    assert "1.14.0" not in message
+
+
+def test_upload_file_malformed_target_raises_and_never_spawns(
+    patched_async_run, monkeypatch
+):
+    """A bad COMFYUI_URL now fails `upload_file` the way it already fails `run`.
+
+    The cost of becoming target-aware, and the intended one: a caller who
+    configured a remote and typo'd it gets a named error instead of a silent
+    upload to the wrong machine.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    procs = patched_async_run(envelope(data={"uploaded": 1}))
+
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        _upload_file(["a.png"])
+
+    assert procs == []  # never spawned comfy-cli
 
 
 # --- forwarding into the streaming (--json-stream) path --------------------

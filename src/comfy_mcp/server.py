@@ -3,7 +3,8 @@
 Every tool shells out to the ``comfy`` command (comfy-cli), pinned to the LOCAL
 target (``--where local``, defaulting to ComfyUI on ``127.0.0.1:8188``), asks
 for JSON, parses comfy-cli's versioned ``envelope/1`` result, and returns its
-``data``. The run/queue tools can be pointed at a ComfyUI running ELSEWHERE by
+``data``. The run/queue tools — and ``upload_file``, which stages the input
+files those runs read — can be pointed at a ComfyUI running ELSEWHERE by
 setting ``COMFYUI_URL`` / ``COMFYUI_HOST`` (see ``_comfy_target``), which
 forwards ``--host`` / ``--port`` to comfy-cli. A LOCAL ComfyUI on a non-default
 address (e.g. ``:8189``) instead needs no code here at all: ``COMFY_LOCAL_URL``
@@ -418,13 +419,39 @@ REMOTE_SHARED_MODELS_ENV = "COMFY_MCP_REMOTE_SHARED_MODELS"
 _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
-# run``, ``comfy run-template``, and every ``comfy jobs`` subcommand — every verb
-# that SUBMITS a job or reads one back, which is the set that has to agree on
-# which server it is talking to. ``run`` / ``jobs`` are the pair comfy-cli's
+# run``, ``comfy run-template``, every ``comfy jobs`` subcommand, and ``comfy
+# upload`` — every verb that SUBMITS a job, reads one back, or stages the files
+# a job will read, which is the set that has to agree on which server it is
+# talking to. ``run`` / ``jobs`` / ``upload`` are the set comfy-cli's
 # ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
 # options and resolves them through that module's own ``resolve_host_port``
 # (``comfy_cli/command/templates.py``), it is just missing from that docstring's
 # list.
+#
+# ``upload`` is here because an input file is only useful on the machine that
+# RUNS the workflow reading it. Without the forward, a session with a remote
+# configured staged ``upload_file``'s images into the LOCAL install's ``input``
+# directory while ``run_workflow`` submitted to the remote, which then failed on
+# a filename it could not see — the same submit/poll-must-agree argument as
+# ``run-template``, one step earlier in the flow. comfy-cli resolves the pair for
+# this verb through ``target.resolve_target`` rather than ``resolve_host_port``
+# (no persisted-background-server fallback), which changes nothing here: this
+# server either forwards an explicit host/port or forwards neither.
+#
+# Unlike ``run-template``, this one gets an explicit VERSION-SKEW error rather
+# than relying on the verb's own age. ``comfy upload`` long predates its
+# ``--host`` / ``--port`` options — they landed in comfy-cli 1.14.0, which is
+# exactly ``_MIN_COMFY_CLI`` — so an older CLI has the verb and rejects only the
+# flags, and ``_check_comfy_version`` fails OPEN (an unparseable / erroring /
+# timing-out ``--version`` lets a stale install through). ``upload_file``
+# therefore translates Click's "No such option" into an upgrade instruction
+# instead of leaving a raw usage dump, and deliberately does NOT retry without
+# the flags: the caller configured a remote, and a silent local upload is the
+# exact wrong-machine bug this forward fixes. It is not a dead end either — that
+# error names the workaround that does work on such a CLI, since comfy-cli
+# 1.13.0's ``upload`` already resolved its address through
+# ``local_address.resolve_local_host_port``, which honors ``COMFY_LOCAL_URL``
+# for ANY host (it is not loopback-restricted).
 #
 # ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
 # It backs both ``run_template`` and ``generate_image``, and while it was absent
@@ -448,7 +475,7 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # hypothetical — for ALL THREE verbs, not just this one.
 #
 # Deliberately NOT forwarded:
-#   * ``env`` / ``download`` / ``upload`` / ``templates`` / ``models`` /
+#   * ``env`` / ``download`` / ``templates`` / ``models`` /
 #     ``generate`` / the lifecycle verbs take NO ``--host`` / ``--port`` at all,
 #     so forwarding would error "No such option" — they stay local-only. That is
 #     not always a functional limit: ``download`` still collects a REMOTE job's
@@ -462,7 +489,7 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 #     set a local check cannot see.
 # Forwarding is a no-op for the local default regardless, so unconfigured
 # behavior is unchanged for every tool.
-_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "run-template", "jobs"})
+_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "run-template", "jobs", "upload"})
 
 # The envelope schema major version this server speaks. comfy-cli tags every
 # result with a ``schema`` like ``envelope/1``; the whole contract (result
@@ -1784,11 +1811,18 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
     The flags are injected into the SUBCOMMAND args (after the ``run`` /
-    ``run-template`` / ``jobs`` verb), never into the global ``--json`` /
-    ``--where`` prefix, since ``--host`` / ``--port`` are subcommand options.
-    A no-op for the local default (``_comfy_target`` is None) and for any
-    subcommand that doesn't accept the flags (see :data:`_TARGET_AWARE_SUBCOMMANDS`),
-    so unconfigured behavior is byte-identical to today.
+    ``run-template`` / ``jobs`` / ``upload`` verb), never into the global
+    ``--json`` / ``--where`` prefix, since ``--host`` / ``--port`` are
+    subcommand options. A no-op for the local default (``_comfy_target`` is
+    None) and for any subcommand that doesn't accept the flags (see
+    :data:`_TARGET_AWARE_SUBCOMMANDS`), so unconfigured behavior is
+    byte-identical to today.
+
+    They go at the END of the subcommand args, past any positionals — Click
+    parses options wherever they appear, and ``upload``'s variadic file list
+    does not swallow them because they are dash-leading (a dash-leading PATH is
+    refused up front by :func:`_validate_upload_paths`, which is the same
+    property read from the other side).
     """
     # Check the verb FIRST, then resolve the target. A malformed
     # COMFYUI_URL/PORT must not brick local-only verbs (server_info's `env`,
@@ -13843,15 +13877,27 @@ def _validate_upload_paths(paths: Any) -> None:
 
 @mcp.tool()
 async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
-    """Upload local files into the LOCAL ComfyUI ``input`` directory.
+    """Upload files from this machine into the target ComfyUI's ``input`` directory.
 
     Wraps ``comfy upload <files...> --overwrite/--no-overwrite``. Use this to
     stage source images/masks a workflow references by filename before running
-    it — it is what unlocks img2img / inpaint workflows on a local ComfyUI.
+    it — it is what unlocks img2img / inpaint workflows.
     Pass ``overwrite=True`` to replace files that already exist in the input
     dir; with the default ``overwrite=False`` the server keeps an existing file
     untouched and stores the new upload under a deduplicated name instead —
     read the envelope's per-file name for where each upload actually landed.
+
+    **Uploads to whichever ComfyUI this server targets** — the local install by
+    default, or the remote a configured ``COMFYUI_URL`` / ``COMFYUI_HOST``
+    names, the same one ``run_workflow`` / ``run_template`` submit to. That is
+    the point: an input file is only useful on the machine that runs the
+    workflow reading it. Unconfigured behavior is unchanged. Forwarding the
+    target needs comfy-cli **>= 1.14.0** (this server's floor), whose ``comfy
+    upload`` gained ``--host`` / ``--port``; against an older one — which only
+    reaches here past the fail-open version guard — this raises rather than
+    quietly uploading into the LOCAL input directory, where the remote run
+    would never find the files, and the error names both ways forward (upgrade,
+    or comfy-cli's own ``COMFY_LOCAL_URL``, which every version resolves).
 
     A cancelled or timed-out call kills the ``comfy`` child mid-batch: files it
     had already staged remain in the input dir, the rest were never sent.
@@ -13863,7 +13909,9 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     ABSOLUTE.** comfy-cli runs with the ComfyUI workspace as its working
     directory, so a relative path resolves against the workspace rather than
     against the agent's own cwd — which is a quiet way for a correct-looking
-    call to fail.
+    call to fail. That stays true with a remote target: the SOURCE paths are
+    read here and their bytes sent to the target, so they name files on THIS
+    machine, never on the remote.
 
     **If the user attached the image in chat, look for a path before giving
     up.** An MCP server never receives an attachment's BYTES: the protocol has
@@ -13901,9 +13949,38 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     # it. The result contract is `_run_comfy`'s own; `stdout_cap` is widened
     # because the envelope echoes every staged path back and a full batch's
     # would lose its front to the default tail (see `_UPLOAD_STDOUT_MAX_CHARS`).
-    return await _run_comfy_async(
-        *args, timeout=300.0, stdout_cap=_UPLOAD_STDOUT_MAX_CHARS
-    )
+    try:
+        return await _run_comfy_async(
+            *args, timeout=300.0, stdout_cap=_UPLOAD_STDOUT_MAX_CHARS
+        )
+    except ComfyCliError as exc:
+        # Version skew, translated the way `_run_version_switch` translates its
+        # own: `comfy upload` is far older than its `--host`/`--port` options, so
+        # a comfy-cli below the 1.14.0 floor — reachable only past the fail-open
+        # version guard — has the verb and rejects just the flags, with Click's
+        # usage dump. Nothing was uploaded: `NoSuchOption` is raised while
+        # PARSING, before comfy-cli sends a byte. `_is_missing_option_error` is
+        # deliberately narrow (no envelope AND the usage exit status), so a
+        # genuine failure that merely quotes the phrase keeps its own message.
+        # Deliberately no retry without the flags: the caller configured a
+        # remote, and staging the files into this machine's input directory
+        # instead is precisely the wrong-machine bug the forward exists to fix —
+        # it would "succeed" and then fail at run time on a missing filename.
+        if not _is_missing_option_error(exc, "--host"):
+            raise
+        raise ComfyCliError(
+            "the installed comfy-cli cannot be pointed at a remote ComfyUI for "
+            "this verb: its `comfy upload` does not accept `--host`, which "
+            "ships in comfy-cli 1.14.0. Nothing was uploaded — and nothing was "
+            "uploaded locally either, since files staged on this machine are "
+            "invisible to the remote ComfyUI the run submits to. Two ways "
+            'forward: upgrade comfy-cli (`update_comfyui(target="cli")`, or '
+            "`comfy update cli` in a terminal) and call this again; or, "
+            "without upgrading, unset COMFYUI_URL / COMFYUI_HOST and set "
+            "comfy-cli's own COMFY_LOCAL_URL=http://<host>:<port> to the same "
+            "address instead — every comfy-cli verb resolves it, upload "
+            "included, so uploads and runs both land there."
+        ) from exc
 
 
 @mcp.tool()
