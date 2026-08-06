@@ -376,6 +376,30 @@ Everything targets the LOCAL server only — there is no cloud access here.
 When this machine should not run a workload locally, say so explicitly and
 point the user at Comfy Cloud or partner nodes; this server cannot run cloud
 jobs itself.
+
+Paid vs free — some models ship BOTH, and the twins look identical. A model can
+have free open-weights nodes AND paid partner-API nodes at once, under
+near-identical display names and template titles. The gallery pairs
+`video_<model>_*` (free) with `api_<model>_*` (paid): `video_minimax_h3_t2v` and
+`api_minimax_h3_t2v` share the title "MiniMax H3: Text to Video", so do the
+LTX-2 pairs, and `search_templates` rows omit `tags` — so that `video_`/`api_`
+NAME PREFIX is all the results give you. Node-side, free `MiniMaxH3*` classes
+and paid `MinimaxHailuo03*` ones share "MiniMax H3 …" display names; there the
+paid markers are `is_api_node` and a `partner/` category prefix, and
+template-side it is the `API` tag (what `exclude_api=True` filters on). So
+before proposing a paid node or template for an open-ended generation request,
+CHECK whether a free twin exists — `search_nodes` and `search_templates`
+WITHOUT `exclude_api`, reading those markers — and when both exist, present
+BOTH and let the USER choose: the paid path bills per run via `confirm_spend`,
+the free path runs locally subject to the hardware-routing steps above. Never
+assert the paid path is the only one without having looked. When the request
+itself implies free / local / open weights, pass `exclude_api=True` to
+`search_templates` — that filter always exists; `search_nodes` takes no such
+argument, so screen its rows on the markers yourself. Twin parameters do NOT
+carry across: a paid node's fixed `resolution` combo does not bound the free
+one, which may take free-form `width`/`height` — read the free node's own
+schema with `get_node` before telling a user a resolution is impossible. This
+weakens no spend gate; it is about which path you PROPOSE, not about consent.
 """
 
 mcp = MCPServer("comfy-mcp", instructions=INSTRUCTIONS)

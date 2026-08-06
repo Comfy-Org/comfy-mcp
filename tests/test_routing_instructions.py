@@ -16,9 +16,17 @@ them tripwires at all: names like ``search_templates``, ``search_models`` and
 routing block had been deleted outright. Slicing means a deleted block fails
 ``test_instructions_carry_a_routing_block`` first, and every content assertion
 after it.
+
+The PAID-VS-FREE block that closes the constant gets its own parallel slice
+(the ``paid_vs_free`` fixture) for exactly the same reason, and is kept OUT of
+the ``routing`` slice on purpose: it is the sibling policy — *which* path to
+propose when a request has both a paid and a free answer — where the routing
+block answers *whether this machine* can run the free one.
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 from conftest import envelope
@@ -32,6 +40,7 @@ FLAT = " ".join(server.INSTRUCTIONS.split())
 
 _ROUTING_HEADER = "Routing — check the machine before running local diffusion."
 _ROUTING_END = "Everything targets the LOCAL server only"
+_PAID_FREE_HEADER = "Paid vs free — some models ship BOTH"
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +51,21 @@ def routing() -> str:
     end = FLAT.find(_ROUTING_END, start + 1)
     assert end > start, f"routing block terminator is gone: {_ROUTING_END!r}"
     return FLAT[start:end]
+
+
+@pytest.fixture(scope="module")
+def paid_vs_free() -> str:
+    """The paid-vs-free block alone, whitespace-collapsed.
+
+    Parallel to ``routing`` and for the same reason (module docstring). It runs
+    to the END of the constant rather than to a terminator phrase, because this
+    block currently closes ``INSTRUCTIONS``. A future section appended after it
+    would therefore be swept into the slice; if one is, give it its own
+    terminator here rather than letting its prose stand in for this block's.
+    """
+    start = FLAT.find(_PAID_FREE_HEADER)
+    assert start != -1, f"paid-vs-free block header is gone: {_PAID_FREE_HEADER!r}"
+    return FLAT[start:]
 
 
 def test_the_server_hands_these_instructions_to_the_client():
@@ -349,15 +373,179 @@ def test_routing_asks_the_user_and_names_no_shell_probe(routing):
 def test_instructions_retain_the_local_only_closing_guarantee():
     """The routing block adds a cloud/partner steer; it must not read as cloud ACCESS.
 
-    The closing guarantee is what keeps "point them at Comfy Cloud" from being
-    mistaken for "this server can run it there". It sits just past the routing
-    block, so this one is scoped to the whole constant on purpose.
+    The local-only guarantee is what keeps "point them at Comfy Cloud" from
+    being mistaken for "this server can run it there". It sits just past the
+    routing block, so this one is scoped to the whole constant on purpose.
     """
     assert (
         "Everything targets the LOCAL server only — there is no cloud access here."
         in FLAT
     )
     assert "this server cannot run cloud jobs itself" in FLAT
+
+
+def test_instructions_carry_a_paid_vs_free_block(paid_vs_free):
+    """The block every paid-vs-free assertion below is scoped to still exists.
+
+    Same tripwire role as ``test_instructions_carry_a_routing_block``: delete
+    the block and this fails outright instead of the content checks quietly
+    passing on names (``search_templates``, ``confirm_spend``, ``get_node``)
+    that pre-existing bullets elsewhere in ``INSTRUCTIONS`` also use.
+
+    ``startswith`` would be tautological — the fixture slices from the header's
+    own index — so assert what the slice does not guarantee: that there is real
+    substance after the header rather than a hollowed-out stub.
+    """
+    assert len(paid_vs_free) > 500, (
+        f"paid-vs-free block hollowed out to {len(paid_vs_free)} chars"
+    )
+
+
+def test_paid_vs_free_names_the_twin_family_naming_pattern(paid_vs_free):
+    """The trap is that the paid and free paths are hard to TELL APART.
+
+    QA found agents asserting no free path existed for "generate an H3 video"
+    on installs where the free open-weights nodes were present and runnable. The
+    reason is naming: the gallery ships ``video_minimax_h3_t2v`` (free) and
+    ``api_minimax_h3_t2v`` (paid) under the *identical* title "MiniMax H3: Text
+    to Video", and the LTX-2 families collide the same way — so a
+    ``search_templates`` result set is genuinely ambiguous unless the agent has
+    been told the ``video_``/``api_`` prefix convention. Stating only "check for
+    a free twin" without the pattern leaves it no way to recognise one.
+
+    The shared-title fact is asserted too, not just the prefixes: an edit that
+    kept the prefixes but dropped "share the title" would read as two clearly
+    distinguishable families and re-open the trap.
+    """
+    assert "`video_<model>_*`" in paid_vs_free
+    assert "`api_<model>_*`" in paid_vs_free
+    assert "video_minimax_h3_t2v" in paid_vs_free
+    assert "api_minimax_h3_t2v" in paid_vs_free
+    assert "share the title" in paid_vs_free
+    assert "LTX-2" in paid_vs_free
+
+
+def test_paid_vs_free_names_the_markers_that_discriminate_the_twins(paid_vs_free):
+    """Naming the trap is useless without the field that resolves it.
+
+    Node-side the paid twin is marked by ``is_api_node`` and a ``partner/``
+    category prefix; template-side by the ``API`` tag. Those are the only
+    machine-readable discriminators — the display names deliberately match — so
+    a block that describes the collision but not the markers tells an agent it
+    has a problem and no way to answer it.
+    """
+    assert "`is_api_node`" in paid_vs_free
+    assert "`partner/` category prefix" in paid_vs_free
+    assert "`API` tag" in paid_vs_free
+
+
+def test_paid_vs_free_presents_both_paths_and_lets_the_user_choose(paid_vs_free):
+    """Which path to spend money on is the USER's call, not the agent's.
+
+    This is the actual QA failure: agents *defaulted* to the paid partner node
+    and asserted no free path existed, without having run a search that could
+    have found one. The rule has three inseparable halves — look first, then
+    surface BOTH, then let the user pick — and the search has to be the one that
+    can still see the paid rows (``exclude_api`` left OFF), or the check cannot
+    compare the two paths at all.
+
+    The "never assert" half is asserted separately because it is the half that
+    actually fires: a block that says "present both when both exist" is silent
+    on the case where the agent never looked, which is precisely what happened.
+    """
+    assert "WITHOUT `exclude_api`" in paid_vs_free
+    assert "present BOTH" in paid_vs_free
+    assert "let the USER choose" in paid_vs_free
+    assert "Never assert the paid path is the only one without having looked" in (
+        paid_vs_free
+    )
+
+
+def test_paid_vs_free_recommends_exclude_api_for_an_explicitly_free_request(
+    paid_vs_free,
+):
+    """A request that already says "local/free" should not be shown paid rows.
+
+    The both-paths rule above is for an OPEN-ENDED request. When the user has
+    already asked for free / local / open weights, presenting the paid twin is
+    noise, and ``exclude_api=True`` is the filter that removes it.
+
+    The advice is deliberately pinned to ``search_templates``, which is where
+    that argument exists today; ``search_nodes`` takes no such filter, so the
+    block tells the caller to screen its rows on the markers by hand instead.
+    Naming ``exclude_api`` as if both tools took it would hand an agent a
+    ``TypeError`` on the node path — so the asymmetry has to be stated.
+
+    The asymmetry is then checked against the real SIGNATURES, not just asserted
+    as prose. A prose-only guard would keep passing after a node-side
+    ``exclude_api`` shipped, leaving the handshake telling every client the
+    filter does not exist; keying on ``inspect.signature`` makes that PR fail
+    here and update the sentence, which is the whole point of the phrasing being
+    tolerant of the filter's arrival.
+    """
+    assert "`exclude_api=True` to `search_templates`" in paid_vs_free
+    assert "that filter always exists" in paid_vs_free
+    assert "`search_nodes` takes no such argument" in paid_vs_free
+
+    def params(tool):
+        # `@mcp.tool()` may hand back a wrapper; `.fn` is the undecorated tool.
+        return inspect.signature(getattr(tool, "fn", tool)).parameters
+
+    assert "exclude_api" in params(server.search_templates), (
+        "search_templates lost `exclude_api` — the block promises it always exists"
+    )
+    assert "exclude_api" not in params(server.search_nodes), (
+        "search_nodes gained `exclude_api` — update the block, which tells "
+        "clients to screen its rows on the markers by hand instead"
+    )
+
+
+def test_paid_vs_free_says_paid_options_do_not_bound_the_free_twin(paid_vs_free):
+    """A paid node's option list is not the free node's parameter space.
+
+    The paid ``MinimaxHailuo03*`` nodes take ``resolution`` as a fixed combo
+    (``768P`` / ``2K``) while the free ``MiniMaxH3*`` nodes take free-form
+    integer ``width`` / ``height``. An agent that read the paid schema and
+    generalised it would tell a user an arbitrary resolution is impossible when
+    the free twin accepts it outright — a capability denial with no basis. The
+    answer is to read the free node's OWN schema, which is what ``get_node``
+    returns.
+    """
+    assert "do NOT carry across" in paid_vs_free
+    assert "`resolution` combo does not bound the free one" in paid_vs_free
+    assert "`width`/`height`" in paid_vs_free
+    assert "`get_node`" in paid_vs_free
+
+
+def test_paid_vs_free_does_not_weaken_the_spend_gate(paid_vs_free):
+    """ "Prefer the free path" must not read as "spend without asking".
+
+    The block is about which path to PROPOSE. Read as consent guidance it could
+    be taken to mean the paid path is now pre-approved (the user "chose" it), so
+    it says outright that it changes nothing there — and it routes the paid
+    option through ``confirm_spend`` by name rather than describing an unguarded
+    paid run.
+    """
+    assert "`confirm_spend`" in paid_vs_free
+    assert "weakens no spend gate" in paid_vs_free
+
+
+def test_the_spend_gate_instructions_survive_the_paid_vs_free_block():
+    """The fail-closed consent wording is unchanged, not just cross-referenced.
+
+    This is the other direction of the test above, and it is scoped to the whole
+    constant on purpose: the paid-vs-free block sits *downstream* of the spend
+    gates and must not have been allowed to soften them. These are the two
+    sentences that keep ``confirm_spend=True`` from being set reflexively; a
+    routing-guidance edit that trimmed either one would be a consent regression
+    wearing a documentation diff.
+    """
+    assert (
+        "set that ONLY when the user has actually agreed to spend credits for "
+        "that call, never just to clear the error, and never because the host "
+        "granted blanket permission to call the tool." in FLAT
+    )
+    assert "comfy-cli's gate fails closed" in FLAT
 
 
 def test_server_info_docstring_points_at_the_routing_guidance():
