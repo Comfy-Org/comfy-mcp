@@ -127,12 +127,61 @@ def test_search_templates_argv_and_empty_query_pages(patched_run):
 
 
 def test_search_templates_compact_projection(monkeypatch):
-    """Listing rows carry only name/title/description/output_type — not the full detail."""
+    """Rows carry name/title/description/output_type + the derived `api` flag."""
     _patch_ls(monkeypatch)
     row = _rows(server.search_templates())[0]
-    assert set(row) == {"name", "title", "description", "output_type"}
-    # The heavy fields live in get_template(name), not the listing.
+    assert set(row) == {"name", "title", "description", "output_type", "api"}
+    # The heavy fields still live in get_template(name), not the listing — `api`
+    # is one derived boolean, not the `tags` list coming back by the side door.
     assert "tags" not in row and "models" not in row and "category_title" not in row
+
+
+def test_search_templates_rows_flag_api_templates(monkeypatch):
+    """`api` is true exactly for the API-tagged rows, matched case-insensitively.
+
+    Without it the projection stripped `tags` and two templates with identical
+    titles (`api_minimax_h3_t2v` / `video_minimax_h3_t2v` in the real gallery)
+    were indistinguishable in results — so an agent could recommend the paid one
+    while reporting no free version exists.
+    """
+    rows = [
+        {"name": "local_one", "title": "T", "output_type": "image", "tags": []},
+        {"name": "paid_upper", "title": "T", "output_type": "image", "tags": ["API"]},
+        # comfy-cli passes gallery tags through verbatim, so the case is the
+        # gallery's to choose — the same predicate `exclude_api` uses folds it.
+        {"name": "paid_lower", "title": "T", "output_type": "image", "tags": ["api"]},
+        {"name": "paid_mixed", "title": "T", "output_type": "image", "tags": ["Api"]},
+        # A row with no `tags` key at all is local, not a KeyError.
+        {"name": "no_tags", "title": "T", "output_type": "image"},
+        # `tags` present but null, and a non-string item, are both tolerated.
+        {"name": "null_tags", "title": "T", "output_type": "image", "tags": None},
+        {"name": "odd_tags", "title": "T", "output_type": "image", "tags": [None, 7]},
+    ]
+    _patch_ls(monkeypatch, rows)
+
+    flags = {r["name"]: r["api"] for r in _rows(server.search_templates())}
+    assert flags == {
+        "local_one": False,
+        "paid_upper": True,
+        "paid_lower": True,
+        "paid_mixed": True,
+        "no_tags": False,
+        "null_tags": False,
+        "odd_tags": False,
+    }
+    assert all(isinstance(v, bool) for v in flags.values())
+
+
+def test_search_templates_exclude_api_page_is_all_api_false(monkeypatch):
+    """The flag and the filter read the same tag, so they can never disagree.
+
+    `exclude_api=True` drops the API rows; whatever survives must therefore
+    report `api: false`. A second copy of the tag test is what would let these
+    two drift apart.
+    """
+    _patch_ls(monkeypatch)
+    kept = _rows(server.search_templates(exclude_api=True))
+    assert kept and all(r["api"] is False for r in kept)
 
 
 def test_search_templates_query_narrows_reported_cases(monkeypatch):
@@ -215,6 +264,11 @@ def test_search_templates_exclude_api(monkeypatch):
     assert "flux_i2i" not in names and "seedream_5" not in names
     assert set(names) == {"image_to_image", "basic_txt2img", "clip_maker"}
     assert kept["total"] == 3
+
+    # The fixture tags are upper-case; a lower-case one drops just the same.
+    lowered = [dict(r, tags=[t.lower() for t in r["tags"]]) for r in ROWS]
+    _patch_ls(monkeypatch, lowered)
+    assert set(_names(server.search_templates(exclude_api=True))) == set(names)
 
 
 def test_search_templates_bad_shape_raises(monkeypatch):

@@ -365,9 +365,10 @@ earlier one:
   partner infrastructure, so they are fine on any Mac. Reach them with
   `search_templates(tag="API", type="video")` — filter on BOTH axes, because
   neither alone isolates partner-run video (`tag` does not constrain the output
-  type, `type` does not constrain WHERE the model runs) and the compact rows
-  omit `tags`, so the caller cannot tell a local template from an `API` one in
-  the results.
+  type, `type` does not constrain WHERE the model runs). Every row comes back
+  with an `api` boolean, so you CAN tell a partner-run template from a local one
+  in the results — read it to confirm the filter did what you meant, and to see
+  whether a free local alternative exists before recommending a paid row.
 - Model choice: pick models via `search_templates` / `search_models` instead
   of assuming a classic default (e.g. SDXL) — current templates track current
   models.
@@ -11083,12 +11084,33 @@ def which() -> Any:
 # The compact per-row projection returned by the listing. The full detail
 # (tags / models / providers / category_title) is what ``get_template(name)``
 # returns — keeping the listing slim is what stops the full 558-row catalog from
-# blowing the MCP client's tool-output cap.
+# blowing the MCP client's tool-output cap. Each projected row also carries a
+# DERIVED `api` boolean (see `_template_is_api`) which has no source key here:
+# the one bit of `tags` a caller cannot do without, at one byte instead of the
+# whole list.
 _TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
 
 # Upper bound on a single page so an oversized `limit` can't build a response
 # that trips the MCP client's tool-output cap; callers page the rest via `offset`.
 _TEMPLATE_LIST_MAX_LIMIT = 200
+
+
+def _template_is_api(row: dict) -> bool:
+    """True if a template ``row`` carries the ``API`` tag.
+
+    An ``API`` row runs its model on a hosted partner API — it spends credits
+    and needs a key — where every other row runs on local hardware for free.
+    Case-insensitive, and tolerant of a non-string item in the list, because
+    ``tags`` is free-form gallery metadata comfy-cli passes through verbatim
+    (which is also why this is the gallery's claim about a template, not a
+    verdict derived from its graph — deriving one here is what the thin-wrapper
+    rule forbids).
+
+    ONE predicate with TWO readers, deliberately: ``exclude_api``'s filter and
+    the derived ``api`` flag on each projected row. Two copies of this test
+    would let the rows disagree with the filter that produced them.
+    """
+    return any(isinstance(t, str) and t.lower() == "api" for t in row.get("tags") or [])
 
 
 def _template_matches(row: dict, query_lower: str) -> bool:
@@ -11144,8 +11166,23 @@ def search_templates(
 
     Returns ``{"total", "shown", "offset", "rows"}`` where ``total`` is the
     filtered match count, ``rows`` is the current page projected down to
-    ``name / title / description / output_type`` (page again with ``offset`` to
-    see more), and ``get_template(name)`` is the full-detail path.
+    ``name / title / description / output_type`` plus a derived ``api`` boolean
+    (page again with ``offset`` to see more), and ``get_template(name)`` is the
+    full-detail path.
+
+    ``api`` is the one bit of ``tags`` the compact rows keep, because it decides
+    what running the template COSTS: ``api: true`` means the template calls a
+    hosted partner API — the model runs on partner infrastructure and spends the
+    signed-in account's credits, so ``run_template`` fails it CLOSED unless
+    ``confirm_spend=True`` — while ``api: false`` runs on local hardware for
+    free. Read it before recommending a template: two rows can
+    carry the SAME title and differ only here (``api_minimax_h3_t2v`` vs
+    ``video_minimax_h3_t2v``), so without it a free local option is easy to miss
+    and a paid one easy to hand over unannounced. It is exactly the tag
+    ``exclude_api`` filters on, so an ``exclude_api=True`` page is all
+    ``api: false`` — and it is the gallery's own tag either way, not an
+    inspection of the graph, so it carries the same "approximating runnable
+    locally" caveat that filter does.
 
     Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
     with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
@@ -11205,13 +11242,7 @@ def search_templates(
             "are not objects. comfy-cli's output shape may have drifted."
         )
     if exclude_api:
-        rows = [
-            r
-            for r in rows
-            if not any(
-                isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
-            )
-        ]
+        rows = [r for r in rows if not _template_is_api(r)]
     if query:
         q = query.lower()
         rows = [r for r in rows if _template_matches(r, q)]
@@ -11219,7 +11250,10 @@ def search_templates(
     total = len(rows)
     offset = max(0, offset)
     page = rows[offset : offset + limit]
-    projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
+    projected = [
+        {**{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS}, "api": _template_is_api(r)}
+        for r in page
+    ]
     return {
         "total": total,
         "shown": len(projected),

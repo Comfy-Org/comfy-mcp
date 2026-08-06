@@ -262,9 +262,12 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     pinning the failure on either one: ``tag`` and ``type`` are separate
     exact-match forwards to ``--tag`` / ``--type``, so ``tag`` alone does not
     constrain the output type and ``type`` alone does not constrain where the
-    model runs. Either way the compact rows omit ``tags`` (see
-    ``test_templates.py``), so the caller cannot tell a local template from an
-    ``API`` one in the results.
+    model runs. The rows themselves now carry an ``api`` boolean (see
+    ``test_templates.py``), so the guidance must say the caller CAN tell a
+    partner-run template from a local one in the results — the old "the compact
+    rows omit ``tags``, so the caller cannot tell" clause is a capability denial
+    that stopped being true, and restoring it would send an agent back to
+    guessing from titles that collide.
 
     The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
     with a discrete card follows the discrete-GPU row, and "any Mac" handed that
@@ -274,6 +277,8 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     assert "neither alone isolates partner-run video" in routing
     assert "emit_partner_workflow" in routing
     assert "APPLE-GPU rule, not" in routing
+    assert "an `api` boolean" in routing
+    assert "cannot tell a local template" not in routing
 
 
 def test_routing_steers_model_choice_to_discovery_not_a_hardcoded_default(routing):
