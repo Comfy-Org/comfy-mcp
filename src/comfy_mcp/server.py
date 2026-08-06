@@ -11095,22 +11095,48 @@ _TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
 _TEMPLATE_LIST_MAX_LIMIT = 200
 
 
+def _row_str_items(row: dict, key: str) -> list[str]:
+    """The string items of a list-valued ``row`` field, tolerant of shape drift.
+
+    ``tags`` / ``models`` are free-form gallery metadata comfy-cli passes
+    through verbatim, so a drifted row can carry anything under either key. A
+    value that is not a list/tuple contributes NO items, because the two ways
+    Python would otherwise read one are both wrong: a number raises
+    ``TypeError`` mid-listing, and a bare ``"API"`` string iterates into the
+    characters ``A``/``P``/``I`` — silently answering "not an API template" for
+    a row that says it is. Both readers below run over EVERY row of the default
+    ``search_templates()`` page, so one drifted row must not decide the call.
+    """
+    value = row.get(key)
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def _template_is_api(row: dict) -> bool:
     """True if a template ``row`` carries the ``API`` tag.
 
     An ``API`` row runs its model on a hosted partner API — it spends credits
     and needs a key — where every other row runs on local hardware for free.
-    Case-insensitive, and tolerant of a non-string item in the list, because
-    ``tags`` is free-form gallery metadata comfy-cli passes through verbatim
-    (which is also why this is the gallery's claim about a template, not a
-    verdict derived from its graph — deriving one here is what the thin-wrapper
-    rule forbids).
+    Case-insensitive, and tolerant of a drifted ``tags`` value (see
+    ``_row_str_items``) because it is gallery metadata comfy-cli passes through
+    verbatim — which is also why this is the gallery's CLAIM about a template,
+    not a verdict derived from its graph; deriving one here is what the
+    thin-wrapper rule forbids.
+
+    Absence of the tag is what returns False, which is not the same evidence as
+    a row that positively says it runs locally: a row with no readable ``tags``
+    at all reports False too. That is deliberate — it is the answer
+    ``exclude_api`` has always given such a row (it keeps it), and a flag that
+    disagreed with the filter that produced the page would be worse than a
+    conservative one. ``get_template(name)`` carries the full ``tags`` when a
+    row looks off.
 
     ONE predicate with TWO readers, deliberately: ``exclude_api``'s filter and
     the derived ``api`` flag on each projected row. Two copies of this test
     would let the rows disagree with the filter that produced them.
     """
-    return any(isinstance(t, str) and t.lower() == "api" for t in row.get("tags") or [])
+    return any(t.lower() == "api" for t in _row_str_items(row, "tags"))
 
 
 def _template_matches(row: dict, query_lower: str) -> bool:
@@ -11126,8 +11152,8 @@ def _template_matches(row: dict, query_lower: str) -> bool:
         if isinstance(value, str) and query_lower in value.lower():
             return True
     for key in ("tags", "models"):
-        for item in row.get(key) or []:
-            if isinstance(item, str) and query_lower in item.lower():
+        for item in _row_str_items(row, key):
+            if query_lower in item.lower():
                 return True
     return False
 
@@ -11182,7 +11208,10 @@ def search_templates(
     ``exclude_api`` filters on, so an ``exclude_api=True`` page is all
     ``api: false`` — and it is the gallery's own tag either way, not an
     inspection of the graph, so it carries the same "approximating runnable
-    locally" caveat that filter does.
+    locally" caveat that filter does. Read ``api: false`` as *this row does not
+    carry the tag*, which is the gallery's silence rather than a promise: a row
+    whose ``tags`` are missing or drifted reads False too, so on a row that
+    looks off, ``get_template(name)`` has the full ``tags``.
 
     Step 1 of the template on-ramp: pick a ``name`` from the results, inspect it
     with ``get_template(name)``, then ``fetch_template(name, out_path)`` to write
