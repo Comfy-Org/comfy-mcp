@@ -4,7 +4,11 @@
 
 <h1>Comfy MCP</h1>
 
-**Drive your own [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any MCP-speaking AI agent — an [MCP](https://modelcontextprotocol.io) server built on [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).**
+**Drive [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any
+MCP-speaking AI agent — on your own machine or on Comfy Cloud.**
+
+Built on the [Model Context Protocol](https://modelcontextprotocol.io) and
+[`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).
 
 <p>
   <a href="https://github.com/comfyanonymous/ComfyUI"><img src="https://img.shields.io/badge/ComfyUI-self--hosted-blue?style=for-the-badge" alt="ComfyUI self-hosted"></a>
@@ -19,19 +23,45 @@
 </p>
 
 <p>
-  <a href="#quickstart"><strong>Quickstart</strong></a> ·
+  <a href="#two-connections"><strong>Which connection?</strong></a> ·
+  <a href="#quickstart">Quickstart (local)</a> ·
+  <a href="#comfy-cloud-mcp">Set up cloud</a> ·
   <a href="#configure-your-ai-client">Configure your client</a> ·
-  <a href="#comfy-cloud-mcp">Comfy Cloud MCP</a> ·
   <a href="#tools">Tools</a> ·
   <a href="#contributing">Contributing</a>
 </p>
 
 </div>
 
-> Looking for the cloud-hosted version? [Comfy Cloud MCP](#comfy-cloud-mcp) is set up below — install
-> it instead of this server, or alongside it.
+## Two connections
 
-**What it does:**
+**Comfy MCP is one product with two connections.** Same kind of tools on both — the difference is
+whose machine runs the workflow. **Setup for both lives in this README**, so you do not need to go
+anywhere else to pick one.
+
+|  | **Cloud connection** | **Local connection** |
+|---|---|---|
+| What it is | Hosted MCP at `https://cloud.comfy.org/mcp` | **This repo** — an open-source server you run |
+| Transport | Remote HTTP; nothing to install | stdio; your client launches it as a subprocess |
+| Runs on | Comfy Cloud GPUs | Your machine, or a ComfyUI you host |
+| Needs ComfyUI | No | Yes, your own |
+| Models & nodes | The Comfy Cloud catalog | Whatever you have installed, custom nodes included |
+| Cost | Credits (subscription) | Free — it is your hardware |
+| Set it up | [Comfy Cloud MCP](#comfy-cloud-mcp) | [Quickstart](#quickstart) |
+
+**Which one do I want?** If you already run ComfyUI, or you work in a coding agent (Claude Code,
+Cursor, Codex), start **local**. Otherwise start on **cloud** — and in claude.ai, ChatGPT or the
+Claude Desktop chat app, cloud is the only option, because those accept remote connectors only.
+
+**On a Mac, start on cloud even if you already have ComfyUI installed.** Current image and video
+models are too large to run at a workable speed on the Apple GPU. The local connection is still
+worth adding for your own nodes and assets — just expect the generating to happen on ours. See
+[When to use this server](#when-to-use-this-server) for the full hardware routing.
+
+Running both at once is normal, and most clients host two MCP servers happily. They sign in to the
+same Comfy account but **separately** — one sign-in does not cover the other.
+
+**What the local connection does:**
 
 - 🖼️ **Generate** — run a workflow JSON (API-format or UI export), or go text-prompt → image in one call.
 - ⏱️ **Monitor jobs** — submit async, then wait / watch / cancel, read the failure verdict, and collect the output PNGs.
@@ -43,30 +73,49 @@ Each tool shells out to the `comfy` command with `--where local --json`, parses 
 `envelope/1` output, and returns it — comfy-cli is the engine, and by default everything targets
 the ComfyUI on **your** machine (`127.0.0.1:8188`).
 
-**Scope — local-first, not local-only.** A few flows already reach beyond your machine:
+**Local-first, not local-only.** Some flows here already reach past your machine:
 [`partner_generate`](#spending-credits-on-partner-models) runs hosted partner models
-(Flux / Ideogram / Kling / …) entirely on partner infrastructure — no local ComfyUI in the
-execution path — and [partner-API nodes](#partner-api-nodes) let a locally-executed workflow call
-those same hosted models, while [`COMFYUI_URL`](#driving-a-remote-comfyui) points the run/job tools
-at a ComfyUI on another machine you control.
-
-**This server vs. [Comfy Cloud MCP](#comfy-cloud-mcp).** Two different servers, and running both is
-normal. This one is **stdio**: your client launches it as a subprocess on **your own machine**, and
-it drives the ComfyUI installed there (or one on another machine you control). Comfy Cloud MCP is a
-**remote HTTP** server at `https://cloud.comfy.org/mcp` that your client connects to over the
-network, and it executes workflows on **Comfy Cloud GPUs** — no local GPU, no ComfyUI install. Both
-authenticate: this one signs in to Comfy through comfy-cli ([`auth_login`](#partner-api-nodes) or
-`COMFY_API_KEY`), the cloud one through OAuth in your browser or a Comfy Cloud API key. Both can
-spend credits on **partner** models, so partner generation is not the dividing line — what this
-server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud queue, no
-cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
-want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
+(Flux / Ideogram / Kling / …) entirely on partner infrastructure, [partner-API
+nodes](#partner-api-nodes) let a locally-executed workflow call those same hosted models, and
+[`COMFYUI_URL`](#driving-a-remote-comfyui) points the run/job tools at a ComfyUI on another machine
+you control. Both connections can spend credits on partner models, so that is not the dividing
+line. What this server has **no** path to is Comfy Cloud itself — no cloud-hosted execution, no
+cloud queue, no cross-session cloud batches. For those, add the
+[cloud connection](#comfy-cloud-mcp) alongside it.
 
 > **Status:** beta. 52 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
+## Table of contents
+
+- [Two connections](#two-connections)
+- [Quickstart](#quickstart)
+- [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
+- [Configure your AI client](#configure-your-ai-client)
+- [Comfy Cloud MCP](#comfy-cloud-mcp)
+- [Prerequisites](#prerequisites)
+- [When to use this server](#when-to-use-this-server)
+- [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
+- [Partner-API nodes](#partner-api-nodes)
+- [Spending credits on partner models](#spending-credits-on-partner-models)
+- [Templates your install can't run](#templates-your-install-cant-run)
+- [Driving a remote ComfyUI](#driving-a-remote-comfyui)
+- [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
+- [Which address variable do I want?](#which-address-variable-do-i-want)
+- [Tools](#tools)
+- [Troubleshooting](#troubleshooting)
+- [Failure log (opt-in)](#failure-log-opt-in)
+- [Smoke test](#smoke-test)
+- [Contributing](#contributing)
+- [License](#license)
+- [Trademarks](#trademarks)
+
 ## Quickstart
+
+This sets up the **local** connection. Not sure which one you want? See
+[Two connections](#two-connections). Going with cloud instead — nothing to install —
+skip ahead to [Comfy Cloud MCP](#comfy-cloud-mcp).
 
 Four steps take you from a fresh install to your first generated image.
 
@@ -255,9 +304,10 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 
 ## Comfy Cloud MCP
 
-Everything above sets up **this** server, which runs on your machine. Comfy also runs a **hosted**
-MCP server — **Comfy Cloud MCP** — and it is a good fit when the machine can't carry local
-diffusion, or when you'd rather not install ComfyUI at all. It lives at:
+This is the **other connection** — the hosted one. Nothing to install, no ComfyUI of your own, and
+workflows run on Comfy Cloud GPUs. It is the right starting point when your machine can't carry
+local diffusion (every Mac, see [Two connections](#two-connections)), when you're in a chat client
+that only accepts remote connectors, or when you'd simply rather not install ComfyUI. It lives at:
 
 ```
 https://cloud.comfy.org/mcp
@@ -351,29 +401,6 @@ shown above. Restart the client and you should see the cloud tools (`search_temp
 https://cloud.comfy.org/mcp` and `openclaw mcp set` / `openclaw mcp login` — in the [Comfy Cloud MCP
 docs](https://docs.comfy.org/agent-tools/mcp), which is also where the screenshot walkthroughs, the
 full cloud tool list, and the slash-command/prompt tables live.
-
-## Table of contents
-
-- [Quickstart](#quickstart)
-- [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
-- [Configure your AI client](#configure-your-ai-client)
-- [Comfy Cloud MCP](#comfy-cloud-mcp)
-- [Prerequisites](#prerequisites)
-- [When to use this server](#when-to-use-this-server)
-- [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
-- [Partner-API nodes](#partner-api-nodes)
-- [Spending credits on partner models](#spending-credits-on-partner-models)
-- [Templates your install can't run](#templates-your-install-cant-run)
-- [Driving a remote ComfyUI](#driving-a-remote-comfyui)
-- [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
-- [Which address variable do I want?](#which-address-variable-do-i-want)
-- [Tools](#tools)
-- [Troubleshooting](#troubleshooting)
-- [Failure log (opt-in)](#failure-log-opt-in)
-- [Smoke test](#smoke-test)
-- [Contributing](#contributing)
-- [License](#license)
-- [Trademarks](#trademarks)
 
 ## Prerequisites
 
@@ -474,19 +501,18 @@ Local diffusion is only a good default on a machine that can actually carry it, 
 | Discrete GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
 | Discrete GPU, **8 GB to under 24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
 | **< 8 GB** VRAM, or the user confirming there is no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the [Comfy Cloud MCP](#comfy-cloud-mcp) if your client has it connected. |
-| **Apple Silicon**, **≥ 32 GB** unified memory | Images are OK. Video on the Apple GPU is not recommended — time estimates are unreliable and thermals suffer. |
-| **Apple Silicon**, under 32 GB unified memory | Same as the no-GPU row above — go partner/cloud rather than local. |
+| **Apple Silicon**, any unified-memory size | Don't run local diffusion — go partner/cloud. Current image and video models are too large to run at a workable speed on the Apple GPU, and the older ones that still fit aren't worth reaching for. |
 
-The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card on a ROCm/XPU build too — the VRAM number is what matters. The no-local-video rule is an *Apple GPU* rule rather than a Mac rule: an Intel Mac with a discrete card follows the discrete-GPU rows.
+The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card on a ROCm/XPU build too — the VRAM number is what matters. The Apple row is an *Apple GPU* rule rather than a Mac rule: an Intel Mac with a discrete card follows the discrete-GPU rows.
 
 The instructions walk these as an ordered procedure, because several of the checks only make sense in sequence:
 
 1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts every tool that submits a job — `run_workflow`, `generate_image`, `run_template` — along with the queue/`jobs` tools, while discovery, templates, downloads, outputs and the lifecycle tools stay here; so against a genuine remote the thresholds below describe the wrong machine. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
-2. **Get a memory figure.** The sizes are bytes (`ram_bytes`, `gpu.vram_bytes`) and the divisor gives GiB, while drivers report under the advertised size — a consumer 24 GB card reads 23.99, an ECC/reserving datacenter card (A10, L4) about 22.3 — so a *small* shortfall, within ~10% of a nominal size, reads as that nominal capacity. A gap wider than that is not driver overhead and is taken at face value instead: on a MIG/vGPU partition the model string names the whole card while `vram_bytes` is the slice you actually get, and rounding a 6 GB A100 slice up into the ≥ 24 GB band would OOM the run. On Apple Silicon `gpu.vram_bytes` is `null` (with `gpu.unified_memory` true) and the figure is `ram_bytes` — an Apple-only substitution.
-3. **If the figure is missing, ask.** A `null` **or zero** `vram_bytes` on any **non-Apple** GPU (a discrete card comfy-cli can't size, but also a non-Apple unified part like a Jetson/Grace board or a Strix Halo APU), a missing `gpu` object, or a missing/zero `ram_bytes` on the Apple path all mean **unknown**, not "no GPU" — the agent asks rather than stranding a machine that has one. The "no GPU" verdict is reserved for a *confirmed* absence, and the only thing that confirms one is your own answer: no `hardware` payload encodes it, because a null or missing `gpu` is unknown by this same step. Nothing in this repo probes hardware, and the instructions tell the agent not to shell out either: a probe runs on a path this server can neither bound nor audit.
-4. **Route on the figure**, then **redirect rather than dead-end** when the answer is "not on this machine". A figure that came from your answer rather than the payload routes on whichever row fits the machine — the unified-memory row on an Apple Silicon Mac, the VRAM rows otherwise, which is what covers the non-Apple unified-memory boards that have no row of their own.
+2. **Get a memory figure.** The sizes are bytes (`ram_bytes`, `gpu.vram_bytes`) and the divisor gives GiB, while drivers report under the advertised size — a consumer 24 GB card reads 23.99, an ECC/reserving datacenter card (A10, L4) about 22.3 — so a *small* shortfall, within ~10% of a nominal size, reads as that nominal capacity. A gap wider than that is not driver overhead and is taken at face value instead: on a MIG/vGPU partition the model string names the whole card while `vram_bytes` is the slice you actually get, and rounding a 6 GB A100 slice up into the ≥ 24 GB band would OOM the run. On Apple Silicon `gpu.vram_bytes` is `null` (with `gpu.unified_memory` true), and no substitute figure is needed — that shape identifies the machine, whose verdict is unconditional.
+3. **If the figure is missing, ask.** A `null` **or zero** `vram_bytes` on any **non-Apple** GPU (a discrete card comfy-cli can't size, but also a non-Apple unified part like a Jetson/Grace board or a Strix Halo APU), or a missing `gpu` object all mean **unknown**, not "no GPU" — the agent asks rather than stranding a machine that has one. The "no GPU" verdict is reserved for a *confirmed* absence, and the only thing that confirms one is your own answer: no `hardware` payload encodes it, because a null or missing `gpu` is unknown by this same step. Nothing in this repo probes hardware, and the instructions tell the agent not to shell out either: a probe runs on a path this server can neither bound nor audit.
+4. **Route on the figure**, then **redirect rather than dead-end** when the answer is "not on this machine". A figure that came from your answer rather than the payload routes on the VRAM rows, which is what covers the non-Apple unified-memory boards that have no row of their own; an Apple Silicon Mac needs no figure at all.
 
-"No local video on a Mac" is about the Apple GPU, not about video as such: `API`-tagged video templates (`search_templates(tag="API", type="video")` — both filters, since neither alone isolates partner-run video, and the compact rows omit `tags`) and `emit_partner_workflow` run the model on partner infrastructure, so they work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
+The Apple row rules out that GPU, not the capability: `API`-tagged video templates (`search_templates(tag="API", type="video")` — both filters, since neither alone isolates partner-run video, and the compact rows omit `tags`) and `emit_partner_workflow` run the model on partner infrastructure, so they work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
 
 The `hardware` block comes straight through from `comfy env`, and a comfy-cli that predates it simply omits the key. There is no HTTP client and no cloud code here — the cloud/partner steer is guidance text only.
 

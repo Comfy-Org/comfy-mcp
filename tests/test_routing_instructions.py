@@ -116,15 +116,23 @@ def test_routing_states_the_units_and_rounds_to_the_nominal_band(routing):
     assert "MIG/vGPU PARTITION" in routing  # ...but never on a partitioned card
 
 
-def test_routing_scopes_the_unified_memory_substitution_to_apple(routing):
-    """A null ``vram_bytes`` means "read ``ram_bytes``" only on Apple Silicon.
+def test_routing_reads_the_apple_shape_as_identification_not_a_figure(routing):
+    """On Apple Silicon the null ``vram_bytes`` names the machine, not its size.
 
-    Stated generically it would hand a 32 GB Intel/AMD integrated-GPU laptop the
-    Apple ">= 32 GB, images OK" verdict, when the only row keyed on
-    ``ram_bytes`` is the Apple one and such a machine belongs in partner/cloud.
+    Since the Apple verdict went unconditional there is no threshold left for a
+    memory figure to be compared against, so the block must stop telling the
+    agent to substitute one — an agent that still reads ``ram_bytes`` as a
+    routing number has no row to route it on and will invent a band.
+
+    The APPLE-ONLY scoping still has to survive that rewrite, in the other
+    direction: a null ``vram_bytes`` on an Intel/AMD integrated GPU is UNKNOWN
+    (step 3), and a block that generalised the short-circuit would hand those
+    machines the Apple verdict without ever asking.
     """
     assert "`gpu.unified_memory` is true" in routing
     assert "APPLE-ONLY" in routing
+    assert "IDENTIFIES" in routing  # ...the machine, rather than sizing it
+    assert "changes no verdict" in routing
 
 
 def test_routing_defers_to_comfy_target_instead_of_local_hardware(routing):
@@ -217,14 +225,23 @@ def test_routing_covers_non_nvidia_discrete_gpus(routing):
     assert "ROCm/XPU" in routing
 
 
-def test_routing_covers_apple_silicon_below_the_32gb_line(routing):
-    """A Mac under 32 GB is not "no GPU" and needs its own stated verdict.
+def test_routing_sends_every_apple_silicon_mac_to_cloud(routing):
+    """Apple Silicon routes away from local diffusion at ANY memory size.
 
-    README ships this row; the handshake has to carry the same guidance, or the
-    documentation describes a policy the agent was never given.
+    This supersedes the old ">= 32 GB, images OK / under 32 GB, treat as no-GPU"
+    split (product decision, 2026-08-06): current image and video models do not
+    run at a workable speed on the Apple GPU at any unified-memory size, and the
+    older models that do fit are not worth steering anyone toward.
+
+    The retired threshold is asserted GONE as well as the new rule asserted
+    present, because a half-applied edit is the dangerous outcome — leaving the
+    band in place alongside the unconditional row hands an M4 Max two
+    contradictory verdicts, which is worse than either policy alone.
     """
-    assert ">= 32 GB" in routing
-    assert "under 32 GB" in routing
+    assert "Apple Silicon: do NOT run local diffusion" in routing
+    assert "at ANY memory size" in routing
+    assert ">= 32 GB" not in routing
+    assert "under 32 GB" not in routing
 
 
 def test_routing_can_act_on_the_answer_it_asks_for(routing):
@@ -299,9 +316,10 @@ def test_routing_asks_rather_than_reading_an_unknown_gpu_as_no_gpu(routing):
     non-Apple UNIFIED part (Jetson/Grace, a Strix Halo APU) also reports a null
     ``vram_bytes``, and the ``ram_bytes`` substitution above is Apple-only, so
     keying on unified-memory left that machine matching neither branch — with
-    64-128 GB of usable memory and a "do NOT run local diffusion" verdict. The
-    Apple path needs the mirror case too: a missing or zero ``ram_bytes`` is the
-    one figure that branch depends on.
+    64-128 GB of usable memory and a "do NOT run local diffusion" verdict.
+    The Apple path needs no mirror case: since its verdict went unconditional it
+    depends on no figure at all, so a missing ``ram_bytes`` there is not a
+    question to ask — which is why the block says Apple never reaches this step.
 
     Zero is asserted alongside null on BOTH paths. A CLI or driver that reports
     an unsizable card as ``vram_bytes: 0`` would otherwise skip this step
@@ -320,7 +338,7 @@ def test_routing_asks_rather_than_reading_an_unknown_gpu_as_no_gpu(routing):
     assert "is UNKNOWN, NOT" in routing
     assert "`vram_bytes` null or zero on ANY non-Apple GPU" in routing
     assert "Jetson/Grace" in routing and "Strix Halo" in routing
-    assert "`ram_bytes` missing or zero on the Apple path" in routing
+    assert "never reaches\n  this step for a memory figure" in server.INSTRUCTIONS
     # the confirmed absence is the user's answer, not a payload shape
     assert "CONFIRMED absence of a GPU is the USER telling you" in routing
     assert "no `hardware` payload states it" in routing
