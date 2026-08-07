@@ -23,7 +23,7 @@ import os
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import argv, instructions, server
 
 # A representative slice of the real comfy-cli `templates ls` payload shape.
 ROWS = [
@@ -127,13 +127,93 @@ def test_search_templates_argv_and_empty_query_pages(patched_run):
 
 
 def test_search_templates_compact_projection(monkeypatch):
-    """Rows carry name/title/description/output_type + the derived `api` flag."""
+    """Listing rows stay slim, but carry the paid-vs-local discriminators.
+
+    ``tags`` and ``category_title`` are IN the projection on purpose: the
+    gallery titles a paid ``API`` template and its free open-source sibling
+    identically ("MiniMax H3: Text to Video", twice), so a listing without
+    them left an agent unable to tell the routes apart and steered users into
+    the paid one. ``api`` rides alongside as a DERIVED boolean — the one bit
+    of ``tags`` a caller can read without scanning the list itself. The heavy
+    fields (``models``/``providers``) still live in ``get_template(name)``
+    only.
+    """
     _patch_ls(monkeypatch)
     row = _rows(server.search_templates())[0]
-    assert set(row) == {"name", "title", "description", "output_type", "api"}
-    # The heavy fields still live in get_template(name), not the listing — `api`
-    # is one derived boolean, not the `tags` list coming back by the side door.
-    assert "tags" not in row and "models" not in row and "category_title" not in row
+    assert set(row) == {
+        "name",
+        "title",
+        "description",
+        "output_type",
+        "tags",
+        "category_title",
+        "api",
+    }
+    assert "models" not in row and "providers" not in row
+
+
+def test_search_templates_identical_titles_stay_distinguishable(monkeypatch):
+    """The MiniMax H3 shape: same title twice, told apart only by tags/category.
+
+    Regression — with the discriminators stripped from the rows, agents built
+    graphs on the paid partner template and told users "the only H3 path is
+    the API node" while the free open-source row sat in the same result page.
+    """
+    h3_pair = [
+        {
+            "name": "video_minimax_h3_t2v",
+            "title": "MiniMax H3: Text to Video",
+            "output_type": "video",
+            "category_title": "Video",
+            "tags": [],
+            "models": ["MiniMax H3"],
+            "providers": [],
+            "description": "Open-source MiniMax H3 text to video.",
+        },
+        {
+            "name": "api_minimax_h3_t2v",
+            "title": "MiniMax H3: Text to Video",
+            "output_type": "video",
+            "category_title": "Video API",
+            "tags": ["API"],
+            "models": ["MiniMax H3"],
+            "providers": ["MiniMax"],
+            "description": "MiniMax H3 text to video via the hosted API.",
+        },
+    ]
+    _patch_ls(monkeypatch, rows=h3_pair)
+
+    rows = _rows(server.search_templates("minimax h3"))
+
+    assert len(rows) == 2
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["video_minimax_h3_t2v"]["tags"] == []
+    assert by_name["api_minimax_h3_t2v"]["tags"] == ["API"]
+    assert by_name["video_minimax_h3_t2v"]["category_title"] == "Video"
+    assert by_name["api_minimax_h3_t2v"]["category_title"] == "Video API"
+    assert by_name["video_minimax_h3_t2v"]["api"] is False
+    assert by_name["api_minimax_h3_t2v"]["api"] is True
+    # And the free sibling is isolable without eyeballing tags at all.
+    free = _rows(server.search_templates("minimax h3", exclude_api=True))
+    assert [r["name"] for r in free] == ["video_minimax_h3_t2v"]
+
+
+def test_instructions_carry_the_dual_route_guidance():
+    """The dual-route bullet behind the ask-first behavior still exists.
+
+    Tripwire in the ``test_routing_instructions.py`` style: the guidance is
+    prose, so no functional test notices it disappearing. Keyed on the
+    load-bearing facts — identical titles, check-both-routes-first, ask the
+    user, and no cross-route parameter limits — rather than whole sentences.
+    """
+    flat = " ".join(instructions.INSTRUCTIONS.split())
+    assert "identical titles" in flat
+    assert "check BOTH routes" in flat
+    assert "ASK the user which they want" in flat
+    assert "never read parameter limits across routes" in flat
+    # The example that motivated the bullet, so the next H3-style QA round can
+    # find this guidance by searching the constant.
+    assert "MiniMax H3" in flat
 
 
 def test_search_templates_rows_flag_api_templates(monkeypatch):
@@ -333,7 +413,7 @@ def test_search_templates_bad_shape_raises(monkeypatch):
 
 
 def test_search_templates_non_dict_rows_raise(monkeypatch):
-    """Non-dict rows are shape drift -> raise loudly, never silently dropped (BE-3342).
+    """Non-dict rows are shape drift -> raise loudly, never silently dropped.
 
     Silently filtering them would undercount `total` and vanish templates, which
     contradicts the loud-fail guard the rest of the function is built around.
@@ -485,7 +565,7 @@ def test_fetch_template_rejects_an_oversized_out_path(no_spawn):
     convert — its `try` wraps only `communicate()`, not the `Popen(...)` that
     raises. The cap is what turns that into a clean `ComfyCliError`.
     """
-    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+    oversized = "/tmp/" + "o" * argv._MAX_PATH_ARG_LEN + ".json"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         server.fetch_template("flux_dev", oversized)
@@ -502,7 +582,7 @@ def test_fetch_template_reports_a_bad_name_ahead_of_an_oversized_out_path(no_spa
     is named as a size rather than as a shape. Hoisting it above `name`'s check
     too would make a call with both mistakes report the wrong argument.
     """
-    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+    oversized = "/tmp/" + "o" * argv._MAX_PATH_ARG_LEN + ".json"
 
     with pytest.raises(server.ComfyCliError, match="invalid name") as excinfo:
         server.fetch_template("--help", oversized)
@@ -513,8 +593,8 @@ def test_fetch_template_reports_a_bad_name_ahead_of_an_oversized_out_path(no_spa
 def test_fetch_template_allows_an_out_path_at_the_ceiling(patched_run):
     """The boundary value itself rides through to argv — the cap is generous."""
     calls = patched_run(envelope(data=None))
-    at_ceiling = "/tmp/" + "o" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "o" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     server.fetch_template("flux_dev", at_ceiling, check_local=False)
 

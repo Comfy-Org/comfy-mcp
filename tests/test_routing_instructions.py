@@ -23,12 +23,12 @@ from __future__ import annotations
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 # ``INSTRUCTIONS`` is hard-wrapped prose, so any phrase long enough to matter can
 # straddle a newline. Match against a whitespace-collapsed copy: these tests are
 # guarding that the POLICY is still stated, not where the line breaks fall.
-FLAT = " ".join(server.INSTRUCTIONS.split())
+FLAT = " ".join(instructions.INSTRUCTIONS.split())
 
 _ROUTING_HEADER = "Routing — check the machine before running local diffusion."
 _ROUTING_END = "Everything targets the LOCAL server only"
@@ -52,7 +52,7 @@ def test_the_server_hands_these_instructions_to_the_client():
     connect to a server that advertises no guidance at all and none of the
     content tests would notice.
     """
-    assert server.mcp.instructions == server.INSTRUCTIONS
+    assert server.mcp.instructions == instructions.INSTRUCTIONS
 
 
 def test_instructions_carry_a_routing_block(routing):
@@ -163,7 +163,7 @@ def test_routing_names_every_submitting_tool_as_diverted(routing):
     which is the failure this guards against in both directions: an agent that
     believes ``generate_image`` runs here will apply this machine's VRAM
     thresholds to a job that lands elsewhere, and — worse — will read a
-    ``prompt_not_found`` from ``wait_for_job`` as a broken queue rather than as
+    ``prompt_not_found`` from ``job(action="wait")`` as a broken queue rather than as
     the two calls having been pointed at different servers.
 
     Scoped to the diversion SENTENCE, not the whole block: every one of these
@@ -267,7 +267,8 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     partner-run template from a local one in the results — the old "the compact
     rows omit ``tags``, so the caller cannot tell" clause is a capability denial
     that stopped being true, and restoring it would send an agent back to
-    guessing from titles that collide.
+    guessing from titles that collide. That only confirms what a filtered
+    search returned — it does not replace filtering on both axes to get there.
 
     The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
     with a discrete card follows the discrete-GPU row, and "any Mac" handed that

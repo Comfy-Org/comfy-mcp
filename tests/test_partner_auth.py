@@ -1,4 +1,4 @@
-"""Partner-API credential handling (BE-3344).
+"""Partner-API credential handling.
 
 Two behaviors:
 1. `_unwrap_envelope` must preserve `error.code` on `ComfyCliError.code` and
@@ -18,7 +18,7 @@ import asyncio
 
 import pytest
 
-from comfy_mcp import server
+from comfy_mcp import errors, server
 
 
 def _partner_error_envelope() -> dict:
@@ -130,9 +130,9 @@ def test_oversized_error_fields_are_length_capped():
     msg = str(excinfo.value)
     # Each rendered field is bounded; the whole message stays a small multiple
     # of the per-field cap rather than tens of KB.
-    assert "x" * (server._MAX_ERROR_FIELD_CHARS + 1) not in msg
-    assert "y" * (server._MAX_ERROR_FIELD_CHARS + 1) not in msg
-    assert "z" * (server._MAX_ERROR_FIELD_CHARS + 1) not in msg
+    assert "x" * (errors._MAX_ERROR_FIELD_CHARS + 1) not in msg
+    assert "y" * (errors._MAX_ERROR_FIELD_CHARS + 1) not in msg
+    assert "z" * (errors._MAX_ERROR_FIELD_CHARS + 1) not in msg
 
 
 # --- bounded retry ----------------------------------------------------------
