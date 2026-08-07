@@ -117,7 +117,7 @@ def test_oversized_argv_records_a_spawn_failed_entry(patched_run, log_path):
 def test_embedded_nul_valueerror_is_converted(patched_run):
     """``subprocess``'s bare ``ValueError`` is named as the embedded NUL it is.
 
-    The backstop under :func:`server._reject_nul`, which normally refuses a NUL
+    The backstop under :func:`argv._reject_nul`, which normally refuses a NUL
     first and names the argument — this covers a value shape it does not reach.
     """
     patched_run(raises=ValueError("embedded null byte"))

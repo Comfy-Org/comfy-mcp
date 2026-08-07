@@ -31,7 +31,7 @@ import json
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import argv, server
 
 
 def _emit(*args, **kwargs):
@@ -213,7 +213,7 @@ def test_emit_rejects_an_oversized_out_path(no_spawn):
     `_run_comfy_raw` never converts — its `try` wraps only `communicate()`, not
     the `Popen(...)` that raises.
     """
-    oversized = "/tmp/" + "e" * server._MAX_PATH_ARG_LEN + ".json"
+    oversized = "/tmp/" + "e" * argv._MAX_PATH_ARG_LEN + ".json"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _emit("flux-pro", oversized)
@@ -226,8 +226,8 @@ def test_emit_rejects_an_oversized_out_path(no_spawn):
 def test_emit_allows_an_out_path_at_the_ceiling(patched_run):
     """The boundary value itself rides through into `--emit-workflow=`."""
     calls = patched_run(envelope(data=_EMIT_DATA))
-    at_ceiling = "/tmp/" + "e" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "e" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     _emit("flux-pro", at_ceiling)
 

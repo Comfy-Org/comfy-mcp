@@ -57,7 +57,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import clitext, instructions, server
+from comfy_mcp import argv, clitext, instructions, server
 
 # Captured before any test patches it, so the one test that wants the REAL
 # `comfy env` pre-flight can put it back and drive the probe end to end through
@@ -241,7 +241,7 @@ def test_a_batch_that_joins_too_long_is_refused(patched_plain_run):
     the real pack past a truncation marker.
     """
     calls = patched_plain_run(0, stderr="installed")
-    names = [f"pack-{n}-" + "x" * 120 for n in range(server._MAX_NODE_PACK_NAMES)]
+    names = [f"pack-{n}-" + "x" * 120 for n in range(argv._MAX_NODE_PACK_NAMES)]
     ctx = _FakeCtx()
 
     with pytest.raises(server.ComfyCliError) as excinfo:
@@ -249,7 +249,7 @@ def test_a_batch_that_joins_too_long_is_refused(patched_plain_run):
 
     message = str(excinfo.value)
     assert "smaller batches" in message
-    assert str(server._MAX_NODE_PACK_NAMES_CHARS) in message
+    assert str(argv._MAX_NODE_PACK_NAMES_CHARS) in message
     assert calls == []
     assert ctx.elicitations == []  # nobody was asked to approve an unreadable list
 
@@ -262,7 +262,7 @@ def test_a_full_size_batch_of_real_looking_ids_still_installs(patched_plain_run)
     a limitation rather than keeping its own prompt readable.
     """
     calls = patched_plain_run(0, stderr="installed")
-    names = [f"comfyui-node-pack-{n:02d}" for n in range(server._MAX_NODE_PACK_NAMES)]
+    names = [f"comfyui-node-pack-{n:02d}" for n in range(argv._MAX_NODE_PACK_NAMES)]
 
     result = _install(names, ctx=(ctx := _FakeCtx()))
 
@@ -274,7 +274,7 @@ def test_a_full_size_batch_of_real_looking_ids_still_installs(patched_plain_run)
 def test_too_many_packs_is_refused_so_the_prompt_stays_readable(patched_plain_run):
     """An approval the user cannot actually read is not an approval."""
     calls = patched_plain_run(0, stderr="installed")
-    names = [f"pack-{n}" for n in range(server._MAX_NODE_PACK_NAMES + 1)]
+    names = [f"pack-{n}" for n in range(argv._MAX_NODE_PACK_NAMES + 1)]
 
     with pytest.raises(server.ComfyCliError, match="exceeds the"):
         _install(names, ctx=_FakeCtx())

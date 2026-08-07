@@ -23,7 +23,7 @@ import os
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import argv, server
 
 # A representative slice of the real comfy-cli `templates ls` payload shape.
 ROWS = [
@@ -382,7 +382,7 @@ def test_fetch_template_rejects_an_oversized_out_path(no_spawn):
     convert — its `try` wraps only `communicate()`, not the `Popen(...)` that
     raises. The cap is what turns that into a clean `ComfyCliError`.
     """
-    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+    oversized = "/tmp/" + "o" * argv._MAX_PATH_ARG_LEN + ".json"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         server.fetch_template("flux_dev", oversized)
@@ -399,7 +399,7 @@ def test_fetch_template_reports_a_bad_name_ahead_of_an_oversized_out_path(no_spa
     is named as a size rather than as a shape. Hoisting it above `name`'s check
     too would make a call with both mistakes report the wrong argument.
     """
-    oversized = "/tmp/" + "o" * server._MAX_PATH_ARG_LEN + ".json"
+    oversized = "/tmp/" + "o" * argv._MAX_PATH_ARG_LEN + ".json"
 
     with pytest.raises(server.ComfyCliError, match="invalid name") as excinfo:
         server.fetch_template("--help", oversized)
@@ -410,8 +410,8 @@ def test_fetch_template_reports_a_bad_name_ahead_of_an_oversized_out_path(no_spa
 def test_fetch_template_allows_an_out_path_at_the_ceiling(patched_run):
     """The boundary value itself rides through to argv — the cap is generous."""
     calls = patched_run(envelope(data=None))
-    at_ceiling = "/tmp/" + "o" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "o" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     server.fetch_template("flux_dev", at_ceiling, check_local=False)
 

@@ -38,7 +38,7 @@ from conftest import (
     stream_reader,
 )
 
-from comfy_mcp import clitext, errors, failure_log, server, tcc, textutil
+from comfy_mcp import argv, clitext, errors, failure_log, server, tcc, textutil
 
 
 def _launch(*args, **kwargs):
@@ -899,7 +899,7 @@ def test_get_logs_bounds_the_rejected_port_it_echoes(no_spawn):
     assert f"({len(repr(huge))} characters)" in message
     # A summary of the input, not the input: a few lines of prose around the cap,
     # nowhere near the 50k it was handed.
-    assert len(message) < server._MAX_PORT_REPR_CHARS + 200
+    assert len(message) < argv._MAX_PORT_REPR_CHARS + 200
 
 
 def test_get_logs_rejects_an_unrenderable_int_port_as_a_range_error(no_spawn):
@@ -1461,7 +1461,7 @@ def test_upload_file_rejects_an_oversized_path(no_spawn):
     `_reject_non_json_array_slot` names `slots[i]`. A good first entry proves
     the guard scans past it rather than stopping at `paths[0]`.
     """
-    oversized = "/tmp/" + "u" * server._MAX_PATH_ARG_LEN + ".png"
+    oversized = "/tmp/" + "u" * argv._MAX_PATH_ARG_LEN + ".png"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _upload_file(["/tmp/ok.png", oversized])
@@ -1481,12 +1481,12 @@ def test_upload_file_rejects_too_many_paths(no_spawn):
     (`E2BIG`) `_run_comfy_raw` never converts. Same pair of caps, for the same
     reason, as `_guard_extra_args`' `_MAX_EXTRA_ARGS`.
     """
-    paths = [f"/tmp/{index}.png" for index in range(server._MAX_UPLOAD_PATHS + 1)]
+    paths = [f"/tmp/{index}.png" for index in range(argv._MAX_UPLOAD_PATHS + 1)]
 
     with pytest.raises(server.ComfyCliError, match="entries exceeds") as excinfo:
         _upload_file(paths)
 
-    assert str(server._MAX_UPLOAD_PATHS) in str(excinfo.value)
+    assert str(argv._MAX_UPLOAD_PATHS) in str(excinfo.value)
 
 
 def test_upload_file_rejects_paths_totalling_past_the_aggregate_cap(no_spawn):
@@ -1496,10 +1496,10 @@ def test_upload_file_rejects_paths_totalling_past_the_aggregate_cap(no_spawn):
     ceiling already pass it while summing past `ARG_MAX` — so the aggregate is
     what actually holds the splatted command line under the kernel's limit.
     """
-    entry = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
+    entry = "/tmp/" + "u" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    count = argv._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
     paths = [entry] * count
-    assert count <= server._MAX_UPLOAD_PATHS, "must clear the count cap first"
+    assert count <= argv._MAX_UPLOAD_PATHS, "must clear the count cap first"
 
     with pytest.raises(server.ComfyCliError, match="totalling") as excinfo:
         _upload_file(paths)
@@ -1520,9 +1520,9 @@ def test_upload_file_measures_the_aggregate_in_bytes_not_characters(no_spawn):
     # 3 bytes per character, so this is a third of the cap in characters and
     # just past it in bytes.
     entry = "/tmp/" + "中" * 1000
-    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // (3 * 1000) + 1
+    count = argv._MAX_UPLOAD_PATHS_TOTAL_BYTES // (3 * 1000) + 1
     paths = [entry] * count
-    assert sum(len(p) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+    assert sum(len(p) for p in paths) < argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
 
     with pytest.raises(server.ComfyCliError, match="bytes exceeds"):
         _upload_file(paths)
@@ -1588,11 +1588,9 @@ def test_upload_file_counts_undecodable_filename_bytes_as_subprocess_would(
     per_entry = "/tmp/" + "\udcff" * 2000
     count = 60
     paths = [per_entry] * count
-    assert (
-        sum(len(os.fsencode(p)) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
-    )
+    assert sum(len(os.fsencode(p)) for p in paths) < argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
     surrogatepass_total = sum(len(p.encode("utf-8", "surrogatepass")) for p in paths)
-    assert surrogatepass_total > server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+    assert surrogatepass_total > argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
 
     _upload_file(paths)
 
@@ -1606,8 +1604,8 @@ def test_upload_file_reports_a_bad_entry_ahead_of_the_aggregate(no_spawn):
     property of one member, and that is the more actionable of the two — so the
     per-entry loop runs before the sum is judged.
     """
-    entry = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    count = server._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
+    entry = "/tmp/" + "u" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    count = argv._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
     paths = [*[entry] * count, "--overwrite"]
 
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
@@ -1622,11 +1620,9 @@ def test_upload_file_allows_a_full_batch_of_real_paths(patched_async_run):
     filling the count cap at realistic path lengths is still well inside the
     aggregate, so the caps refuse runaway argv rather than bulk uploads.
     """
-    procs = patched_async_run(envelope(data={"uploaded": server._MAX_UPLOAD_PATHS}))
-    paths = [
-        f"/tmp/frames/{index:04d}.png" for index in range(server._MAX_UPLOAD_PATHS)
-    ]
-    assert sum(len(p) for p in paths) < server._MAX_UPLOAD_PATHS_TOTAL_BYTES
+    procs = patched_async_run(envelope(data={"uploaded": argv._MAX_UPLOAD_PATHS}))
+    paths = [f"/tmp/frames/{index:04d}.png" for index in range(argv._MAX_UPLOAD_PATHS)]
+    assert sum(len(p) for p in paths) < argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
 
     _upload_file(paths)
 
@@ -1636,8 +1632,8 @@ def test_upload_file_allows_a_full_batch_of_real_paths(patched_async_run):
 def test_upload_file_allows_a_path_at_the_ceiling(patched_async_run):
     """The boundary value itself rides through as a positional."""
     procs = patched_async_run(envelope(data={"uploaded": 1}))
-    at_ceiling = "/tmp/" + "u" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "u" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     _upload_file(["/tmp/ok.png", at_ceiling])
 
@@ -2645,7 +2641,7 @@ def test_prompt_id_guard_rejects_an_oversized_id(monkeypatch):
     (and echoed back whole in the error), rather than failing as a clean
     `ComfyCliError` like every other bad input.
     """
-    oversized = "p" * (server._MAX_PROMPT_ID_LEN + 1)
+    oversized = "p" * (argv._MAX_PROMPT_ID_LEN + 1)
 
     def fake_run(*args, **kwargs):
         raise AssertionError("spawned comfy-cli with an oversized prompt_id")
@@ -2656,7 +2652,7 @@ def test_prompt_id_guard_rejects_an_oversized_id(monkeypatch):
         server.job_status(oversized)
 
     # The cap is generous enough that a real (UUID-shaped) id is untouched.
-    assert server._guard_prompt_id("p" * server._MAX_PROMPT_ID_LEN)
+    assert argv._guard_prompt_id("p" * argv._MAX_PROMPT_ID_LEN)
 
 
 def test_fetch_outputs_rejects_a_nul_in_out_dir(monkeypatch):
@@ -2684,7 +2680,7 @@ def test_fetch_outputs_rejects_an_oversized_out_dir(no_spawn):
     `OSError` (`E2BIG`) `_run_comfy_raw` never converts — its `try` wraps
     `communicate()`, not the `Popen(...)` that raises.
     """
-    oversized = "/tmp/" + "d" * server._MAX_PATH_ARG_LEN
+    oversized = "/tmp/" + "d" * argv._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         server.fetch_outputs("pid", oversized)
@@ -2696,8 +2692,8 @@ def test_fetch_outputs_rejects_an_oversized_out_dir(no_spawn):
 def test_fetch_outputs_allows_an_out_dir_at_the_ceiling(patched_run):
     """The boundary value itself rides through to `-o`."""
     calls = patched_run(envelope(data={"files": []}))
-    at_ceiling = "/tmp/" + "d" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "d" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     server.fetch_outputs("pid", at_ceiling)
 
@@ -6462,7 +6458,7 @@ def test_run_and_validate_workflow_reject_embedded_nul(monkeypatch):
 )
 def test_guard_model_relative_path_returns_accepted_values_unchanged(value):
     """An accepted value is forwarded VERBATIM — the guard never rewrites it."""
-    assert server._guard_model_relative_path(value) == value
+    assert argv._guard_model_relative_path(value) == value
 
 
 @pytest.mark.parametrize(
@@ -6479,12 +6475,12 @@ def test_guard_model_relative_path_returns_accepted_values_unchanged(value):
 def test_guard_model_relative_path_rejects(value, match):
     """A refused value raises `ComfyCliError` with its diagnosis-specific text."""
     with pytest.raises(server.ComfyCliError, match=match):
-        server._guard_model_relative_path(value)
+        argv._guard_model_relative_path(value)
 
 
 def test_guard_model_filename_returns_accepted_values_unchanged():
     """A bare filename is forwarded VERBATIM, like the guard above."""
-    assert server._guard_model_filename("model.safetensors") == "model.safetensors"
+    assert argv._guard_model_filename("model.safetensors") == "model.safetensors"
 
 
 @pytest.mark.parametrize(
@@ -6500,4 +6496,4 @@ def test_guard_model_filename_returns_accepted_values_unchanged():
 def test_guard_model_filename_rejects(value):
     """A refused value raises `ComfyCliError` naming the bare-filename rule."""
     with pytest.raises(server.ComfyCliError, match=r"must be a bare filename"):
-        server._guard_model_filename(value)
+        argv._guard_model_filename(value)

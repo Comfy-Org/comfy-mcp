@@ -242,7 +242,7 @@ def _encode_argv_like_posix(cmd) -> None:
 
     A no-op off POSIX, where ``subprocess`` builds a UTF-16 command line for
     ``CreateProcessW`` and never calls :func:`os.fsencode` at all — the same
-    platform split ``server._encode_argv`` documents.
+    platform split ``argv._encode_argv`` documents.
     """
     if os.name != "posix":
         return

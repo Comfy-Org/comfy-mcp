@@ -30,7 +30,7 @@ import pytest
 from conftest import envelope
 from pydantic import ValidationError
 
-from comfy_mcp import errors, server
+from comfy_mcp import argv, errors, server
 
 
 def test_list_workflow_slots_argv(patched_run):
@@ -330,7 +330,7 @@ def test_workflow_path_guard_rejects_an_oversized_path(call, no_spawn):
     blocks both spawn paths, which is what makes `run_workflow` (which streams
     rather than going through `_run_comfy`) provable in the same parametrization.
     """
-    oversized = "w" * (server._MAX_PATH_ARG_LEN + 1)
+    oversized = "w" * (argv._MAX_PATH_ARG_LEN + 1)
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         call(oversized)
@@ -349,10 +349,10 @@ def test_workflow_path_guard_allows_a_path_at_the_ceiling():
     `_phrase_is_only_the_caller_s` forgery window — which would need a cap under
     500 characters. The boundary value itself passes.
     """
-    at_ceiling = "w" * server._MAX_PATH_ARG_LEN
+    at_ceiling = "w" * argv._MAX_PATH_ARG_LEN
 
-    assert server._guard_workflow_path(at_ceiling)
-    assert server._guard_workflow_path(at_ceiling, frontend=True)
+    assert argv._guard_workflow_path(at_ceiling)
+    assert argv._guard_workflow_path(at_ceiling, frontend=True)
 
 
 def test_guard_arg_len_reads_the_module_constant_at_call_time(monkeypatch):
@@ -363,13 +363,13 @@ def test_guard_arg_len_reads_the_module_constant_at_call_time(monkeypatch):
     while every call kept reading the old 4096 — a guard that silently tests
     nothing. `_MAX_PATH_ARG_LEN` stays the single source of truth instead.
     """
-    monkeypatch.setattr(server, "_MAX_PATH_ARG_LEN", 8)
+    monkeypatch.setattr(argv, "_MAX_PATH_ARG_LEN", 8)
 
     with pytest.raises(server.ComfyCliError, match="exceeds"):
-        server._guard_arg_len("workflow_path", "w" * 9)
-    assert server._guard_arg_len("workflow_path", "w" * 8) == "w" * 8
+        argv._guard_arg_len("workflow_path", "w" * 9)
+    assert argv._guard_arg_len("workflow_path", "w" * 8) == "w" * 8
     # An explicit `limit` still wins over the module default.
-    assert server._guard_arg_len("url", "u" * 9, 16) == "u" * 9
+    assert argv._guard_arg_len("url", "u" * 9, 16) == "u" * 9
 
 
 @pytest.mark.parametrize("call", _WORKFLOW_PATH_CALLS)
@@ -398,10 +398,10 @@ def test_guard_arg_len_reports_size_before_encodability():
     Same per-value ordering rule the rest of these guards follow: the size is
     the more actionable of the two, and it is what the caller can see.
     """
-    oversized = "\ud800" + "w" * server._MAX_PATH_ARG_LEN
+    oversized = "\ud800" + "w" * argv._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds"):
-        server._guard_arg_len("workflow_path", oversized)
+        argv._guard_arg_len("workflow_path", oversized)
 
 
 def test_option_like_rejection_bounds_the_value_it_echoes():
@@ -414,10 +414,10 @@ def test_option_like_rejection_bounds_the_value_it_echoes():
     `_clip_for_error`, so the message honors `errors._MAX_ERROR_FIELD_CHARS`
     like every other field that quotes caller input.
     """
-    at_ceiling = "-" + "w" * (server._MAX_PATH_ARG_LEN - 1)
+    at_ceiling = "-" + "w" * (argv._MAX_PATH_ARG_LEN - 1)
 
     with pytest.raises(server.ComfyCliError, match="leading '-'") as excinfo:
-        server._guard_workflow_path(at_ceiling)
+        argv._guard_workflow_path(at_ceiling)
 
     message = str(excinfo.value)
     assert at_ceiling not in message
@@ -433,7 +433,7 @@ def test_option_like_rejection_is_unchanged_for_an_ordinary_value():
     used to interpolate — the wording every other guard test asserts on.
     """
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server._guard_workflow_path("-flux.json")
+        argv._guard_workflow_path("-flux.json")
 
     assert repr("-flux.json") in str(excinfo.value)
 
@@ -570,7 +570,7 @@ def test_vary_workflow_rejects_an_oversized_out_dir(no_spawn):
     an `OSError` (`E2BIG`) `_run_comfy_raw` never converts, because its `try`
     wraps only `communicate()` and not the `Popen(...)` that raises.
     """
-    oversized = "/tmp/" + "v" * server._MAX_PATH_ARG_LEN
+    oversized = "/tmp/" + "v" * argv._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"], out_dir=oversized)
@@ -583,8 +583,8 @@ def test_vary_workflow_rejects_an_oversized_out_dir(no_spawn):
 def test_vary_workflow_allows_an_out_dir_at_the_ceiling(patched_run):
     """The boundary value itself rides through to `--out-dir`."""
     calls = patched_run(envelope(data=None))
-    at_ceiling = "/tmp/" + "v" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "v" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     server.vary_workflow("/tmp/flux.json", ["3.seed=[1,2]"], out_dir=at_ceiling)
 
@@ -831,7 +831,7 @@ def test_clip_for_error_never_exceeds_the_cap(text):
     Checked directly rather than through a message, because the cap is this
     helper's whole contract and the call sites add their own fixed prose on top.
     """
-    assert len(server._clip_for_error(text)) <= errors._MAX_ERROR_FIELD_CHARS
+    assert len(argv._clip_for_error(text)) <= errors._MAX_ERROR_FIELD_CHARS
 
 
 def test_clip_for_error_matches_an_unsliced_repr():
@@ -845,7 +845,7 @@ def test_clip_for_error_matches_an_unsliced_repr():
     the one part that CAN differ, which the next test pins down.
     """
     for text in ("\x01" * 10_000, "y" * 10_000, "a, b" * 5_000):
-        clipped = server._clip_for_error(text)
+        clipped = argv._clip_for_error(text)
         assert clipped.endswith("…")
         assert repr(text).startswith(clipped[:-1])
 
@@ -862,7 +862,7 @@ def test_clip_for_error_quote_style_follows_the_slice():
     cap = errors._MAX_ERROR_FIELD_CHARS
     text = "a" * (cap + 100) + "'"
 
-    clipped = server._clip_for_error(text)
+    clipped = argv._clip_for_error(text)
 
     assert len(clipped) <= cap
     assert not repr(text).startswith(clipped[:-1])  # the quote char differs...

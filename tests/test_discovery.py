@@ -17,7 +17,7 @@ import threading
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import argv, server
 
 
 def test_search_nodes_argv(patched_run):
@@ -513,7 +513,7 @@ def test_node_dependencies_rejects_an_oversized_id(patched_run, label):
     echo a megabyte-long value back through the response and the failure log.
     """
     calls = patched_run(envelope(data={"packs": []}))
-    oversized = "-" + "x" * server._MAX_NODE_PACK_ID_LEN
+    oversized = "-" + "x" * argv._MAX_NODE_PACK_ID_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds the") as excinfo:
         server.node_dependencies(**{label: oversized})
@@ -567,7 +567,7 @@ def test_search_models_rejects_an_oversized_folder(no_spawn):
     `_run_comfy_raw` never converts, because its `try` wraps only
     `communicate()` and not the `Popen(...)` that raises.
     """
-    oversized = "checkpoints/" + "f" * server._MAX_PATH_ARG_LEN
+    oversized = "checkpoints/" + "f" * argv._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         server.search_models(folder=oversized)
@@ -581,8 +581,8 @@ def test_search_models_allows_a_folder_at_the_ceiling(patched_run):
     """The boundary value itself rides through as the `list-folder` positional."""
     calls = patched_run(envelope(data=[]))
     prefix = "checkpoints/"
-    at_ceiling = prefix + "f" * (server._MAX_PATH_ARG_LEN - len(prefix))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = prefix + "f" * (argv._MAX_PATH_ARG_LEN - len(prefix))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     server.search_models(folder=at_ceiling)
 
@@ -599,7 +599,7 @@ def test_search_models_leaves_the_free_form_query_uncapped(patched_run):
     `_MAX_URL_LEN`.
     """
     calls = patched_run(envelope(data=[]))
-    long_query = "q" * (server._MAX_PATH_ARG_LEN + 1)
+    long_query = "q" * (argv._MAX_PATH_ARG_LEN + 1)
 
     server.search_models(query=long_query)
 
@@ -1182,7 +1182,7 @@ def test_workflow_deps_rejects_an_embedded_nul(no_spawn):
 def test_workflow_deps_rejects_an_oversized_path(no_spawn):
     """Length is checked ahead of the value guards — see `_guard_workflow_path`."""
     with pytest.raises(server.ComfyCliError, match="exceeds"):
-        _workflow_deps("/tmp/" + "f" * server._MAX_PATH_ARG_LEN)
+        _workflow_deps("/tmp/" + "f" * argv._MAX_PATH_ARG_LEN)
 
 
 def test_workflow_deps_cancellation_reaps_the_resolver(patched_async_run, monkeypatch):

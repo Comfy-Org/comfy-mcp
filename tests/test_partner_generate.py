@@ -33,7 +33,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import clitext, server
+from comfy_mcp import argv, clitext, server
 
 
 def _generate(*args, **kwargs):
@@ -627,7 +627,7 @@ def test_partner_generate_rejects_an_oversized_out_path(no_spawn):
     runs FIRST: `out_path=""` carries distinct None-vs-empty semantics, so the
     size cap sits between that branch and `_reject_nul` rather than at the top.
     """
-    oversized = "/tmp/" + "p" * server._MAX_PATH_ARG_LEN + ".png"
+    oversized = "/tmp/" + "p" * argv._MAX_PATH_ARG_LEN + ".png"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _generate("flux-pro", out_path=oversized)
@@ -639,8 +639,8 @@ def test_partner_generate_rejects_an_oversized_out_path(no_spawn):
 def test_partner_generate_allows_an_out_path_at_the_ceiling(patched_plain_run):
     """The boundary value itself rides through into `--download=`."""
     calls = patched_plain_run(0, stdout="done")
-    at_ceiling = "/tmp/" + "p" * (server._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == server._MAX_PATH_ARG_LEN
+    at_ceiling = "/tmp/" + "p" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
+    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
 
     _generate("flux-pro", out_path=at_ceiling)
 

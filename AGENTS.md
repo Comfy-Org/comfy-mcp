@@ -105,7 +105,7 @@ reads the **user's live install** — custom nodes included — not a static cat
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the
 `--json-stream` machinery, the spend-consent plumbing) and every `@mcp.tool()`.
-Six **leaf** modules sit under it — none imports `server`, so the dependency
+Seven **leaf** modules sit under it — none imports `server`, so the dependency
 edges only ever point one way:
 
 | Module | Owns |
@@ -116,6 +116,7 @@ edges only ever point one way:
 | `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — the client-handshake text |
 | `errors.py` | `ComfyCliError`, the "nothing recorded to stop" detector (`_is_no_recorded_server` + its markers), and the `error.details` renderer + per-field char cap (`_render_error_details`, `_MAX_ERROR_FIELD_CHARS`) |
 | `clitext.py` | comfy-cli **human-output** parsing — the text channel for verbs with no envelope: the `Saved:`-block / install-failure extractors and `plain_ok` synthesis (`_extract_saved_paths`, `_extract_install_failures`, `_synthesize_plain_result`), the missing-verb/-option capability probes (`_is_missing_verb_error`, `_is_missing_option_error`, `_normalize_cli_text`), `install_node`'s per-pack verdict (`_classify_install_result`), and the echoed-argv forgery guards (`_phrase_is_only_the_caller_s`, `_is_manager_missing_error`). `_extract_install_failures` / `_extract_saved_paths` are the AGENTS.md-documented cm-cli contract (see "The architecture rule" above) — move or edit them byte-for-byte |
+| `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: the shared primitives (`_reject_nul`, `_reject_option_like`, `_reject_nul_deep`, `_guard_arg_len`, `_encode_argv`, `_bounded_timeout`, `_clip_for_error`) and the per-domain guards built on them — `_guard_workflow_path`, `_guard_prompt_id`, `_guard_download_id`, `_guard_extra_args`, `_guard_version`, `_guard_node_names`, `_guard_log_port` / `_render_bad_port`, `_guard_model_relative_path` / `_guard_model_filename`, `_validate_upload_paths` — plus their length/shape constants and regexes |
 
 `server` reaches them **module-qualified** (`tcc._tcc_guidance(...)`,
 `failure_log._log_failure(...)`) and re-exports no BEHAVIOR — deliberately: a

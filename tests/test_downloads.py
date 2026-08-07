@@ -22,7 +22,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 import pytest
 from conftest import NO_SUCH_OPTION_STDERR, envelope
 
-from comfy_mcp import failure_log, server
+from comfy_mcp import argv, failure_log, server
 
 
 def _download_model(*args, **kwargs):
@@ -213,7 +213,7 @@ def test_download_model_rejects_an_oversized_url(patched_run):
     rather than failing as a clean `ComfyCliError` like every other bad input.
     """
     calls = patched_run(envelope(data=_submit()))
-    oversized = "https://hf.co/" + "u" * server._MAX_URL_LEN
+    oversized = "https://hf.co/" + "u" * argv._MAX_URL_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model(oversized)
@@ -224,8 +224,8 @@ def test_download_model_rejects_an_oversized_url(patched_run):
 
     # The cap is generous enough that the boundary value itself rides through
     # to argv — real signed CivitAI/HuggingFace URLs sit far below it.
-    at_ceiling = "https://hf.co/" + "u" * (server._MAX_URL_LEN - len("https://hf.co/"))
-    assert len(at_ceiling) == server._MAX_URL_LEN
+    at_ceiling = "https://hf.co/" + "u" * (argv._MAX_URL_LEN - len("https://hf.co/"))
+    assert len(at_ceiling) == argv._MAX_URL_LEN
     _download_model(at_ceiling, wait=False)
     assert calls[0]["cmd"][4:8] == ["model", "download", "--url", at_ceiling]
 
@@ -237,7 +237,7 @@ def test_download_model_rejects_an_oversized_relative_path(patched_run):
     and land in argv — the size refusal is what stops it, not the tree guard.
     """
     calls = patched_run(envelope(data=_submit()))
-    oversized = "models/" + "d" * server._MAX_PATH_ARG_LEN
+    oversized = "models/" + "d" * argv._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model("https://hf.co/x.safetensors", relative_path=oversized)
@@ -245,14 +245,14 @@ def test_download_model_rejects_an_oversized_relative_path(patched_run):
     assert calls == []
     assert oversized not in str(excinfo.value)
     # Generous boundary: the value at exactly the ceiling still passes.
-    at_ceiling = "models/" + "d" * (server._MAX_PATH_ARG_LEN - len("models/"))
-    assert server._guard_model_relative_path(at_ceiling) == at_ceiling
+    at_ceiling = "models/" + "d" * (argv._MAX_PATH_ARG_LEN - len("models/"))
+    assert argv._guard_model_relative_path(at_ceiling) == at_ceiling
 
 
 def test_download_model_rejects_an_oversized_filename(patched_run):
     """An oversized `filename` is capped ahead of the bare-name shape check."""
     calls = patched_run(envelope(data=_submit()))
-    oversized = "f" * (server._MAX_PATH_ARG_LEN + 1) + ".safetensors"
+    oversized = "f" * (argv._MAX_PATH_ARG_LEN + 1) + ".safetensors"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model("https://hf.co/x.safetensors", filename=oversized)
@@ -262,8 +262,8 @@ def test_download_model_rejects_an_oversized_filename(patched_run):
     # Generous boundary: the name at exactly the ceiling still passes — the cap
     # is the argv one, deliberately not a NAME_MAX-tight one of its own.
     suffix = ".safetensors"
-    at_ceiling = "f" * (server._MAX_PATH_ARG_LEN - len(suffix)) + suffix
-    assert server._guard_model_filename(at_ceiling) == at_ceiling
+    at_ceiling = "f" * (argv._MAX_PATH_ARG_LEN - len(suffix)) + suffix
+    assert argv._guard_model_filename(at_ceiling) == at_ceiling
 
 
 @pytest.mark.parametrize(
@@ -1533,10 +1533,10 @@ def test_guard_download_id_reports_a_size_not_an_oversized_value():
     and the failure log — defeating the "report the length, not the value" rule
     the cap exists to enforce.
     """
-    oversized_blank = " " * (server._MAX_DOWNLOAD_ID_LEN + 50)
+    oversized_blank = " " * (argv._MAX_DOWNLOAD_ID_LEN + 50)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server._guard_download_id(oversized_blank)
+        argv._guard_download_id(oversized_blank)
 
     assert "exceeds the" in str(excinfo.value)
     assert oversized_blank not in str(excinfo.value)
@@ -1551,7 +1551,7 @@ def test_guard_download_id_rejects_a_non_string(bad):
     error every other bad input produces.
     """
     with pytest.raises(server.ComfyCliError, match="expected a string"):
-        server._guard_download_id(bad)
+        argv._guard_download_id(bad)
 
 
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
