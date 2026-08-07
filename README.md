@@ -847,10 +847,18 @@ then runs with that directory as its `cwd`, so comfy-cli's own cwd-walk resolves
 shell had `cd`'d there first. Read from the environment **once per process** (a value changed
 mid-session is not picked up until restart) and validated on every spawn: the directory does **not**
 need to contain `comfy.yaml` yet — call `project(action="init")` for that — but it does need to
-**exist**. A set-but-missing (or non-directory) value **fails closed**: the next comfy-cli spawn
-raises rather than silently falling back to the unanchored default, because a silent fallback would
-reintroduce exactly the non-determinism this feature exists to remove. Fix it by unsetting
-`COMFY_PROJECT` or creating the directory.
+**exist**, and it must be **absolute**. A relative value is rejected outright, never silently
+resolved against this server's own (client-assigned, arbitrary) working directory — that resolution
+would be exactly as non-deterministic as leaving `COMFY_PROJECT` unset while looking configured. A
+set-but-relative or set-but-missing (or non-directory) value **fails closed**: the next comfy-cli
+spawn raises rather than silently falling back to the unanchored default, because a silent fallback
+would reintroduce exactly the non-determinism this feature exists to remove. Fix it by setting an
+absolute path, unsetting `COMFY_PROJECT`, or creating the directory.
+
+Calling `project(action="init")` on a root that is **already** governed by a project (its own or an
+ancestor's `comfy.yaml`) is not a no-op: comfy-cli raises `project_already_exists` rather than
+re-initializing it. Call `project(action="status")` first when unsure whether a root is already
+governed.
 
 **Unset (the default): behavior is unchanged.** No `cwd` is passed to any spawn, exactly as before
 this feature existed — every tool keeps acting on this server's own process directory, an unanchored

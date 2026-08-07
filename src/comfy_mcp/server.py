@@ -476,16 +476,22 @@ def _project_root() -> str | None:
     at all, i.e. today's behavior, byte for byte.
 
     A SET value is validated on every call (not cached past the read) — cheap
-    (one ``os.path.isdir`` stat), and unlike the read this deliberately does
-    NOT latch a bad verdict, so an operator who fixes it (``mkdir``) mid-process
-    has the very next spawn pick it up, the same "don't memoize the negative"
-    policy `_check_comfy_version` uses for a too-old CLI. An invalid root
-    raises :class:`ComfyCliError` rather than falling back to unanchored: this
-    feature exists to make project-governed behavior deterministic, and a
-    silent fallback would reintroduce exactly the non-determinism it removes.
-    The root does NOT need to contain ``comfy.yaml`` — an uninitialized
-    directory is valid here; that's what the ``project`` tool's ``init`` action
-    is for.
+    (an ``os.path.isabs`` check plus one ``os.path.isdir`` stat), and unlike
+    the read this deliberately does NOT latch a bad verdict, so an operator
+    who fixes it (``mkdir``) mid-process has the very next spawn pick it up,
+    the same "don't memoize the negative" policy `_check_comfy_version` uses
+    for a too-old CLI. An invalid root raises :class:`ComfyCliError` rather
+    than falling back to unanchored: this feature exists to make
+    project-governed behavior deterministic, and a silent fallback would
+    reintroduce exactly the non-determinism it removes. The root does NOT need
+    to contain ``comfy.yaml`` — an uninitialized directory is valid here;
+    that's what the ``project`` tool's ``init`` action is for.
+
+    A RELATIVE value is rejected the same fail-closed way, not silently
+    resolved against this server's own ``cwd``: that resolution would depend
+    on the same client-assigned, arbitrary launch directory this feature
+    exists to stop depending on, so a relative ``COMFY_PROJECT`` would be
+    exactly as non-deterministic as leaving it unset while looking configured.
     """
     global _project_root_env
     if _project_root_env is _PROJECT_ENV_UNREAD:
@@ -493,6 +499,15 @@ def _project_root() -> str | None:
     root = _project_root_env
     if root is None:
         return None
+    if not os.path.isabs(root):
+        raise ComfyCliError(
+            f"COMFY_PROJECT is set to {root!r}, a relative path. Every "
+            "comfy-cli spawn this server makes is anchored to it, and resolving "
+            "a relative value against this server's own (client-assigned, "
+            "arbitrary) cwd would reintroduce the exact non-determinism this "
+            "feature exists to remove. Fix: set COMFY_PROJECT to an absolute "
+            "path."
+        )
     if not os.path.isdir(root):
         raise ComfyCliError(
             f"COMFY_PROJECT is set to {root!r}, but that is not a directory "
@@ -7545,14 +7560,14 @@ _PROJECT_ACTIONS = ("status", "init")
 def project(action: str = "status") -> Any:
     """Report or create the operator-anchored comfy-cli project (`project/1`).
 
-    `action`: `"status"` -> `comfy project status`; `"init"` -> `comfy project
-    init` (creates `comfy.yaml` + supporting dirs; safe to re-run). comfy-cli
-    finds the governing project by walking up from its OWN cwd; an MCP
-    client's cwd is arbitrary, so with no `COMFY_PROJECT` set (absolute path,
-    read once per process) both act on THIS SERVER's cwd — unanchored.
-    `init`'s `where_default` is comfy-cli's own (1.15.0: `cloud` with no
-    `--where`); this server always pins `--where local`, so routing is
-    unaffected either way.
+    `action="status"` -> `comfy project status`; `"init"` -> `comfy project
+    init` (creates `comfy.yaml` + dirs; `project_already_exists` if already
+    governed — try `action="status"` first). comfy-cli walks up from ITS OWN
+    cwd to find the governing project; an MCP client's cwd cannot pin that, so
+    with no `COMFY_PROJECT` set (absolute path, read once per process) both
+    act on this server's cwd, unanchored. `init`'s `where_default` is
+    comfy-cli's own (`cloud` by default); this server pins `--where local`
+    regardless.
     """
     if action not in _PROJECT_ACTIONS:
         raise ComfyCliError(

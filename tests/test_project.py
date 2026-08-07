@@ -9,11 +9,15 @@ is arbitrary and unrelated to any project the user has in mind, so this server
 anchors every spawn from the OUTSIDE instead: `cwd=` on its own subprocess
 calls, resolved by `server._project_root` from `COMFY_PROJECT`. These lock in:
 
-1. `_project_root` resolution/caching/validation on its own.
+1. `_project_root` resolution/caching/validation on its own, including that a
+   RELATIVE value is rejected exactly like a missing/non-directory one — it
+   would otherwise resolve against this server's own client-assigned cwd,
+   reintroducing the non-determinism anchoring exists to remove.
 2. Unset -> every spawn path (plain / async / streaming) passes no `cwd`,
    byte-identical to before this feature existed.
 3. Set + valid -> every spawn path passes it.
-4. Set + invalid -> the first comfy-cli call raises, before anything spawns.
+4. Set + invalid (missing, non-directory, or relative) -> the first comfy-cli
+   call raises, before anything spawns.
 5. `project(action=...)`'s exact argv, default, and bad-action rejection.
 6. The tool docstring's own token budget.
 """
@@ -101,6 +105,36 @@ def test_project_root_does_not_latch_an_invalid_verdict(tmp_path, monkeypatch):
 
     not_yet.mkdir()
     assert server._project_root() == str(not_yet)  # the retry sees it
+
+
+def test_project_root_raises_on_a_relative_path(monkeypatch):
+    """A relative COMFY_PROJECT must not silently resolve against this
+    server's own (client-assigned, arbitrary) cwd — that would be exactly
+    the non-determinism anchoring exists to remove."""
+    monkeypatch.setenv("COMFY_PROJECT", "relative/project/dir")
+
+    with pytest.raises(server.ComfyCliError, match="absolute"):
+        server._project_root()
+
+
+def test_project_root_relative_error_names_the_value(monkeypatch):
+    monkeypatch.setenv("COMFY_PROJECT", "some/relative/path")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server._project_root()
+
+    assert "some/relative/path" in str(excinfo.value)
+
+
+def test_relative_project_root_refuses_before_any_spawn(monkeypatch):
+    """The relative check fails closed at the same point the directory check
+    does: before the real comfy-cli subcommand ever spawns."""
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.subprocess, "Popen", _boom)
+    monkeypatch.setenv("COMFY_PROJECT", "relative/dir")
+
+    with pytest.raises(server.ComfyCliError, match="absolute"):
+        server._run_comfy("env")
 
 
 # --- unset: every spawn path carries no cwd (byte-identical to before) ------
