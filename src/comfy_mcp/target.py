@@ -360,7 +360,7 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     # COMFYUI_URL/PORT must not brick local-only verbs (server_info's `env`,
     # download, the stop/logs lifecycle) that never touch the remote — they'd
     # otherwise raise ComfyCliError here despite ignoring the target entirely,
-    # breaking the "local behavior unchanged" contract (BE-3869 review).
+    # breaking the "local behavior unchanged" contract.
     if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
         return args
     target = _comfy_target()
@@ -404,7 +404,7 @@ def _reject_remote_model_download() -> None:
 
     Deliberately NOT folded into :func:`_with_target`: that helper checks the
     verb before resolving the target precisely so a malformed ``COMFYUI_URL``
-    cannot brick local-only verbs (BE-3869). Here the opposite is wanted — the
+    cannot brick local-only verbs. Here the opposite is wanted — the
     caller has opted into a remote, so a malformed value should fail loudly
     rather than be ignored, and the raise comes straight out of
     :func:`_comfy_target`.
@@ -470,7 +470,7 @@ def _annotate_comfy_target(payload: Any) -> Any:
     * **Malformed config** → reported, never raised. A bad ``COMFYUI_URL`` raises
       out of :func:`_comfy_target`, and these two tools never touch the remote,
       so it must not break them — the same "local behavior unchanged" contract
-      :func:`_with_target` honors (BE-3869). But swallowing it outright would
+      :func:`_with_target` honors. But swallowing it outright would
       make a typo look like "nothing configured", which is the one reading this
       key exists to rule out, so it becomes an ERROR-SHAPED note (``error`` /
       ``note``) the way ``server_info`` reports the same breakage. Absence of the

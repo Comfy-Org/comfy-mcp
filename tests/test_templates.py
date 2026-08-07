@@ -230,7 +230,7 @@ def test_search_templates_bad_shape_raises(monkeypatch):
 
 
 def test_search_templates_non_dict_rows_raise(monkeypatch):
-    """Non-dict rows are shape drift -> raise loudly, never silently dropped (BE-3342).
+    """Non-dict rows are shape drift -> raise loudly, never silently dropped.
 
     Silently filtering them would undercount `total` and vanish templates, which
     contradicts the loud-fail guard the rest of the function is built around.

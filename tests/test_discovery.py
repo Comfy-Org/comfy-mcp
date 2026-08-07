@@ -523,7 +523,7 @@ def test_node_dependencies_rejects_an_oversized_id(patched_run, label):
 
 
 def test_search_models_query_uses_search(patched_run):
-    # BE-2952: comfy-cli 1.12's `models search` takes the query as `--text`,
+    # comfy-cli 1.12's `models search` takes the query as `--text`,
     # not a positional — a positional exits 2 ("returned no JSON (exit 2)").
     calls = patched_run(envelope(data=["sd_xl_base.safetensors"]))
     assert server.search_models(query="xl") == ["sd_xl_base.safetensors"]

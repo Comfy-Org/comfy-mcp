@@ -216,7 +216,7 @@ def test_run_comfy_leaves_askpass_alone(patched_run, monkeypatch):
 # the detached process, so an absolute COMFY_BIN whose directory is not on the
 # inherited PATH (an MCP server started by a GUI client + a venv-installed
 # comfy-cli) crashed the child with FileNotFoundError before ComfyUI was ever
-# started. See `_comfy_env` (BE-4735 / BE-3780).
+# started. See `_comfy_env`.
 
 _needs_posix_exec = pytest.mark.skipif(
     sys.platform == "win32",
@@ -2991,7 +2991,7 @@ def test_stop_comfyui_surfaces_no_recorded_server_error(patched_run):
     assert calls[0]["cmd"][4:] == ["stop"]
 
 
-# --- lifecycle commands with no JSON envelope (BE-2953) --------------------
+# --- lifecycle commands with no JSON envelope -------------------------------
 
 
 def test_stop_comfyui_synthesizes_success_on_plain_exit(patched_plain_run):
@@ -3029,7 +3029,7 @@ def test_plain_ok_synthesizes_despite_stray_non_envelope_json(patched_plain_run)
 
     `_last_json_object` returns any JSON object (not just `type==envelope`), so a
     diagnostic line that happens to parse must NOT be mistaken for a result
-    envelope and unwrapped into a spurious failure (BE-2953 edge case).
+    envelope and unwrapped into a spurious failure.
     """
     patched_plain_run(
         0,
@@ -3558,7 +3558,7 @@ def test_run_comfy_async_nonzero_exit_without_an_envelope_raises(patched_async_r
 def test_run_comfy_async_plain_ok_synthesizes_on_a_clean_no_envelope_exit(
     patched_async_run,
 ):
-    """BE-3345 regression guard: exit 0 + human text + no envelope is a SUCCESS.
+    """Regression guard: exit 0 + human text + no envelope is a SUCCESS.
 
     Losing this in the move off `_run_comfy` would turn every legacy download
     that actually landed into a "returned no JSON" false negative — and invite a
@@ -4066,8 +4066,8 @@ def test_run_workflow_wait_false_still_submits_with_an_odd_timeout(
     assert seen["timeout"] == 60.0
 
 
-# --- BE-3343: timeout errors must surface the captured stdout/stderr tails ---
-# A crashed-and-wedged comfy-cli (e.g. the BE-3328 Windows UnicodeEncodeError)
+# --- timeout errors must surface the captured stdout/stderr tails ----------
+# A crashed-and-wedged comfy-cli (e.g. a Windows UnicodeEncodeError)
 # wrote its diagnosis on stderr before being killed; the timeout handler used to
 # discard it, so the failure looked identical to a genuinely slow run.
 

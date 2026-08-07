@@ -1,4 +1,4 @@
-"""Tests for the comfy-cli compatibility gate (BE-2997).
+"""Tests for the comfy-cli compatibility gate.
 
 comfy-cli is unpinned — it comes from PATH at whatever version — so the whole
 contract (envelope shape, flag ordering, error codes) rests on an unversioned

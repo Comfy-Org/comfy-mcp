@@ -299,7 +299,7 @@ def test_emit_takes_no_confirm_spend_argument():
     assert set(tool.parameters["required"]) == {"model", "out_path"}
 
 
-# --- comfy-cli must actually support --emit-workflow (BE-4971) -------------
+# --- comfy-cli must actually support --emit-workflow -----------------------
 #
 # `emit_partner_workflow`'s whole safety claim is that `--emit-workflow`
 # returns before any partner-proxy call, so it deliberately skips the spend

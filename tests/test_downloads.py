@@ -1675,8 +1675,8 @@ def test_download_model_guards_the_id_comfy_cli_hands_back(monkeypatch):
 #
 # A comfy-cli that predates `model download --background` rejects the flag at
 # parse time, and `download_model` falls back to the old one-shot synchronous
-# call. That path keeps the old contract in full, including the BE-3345
-# no-envelope handling below — which is now scoped to it alone, since a
+# call. That path keeps the old contract in full, including the no-envelope
+# handling below — which is now scoped to it alone, since a
 # `--background` submit returns a real envelope. `legacy_comfy_cli` is what
 # makes the installed CLI look that old.
 
@@ -1805,7 +1805,7 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(
 
     `_last_json_object` returns any JSON object (not just `type==envelope`), so a
     diagnostic line that happens to parse must NOT be mistaken for a result
-    envelope and unwrapped into a spurious failure (BE-3345 edge case).
+    envelope and unwrapped into a spurious failure.
     """
     patched_async_run(
         '{"level": "info", "msg": "connection reused"}\n',
@@ -1822,7 +1822,7 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(
 def test_download_model_envelope_then_diagnostic_keeps_envelope_data(
     patched_async_run, legacy_comfy_cli
 ):
-    """A real envelope FOLLOWED BY a diagnostic JSON line still wins (BE-3345).
+    """A real envelope FOLLOWED BY a diagnostic JSON line still wins.
 
     `_last_json_object` prefers a `type==envelope` object over a later plain JSON
     line, so a trailing diagnostic must NOT null out `real_envelope` and demote a
@@ -1848,7 +1848,7 @@ def test_download_model_error_envelope_then_diagnostic_still_raises(
 
     Even on exit 0, a trailing diagnostic JSON line must not mask an earlier
     error envelope as a synthesized success — the error envelope is preferred and
-    propagates its code (BE-3345).
+    propagates its code.
     """
     patched_async_run(
         '{"type": "envelope", "ok": false, '
@@ -1918,7 +1918,7 @@ def test_download_model_legacy_timeout_kills_the_transfer_and_guides_the_caller(
 ):
     """A waited fallback that overruns its bound kills the transfer and says so.
 
-    This is the BE-5167 shape: the bytes were moving inside THIS call, so unlike
+    The bytes were moving inside THIS call, so unlike
     the `--background` path there is no detached worker left to poll — the
     transfer is dead and a partial file may be on disk with no `download_id` to
     check it with. The error has to carry all of that, plus the way out.
@@ -2093,7 +2093,7 @@ def test_download_model_legacy_non_timeout_failure_propagates_unwrapped(
 def test_download_model_legacy_cancellation_reaps_the_transfer(
     patched_async_run, legacy_comfy_cli, monkeypatch
 ):
-    """Cancelling the tool call must kill the transfer, not orphan it (BE-5167).
+    """Cancelling the tool call must kill the transfer, not orphan it.
 
     This is what `asyncio.to_thread(_run_comfy, …)` could not do: its cancellation
     never reached the thread, so an MCP cancel notification (or a stdio shutdown

@@ -386,10 +386,10 @@ def _comfy_env() -> dict[str, str]:
     the inherited ``PATH`` — the normal state for an MCP server launched by a
     GUI client on macOS — crashes background launch with ``FileNotFoundError:
     'comfy'`` before ComfyUI is ever spawned, surfacing here as the opaque
-    ``comfy-cli returned no JSON (exit 1)`` (BE-4735). Prepending rather than
+    ``comfy-cli returned no JSON (exit 1)``. Prepending rather than
     appending is deliberate: it also stops a stale second comfy install earlier
-    on the user's ``PATH`` from shadowing the intended one inside the child
-    (BE-3780). The entry is absolutized because comfy-cli ``os.chdir``s to the
+    on the user's ``PATH`` from shadowing the intended one inside the child.
+    The entry is absolutized because comfy-cli ``os.chdir``s to the
     workspace in the child before that re-invocation resolves, so a relative
     entry would point somewhere else by then.
 
@@ -892,7 +892,7 @@ def _run_comfy_raw(
             encoding="utf-8",
             env=env,
             # Own process group so a timeout can kill the whole TREE, exactly as
-            # the streaming path has since BE-3343. comfy-cli's long verbs fork
+            # the streaming path already does. comfy-cli's long verbs fork
             # real work — `update` runs `git pull` and then a multi-GB
             # `pip install -r requirements.txt`, `model download` streams a large
             # file — and `subprocess.run` (which this used to be) kills only the
@@ -913,7 +913,7 @@ def _run_comfy_raw(
         _reap(proc)
         # Whatever the child wrote before being killed — surface it so a
         # crashed, wedged comfy-cli (e.g. a traceback on stderr) is not
-        # indistinguishable from a genuinely slow one. See BE-3343.
+        # indistinguishable from a genuinely slow one.
         stdout, stderr = _drain_timed_out(proc, exc)
         raise _timeout_failure(cmd, args, timeout, stdout, stderr) from exc
     except BaseException:
@@ -946,7 +946,7 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
 
     ``plain_ok`` relaxes the envelope requirement for the commands that print
     human text and exit 0 WITHOUT emitting an envelope — the lifecycle verbs
-    ``launch`` / ``stop`` (BE-2953) and ``model download`` (BE-3345): a clean
+    ``launch`` / ``stop`` and ``model download``: a clean
     exit with no JSON is treated as success and a result dict is synthesized
     from the printed text, rather than raising the "returned no JSON" error on
     an action that actually succeeded. A non-zero exit, or a real error
@@ -954,13 +954,14 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     """
     envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
     # A plain_ok command that exits 0 without a *real* envelope is a success
-    # (BE-2953 launch/stop, BE-3345 model download). `_last_json_object` may
-    # return a stray non-envelope JSON line (e.g. a diagnostic log that happens
-    # to parse), so key the fast-path off the absence of a `type==envelope`
-    # object rather than the absence of any JSON — otherwise one incidental JSON
-    # line on a successful run would be mis-unwrapped into a spurious "failed"
-    # raise. A real error envelope still has `type==envelope`, so it flows to
-    # `_unwrap_envelope` and raises as usual.
+    # (the lifecycle verbs and model download, per the docstring above).
+    # `_last_json_object` may return a stray non-envelope JSON line (e.g. a
+    # diagnostic log that happens to parse), so key the fast-path off the
+    # absence of a `type==envelope` object rather than the absence of any
+    # JSON — otherwise one incidental JSON line on a successful run would be
+    # mis-unwrapped into a spurious "failed" raise. A real error envelope
+    # still has `type==envelope`, so it flows to `_unwrap_envelope` and
+    # raises as usual.
     real_envelope = _real_envelope(envelope)
     if plain_ok and real_envelope is None and returncode == 0:
         return clitext._synthesize_plain_result(args, stdout, stderr)
@@ -1039,7 +1040,6 @@ def _kill_proc_tree(proc: subprocess.Popen) -> None:
     Falls back to a plain ``kill`` on Windows / test fakes, where ``killpg`` is
     unavailable. That fallback reaches only the direct child; a Windows tree
     kill needs ``taskkill /T`` or a Job Object and is tracked separately.
-    (BE-3343)
     """
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -1056,7 +1056,7 @@ def _reap(proc: subprocess.Popen, timeout: float = 5.0) -> None:
     A child stuck in uninterruptible sleep (D state) can ignore ``SIGKILL``
     indefinitely; ``Popen.wait(timeout=...)`` polls rather than blocking on it,
     so the timeout handler returns promptly instead of leaking the reaper
-    thread. Best-effort: a still-unreaped child is left to the OS. (BE-3343)
+    thread. Best-effort: a still-unreaped child is left to the OS.
     """
     try:
         proc.wait(timeout=timeout)
@@ -1639,7 +1639,7 @@ async def _drain_timed_out_async(
     before the deadline is already in ``stdout_sink`` / ``stderr_sink`` and this
     only appends the bytes still sitting unread in the pipes. Reporting a timeout
     with no hint at all as to why the child was stuck is the failure mode both
-    exist to prevent (BE-3343).
+    exist to prevent.
 
     Call it only AFTER the process tree is dead: a live child (or a grandchild
     holding an inherited write fd) never EOFs the pipe, so the read would hang.
@@ -1750,7 +1750,7 @@ async def _run_comfy_async(
             # Own process group so one kill reaps the whole TREE (child +
             # grandchildren) and closes every inherited copy of the pipes —
             # otherwise a grandchild holding an fd keeps the drain from ever
-            # seeing EOF. See _kill_proc_tree_async. (BE-3343)
+            # seeing EOF. See _kill_proc_tree_async.
             start_new_session=True,
         )
     except (OSError, ValueError) as exc:
@@ -1806,7 +1806,7 @@ async def _run_comfy_async(
         stderr = stderr_sink[0].decode("utf-8", "replace")
         # Unwrapping is `_run_comfy`'s, verbatim — see its body for why the
         # plain_ok fast-path keys off `_real_envelope` being None rather than off
-        # the absence of any JSON (BE-2953 launch/stop, BE-3345 model download).
+        # the absence of any JSON.
         real_envelope = _real_envelope(_last_json_object(stdout))
         if plain_ok and real_envelope is None and proc.returncode == 0:
             return clitext._synthesize_plain_result(args, stdout, stderr)
@@ -1818,7 +1818,7 @@ async def _run_comfy_async(
         # exit path — and unlike the thread-pool path this one includes
         # `CancelledError`, from an MCP cancel notification or from stdio-shutdown
         # task-group teardown. Kill the whole tree, not just the direct child, for
-        # the `start_new_session` reason above. (BE-3343)
+        # the `start_new_session` reason above.
         #
         # Unconditional: both helpers are no-ops for a child that already exited
         # (`_kill_proc_tree_async` refuses to signal a reaped pid, and `proc.wait()`
@@ -1877,7 +1877,7 @@ async def _run_comfy_streaming(
             # Own process group so a timeout can kill the whole tree (child +
             # grandchildren) and close every copy of the stderr pipe — otherwise
             # a grandchild that inherited the fd keeps the stderr drain from ever
-            # seeing EOF. See _kill_proc_tree_async. (BE-3343)
+            # seeing EOF. See _kill_proc_tree_async.
             start_new_session=True,
             # Read granularity, not a maximum line length: `_readline_unbounded`
             # stitches an over-long line back together rather than raising.
@@ -1986,7 +1986,7 @@ async def _run_comfy_streaming(
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
                 return {"timed_out": True, "status": tracker.snapshot()}
-            # Surface what the child wrote before the deadline (BE-3343). Kill
+            # Surface what the child wrote before the deadline. Kill
             # the whole tree FIRST so every copy of the stderr pipe closes and
             # the drain returns the buffered output (a wedged child — or a
             # grandchild holding the fd — would otherwise block the read).
@@ -2079,7 +2079,7 @@ async def _run_comfy_streaming(
         # notification is swallowed in `_StreamProgress.report` and reaches
         # neither this block nor the caller). Kill the whole process tree (not
         # just the direct child) so a descendant holding the stderr write fd
-        # can't keep the pipe from EOFing — see _kill_proc_tree_async. (BE-3343)
+        # can't keep the pipe from EOFing — see _kill_proc_tree_async.
         if proc.returncode is None:
             _kill_proc_tree_async(proc)
             await _reap_async(proc)
@@ -2301,7 +2301,7 @@ def server_info() -> Any:
 # comfy-cli error codes worth a short bounded retry from ``run_workflow`` —
 # transient credential failures the run's PREFLIGHT raises BEFORE the job is
 # submitted, so re-invoking `comfy run` cannot double-submit. Verified against
-# comfy-cli source (BE-3344):
+# comfy-cli source:
 #   * `partner_node_requires_credential` — raised in run preflight
 #     (`command/run/__init__.py`) BEFORE `execution.queue()`; safe to retry.
 #   * `cloud_unauthorized` — only raised on the CLOUD execute path; it never
@@ -8906,7 +8906,7 @@ async def _legacy_foreground_download(
     # plain_ok=True: `comfy model download` exits 0 with human progress text
     # and no envelope, so treat a clean exit as success instead of raising
     # the "returned no JSON" false negative on a download that actually
-    # landed (BE-3345). A real error envelope or a non-zero exit still raises.
+    # landed. A real error envelope or a non-zero exit still raises.
     #
     # `_run_comfy_async`, NOT `to_thread(_run_comfy, …)`: this is the one
     # plain-JSON call that runs for the whole length of a multi-GB transfer,
@@ -8933,8 +8933,7 @@ async def _legacy_foreground_download(
         #
         # Not deleted for them: the exact path is only fully known when
         # `filename` was passed, so removing a file guessed from the URL could
-        # delete the wrong one. Reporting it is v1 (see BE-3428 for the
-        # adjacent trust-the-engine's-own-answer theme).
+        # delete the wrong one. Reporting it is v1.
         #
         # The way out is keyed on whether the bound that just expired WAS the
         # cap, not on `wait`: "raise `timeout_seconds`" is dead advice for

@@ -399,7 +399,7 @@ def _synthesize_plain_result(args: tuple[str, ...], stdout: str, stderr: str) ->
 
     Some comfy-cli commands print human-readable text and exit 0 instead of
     emitting an ``envelope/1`` object: the lifecycle verbs ``launch`` / ``stop``
-    (BE-2953) and ``model download`` (BE-3345), whose stderr carries the progress
+    and ``model download``, whose stderr carries the progress
     tail (e.g. ``Done in 55.8s``) and the saved-path text. For those a clean exit
     IS the success signal, so we return a result dict carrying whatever text
     comfy-cli printed (preferring stderr, per the CLI's logging) rather than

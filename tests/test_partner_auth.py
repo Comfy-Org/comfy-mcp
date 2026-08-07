@@ -1,4 +1,4 @@
-"""Partner-API credential handling (BE-3344).
+"""Partner-API credential handling.
 
 Two behaviors:
 1. `_unwrap_envelope` must preserve `error.code` on `ComfyCliError.code` and

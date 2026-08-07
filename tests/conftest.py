@@ -568,7 +568,7 @@ class _FakeAsyncRunProc:
 
     ``kill()`` closes both pipes, because that is what killing the process GROUP
     does — every inherited copy of the write fd goes with it, which is the only
-    reason the post-kill drain can reach EOF instead of hanging (BE-3343). Without
+    reason the post-kill drain can reach EOF instead of hanging. Without
     that fidelity a fake would pass while the real thing wedged.
 
     Deliberately carries NO ``pid``, exactly like :class:`_FakeProc` and
