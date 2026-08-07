@@ -7646,11 +7646,23 @@ def project(action: str = "status") -> Any:
     return _run_comfy("project", action, timeout=60.0)
 
 
-# The compact per-row projection returned by the listing. The full detail
-# (tags / models / providers / category_title) is what ``get_template(name)``
-# returns — keeping the listing slim is what stops the full 558-row catalog from
-# blowing the MCP client's tool-output cap.
-_TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
+# The compact per-row projection returned by the listing. The heavy fields
+# (models / providers) still live in ``get_template(name)`` only — keeping
+# the listing slim is what stops the full 558-row catalog from blowing the
+# MCP client's tool-output cap. ``tags`` and ``category_title`` ride along
+# anyway: a few short strings each, and the ONLY fields that tell a paid
+# hosted ``API`` template from its free open-source sibling, which the
+# gallery titles IDENTICALLY (e.g. two "MiniMax H3: Text to Video" rows) —
+# without them a listing steers agents to the paid route while implying no
+# free one exists.
+_TEMPLATE_LIST_FIELDS = (
+    "name",
+    "title",
+    "description",
+    "output_type",
+    "tags",
+    "category_title",
+)
 
 # Upper bound on a single page so an oversized `limit` can't build a response
 # that trips the MCP client's tool-output cap; callers page the rest via `offset`.
@@ -7689,26 +7701,26 @@ def search_templates(
 ) -> Any:
     """Search the built-in ComfyUI workflow-template gallery.
 
-    Wraps ``comfy templates ls`` (~558 rows, so this narrows/pages it).
-    Returns ``{"total", "shown", "offset", "rows"}`` — rows projected to
-    ``name/title/description/output_type``; ``get_template(name)`` is the
-    full-detail path.
+    Wraps ``comfy templates ls`` (~558 rows, narrows/pages it). Returns
+    ``{"total", "shown", "offset", "rows"}`` — rows projected to
+    ``name/title/description/output_type/tags/category_title``. ``API`` in
+    ``tags`` means paid hosted; an identically-titled row without it is the
+    free local sibling — ``tags``/``category_title``, not the title, tell
+    them apart.
 
     Args:
-        query: free-text substring match (client-side) over
-            name/title/description/tags/models.
-        tag/type/model/provider: forwarded gallery filters (``tag``/``type``
-            exact-match, ``model``/``provider`` substring).
-        exclude_api: drop rows tagged ``API`` — approximates "runnable
-            locally".
-        limit/offset: page the filtered rows (``limit`` capped at 200).
+        query: free-text match over name/title/description/tags/models.
+        tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
+            ``model``/``provider`` substring).
+        exclude_api: drop ``API``-tagged rows.
+        limit/offset: page results (``limit`` capped at 200).
 
-    Step 1 of the on-ramp: pick a ``name``, inspect with ``get_template``,
-    then ``fetch_template``. Step 4 — validating against this install before
-    ``run_workflow`` — is MANDATORY via ``local_check``.
+    Step 1: pick a ``name``, inspect with ``get_template``, then
+    ``fetch_template``. Step 4 — validating before ``run_workflow`` — is
+    MANDATORY via ``local_check``.
 
-    Freshness: CACHED, 24h TTL as of v1.14.0 (this server's floor); refresh
-    with ``comfy templates refresh``. NOT read from the local install.
+    Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
+    refresh``. NOT read from the local install.
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")

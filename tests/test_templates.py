@@ -23,7 +23,7 @@ import os
 import pytest
 from conftest import envelope
 
-from comfy_mcp import argv, server
+from comfy_mcp import argv, instructions, server
 
 # A representative slice of the real comfy-cli `templates ls` payload shape.
 ROWS = [
@@ -127,12 +127,88 @@ def test_search_templates_argv_and_empty_query_pages(patched_run):
 
 
 def test_search_templates_compact_projection(monkeypatch):
-    """Listing rows carry only name/title/description/output_type — not the full detail."""
+    """Listing rows stay slim, but carry the two paid-vs-local discriminators.
+
+    ``tags`` and ``category_title`` are IN the projection on purpose: the
+    gallery titles a paid ``API`` template and its free open-source sibling
+    identically ("MiniMax H3: Text to Video", twice), so a listing without
+    them left an agent unable to tell the routes apart and steered users into
+    the paid one. The heavy fields (``models``/``providers``) still live in
+    ``get_template(name)`` only.
+    """
     _patch_ls(monkeypatch)
     row = _rows(server.search_templates())[0]
-    assert set(row) == {"name", "title", "description", "output_type"}
-    # The heavy fields live in get_template(name), not the listing.
-    assert "tags" not in row and "models" not in row and "category_title" not in row
+    assert set(row) == {
+        "name",
+        "title",
+        "description",
+        "output_type",
+        "tags",
+        "category_title",
+    }
+    assert "models" not in row and "providers" not in row
+
+
+def test_search_templates_identical_titles_stay_distinguishable(monkeypatch):
+    """The MiniMax H3 shape: same title twice, told apart only by tags/category.
+
+    Regression — with the discriminators stripped from the rows, agents built
+    graphs on the paid partner template and told users "the only H3 path is
+    the API node" while the free open-source row sat in the same result page.
+    """
+    h3_pair = [
+        {
+            "name": "video_minimax_h3_t2v",
+            "title": "MiniMax H3: Text to Video",
+            "output_type": "video",
+            "category_title": "Video",
+            "tags": [],
+            "models": ["MiniMax H3"],
+            "providers": [],
+            "description": "Open-source MiniMax H3 text to video.",
+        },
+        {
+            "name": "api_minimax_h3_t2v",
+            "title": "MiniMax H3: Text to Video",
+            "output_type": "video",
+            "category_title": "Video API",
+            "tags": ["API"],
+            "models": ["MiniMax H3"],
+            "providers": ["MiniMax"],
+            "description": "MiniMax H3 text to video via the hosted API.",
+        },
+    ]
+    _patch_ls(monkeypatch, rows=h3_pair)
+
+    rows = _rows(server.search_templates("minimax h3"))
+
+    assert len(rows) == 2
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["video_minimax_h3_t2v"]["tags"] == []
+    assert by_name["api_minimax_h3_t2v"]["tags"] == ["API"]
+    assert by_name["video_minimax_h3_t2v"]["category_title"] == "Video"
+    assert by_name["api_minimax_h3_t2v"]["category_title"] == "Video API"
+    # And the free sibling is isolable without eyeballing tags at all.
+    free = _rows(server.search_templates("minimax h3", exclude_api=True))
+    assert [r["name"] for r in free] == ["video_minimax_h3_t2v"]
+
+
+def test_instructions_carry_the_dual_route_guidance():
+    """The dual-route bullet behind the ask-first behavior still exists.
+
+    Tripwire in the ``test_routing_instructions.py`` style: the guidance is
+    prose, so no functional test notices it disappearing. Keyed on the
+    load-bearing facts — identical titles, check-both-routes-first, ask the
+    user, and no cross-route parameter limits — rather than whole sentences.
+    """
+    flat = " ".join(instructions.INSTRUCTIONS.split())
+    assert "identical titles" in flat
+    assert "check BOTH routes" in flat
+    assert "ASK the user which they want" in flat
+    assert "never read parameter limits across routes" in flat
+    # The example that motivated the bullet, so the next H3-style QA round can
+    # find this guidance by searching the constant.
+    assert "MiniMax H3" in flat
 
 
 def test_search_templates_query_narrows_reported_cases(monkeypatch):
