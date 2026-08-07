@@ -4973,6 +4973,12 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     return selected
 
 
+# The docstring below says "not in _TARGET_AWARE_SUBCOMMANDS" without a module
+# qualifier deliberately: tool docstrings are protocol-visible (the `tools/list`
+# `description` field), so this stays reader prose rather than an internal
+# cross-reference. For maintainers: that's `target._TARGET_AWARE_SUBCOMMANDS`
+# (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
+# being made below.
 @mcp.tool()
 def fetch_outputs(
     prompt_id: str,
@@ -4986,7 +4992,7 @@ def fetch_outputs(
     ``url_only=True`` adds ``--url-only`` — emits URLs without downloading.
 
     Works for a job that ran on a configured REMOTE too, even though this verb
-    forwards no ``--host``/``--port`` (not in ``target._TARGET_AWARE_SUBCOMMANDS``):
+    forwards no ``--host``/``--port`` (not in ``_TARGET_AWARE_SUBCOMMANDS``):
     the run that submitted the job wrote a state file on THIS machine keyed by
     ``prompt_id``, and against a remote that file records each output as an
     absolute URL comfy-cli streams from there. Only a ``prompt_id`` this
