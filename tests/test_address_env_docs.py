@@ -141,15 +141,13 @@ def test_target_aware_tools_do_not_claim_to_be_local_only():
     ``upload_file`` is the same pairing for ``upload``: its summary said LOCAL
     while it staged a remote run's inputs onto the wrong disk.
     """
+    # `server.job` replaces the former `job_status` / `wait_for_job` /
+    # `watch_job` / `cancel_job` / `get_queue` — one grouped tool now.
     for tool in (
         server.run_workflow,
         server.generate_image,
         server.run_template,
-        server.job_status,
-        server.wait_for_job,
-        server.watch_job,
-        server.cancel_job,
-        server.get_queue,
+        server.job,
         server.upload_file,
     ):
         lines = (tool.__doc__ or "").strip().splitlines()

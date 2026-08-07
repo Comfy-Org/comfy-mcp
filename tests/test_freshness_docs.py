@@ -34,17 +34,9 @@ import pytest
 
 from comfy_mcp import instructions, server
 
-# The node tools, all of which resolve against the live local `object_info`.
-LIVE_NODE_TOOLS = (
-    "search_nodes",
-    "get_node",
-    "list_nodes",
-    "nodes_upstream",
-    "nodes_downstream",
-    "nodes_path",
-    "nodes_types",
-    "nodes_categories",
-)
+# The node tool — one grouped `nodes(action=...)` since the tool-consolidation
+# series, all of whose actions resolve against the live local `object_info`.
+LIVE_NODE_TOOLS = ("nodes",)
 
 # The gallery-backed template tools.
 CACHED_TEMPLATE_TOOLS = ("search_templates", "get_template", "fetch_template")

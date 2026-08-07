@@ -163,7 +163,7 @@ def _validate_generate_model(model: str) -> None:
             "(e.g. 'flux-pro'), not an empty value."
         )
     # A leading-dash target is read by comfy-cli as an option rather than a
-    # model (the same guard watch_job applies to prompt_id).
+    # model (the same guard job(action="watch") applies to prompt_id).
     argv._reject_option_like(
         "model", model, expected="a partner model alias (e.g. 'flux-pro')"
     )

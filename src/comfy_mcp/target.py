@@ -96,8 +96,8 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
 # It backs both ``run_template`` and ``generate_image``, and while it was absent
 # the submit-then-poll flow did not merely run on the wrong box, it could not
-# complete at all: the run executed locally, ``wait_for_job`` (a ``jobs`` verb,
-# forwarded) polled the configured remote, and the local ``prompt_id`` came back
+# complete at all: the run executed locally, ``job(action="wait")`` (a ``jobs``
+# verb, forwarded) polled the configured remote, and the local ``prompt_id`` came back
 # ``prompt_not_found`` from a queue it was never submitted to. Adding a verb here
 # is only safe when comfy-cli actually accepts the flags on it — otherwise the
 # forward turns every call into "No such option". There is no such window for
@@ -426,8 +426,8 @@ def _reject_remote_model_download() -> None:
         "(shared storage — an NFS / tailnet mount), set "
         f"{REMOTE_SHARED_MODELS_ENV}=1 to allow the download, or (3) unset "
         "COMFYUI_URL/COMFYUI_HOST to work entirely locally. Already-submitted "
-        "downloads are unaffected: download_status, wait_for_download and "
-        "cancel_download keep working."
+        "downloads are unaffected: download(action='status'/'wait'/'cancel') "
+        "keeps working."
     )
 
 

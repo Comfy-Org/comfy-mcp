@@ -210,8 +210,8 @@ def test_streaming_runner_converts_an_unencodable_argument(patched_stream):
     """The unencodable branch on the streaming spawn, driven at the runner.
 
     Deliberately NOT through a tool: no streaming tool forwards a raw free-form
-    string to argv today. ``run_workflow`` / ``watch_job`` take only path- and
-    id-shaped values, which ``_guard_arg_len`` / ``_guard_prompt_id`` already
+    string to argv today. ``run_workflow`` / ``job(action="watch")`` take only
+    path- and id-shaped values, which ``_guard_arg_len`` / ``_guard_prompt_id`` already
     refuse first and name; ``run_template``'s params are ``json.dumps``-encoded
     with the default ``ensure_ascii=True``, which escapes an unencodable
     character to a pure-ASCII ``\\uXXXX`` before it ever reaches the spawn. The

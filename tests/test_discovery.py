@@ -1,4 +1,4 @@
-"""Mocked tests for the discovery tools (search_nodes / get_node / search_models).
+"""Mocked tests for the discovery tools (nodes / search_models).
 
 These assert the exact ``comfy`` argv each tool composes (the thin-passthrough
 contract) against a stubbed ``subprocess.run`` — except ``workflow_deps``, whose
@@ -9,20 +9,24 @@ contract) against a stubbed ``subprocess.run`` — except ``workflow_deps``, who
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
 import threading
+from pathlib import Path
 
 import pytest
 from conftest import envelope
 
 from comfy_mcp import argv, server
 
+_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
 
-def test_search_nodes_argv(patched_run):
+
+def test_nodes_search_argv(patched_run):
     calls = patched_run(envelope(data=[{"name": "KSampler"}]))
-    assert server.search_nodes("sampler") == [{"name": "KSampler"}]
+    assert server.nodes(action="search", query="sampler") == [{"name": "KSampler"}]
     # global flags first, then the subcommand + query verbatim
     assert calls[0]["cmd"] == [
         server.COMFY_BIN,
@@ -35,27 +39,39 @@ def test_search_nodes_argv(patched_run):
     ]
 
 
-# `search_nodes` / `get_node` leading-dash + NUL rejection is covered for the
-# whole `nodes` family by `test_node_tools_reject_option_like_positionals` and
-# `test_node_tools_reject_embedded_nul` below (landed on main in #86).
+def test_nodes_search_is_the_default_action(patched_run):
+    """``action`` defaults to ``"search"`` — a bare ``query`` call still works."""
+    calls = patched_run(envelope(data=[]))
+    server.nodes(query="sampler")
+    assert calls[0]["cmd"][4:] == ["nodes", "search", "sampler"]
 
 
-def test_get_node_argv(patched_run):
+# `nodes`' leading-dash + NUL rejection is covered for the whole family by
+# `test_nodes_reject_option_like_positionals` and
+# `test_nodes_reject_embedded_nul` below (landed on main in #86, regrouped in
+# the tool-consolidation series).
+
+
+def test_nodes_get_argv(patched_run):
     calls = patched_run(envelope(data={"name": "KSampler", "inputs": {}}))
-    assert server.get_node("KSampler") == {"name": "KSampler", "inputs": {}}
+    assert server.nodes(action="get", name="KSampler") == {
+        "name": "KSampler",
+        "inputs": {},
+    }
     assert calls[0]["cmd"][4:] == ["nodes", "show", "KSampler"]
 
 
-def test_list_nodes_no_filters_bare_ls(patched_run):
+def test_nodes_list_no_filters_bare_ls(patched_run):
     calls = patched_run(envelope(data=[{"name": "KSampler"}]))
-    assert server.list_nodes() == [{"name": "KSampler"}]
+    assert server.nodes(action="list") == [{"name": "KSampler"}]
     # no filters -> a bare `nodes ls`, no stray flags
     assert calls[0]["cmd"][4:] == ["nodes", "ls"]
 
 
-def test_list_nodes_all_filters_in_order(patched_run):
+def test_nodes_list_all_filters_in_order(patched_run):
     calls = patched_run(envelope(data=[]))
-    server.list_nodes(
+    server.nodes(
+        action="list",
         produces="IMAGE",
         accepts="MODEL",
         category="loaders",
@@ -78,9 +94,9 @@ def test_list_nodes_all_filters_in_order(patched_run):
     ]
 
 
-def test_list_nodes_omits_empty_filters(patched_run):
+def test_nodes_list_omits_empty_filters(patched_run):
     calls = patched_run(envelope(data=[]))
-    server.list_nodes(produces="IMAGE", category="sampling")
+    server.nodes(action="list", produces="IMAGE", category="sampling")
     # only the two non-empty filters are passed, in declared order
     assert calls[0]["cmd"][4:] == [
         "nodes",
@@ -103,11 +119,11 @@ def test_list_nodes_omits_empty_filters(patched_run):
     ],
     ids=lambda kw: next(iter(kw)),
 )
-def test_list_nodes_rejects_leading_dash_filter_values(patched_run, kwargs):
+def test_nodes_list_rejects_leading_dash_filter_values(patched_run, kwargs):
     """A filter value starting with '-' is rejected before it reaches comfy-cli argv."""
     calls = patched_run(envelope(data=[]))
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        server.list_nodes(**kwargs)
+        server.nodes(action="list", **kwargs)
     # refused before the spawn, not after
     assert calls == []
 
@@ -123,48 +139,50 @@ def test_list_nodes_rejects_leading_dash_filter_values(patched_run, kwargs):
     ],
     ids=lambda kw: next(iter(kw)),
 )
-def test_list_nodes_rejects_embedded_nul_filter_values(patched_run, kwargs):
+def test_nodes_list_rejects_embedded_nul_filter_values(patched_run, kwargs):
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
     calls = patched_run(envelope(data=[]))
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
-        server.list_nodes(**kwargs)
+        server.nodes(action="list", **kwargs)
     assert calls == []
 
 
-def test_list_nodes_still_passes_a_normal_filter_value(patched_run):
+def test_nodes_list_still_passes_a_normal_filter_value(patched_run):
     """The guards are value-shape only — an ordinary filter still reaches argv."""
     calls = patched_run(envelope(data=[]))
-    server.list_nodes(produces="IMAGE")
+    server.nodes(action="list", produces="IMAGE")
     assert calls[0]["cmd"][4:] == ["nodes", "ls", "--produces", "IMAGE"]
 
 
 def test_nodes_upstream_without_limit(patched_run):
     calls = patched_run(envelope(data=[{"name": "CheckpointLoaderSimple"}]))
-    assert server.nodes_upstream("KSampler") == [{"name": "CheckpointLoaderSimple"}]
+    assert server.nodes(action="upstream", name="KSampler") == [
+        {"name": "CheckpointLoaderSimple"}
+    ]
     assert calls[0]["cmd"][4:] == ["nodes", "upstream", "KSampler"]
 
 
 def test_nodes_upstream_with_limit(patched_run):
     calls = patched_run(envelope(data=[]))
-    server.nodes_upstream("KSampler", limit=5)
+    server.nodes(action="upstream", name="KSampler", limit=5)
     assert calls[0]["cmd"][4:] == ["nodes", "upstream", "KSampler", "--limit", "5"]
 
 
 def test_nodes_downstream_without_limit(patched_run):
     calls = patched_run(envelope(data=[{"name": "VAEDecode"}]))
-    assert server.nodes_downstream("KSampler") == [{"name": "VAEDecode"}]
+    assert server.nodes(action="downstream", name="KSampler") == [{"name": "VAEDecode"}]
     assert calls[0]["cmd"][4:] == ["nodes", "downstream", "KSampler"]
 
 
 def test_nodes_downstream_with_limit(patched_run):
     calls = patched_run(envelope(data=[]))
-    server.nodes_downstream("KSampler", limit=3)
+    server.nodes(action="downstream", name="KSampler", limit=3)
     assert calls[0]["cmd"][4:] == ["nodes", "downstream", "KSampler", "--limit", "3"]
 
 
 def test_nodes_path_defaults(patched_run):
     calls = patched_run(envelope(data=[]))
-    server.nodes_path("MODEL", "IMAGE")
+    server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
     # concrete int defaults are always passed, so the argv is deterministic
     assert calls[0]["cmd"][4:] == [
         "nodes",
@@ -180,7 +198,9 @@ def test_nodes_path_defaults(patched_run):
 
 def test_nodes_path_overrides(patched_run):
     calls = patched_run(envelope(data=[]))
-    server.nodes_path("LATENT", "IMAGE", max_depth=3, max_paths=2)
+    server.nodes(
+        action="path", from_type="LATENT", to_type="IMAGE", max_depth=3, max_paths=2
+    )
     assert calls[0]["cmd"][4:] == [
         "nodes",
         "path",
@@ -195,14 +215,114 @@ def test_nodes_path_overrides(patched_run):
 
 def test_nodes_types_argv(patched_run):
     calls = patched_run(envelope(data=["MODEL", "IMAGE", "LATENT"]))
-    assert server.nodes_types() == ["MODEL", "IMAGE", "LATENT"]
+    assert server.nodes(action="types") == ["MODEL", "IMAGE", "LATENT"]
     assert calls[0]["cmd"][4:] == ["nodes", "types"]
 
 
 def test_nodes_categories_argv(patched_run):
     calls = patched_run(envelope(data={"loaders": {}}))
-    assert server.nodes_categories() == {"loaders": {}}
+    assert server.nodes(action="categories") == {"loaders": {}}
     assert calls[0]["cmd"][4:] == ["nodes", "categories"]
+
+
+# --- extraneous-parameter / missing-required policy (REJECT LOUDLY) --------
+
+
+def test_nodes_rejects_an_unknown_action(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="invalid nodes action"):
+        server.nodes(action="bogus")
+
+
+def test_nodes_bad_action_error_names_the_valid_ones(no_spawn):
+    with pytest.raises(
+        server.ComfyCliError,
+        match=r"'search'.*'get'.*'list'.*'upstream'.*'downstream'.*'path'.*'types'.*'categories'",
+    ):
+        server.nodes(action="bogus")
+
+
+def test_nodes_search_requires_query(no_spawn):
+    with pytest.raises(server.ComfyCliError, match=r"requires query"):
+        server.nodes(action="search")
+
+
+@pytest.mark.parametrize("action", ["get", "upstream", "downstream"])
+def test_nodes_requires_name(no_spawn, action):
+    with pytest.raises(server.ComfyCliError, match=r"requires name"):
+        server.nodes(action=action)
+
+
+def test_nodes_path_requires_from_type_and_to_type(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="requires from_type and to_type"):
+        server.nodes(action="path")
+
+
+def test_nodes_path_missing_to_type_names_only_to_type(no_spawn):
+    """Only the ACTUALLY missing param is named — `from_type` was given."""
+    with pytest.raises(
+        server.ComfyCliError, match=r"requires from_type and to_type"
+    ) as excinfo:
+        server.nodes(action="path", from_type="MODEL")
+    assert "to_type" in str(excinfo.value)
+    assert "was not given" in str(excinfo.value)
+
+
+def test_nodes_path_missing_from_type_names_only_from_type(no_spawn):
+    with pytest.raises(
+        server.ComfyCliError, match=r"requires from_type and to_type"
+    ) as excinfo:
+        server.nodes(action="path", to_type="IMAGE")
+    assert "from_type" in str(excinfo.value)
+    assert "was not given" in str(excinfo.value)
+
+
+def test_nodes_get_rejects_query(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="does not take query"):
+        server.nodes(action="get", name="KSampler", query="sampler")
+
+
+def test_nodes_search_rejects_name(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="does not take name"):
+        server.nodes(action="search", query="sampler", name="KSampler")
+
+
+@pytest.mark.parametrize("param", ["produces", "accepts", "category", "pack", "label"])
+def test_nodes_search_rejects_list_filters(no_spawn, param):
+    with pytest.raises(server.ComfyCliError, match=rf"does not take {param}"):
+        server.nodes(action="search", query="sampler", **{param: "x"})
+
+
+def test_nodes_search_rejects_limit(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="does not take limit"):
+        server.nodes(action="search", query="sampler", limit=5)
+
+
+@pytest.mark.parametrize("param", ["from_type", "to_type"])
+def test_nodes_search_rejects_path_types(no_spawn, param):
+    with pytest.raises(server.ComfyCliError, match=rf"does not take {param}"):
+        server.nodes(action="search", query="sampler", **{param: "MODEL"})
+
+
+@pytest.mark.parametrize("param", ["max_depth", "max_paths"])
+def test_nodes_search_rejects_depth_paths(no_spawn, param):
+    with pytest.raises(server.ComfyCliError, match=rf"does not take {param}"):
+        server.nodes(action="search", query="sampler", **{param: 3})
+
+
+def test_nodes_list_rejects_name(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="does not take name"):
+        server.nodes(action="list", name="KSampler")
+
+
+def test_nodes_types_rejects_every_param(no_spawn):
+    """`"types"`/`"categories"` take none of the union params — spot-check one each."""
+    with pytest.raises(server.ComfyCliError, match="does not take query"):
+        server.nodes(action="types", query="sampler")
+
+
+def test_nodes_categories_rejects_every_param(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="does not take name"):
+        server.nodes(action="categories", name="KSampler")
 
 
 def test_node_dependencies_bare_argv(patched_run):
@@ -251,7 +371,7 @@ def test_node_dependencies_both_are_additive(patched_run):
     ids=["pack-long", "pack-short", "registry_id"],
 )
 def test_node_dependencies_rejects_leading_dash(patched_run, kwargs):
-    """Both values are refused before the spawn, `get_node`/`list_nodes`-style."""
+    """Both values are refused before the spawn, `nodes`-style."""
     calls = patched_run(envelope(data={"packs": []}))
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
         server.node_dependencies(**kwargs)
@@ -683,17 +803,17 @@ def test_discovery_surfaces_error_envelope(patched_run):
         )
     )
     with pytest.raises(server.ComfyCliError, match="server_not_running"):
-        server.search_nodes("sampler")
+        server.nodes(action="search", query="sampler")
 
 
-def test_node_tools_reject_option_like_positionals(monkeypatch):
-    """Every bare positional on the `nodes` verbs refuses a leading-dash value.
+def test_nodes_reject_option_like_positionals(monkeypatch):
+    """Every bare positional on the `nodes` actions refuses a leading-dash value.
 
-    `search_nodes`/`get_node`/`nodes_upstream`/`nodes_downstream`/`nodes_path`
-    all splat their caller string in as a positional, so comfy-cli reads a
-    dash-leading value as an option — sharpest on `upstream`/`downstream`
-    (beside their own `--limit`) and on `path`, where consuming the first type
-    as a flag shifts the second into its slot.
+    "search"/"get"/"upstream"/"downstream"/"path" all splat their caller
+    string in as a positional, so comfy-cli reads a dash-leading value as an
+    option — sharpest on `upstream`/`downstream` (beside their own `--limit`)
+    and on `path`, where consuming the first type as a flag shifts the second
+    into its slot.
     """
 
     def boom(*a, **k):
@@ -702,12 +822,12 @@ def test_node_tools_reject_option_like_positionals(monkeypatch):
     monkeypatch.setattr(server, "_run_comfy", boom)
 
     for call in (
-        lambda: server.search_nodes("--help"),
-        lambda: server.get_node("--help"),
-        lambda: server.nodes_upstream("--help"),
-        lambda: server.nodes_downstream("--help"),
-        lambda: server.nodes_path("--help", "IMAGE"),
-        lambda: server.nodes_path("MODEL", "--help"),
+        lambda: server.nodes(action="search", query="--help"),
+        lambda: server.nodes(action="get", name="--help"),
+        lambda: server.nodes(action="upstream", name="--help"),
+        lambda: server.nodes(action="downstream", name="--help"),
+        lambda: server.nodes(action="path", from_type="--help", to_type="IMAGE"),
+        lambda: server.nodes(action="path", from_type="MODEL", to_type="--help"),
     ):
         with pytest.raises(server.ComfyCliError, match="leading '-'"):
             call()
@@ -721,7 +841,9 @@ def test_nodes_path_still_passes_negative_bounds_through(patched_run):
     wrapper's to refuse for looking dash-leading.
     """
     calls = patched_run(envelope(data=[]))
-    server.nodes_path("MODEL", "IMAGE", max_depth=-1, max_paths=-2)
+    server.nodes(
+        action="path", from_type="MODEL", to_type="IMAGE", max_depth=-1, max_paths=-2
+    )
     assert calls[0]["cmd"][4:] == [
         "nodes",
         "path",
@@ -734,7 +856,7 @@ def test_nodes_path_still_passes_negative_bounds_through(patched_run):
     ]
 
 
-def test_node_tools_reject_embedded_nul(monkeypatch):
+def test_nodes_reject_embedded_nul(monkeypatch):
     """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError.
 
     Orthogonal to the leading-dash guard: `subprocess` cannot carry a NUL in
@@ -747,15 +869,30 @@ def test_node_tools_reject_embedded_nul(monkeypatch):
     monkeypatch.setattr(server, "_run_comfy", boom)
 
     for call in (
-        lambda: server.search_nodes("samp\0ler"),
-        lambda: server.get_node("KSamp\0ler"),
-        lambda: server.nodes_upstream("KSamp\0ler"),
-        lambda: server.nodes_downstream("KSamp\0ler"),
-        lambda: server.nodes_path("MOD\0EL", "IMAGE"),
-        lambda: server.nodes_path("MODEL", "IMA\0GE"),
+        lambda: server.nodes(action="search", query="samp\0ler"),
+        lambda: server.nodes(action="get", name="KSamp\0ler"),
+        lambda: server.nodes(action="upstream", name="KSamp\0ler"),
+        lambda: server.nodes(action="downstream", name="KSamp\0ler"),
+        lambda: server.nodes(action="path", from_type="MOD\0EL", to_type="IMAGE"),
+        lambda: server.nodes(action="path", from_type="MODEL", to_type="IMA\0GE"),
     ):
         with pytest.raises(server.ComfyCliError, match="embedded NUL"):
             call()
+
+
+# --- tool docstring budget (<=300 est. tokens) ------------------------------
+
+
+def test_nodes_tool_docstring_within_its_own_token_budget():
+    tree = ast.parse(_SERVER_SRC.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "nodes":
+            doc = ast.get_docstring(node)
+            assert doc is not None
+            est_tokens = len(doc) // 4
+            assert est_tokens <= 300, f"nodes() docstring ~{est_tokens} est. tokens"
+            return
+    pytest.fail("nodes() tool not found in server.py")
 
 
 # ---------------------------------------------------------------------------
@@ -885,9 +1022,8 @@ def test_workflow_deps_degrades_without_comfyui_manager(patched_async_run):
     assert "ComfyUI-Manager" in result["error"]
     # The degrade must route on, not dead-end — and it must route somewhere that
     # actually WORKS. `comfy nodes search/show` reads the running ComfyUI, so
-    # `search_nodes`/`get_node` are unaffected by a missing Manager…
-    assert "search_nodes" in result["error"]
-    assert "get_node" in result["error"]
+    # `nodes` is unaffected by a missing Manager…
+    assert "`nodes`" in result["error"]
     # …while `comfy node install` goes through the very same `execute_cm_cli`
     # that aborted here, so `install_node` is NOT an alternative. Naming it as
     # one would send the agent into a second guaranteed failure.

@@ -14,9 +14,9 @@ that above a background record, and ``127.0.0.1:8188`` last. There is
 deliberately no HTTP client and no code shared with the Comfy Cloud MCP —
 comfy-cli is the engine.
 
-Tools so far: the run -> get-output core loop plus job management
-(``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
-``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` /
+Tools so far: the run -> get-output core loop plus job management via the
+grouped ``job(action=...)`` tool (``"status"`` / ``"wait"`` / ``"watch"`` /
+``"error"`` / ``"cancel"`` / ``"queue"``), the ``launch_comfyui`` / ``stop_comfyui`` /
 ``restart_comfyui`` lifecycle trio (``comfy launch --background`` /
 ``comfy stop`` / stop-then-launch — the two that forward ``extra_args`` ask the
 user to confirm any flag that would publish the unauthenticated local ComfyUI to
@@ -81,6 +81,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
+import anyio.to_thread
 from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
@@ -115,21 +116,22 @@ ENVELOPE_SCHEMA_MAJOR = 1
 MIN_COMFY_CLI_VERSION = os.environ.get("COMFY_CLI_MIN_VERSION") or None
 
 # Hard ceiling for a single bounded wait on an already-submitted job — the
-# streaming `watch_job` and the polling `wait_for_job` share it — so
-# `float('inf')` / an absurd value can't hold a `comfy jobs watch` child open,
-# or keep re-spawning `comfy jobs status`, effectively forever (1 hour).
+# streaming `job(action="watch")` and the polling `job(action="wait")` share
+# it — so `float('inf')` / an absurd value can't hold a `comfy jobs watch`
+# child open, or keep re-spawning `comfy jobs status`, effectively forever
+# (1 hour).
 _MAX_WATCH_TIMEOUT = 3600.0
 
 # Hard ceiling for one waited `run_workflow`, so a `float('inf')` / absurd value
 # can't hold the `comfy run --wait` child open effectively forever. Matches the
-# other per-tool ceilings (partner_generate, run_template, watch_job) at an
-# hour; the docstring already steers genuinely long runs to `wait=False`.
+# other per-tool ceilings (partner_generate, run_template, `job(action="watch")`)
+# at an hour; the docstring already steers genuinely long runs to `wait=False`.
 _MAX_RUN_WORKFLOW_TIMEOUT = 3600.0
 
 # Hard ceiling for one bounded wait on an already-submitted background model
-# download — `wait_for_download` and `download_model(wait=True)` share it, for
-# the same reason `_MAX_WATCH_TIMEOUT` exists on the jobs side: an `inf` bound
-# would keep re-spawning `comfy model download-status` forever.
+# download — `download(action="wait")` and `download_model(wait=True)` share
+# it, for the same reason `_MAX_WATCH_TIMEOUT` exists on the jobs side: an
+# `inf` bound would keep re-spawning `comfy model download-status` forever.
 _MAX_DOWNLOAD_WAIT_TIMEOUT = 3600.0
 
 # Budget for the `model download --background` SUBMIT. It is metadata-only — the
@@ -163,7 +165,7 @@ _DOWNLOAD_SYNC_TIMEOUT = 1800.0
 _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 
 # Sleep between polls in the shared bounded-poll loop (`_poll_until_terminal`) —
-# `wait_for_job`'s `jobs status` polls and `_poll_download`'s
+# `job(action="wait")`'s `jobs status` polls and `_poll_download`'s
 # `model download-status` polls run on the same cadence: a job's queue state and
 # a download's state file are each rewritten at most once a second, so polling
 # faster buys nothing. One named constant rather than two identical 2.0s that
@@ -171,7 +173,7 @@ _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 _POLL_INTERVAL = 2.0
 
 # Per-poll subprocess budget for the shared bounded-poll loop's calls
-# (`wait_for_job`'s `comfy jobs status`, `_poll_download`'s
+# (`job(action="wait")`'s `comfy jobs status`, `_poll_download`'s
 # `comfy model download-status`), and the smallest slice worth spawning one for.
 # Each poll is capped to whatever is left of the caller's own bound, so a wedged
 # status call can't hold a one-second wait open for the full budget; the floor
@@ -1177,7 +1179,14 @@ def _kill_proc_tree_async(proc: Any) -> None:
             pass
 
 
-async def _reap_async(proc: Any, timeout: float = 5.0) -> None:
+# ASYNC109 (below, and on the three functions after it) is a false positive:
+# these four `timeout` parameters predate this file importing `anyio.to_thread`
+# (for `job`'s off-load, see R2 in the job-tool consolidation) and are plain
+# `asyncio.wait_for` users, not anyio's. Ruff's flake8-async plugin detects the
+# framework per FILE, from its imports — so the `anyio` import alone flips
+# these four from "ignored, asyncio target < 3.11" to "flagged, use
+# anyio.fail_after", despite none of them using anyio at all.
+async def _reap_async(proc: Any, timeout: float = 5.0) -> None:  # noqa: ASYNC109
     """Reap a (killed) async-spawned child without blocking forever.
 
     The :func:`_reap` twin for :class:`asyncio.subprocess.Process`. Same reason
@@ -1714,7 +1723,7 @@ async def _drain_timed_out_async(
     proc: Any,
     stdout_sink: list[bytes],
     stderr_sink: list[bytes],
-    timeout: float = 2.0,
+    timeout: float = 2.0,  # noqa: ASYNC109 - see the note above _reap_async
 ) -> None:
     """Top up a killed async child's captured output with whatever is left in its pipes.
 
@@ -1765,7 +1774,7 @@ async def _drain_timed_out_async(
 
 async def _run_comfy_async(
     *args: str,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     plain_ok: bool = False,
     stdout_cap: int | None = None,
 ) -> Any:
@@ -1922,7 +1931,7 @@ async def _run_comfy_async(
 async def _run_comfy_streaming(
     *args: str,
     ctx: Context | None = None,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     raise_on_timeout: bool = True,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
@@ -1938,7 +1947,7 @@ async def _run_comfy_streaming(
     :class:`ComfyCliError` (the run-workflow contract); pass
     ``raise_on_timeout=False`` for a bounded *tail* that should instead return a
     ``{"timed_out": True, "status": <progress snapshot>}`` payload (mirroring
-    :func:`wait_for_job`) rather than surface the deadline as an error.
+    ``job(action="wait")``) rather than surface the deadline as an error.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -1947,7 +1956,7 @@ async def _run_comfy_streaming(
     await asyncio.to_thread(_check_comfy_version)
     # Forward --host/--port into the subcommand for a configured remote ComfyUI
     # (no-op for the local default; see target._with_target). run_workflow(wait=True)
-    # -> `run` and watch_job -> `jobs watch` are both target-aware verbs.
+    # -> `run` and job(action="watch") -> `jobs watch` are both target-aware verbs.
     args = target._with_target(args)
     # --json-stream is a global flag and, like --json/--where, MUST precede the
     # subcommand; a trailing form errors with "No such option".
@@ -2111,8 +2120,9 @@ async def _run_comfy_streaming(
             message = (
                 f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
                 f"Progress so far: {tracker.snapshot()}. The run may still be "
-                "going — check `job_status`, or for long generations submit "
-                "with `wait=False` and poll `wait_for_job` / `watch_job`. "
+                'going — check `job(action="status")`, or for long generations '
+                'submit with `wait=False` and poll `job(action="wait")` / '
+                '`job(action="watch")`. '
                 # Scrubbed, not raw: comfy-cli echoes the URL it is fetching to
                 # stderr, and this sentence goes straight to the MCP client. See
                 # `_timeout_failure`, whose two fragments this mirrors.
@@ -2891,10 +2901,10 @@ async def run_workflow(
         wait: if True (default), block until the run finishes, streaming
             progress as MCP notifications, and return the full result. If
             False, submit and return with a ``prompt_id`` to poll via
-            ``job_status``.
+            ``job(action="status")``.
         timeout_seconds: used only when ``wait=True``; default 110s sits under
             a typical client's ~120s budget. For a longer run, prefer
-            ``wait=False`` + ``wait_for_job``/``watch_job``.
+            ``wait=False`` + ``job(action="wait")``/``job(action="watch")``.
         confirm_spend: SOME workflows (partner-API nodes from
             ``emit_partner_workflow``, or an ``API``-tagged template) spend
             credits when run. Set True ONLY when the user has actually agreed
@@ -3072,7 +3082,7 @@ async def generate_image(
         checkpoint: swaps the checkpoint model; must already be installed on
             the machine that RUNS the job. Omit for the template's default.
         wait: True (default) blocks/streams progress; False submits and
-            returns a ``prompt_id`` to poll via ``job_status``.
+            returns a ``prompt_id`` to poll via ``job(action="status")``.
         timeout_seconds: used only when ``wait=True``; ignored (fixed short
             submit timeout) when ``wait=False``.
 
@@ -3663,7 +3673,7 @@ def list_partner_models(
     """List the hosted PARTNER models ``partner_generate`` can run.
 
     Wraps ``comfy generate list`` — the ONLY source of the partner alias
-    catalog (``search_nodes``/``search_templates`` read the local install).
+    catalog (``nodes``/``search_templates`` read the local install).
 
     Args:
         style/partner/query: filters forwarded to comfy-cli, exact/substring;
@@ -3812,7 +3822,7 @@ async def partner_generate(
     Args:
         params: the model's own inputs (``prompt``, ``aspect_ratio``, ``seed``,
             …), forwarded verbatim. Discover them with ``list_partner_models()``
-            and ``partner_model_schema(model)`` — not ``search_nodes`` /
+            and ``partner_model_schema(model)`` — not ``nodes`` /
             ``search_templates``, which answer a local-install question.
         confirm_spend: this call ALWAYS spends credits. Set True ONLY when the
             user has actually agreed to spend on this call — never merely to
@@ -4421,25 +4431,11 @@ async def run_template(
     return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
 
 
-@mcp.tool()
-def job_status(prompt_id: str) -> Any:
-    """Check a submitted job's status (queued / running / completed / error).
-
-    Wraps ``comfy jobs status <prompt_id>``. Returns status and, when finished,
-    output references. Poll after ``run_workflow(wait=False)``.
-
-    A server crash mid-run (e.g. an OOM kill) still makes this call SUCCEED;
-    see ``get_execution_error`` for the ``server_died`` verdict and the
-    recovery steps (check ``get_logs``, relaunch, shrink allocations).
-    """
-    prompt_id = argv._guard_prompt_id(prompt_id)
-    return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
-
-
-# How many trailing traceback frames survive into a get_execution_error verdict.
-# A full ComfyUI traceback can run hundreds of frames; the tail carries the
-# actual failure site. Mirrors comfy-cli's execution_errors._TRACEBACK_TAIL_FRAMES
-# (a smaller tail there — this tool is the deliberate deep-dive companion).
+# How many trailing traceback frames survive into a `job(action="error")`
+# verdict. A full ComfyUI traceback can run hundreds of frames; the tail
+# carries the actual failure site. Mirrors comfy-cli's
+# execution_errors._TRACEBACK_TAIL_FRAMES (a smaller tail there — this tool is
+# the deliberate deep-dive companion).
 _TRACEBACK_TAIL_FRAMES = 20
 
 # Character cap on the joined traceback tail, so a pathological (megabyte)
@@ -4503,11 +4499,12 @@ def _cap_text(value: Any, limit: int = _EXCEPTION_TEXT_MAX_CHARS) -> Any:
     return value
 
 
-@mcp.tool()
-def get_execution_error(prompt_id: str) -> Any:
-    """Diagnostics companion to ``job_status``: normalized failure verdict for a run.
+def _execution_error_verdict(prompt_id: str, status: Any) -> Any:
+    """Normalize a ``jobs status`` payload into a flat failure verdict.
 
-    Wraps ``comfy jobs status <prompt_id>`` and flattens ComfyUI's raw
+    The body ``job(action="error")`` runs after fetching ``status`` itself
+    (extracted verbatim from the tool this replaced, ``get_execution_error``,
+    so the shape below is unchanged). Flattens ComfyUI's raw
     ``execution_error``. On a healthy prompt (no error) returns
     ``{"prompt_id", "status", "error": None}`` — safe to call speculatively.
 
@@ -4524,10 +4521,6 @@ def get_execution_error(prompt_id: str) -> Any:
     - Either way the live server lost the run's history — check ``get_logs``
       (survives the crash) before relaunching and shrinking allocations.
     """
-    prompt_id = argv._guard_prompt_id(prompt_id)
-
-    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
-
     error = status.get("error") if isinstance(status, dict) else None
     reported = status.get("status") if isinstance(status, dict) else None
     if not error:
@@ -4634,8 +4627,9 @@ def _poll_until_terminal(
 ) -> Any:
     """Poll ``comfy <args>`` until ``is_terminal`` or ``timeout_seconds`` expires.
 
-    The one bounded-poll loop behind :func:`wait_for_job` (``jobs status``) and
-    :func:`_poll_download` (``model download-status``). Those two ran
+    The one bounded-poll loop behind ``job(action="wait")`` (``jobs status``,
+    via :func:`_job_wait_sync`) and :func:`_poll_download` (``model
+    download-status``). Those two ran
     statement-for-statement identical loops and differ only in argv, in the
     terminal predicate, and in the extra keys their timed-out payload carries —
     so the timing rules below hold identically for both, and cannot drift apart.
@@ -4724,26 +4718,32 @@ def _poll_until_terminal(
         time.sleep(min(_POLL_INTERVAL, remaining))
 
 
-@mcp.tool()
-def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
-    """Wait (bounded) for a submitted job to reach a terminal status.
+def _job_status_sync(prompt_id: str) -> Any:
+    """``job(action="status")``'s body — the exact ``job_status`` this replaced."""
+    prompt_id = argv._guard_prompt_id(prompt_id)
+    return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
-    Polls ``comfy jobs status <prompt_id>`` until it finishes (completed /
-    error / cancelled) or ``timeout_seconds`` elapses (clamped to a sane max,
-    same ceiling as ``watch_job``; non-positive/NaN is rejected). Use after
-    ``run_workflow(wait=False)``.
 
-    Returns the final status payload, or ``{"timed_out": True, "status": <last
-    payload>}`` on expiry — a TIMEOUT, not a failure. The wait is bounded by
-    design: chain several short calls (checking ``job_status`` in between)
-    rather than one long block.
+def _job_error_sync(prompt_id: str) -> Any:
+    """``job(action="error")``'s body — fetch, then :func:`_execution_error_verdict`."""
+    prompt_id = argv._guard_prompt_id(prompt_id)
+    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
+    return _execution_error_verdict(prompt_id, status)
+
+
+def _job_wait_sync(prompt_id: str, timeout_seconds: float) -> Any:
+    """``job(action="wait")``'s body — the exact ``wait_for_job`` this replaced.
+
+    ``timeout_seconds`` arrives already defaulted (25.0 when the caller passed
+    none) but NOT yet bounded — the guard order below (prompt_id, then the
+    bound) matches every other branch's, and matches what ``wait_for_job`` did.
+    "Bounded by design" only holds if the bound itself is bounded. Left raw,
+    `inf` keeps `remaining` positive forever and NaN makes every comparison
+    False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
+    yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
+    `comfy jobs status` until the client gives up. See `argv._bounded_timeout`.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
-    # "Bounded by design" only holds if the bound itself is bounded. Left raw,
-    # `inf` keeps `remaining` positive forever and NaN makes every comparison
-    # False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
-    # yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
-    # `comfy jobs status` until the client gives up. See `argv._bounded_timeout`.
     timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
     return _poll_until_terminal(
         "jobs",
@@ -4754,45 +4754,8 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     )
 
 
-@mcp.tool()
-async def watch_job(
-    prompt_id: str,
-    timeout_seconds: float = 600.0,
-    ctx: Context | None = None,
-) -> Any:
-    """Tail a submitted job's live execution, streaming progress.
-
-    Wraps ``comfy jobs watch <prompt_id>``, forwarding per-node/sampler events
-    as MCP progress notifications and returning the final result on
-    completion. Streaming counterpart to the polled ``wait_for_job`` — use for
-    a job already submitted via ``run_workflow(wait=False)``.
-
-    Bounded by ``timeout_seconds`` (clamped to a sane max) so it never blocks
-    forever; on expiry it's a TIMEOUT, not a failure — same
-    ``{"timed_out": True, "status": ...}`` shape as ``wait_for_job``, except
-    ``status`` here is a live snapshot (``{progress, total, nodes_done}``), not
-    a raw ``jobs status`` dict.
-    """
-    prompt_id = argv._guard_prompt_id(prompt_id)
-    timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
-    return await _run_comfy_streaming(
-        "jobs",
-        "watch",
-        prompt_id,
-        ctx=ctx,
-        timeout=timeout_seconds,
-        raise_on_timeout=False,
-    )
-
-
-@mcp.tool()
-def cancel_job(prompt_id: str) -> Any:
-    """Cancel a queued or running job.
-
-    Wraps ``comfy jobs cancel <prompt_id>``. Use this to stop a job you
-    submitted via ``run_workflow(wait=False)`` before it finishes; cancelling an
-    unknown or already-finished ``prompt_id`` surfaces comfy-cli's error envelope.
-    """
+def _job_cancel_sync(prompt_id: str) -> Any:
+    """``job(action="cancel")``'s body — the exact ``cancel_job`` this replaced."""
     prompt_id = argv._guard_prompt_id(prompt_id)
     return _run_comfy("jobs", "cancel", prompt_id, timeout=60.0)
 
@@ -4830,20 +4793,127 @@ def _drop_cloud_jobs(data: Any) -> Any:
     return {**data, "jobs": kept, "count": len(kept)}
 
 
-@mcp.tool()
-def get_queue() -> Any:
-    """List known jobs with their status (pending / running / completed).
-
-    Wraps ``comfy jobs ls``, merging on-disk job state with the running
-    server's queue — find a ``prompt_id`` to inspect with ``job_status`` or
-    stop with ``cancel_job``.
-
-    NO CLOUD JOBS: rows comfy-cli tracks from a CLOUD run are dropped (only
-    rows POSITIVELY marked ``"cloud"``; other payload shapes pass through
-    untouched) — this server only drives a ComfyUI the user runs themselves,
-    and those ids would not resolve here anyway.
-    """
+def _job_queue_sync() -> Any:
+    """``job(action="queue")``'s body — the exact ``get_queue`` this replaced."""
     return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
+
+
+# The six actions `job` dispatches, in the order their old standalone tools
+# used to appear (status, error, wait, watch, cancel, queue). An unknown value
+# is rejected before anything else runs — mirrors `project`'s bad-action shape.
+_JOB_ACTIONS = ("status", "error", "wait", "watch", "cancel", "queue")
+
+# Which actions consume each of `job`'s union params. Every action but
+# "queue" takes `prompt_id`; only "wait"/"watch" take `timeout_seconds`. This
+# is the REJECT LOUDLY policy's table: a param supplied for an action that
+# does not consume it is refused rather than silently ignored, the same way
+# an unrecognized `action` is refused rather than falling back to "status" —
+# `job(action="queue", prompt_id="p1")` looking like it filtered the queue
+# by id (it would not have) is exactly the silent-drop failure mode this
+# guards against. Tuples, not frozensets: membership testing is the same
+# either way, but these are also formatted straight into the error messages
+# below, and a set's iteration order is hash-dependent (so unstable ACROSS
+# RUNS, not just unordered) — a tuple keeps that message deterministic.
+_JOB_ACTIONS_TAKING_PROMPT_ID = ("status", "error", "wait", "watch", "cancel")
+_JOB_ACTIONS_TAKING_TIMEOUT = ("wait", "watch")
+
+
+@mcp.tool()
+async def job(
+    action: str = "status",
+    prompt_id: str = "",
+    timeout_seconds: float | None = None,
+    ctx: Context | None = None,
+) -> Any:
+    """Inspect, wait on, watch, or cancel a submitted job — one action per call.
+
+    Wraps the `comfy jobs` family. `action`:
+    - "status" (default) -> `comfy jobs status <prompt_id>`: status + outputs.
+    - "error" -> same call, normalized: `error_code` (comfy-cli's own code, e.g.
+      "server_died" for a crash mid-run, such as an OOM kill — check `get_logs`
+      before relaunching; `None` on an ordinary node failure),
+      `exception_type`/`exception_message`, `node_id`/`node_type`, a capped
+      `traceback_tail`. `error: None` when healthy — safe to call speculatively.
+    - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns the
+      final payload, or `{"timed_out": True, "status": <last>}` on expiry — a
+      TIMEOUT, not a failure.
+    - "watch" -> stream live progress via MCP notifications (default 600.0s,
+      same ceiling); same `timed_out` (timeout, not failure) shape, but `status` is a live
+      `{progress, total, nodes_done}` snapshot, not a raw status dict.
+    - "cancel" -> stop a queued/running job.
+    - "queue" -> list known jobs (Comfy Cloud-tracked rows filtered out).
+
+    `prompt_id` is required for every action but "queue"; `timeout_seconds` only
+    for "wait"/"watch" — either where unused is rejected.
+    """
+    if action not in _JOB_ACTIONS:
+        raise ComfyCliError(
+            f"invalid job action: {action!r} — expected one of "
+            f"{', '.join(repr(name) for name in _JOB_ACTIONS)}."
+        )
+
+    wants_prompt_id = action in _JOB_ACTIONS_TAKING_PROMPT_ID
+    wants_timeout = action in _JOB_ACTIONS_TAKING_TIMEOUT
+
+    # Missing a REQUIRED param is named by action AND param — deliberately not
+    # left to fall through to `argv._guard_prompt_id("")`, whose generic
+    # "empty or leading '-'" message would not say which action needed it.
+    if wants_prompt_id and not prompt_id:
+        raise ComfyCliError(
+            f"job(action={action!r}) requires prompt_id, but none was given."
+        )
+    # Supplied-but-ignored params are REJECT LOUDLY, not silently dropped —
+    # see `_JOB_ACTIONS_TAKING_PROMPT_ID` above for why.
+    if not wants_prompt_id and prompt_id:
+        raise ComfyCliError(
+            f"job(action={action!r}) does not take prompt_id — prompt_id is "
+            "used by action in "
+            f"{', '.join(repr(name) for name in _JOB_ACTIONS_TAKING_PROMPT_ID)}."
+        )
+    if not wants_timeout and timeout_seconds is not None:
+        raise ComfyCliError(
+            f"job(action={action!r}) does not take timeout_seconds — "
+            "timeout_seconds is used by action in "
+            f"{', '.join(repr(name) for name in _JOB_ACTIONS_TAKING_TIMEOUT)}."
+        )
+
+    if action == "watch":
+        # The one branch that stays on the event loop: `_run_comfy_streaming`
+        # is genuinely async (asyncio subprocess + stream reads, see the note
+        # above its definition) — never a blocking call, so it needs no
+        # off-load.
+        prompt_id = argv._guard_prompt_id(prompt_id)
+        bound = argv._bounded_timeout(
+            600.0 if timeout_seconds is None else timeout_seconds, _MAX_WATCH_TIMEOUT
+        )
+        return await _run_comfy_streaming(
+            "jobs",
+            "watch",
+            prompt_id,
+            ctx=ctx,
+            timeout=bound,
+            raise_on_timeout=False,
+        )
+
+    # Every other branch is a blocking `subprocess` call or a `time.sleep`
+    # poll loop (up to `_MAX_WATCH_TIMEOUT` = 3600s for "wait") — off-loaded to
+    # a worker thread via `anyio.to_thread.run_sync`, exactly what the SDK
+    # itself does to run a plain `def` tool (`func_metadata.py`), so `job`
+    # being `async def` (forced by the "watch" branch above) never wedges the
+    # event loop for the other five. R2 in the job-tool consolidation; mirrors
+    # `_in_generate_pool` / `_GENERATE_EXECUTOR`'s reasoning for
+    # `partner_generate`'s own blocking run.
+    if action == "status":
+        return await anyio.to_thread.run_sync(_job_status_sync, prompt_id)
+    if action == "error":
+        return await anyio.to_thread.run_sync(_job_error_sync, prompt_id)
+    if action == "cancel":
+        return await anyio.to_thread.run_sync(_job_cancel_sync, prompt_id)
+    if action == "queue":
+        return await anyio.to_thread.run_sync(_job_queue_sync)
+    # action == "wait"
+    bound = 25.0 if timeout_seconds is None else timeout_seconds
+    return await anyio.to_thread.run_sync(_job_wait_sync, prompt_id, bound)
 
 
 # `comfy system-stats` and `comfy free` landed in comfy-cli 1.14.0, which is also
@@ -4879,8 +4949,8 @@ def _resource_verb_upgrade_error(
     reads like a broken MCP rather than the one-command capability gap it is.
 
     Returning a *new* error (rather than degrading to an `unsupported: True`
-    payload the way `download_status` does) is deliberate: those tools have a
-    working alternative to point at, whereas here the missing verb IS the whole
+    payload the way `download(action="status")` does) is deliberate: that tool
+    has a working alternative to point at, whereas here the missing verb IS the whole
     call — there is no partial answer to hand back, so failing loudly with the
     fix in the message is the honest shape, and it matches how every other tool
     surfaces a `ComfyCliError`.
@@ -4951,7 +5021,7 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 
     NOT IMMEDIATE, never destructive: applied when the queue worker next
     iterates — does **not** interrupt a running job, so this cannot stop one
-    (``cancel_job`` does). Returns what was REQUESTED, not a measurement —
+    (``job(action="cancel")`` does). Returns what was REQUESTED, not a measurement —
     re-check ``system_stats``. NOT diverted by ``COMFYUI_URL``/``COMFYUI_HOST``
     — same ``comfy_target_note`` behavior as ``system_stats``.
     """
@@ -7192,7 +7262,7 @@ def _install_node_unavailable(reason: str | None) -> dict[str, Any]:
     Same shape and same environment description as ``workflow_deps``' — see
     :func:`_manager_state_clause`. What differs is only the ROUTING, because the
     two tools have different ways out: a class this install already has is still
-    described by ``get_node``, whereas a pack it does not have cannot be
+    described by ``nodes``, whereas a pack it does not have cannot be
     installed by any tool on this server.
 
     The route named for a legacy clone is ComfyUI-Manager's own UI, which is a
@@ -7315,7 +7385,7 @@ async def install_node(
     """Install custom node packs into the LOCAL ComfyUI — runs third-party code, asks first.
 
     Wraps ``comfy node install <name...> --exit-on-fail``. Feed it registry pack
-    ids (e.g. ``"comfyui-impact-pack"``) from ``search_nodes`` /
+    ids (e.g. ``"comfyui-impact-pack"``) from ``nodes`` /
     ``workflow_deps`` — never a node CLASS name (convert it with
     ``workflow_deps`` first); a git URL or an ``@version`` pin is refused
     before anything runs (run ``comfy node install`` in a terminal for those).
@@ -7429,7 +7499,7 @@ _MAX_LOG_TAIL = 10000
 # COUNT, but a single pathological line — a base64 blob or tensor dump from a
 # buggy or hostile custom node — could still be megabytes and flood an agent's
 # context. Cap each line individually, mirroring the `_cap_text` guard on
-# get_execution_error's free-text fields. This is a TOTAL cap: the truncation
+# job(action="error")'s free-text fields. This is a TOTAL cap: the truncation
 # marker is charged against it (see get_logs) so a capped line never exceeds it.
 _MAX_LOG_LINE_CHARS = 4000
 
@@ -7576,11 +7646,23 @@ def project(action: str = "status") -> Any:
     return _run_comfy("project", action, timeout=60.0)
 
 
-# The compact per-row projection returned by the listing. The full detail
-# (tags / models / providers / category_title) is what ``get_template(name)``
-# returns — keeping the listing slim is what stops the full 558-row catalog from
-# blowing the MCP client's tool-output cap.
-_TEMPLATE_LIST_FIELDS = ("name", "title", "description", "output_type")
+# The compact per-row projection returned by the listing. The heavy fields
+# (models / providers) still live in ``get_template(name)`` only — keeping
+# the listing slim is what stops the full 558-row catalog from blowing the
+# MCP client's tool-output cap. ``tags`` and ``category_title`` ride along
+# anyway: a few short strings each, and the ONLY fields that tell a paid
+# hosted ``API`` template from its free open-source sibling, which the
+# gallery titles IDENTICALLY (e.g. two "MiniMax H3: Text to Video" rows) —
+# without them a listing steers agents to the paid route while implying no
+# free one exists.
+_TEMPLATE_LIST_FIELDS = (
+    "name",
+    "title",
+    "description",
+    "output_type",
+    "tags",
+    "category_title",
+)
 
 # Upper bound on a single page so an oversized `limit` can't build a response
 # that trips the MCP client's tool-output cap; callers page the rest via `offset`.
@@ -7619,26 +7701,26 @@ def search_templates(
 ) -> Any:
     """Search the built-in ComfyUI workflow-template gallery.
 
-    Wraps ``comfy templates ls`` (~558 rows, so this narrows/pages it).
-    Returns ``{"total", "shown", "offset", "rows"}`` — rows projected to
-    ``name/title/description/output_type``; ``get_template(name)`` is the
-    full-detail path.
+    Wraps ``comfy templates ls`` (~558 rows, narrows/pages it). Returns
+    ``{"total", "shown", "offset", "rows"}`` — rows projected to
+    ``name/title/description/output_type/tags/category_title``. ``API`` in
+    ``tags`` means paid hosted; an identically-titled row without it is the
+    free local sibling — ``tags``/``category_title``, not the title, tell
+    them apart.
 
     Args:
-        query: free-text substring match (client-side) over
-            name/title/description/tags/models.
-        tag/type/model/provider: forwarded gallery filters (``tag``/``type``
-            exact-match, ``model``/``provider`` substring).
-        exclude_api: drop rows tagged ``API`` — approximates "runnable
-            locally".
-        limit/offset: page the filtered rows (``limit`` capped at 200).
+        query: free-text match over name/title/description/tags/models.
+        tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
+            ``model``/``provider`` substring).
+        exclude_api: drop ``API``-tagged rows.
+        limit/offset: page results (``limit`` capped at 200).
 
-    Step 1 of the on-ramp: pick a ``name``, inspect with ``get_template``,
-    then ``fetch_template``. Step 4 — validating against this install before
-    ``run_workflow`` — is MANDATORY via ``local_check``.
+    Step 1: pick a ``name``, inspect with ``get_template``, then
+    ``fetch_template``. Step 4 — validating before ``run_workflow`` — is
+    MANDATORY via ``local_check``.
 
-    Freshness: CACHED, 24h TTL as of v1.14.0 (this server's floor); refresh
-    with ``comfy templates refresh``. NOT read from the local install.
+    Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
+    refresh``. NOT read from the local install.
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -8147,74 +8229,20 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     }
 
 
-@mcp.tool()
-def search_nodes(query: str) -> Any:
-    """Search node classes in the LOCAL ComfyUI's live ``object_info``.
-
-    Wraps ``comfy nodes search <query>``. Includes the user's INSTALLED
-    custom nodes, not a static catalog. Find a class name (e.g. "KSampler",
-    "load image") before authoring/repairing a graph; pass it to ``get_node``
-    for the full schema.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional: a leading-dash query is read as an option, not a search
-    # term (argument injection).
-    argv._reject_option_like(
-        "query", query, expected="a search term (e.g. 'KSampler' or 'load image')"
-    )
-    argv._reject_nul("query", query)
+def _nodes_search_sync(query: str) -> Any:
+    """``nodes(action="search")``'s body — the exact ``search_nodes`` this replaced."""
     return _run_comfy("nodes", "search", query, timeout=60.0)
 
 
-@mcp.tool()
-def get_node(name: str) -> Any:
-    """Return one node class's full input/output schema from the live local catalog.
-
-    Wraps ``comfy nodes show <ClassName>``. ``name`` is the class name (from
-    ``search_nodes``). Reflects the live install, so custom-node classes
-    resolve too.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional: a leading-dash name is read as an option rather than the
-    # node class to show (argument injection).
-    argv._reject_option_like(
-        "name", name, expected="a node class name (e.g. 'KSampler')"
-    )
-    argv._reject_nul("name", name)
+def _nodes_get_sync(name: str) -> Any:
+    """``nodes(action="get")``'s body — the exact ``get_node`` this replaced."""
     return _run_comfy("nodes", "show", name, timeout=60.0)
 
 
-@mcp.tool()
-def list_nodes(
-    produces: str = "",
-    accepts: str = "",
-    category: str = "",
-    pack: str = "",
-    label: str = "",
+def _nodes_list_sync(
+    produces: str, accepts: str, category: str, pack: str, label: str
 ) -> Any:
-    """List node classes from the live local ``object_info``, with optional filters.
-
-    Wraps ``comfy nodes ls``; empty args are omitted (bare call lists all).
-    Includes installed custom nodes — the broad "what nodes can do X?"
-    companion to ``search_nodes``' name search.
-
-    Args:
-        produces/accepts: filter by output/input connection ``TYPE`` (e.g.
-            ``IMAGE``, ``MODEL``).
-        category: glob on the category path (``loaders*``, ``sampling/*``).
-        pack: custom-node pack name, matched case-insensitively.
-        label: one of comfy-cli's curated behavioral labels
-            (``WritesToDisk``, ``NetworkAccess``, ``ReadsArbitraryFile``, …),
-            exact match, only on nodes comfy-cli annotates — not a name
-            search (use ``search_nodes``).
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
+    """``nodes(action="list")``'s body — the exact ``list_nodes`` this replaced."""
     args = ["nodes", "ls"]
     for flag, value in (
         ("--produces", produces),
@@ -8224,90 +8252,30 @@ def list_nodes(
         ("--label", label),
     ):
         if value:
-            # Same guarded loop as `search_templates`' filters, for the same two
-            # reasons: a dash-leading filter is input hygiene (Click reads an
-            # option's value verbatim, so this is a caller mistake worth naming
-            # rather than an injection vector — see `argv._reject_option_like`), and a
-            # NUL would otherwise escape as `subprocess`' bare ValueError instead
-            # of a `ComfyCliError`.
-            argv._reject_option_like(f"{flag} value", value)
-            argv._reject_nul(f"{flag} value", value)
             args += [flag, value]
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
-def nodes_upstream(name: str, limit: int | None = None) -> Any:
-    """List node classes whose outputs can feed ``name``'s inputs.
-
-    Wraps ``comfy nodes upstream <name> [--limit N]`` — "what can I wire INTO
-    this node?", computed against the live local ``object_info`` (custom
-    nodes included). ``limit`` caps the result count; omit for the full set.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional, and it sits beside this command's own `--limit`: a
-    # leading-dash name is read as an option (argument injection).
-    argv._reject_option_like(
-        "name", name, expected="a node class name (e.g. 'KSampler')"
-    )
-    argv._reject_nul("name", name)
+def _nodes_upstream_sync(name: str, limit: int | None) -> Any:
+    """``nodes(action="upstream")``'s body — the exact ``nodes_upstream`` this replaced."""
     args = ["nodes", "upstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
-def nodes_downstream(name: str, limit: int | None = None) -> Any:
-    """List node classes that accept ``name``'s output types.
-
-    Wraps ``comfy nodes downstream <name> [--limit N]`` — "what can I wire
-    this node INTO?", computed against the live local ``object_info`` (custom
-    nodes included). ``limit`` caps the result count; omit for the full set.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional, and it sits beside this command's own `--limit`: a
-    # leading-dash name is read as an option (argument injection).
-    argv._reject_option_like(
-        "name", name, expected="a node class name (e.g. 'KSampler')"
-    )
-    argv._reject_nul("name", name)
+def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
+    """``nodes(action="downstream")``'s body — the exact ``nodes_downstream`` this replaced."""
     args = ["nodes", "downstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
-def nodes_path(
-    from_type: str, to_type: str, max_depth: int = 6, max_paths: int = 10
+def _nodes_path_sync(
+    from_type: str, to_type: str, max_depth: int, max_paths: int
 ) -> Any:
-    """Find node chains that route a value from ``from_type`` to ``to_type``.
-
-    Wraps ``comfy nodes path <FROM> <TO> --max-depth N --max-paths N`` over
-    the live local ``object_info`` graph (e.g. ``MODEL`` -> ``IMAGE``).
-    ``max_depth`` bounds chain length, ``max_paths`` caps how many routes
-    come back.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Two bare positionals ahead of `--max-depth` / `--max-paths`: a leading-dash
-    # type is read as an option and shifts every later token up a slot, so the
-    # second type could land in the first's place (argument injection).
-    # `max_depth` / `max_paths` need no guard: they are typed ints (so they
-    # cannot carry an arbitrary caller string at all) and they ride behind
-    # `--max-depth` / `--max-paths` as option values, which Click takes
-    # verbatim — even the `"-1"` a negative bound would render as.
-    for label, value in (("from_type", from_type), ("to_type", to_type)):
-        argv._reject_option_like(
-            label, value, expected="a connection type (e.g. 'MODEL' or 'IMAGE')"
-        )
-        argv._reject_nul(label, value)
+    """``nodes(action="path")``'s body — the exact ``nodes_path`` this replaced."""
     return _run_comfy(
         "nodes",
         "path",
@@ -8321,32 +8289,228 @@ def nodes_path(
     )
 
 
-@mcp.tool()
-def nodes_types() -> Any:
-    """List every connection type in the live local graph, ranked by connectivity.
-
-    Wraps ``comfy nodes types`` — edge types (``MODEL``, ``IMAGE``,
-    ``LATENT``, …) across installed nodes, most-connective first: the
-    vocabulary you wire with. Includes custom-node types.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
+def _nodes_types_sync() -> Any:
+    """``nodes(action="types")``'s body — the exact ``nodes_types`` this replaced."""
     return _run_comfy("nodes", "types", timeout=60.0)
 
 
+def _nodes_categories_sync() -> Any:
+    """``nodes(action="categories")``'s body — the exact ``nodes_categories`` this replaced."""
+    return _run_comfy("nodes", "categories", timeout=60.0)
+
+
+# The eight actions `nodes` dispatches, in the order their old standalone tools
+# used to appear (search, get, list, upstream, downstream, path, types,
+# categories). An unknown value is rejected before anything else runs —
+# mirrors `job`/`download`'s bad-action shape.
+_NODES_ACTIONS = (
+    "search",
+    "get",
+    "list",
+    "upstream",
+    "downstream",
+    "path",
+    "types",
+    "categories",
+)
+
+# Which actions consume each of `nodes`' union params — the REJECT LOUDLY
+# policy's tables, same shape as `job`'s: a param supplied for an action that
+# does not consume it is refused rather than silently ignored.
+_NODES_ACTIONS_TAKING_QUERY = ("search",)
+_NODES_ACTIONS_TAKING_NAME = ("get", "upstream", "downstream")
+# The five `list_nodes` filters share one consumer, so one table covers all
+# five rather than five identical one-element tuples.
+_NODES_ACTIONS_TAKING_LIST_FILTERS = ("list",)
+_NODES_ACTIONS_TAKING_LIMIT = ("upstream", "downstream")
+# `from_type`/`to_type` are both REQUIRED by, and only consumed by, "path".
+_NODES_ACTIONS_TAKING_PATH_TYPES = ("path",)
+# `max_depth`/`max_paths` are optional (sentinel `None` resolves to comfy-cli's
+# own defaults, 6 and 10 — R4) and only "path" consumes either.
+_NODES_ACTIONS_TAKING_DEPTH_PATHS = ("path",)
+
+
 @mcp.tool()
-def nodes_categories() -> Any:
-    """Return the node category tree from the live local ``object_info``.
+def nodes(
+    action: str = "search",
+    query: str = "",
+    name: str = "",
+    produces: str = "",
+    accepts: str = "",
+    category: str = "",
+    pack: str = "",
+    label: str = "",
+    limit: int | None = None,
+    from_type: str = "",
+    to_type: str = "",
+    max_depth: int | None = None,
+    max_paths: int | None = None,
+) -> Any:
+    """Search, inspect, filter, or graph-walk node classes in the LOCAL live catalog.
 
-    Wraps ``comfy nodes categories`` — the menu-category hierarchy (loaders,
-    sampling, image, …) for browsing by area rather than by name. Includes
-    custom-node categories.
+    Wraps the `comfy nodes` family (`object_info`, incl. custom nodes).
+    `action`:
+    - "search" (default) -> `nodes search <query>`: find a class name by
+      keyword (e.g. "KSampler", "load image").
+    - "get" -> `nodes show <name>`: one class's full input/output schema.
+    - "list" -> `nodes ls [--produces/--accepts/--category/--pack/--label]`:
+      filtered browse; bare call lists all.
+    - "upstream"/"downstream" -> `nodes upstream|downstream <name>
+      [--limit N]`: what feeds INTO / is fed FROM `name`.
+    - "path" -> `nodes path <from_type> <to_type> --max-depth N
+      --max-paths N`: chains between two types; depth/paths default 6/10.
+    - "types" -> `nodes types`: connection types by connectivity.
+    - "categories" -> `nodes categories`: the category tree.
 
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
+    `query` only for "search"; `name` for "get"/"upstream"/"downstream";
+    the five list filters only for "list"; `limit` only for
+    "upstream"/"downstream"; `from_type`/`to_type`/`max_depth`/`max_paths`
+    only for "path" — elsewhere each is rejected.
+
+    Freshness: LIVE — read from `object_info` every call; an outdated
     install lists outdated nodes.
     """
-    return _run_comfy("nodes", "categories", timeout=60.0)
+    if action not in _NODES_ACTIONS:
+        raise ComfyCliError(
+            f"invalid nodes action: {action!r} — expected one of "
+            f"{', '.join(repr(candidate) for candidate in _NODES_ACTIONS)}."
+        )
+
+    wants_query = action in _NODES_ACTIONS_TAKING_QUERY
+    wants_name = action in _NODES_ACTIONS_TAKING_NAME
+    wants_list_filters = action in _NODES_ACTIONS_TAKING_LIST_FILTERS
+    wants_limit = action in _NODES_ACTIONS_TAKING_LIMIT
+    wants_path_types = action in _NODES_ACTIONS_TAKING_PATH_TYPES
+    wants_depth_paths = action in _NODES_ACTIONS_TAKING_DEPTH_PATHS
+
+    # Missing a REQUIRED param is named by action AND param — deliberately not
+    # left to fall through to a generic guard's own message, which would not
+    # say which action needed it. Mirrors `job`/`download`.
+    if wants_query and not query:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) requires query, but none was given."
+        )
+    if wants_name and not name:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) requires name, but none was given."
+        )
+    if wants_path_types:
+        missing = [
+            param
+            for param, value in (("from_type", from_type), ("to_type", to_type))
+            if not value
+        ]
+        if missing:
+            raise ComfyCliError(
+                f"nodes(action={action!r}) requires from_type and to_type, but "
+                f"{' and '.join(missing)} {'were' if len(missing) > 1 else 'was'} "
+                "not given."
+            )
+
+    # Supplied-but-ignored params are REJECT LOUDLY, not silently dropped —
+    # same policy as `job`/`download`.
+    if not wants_query and query:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take query — query is used by "
+            f"action in {', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_QUERY)}."
+        )
+    if not wants_name and name:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take name — name is used by "
+            f"action in {', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_NAME)}."
+        )
+    if not wants_list_filters:
+        for param, value in (
+            ("produces", produces),
+            ("accepts", accepts),
+            ("category", category),
+            ("pack", pack),
+            ("label", label),
+        ):
+            if value:
+                raise ComfyCliError(
+                    f"nodes(action={action!r}) does not take {param} — {param} "
+                    "is used by action in "
+                    f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_LIST_FILTERS)}."
+                )
+    if not wants_limit and limit is not None:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take limit — limit is used by "
+            f"action in {', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_LIMIT)}."
+        )
+    if not wants_path_types:
+        for param, value in (("from_type", from_type), ("to_type", to_type)):
+            if value:
+                raise ComfyCliError(
+                    f"nodes(action={action!r}) does not take {param} — {param} "
+                    "is used by action in "
+                    f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_PATH_TYPES)}."
+                )
+    if not wants_depth_paths:
+        for param, value in (("max_depth", max_depth), ("max_paths", max_paths)):
+            if value is not None:
+                raise ComfyCliError(
+                    f"nodes(action={action!r}) does not take {param} — {param} "
+                    "is used by action in "
+                    f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_DEPTH_PATHS)}."
+                )
+
+    # ALL params validated up front, before ANY dispatch — `download`'s shape
+    # (commit 2), not `job`'s: a rejection never costs a spawn even on the
+    # branch it would have reached. Per-param guards run in the SAME order the
+    # eight standalone tools ran them in.
+    if wants_query:
+        argv._reject_option_like(
+            "query", query, expected="a search term (e.g. 'KSampler' or 'load image')"
+        )
+        argv._reject_nul("query", query)
+    if wants_name:
+        argv._reject_option_like(
+            "name", name, expected="a node class name (e.g. 'KSampler')"
+        )
+        argv._reject_nul("name", name)
+    if wants_list_filters:
+        for flag, value in (
+            ("--produces", produces),
+            ("--accepts", accepts),
+            ("--category", category),
+            ("--pack", pack),
+            ("--label", label),
+        ):
+            if value:
+                argv._reject_option_like(f"{flag} value", value)
+                argv._reject_nul(f"{flag} value", value)
+    if wants_path_types:
+        for field, value in (("from_type", from_type), ("to_type", to_type)):
+            argv._reject_option_like(
+                field, value, expected="a connection type (e.g. 'MODEL' or 'IMAGE')"
+            )
+            argv._reject_nul(field, value)
+    # `max_depth` / `max_paths` need no guard: they are typed ints (so they
+    # cannot carry an arbitrary caller string at all) and they ride behind
+    # `--max-depth` / `--max-paths` as option values, which Click takes
+    # verbatim — even the `"-1"` a negative bound would render as.
+
+    if action == "search":
+        return _nodes_search_sync(query)
+    if action == "get":
+        return _nodes_get_sync(name)
+    if action == "list":
+        return _nodes_list_sync(produces, accepts, category, pack, label)
+    if action == "upstream":
+        return _nodes_upstream_sync(name, limit)
+    if action == "downstream":
+        return _nodes_downstream_sync(name, limit)
+    if action == "path":
+        return _nodes_path_sync(
+            from_type,
+            to_type,
+            6 if max_depth is None else max_depth,
+            10 if max_paths is None else max_paths,
+        )
+    if action == "types":
+        return _nodes_types_sync()
+    return _nodes_categories_sync()
 
 
 # Freshness: the installed-pack half is LIVE (re-read off disk and diffed
@@ -8357,8 +8521,8 @@ def nodes_categories() -> Any:
 def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """Report a custom node pack's Python dependency requirements vs the installed venv (read-only).
 
-    Wraps ``comfy node deps``. Separate from ``get_node``/``search_nodes``
-    (those read live ``object_info``; this reads the venv's ``pip list``) —
+    Wraps ``comfy node deps``. Separate from ``nodes``
+    (that reads live ``object_info``; this reads the venv's ``pip list``) —
     nothing is installed or changed.
 
     Args:
@@ -8374,7 +8538,7 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """
     args = ["node", "deps"]
     # `pack` is a bare positional and `registry_id` is `--registry`'s value, so
-    # the same guarded pattern `get_node` / `list_nodes` use applies to both: a
+    # the same guarded pattern `nodes` uses applies to both: a
     # dash-leading positional is read as an option (argument injection), a
     # dash-leading option value is a caller mistake worth naming, and a NUL would
     # otherwise escape as `subprocess`' bare ValueError instead of a
@@ -8733,8 +8897,8 @@ async def workflow_deps(workflow_path: str) -> Any:
                         "deps-in-workflow' resolves node classes to packs "
                         f"through Manager's map. {_MANAGER_VENV_REMEDY} Until "
                         "then a class this install already has is still "
-                        "described by `get_node`/`search_nodes`, which read the "
-                        "running ComfyUI directly and never touch Manager. "
+                        "described by `nodes`, which reads the "
+                        "running ComfyUI directly and never touches Manager. "
                         "`install_node` is NOT a way around this, though: "
                         "`comfy node install` goes through the same `cm-cli`, "
                         "so it fails on this install too — installing Manager "
@@ -8899,8 +9063,8 @@ def _legacy_download_partial(relative_path: str | None, filename: str | None) ->
 
     comfy-cli writes straight to the final path while transferring, so a
     foreground download killed at its bound leaves an incomplete file behind. The
-    caller cannot ask ``download_status`` about it (that path never mints an id),
-    which is why the timeout message has to name it.
+    caller cannot ask ``download(action="status")`` about it (that path never
+    mints an id), which is why the timeout message has to name it.
 
     How precisely it can be named depends on the arguments: with ``filename`` the
     exact path is known, without it comfy-cli derives the basename from the URL,
@@ -9049,8 +9213,8 @@ async def _legacy_foreground_download(
         # so the kill stopped a real transfer — unlike the `--background`
         # path, where a timeout leaves a detached worker still going. Say so,
         # and say where the incomplete file is: the caller cannot check
-        # `download_status` (no id exists) and a partial model on disk looks
-        # exactly like a complete one to `search_models`. APPEND to the
+        # `download(action="status")` (no id exists) and a partial model on
+        # disk looks exactly like a complete one to `search_models`. APPEND to the
         # original message so the stderr/stdout tails survive.
         #
         # Not deleted for them: the exact path is only fully known when
@@ -9162,18 +9326,20 @@ def _download_verb_unsupported(
 def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     """Poll ``comfy model download-status`` until terminal or ``timeout_seconds``.
 
-    The blocking half of ``wait_for_download`` and of ``download_model``'s wait
-    path, shared so the two can never disagree about what a bound expiring means.
-    Runs on ``_poll_until_terminal``, the same bounded-poll loop ``wait_for_job``
-    uses — see it for why each poll is capped to the time left on the caller's
-    bound, why the floor exists, and why a poll killed at that cap yields the
-    ``timed_out`` payload instead of an error.
+    The blocking half of ``download(action="wait")`` and of ``download_model``'s
+    wait path, shared so the two can never disagree about what a bound expiring
+    means.
+    Runs on ``_poll_until_terminal``, the same bounded-poll loop
+    ``job(action="wait")`` (:func:`_job_wait_sync`) uses — see it for why each
+    poll is capped to the time left on the caller's bound, why the floor
+    exists, and why a poll killed at that cap yields the ``timed_out`` payload
+    instead of an error.
 
     Returns the terminal status payload, or ``{"timed_out": True, "download_id":
     ..., "status": <last payload>}`` on expiry. A ``failed`` / ``cancelled``
     payload is returned like any other terminal one; only ``download_model``
-    turns that into a raise, matching ``wait_for_job``, which likewise hands back
-    a failed job's status rather than raising on it.
+    turns that into a raise, matching ``job(action="wait")``, which likewise
+    hands back a failed job's status rather than raising on it.
     """
     return _poll_until_terminal(
         "model",
@@ -9199,8 +9365,8 @@ async def download_model(
     [--filename <name>] --background`` (the singular ``model`` verb, not the
     ``models`` catalog ``search_models`` reads). Fetches a known URL, no hub
     search. The transfer is SUBMITTED, not held open: comfy-cli detaches a
-    worker and returns a ``download_id``, the handle for ``download_status`` /
-    ``wait_for_download`` / ``cancel_download``.
+    worker and returns a ``download_id``, the handle for
+    ``download(action="status"/"wait"/"cancel")``.
 
     Args:
         relative_path: workspace-relative; first segment must be ``models``
@@ -9218,7 +9384,7 @@ async def download_model(
 
     Gotchas:
         - comfy-cli writes straight to the FINAL path while transferring, so a
-          present file proves nothing. ``download_status`` reporting
+          present file proves nothing. ``download(action="status")`` reporting
           ``completed`` is the only proof the model is usable.
         - REFUSES when a remote ComfyUI is configured (``COMFYUI_URL``/
           ``COMFYUI_HOST``): this always writes LOCALLY, so a remote target
@@ -9365,19 +9531,20 @@ async def download_model(
         # to it — it was minted inside this call, so letting the exception through
         # untouched orphans a multi-GB download with no way to enumerate or stop
         # it. Re-raise carrying the id (and every structured attribute, so a
-        # caller branching on `code` / `timed_out` still can). `wait_for_download`
-        # needs no such wrapping: its caller passed the id in and still holds it.
+        # caller branching on `code` / `timed_out` still can). `download(action=
+        # "wait")` needs no such wrapping: its caller passed the id in and still
+        # holds it.
         #
-        # No `_download_verb_unsupported` degrade HERE, unlike the three standalone
-        # download tools: the submit above already parsed `--background`, so this
-        # CLI ships the whole verb group. A missing-verb read at this point would
-        # therefore be spurious — and claiming "nothing is broken" over a transfer
-        # that is genuinely running detached is the one thing that degrade must
-        # never do.
+        # No `_download_verb_unsupported` degrade HERE, unlike the grouped
+        # `download` tool: the submit above already parsed `--background`, so
+        # this CLI ships the whole verb group. A missing-verb read at this point
+        # would therefore be spurious — and claiming "nothing is broken" over a
+        # transfer that is genuinely running detached is the one thing that
+        # degrade must never do.
         raise ComfyCliError(
             f"{exc} (the background download is still running — check it with "
-            f"`download_status({download_id!r})` or stop it with "
-            f"`cancel_download({download_id!r})`)",
+            f"`download(action='status', download_id={download_id!r})` or stop "
+            f"it with `download(action='cancel', download_id={download_id!r})`)",
             code=exc.code,
             no_envelope=exc.no_envelope,
             returncode=exc.returncode,
@@ -9398,80 +9565,118 @@ async def download_model(
     return result
 
 
-@mcp.tool()
-def download_status(download_id: str) -> Any:
-    """Check a background model download's progress (starting / downloading / …).
-
-    Wraps ``comfy model download-status <download_id>``. Returns ``status``,
-    ``completed_bytes``/``total_bytes``/``percent``, ``elapsed_seconds``,
-    ``dest``, and ``error`` when failed. Poll after ``download_model(wait=False)``
-    or a ``timed_out`` result.
-
-    This is the SOURCE OF TRUTH for whether a model is usable: comfy-cli
-    writes the file straight to ``dest`` as it transfers, so the path
-    existing proves nothing until ``status`` reads ``completed`` (``failed``/
-    ``cancelled`` are the other terminals).
-
-    On a comfy-cli too old for the verb, returns ``{"error", "unsupported":
-    True}`` instead of raising.
-    """
-    download_id = argv._guard_download_id(download_id)
-    try:
-        return _run_comfy("model", "download-status", download_id, timeout=60.0)
-    except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-status", download_id)
-        if degraded is None:
-            raise
-        return degraded
+def _download_status_sync(download_id: str) -> Any:
+    """``download(action="status")``'s body — the exact ``download_status`` this replaced."""
+    return _run_comfy("model", "download-status", download_id, timeout=60.0)
 
 
-@mcp.tool()
-def wait_for_download(download_id: str, timeout_seconds: float = 25.0) -> Any:
-    """Wait (bounded) for a background model download to finish.
+def _download_wait_sync(download_id: str, timeout_seconds: float) -> Any:
+    """``download(action="wait")``'s body — the exact ``wait_for_download`` this replaced."""
+    return _poll_download(download_id, timeout_seconds)
 
-    Polls ``comfy model download-status <download_id>`` until a terminal
-    state (completed/failed/cancelled) or ``timeout_seconds`` elapses
-    (clamped to a sane max; non-positive/NaN rejected). Chain several short
-    calls (checking ``download_status`` in between) rather than one long
-    block — a multi-GB checkpoint outlasts any single MCP request.
 
-    Returns the final status, or ``{"timed_out": True, "download_id": ...,
-    "status": <last payload>}`` on expiry — this is PROGRESS, not an error:
-    keep polling, do NOT re-download. A terminal FAILURE is returned, not
-    raised — read ``status``/``error`` off the payload. ``download_status``
-    is the only proof a model is actually usable.
+def _download_cancel_sync(download_id: str) -> Any:
+    """``download(action="cancel")``'s body — the exact ``cancel_download`` this replaced."""
+    return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
 
-    On a comfy-cli too old for the verb, returns ``{"error", "unsupported":
-    True}`` instead of raising.
-    """
-    download_id = argv._guard_download_id(download_id)
-    timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_DOWNLOAD_WAIT_TIMEOUT)
-    try:
-        return _poll_download(download_id, timeout_seconds)
-    except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-status", download_id)
-        if degraded is None:
-            raise
-        return degraded
+
+# The three actions `download` dispatches, in the order their old standalone
+# tools used to appear (status, wait, cancel). An unknown value is rejected
+# before anything else runs — mirrors `job`'s bad-action shape.
+_DOWNLOAD_ACTIONS = ("status", "wait", "cancel")
+
+# Only "wait" takes `timeout_seconds`; `download_id` is required by every
+# action, so it has no analogous "which actions want it" table. REJECT
+# LOUDLY policy, same as `job`: `download(action="status", timeout_seconds=5)`
+# looking like it shortened the status call (it would not have) is exactly
+# the silent-drop failure mode this guards against.
+_DOWNLOAD_ACTIONS_TAKING_TIMEOUT = ("wait",)
+
+# The `_download_verb_unsupported` verb each action's underlying comfy-cli
+# call degrades against — R3: "status"/"wait" both poll `download-status`,
+# only "cancel" hits `download-cancel`. Pinned as a table (not inlined at
+# each `except`) so a fourth action cannot reach the dispatch below without
+# also declaring which verb its own degrade checks.
+_DOWNLOAD_ACTION_VERB = {
+    "status": "download-status",
+    "wait": "download-status",
+    "cancel": "download-cancel",
+}
 
 
 @mcp.tool()
-def cancel_download(download_id: str) -> Any:
-    """Cancel a running background model download and delete its partial file.
+def download(
+    action: str = "status",
+    download_id: str = "",
+    timeout_seconds: float | None = None,
+) -> Any:
+    """Track a transfer already started by download_model; does NOT start one.
 
-    Wraps ``comfy model download-cancel <download_id>``. Use to stop a
-    transfer from ``download_model`` — wrong URL, wrong quant, an oversized
-    file. Cancelling an unknown or already-finished id surfaces comfy-cli's
-    own answer (error envelope, or the unchanged terminal status).
+    Wraps `comfy model download-status`/`download-cancel`. `action`:
+    - "status" (default) -> status, completed_bytes/total_bytes/percent,
+      elapsed_seconds, dest, error. comfy-cli writes to `dest` while
+      transferring, so a present file proves nothing until status reads
+      "completed" -- the only proof a model is usable.
+    - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns
+      the final payload, or `{"timed_out": True, "download_id": ...,
+      "status": <last>}` on expiry -- a TIMEOUT, not a failure.
+    - "cancel" -> stop a running transfer and its partial file.
 
-    On a comfy-cli too old for the verb, returns ``{"error", "unsupported":
-    True}`` instead of raising.
+    `download_id` required for every action; `timeout_seconds` only for
+    "wait" -- rejected elsewhere. Too-old comfy-cli: `{"error",
+    "unsupported": True}` instead of raising.
     """
+    if action not in _DOWNLOAD_ACTIONS:
+        raise ComfyCliError(
+            f"invalid download action: {action!r} — expected one of "
+            f"{', '.join(repr(name) for name in _DOWNLOAD_ACTIONS)}."
+        )
+
+    wants_timeout = action in _DOWNLOAD_ACTIONS_TAKING_TIMEOUT
+
+    # Missing the REQUIRED param is named by action AND param — deliberately
+    # not left to fall through to `argv._guard_download_id("")`'s generic
+    # "expected a string"/empty message, which would not say which action
+    # needed it. Every action here takes `download_id`, unlike `job`'s
+    # `prompt_id` (which "queue" skips), so there is no per-action table to
+    # consult — just the one check.
+    if not download_id:
+        raise ComfyCliError(
+            f"download(action={action!r}) requires download_id, but none was given."
+        )
+    # Supplied-but-ignored `timeout_seconds` is REJECT LOUDLY, not silently
+    # dropped — see `_DOWNLOAD_ACTIONS_TAKING_TIMEOUT` above for why.
+    if not wants_timeout and timeout_seconds is not None:
+        raise ComfyCliError(
+            f"download(action={action!r}) does not take timeout_seconds — "
+            "timeout_seconds is used by action in "
+            f"{', '.join(repr(name) for name in _DOWNLOAD_ACTIONS_TAKING_TIMEOUT)}."
+        )
+
+    # ALL params validated up front, before ANY dispatch — the symmetric
+    # shape `job` did not quite have (its per-action `_job_*_sync` helpers
+    # each re-ran their own `argv._guard_prompt_id`). Validating here instead
+    # means a rejection never costs a spawn even on the one branch it would
+    # have reached, and the two guards below run in the SAME order the three
+    # standalone tools ran them in (`download_id` first, then the bound).
     download_id = argv._guard_download_id(download_id)
+    bound = 25.0
+    if wants_timeout:
+        bound = argv._bounded_timeout(
+            25.0 if timeout_seconds is None else timeout_seconds,
+            _MAX_DOWNLOAD_WAIT_TIMEOUT,
+        )
+
     try:
-        return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
+        if action == "status":
+            return _download_status_sync(download_id)
+        if action == "cancel":
+            return _download_cancel_sync(download_id)
+        return _download_wait_sync(download_id, bound)
     except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-cancel", download_id)
+        degraded = _download_verb_unsupported(
+            exc, _DOWNLOAD_ACTION_VERB[action], download_id
+        )
         if degraded is None:
             raise
         return degraded
@@ -9863,6 +10068,160 @@ def vary_workflow(
     return _run_comfy(*args, timeout=120.0)
 
 
+# How long the startup snapshot probe may hold up the handshake, WALL-CLOCK.
+# Enforced by `_apply_startup_instructions`' bounded thread join rather than by
+# the probe's own subprocess timeouts, because those do not compose into a
+# startup budget: in a fresh process `_run_comfy` first runs the once-per-process
+# `comfy --version` guard (its own 30s timeout) before the env call, so summing
+# inner timeouts budgets 45s+ against a wedged binary — measured, not
+# theoretical. The join is the one number that caps the client-visible stall;
+# the probe thread is a daemon and its late result is discarded. Shorter than
+# `server_info`'s 60s on purpose: this runs before the server answers its first
+# initialize, so a wedged comfy binary must cost bounded startup time and then
+# fall open to the static INSTRUCTIONS rather than stall the client.
+_SNAPSHOT_PROBE_TIMEOUT_S = 15.0
+
+_SNAPSHOT_HEADER = "Machine snapshot (`comfy env`, captured once at server start):"
+
+# Upper bound on the rendered `hardware` JSON that rides the handshake. A real
+# block is a few hundred bytes; this exists because the payload is another
+# program's output quoted into EVERY conversation's context, so a drifted or
+# hostile `comfy env` must not be able to bloat the instructions. Oversized
+# means the payload is not what this section was designed for — fall open
+# (drop the snapshot) rather than truncate JSON into something half-parseable.
+_SNAPSHOT_MAX_HARDWARE_CHARS = 4000
+
+
+def _machine_snapshot_block() -> str | None:
+    """The `Machine snapshot` section appended to the handshake, or ``None``.
+
+    The routing policy in ``instructions.INSTRUCTIONS`` keys on ``server_info``'s
+    ``hardware`` block, but that only helps an agent that remembers to CALL the
+    tool before its first generation — and in practice agents skip it and start
+    heavy local runs on machines the policy would have routed to
+    partner/cloud. So the handshake itself carries the data: probe ``comfy env``
+    once at startup and render its ``hardware`` block (plus the resolved remote
+    target, whose presence flips routing STEP 1) into the instructions every
+    client receives.
+
+    Thin-wrapper guardrail (AGENTS.md): nothing is DERIVED here. The block is
+    comfy-cli's own payload quoted verbatim — no VRAM branching, no verdict —
+    into the one surface this repo legitimately owns, the MCP handshake. The
+    probe is best-effort in every direction: any failure (missing binary,
+    timeout, envelope error, undecodable output — the same set
+    :func:`_freshness_report` tolerates) or a drifted payload shape returns
+    ``None``, and the static ``instructions.INSTRUCTIONS`` stand alone, still
+    telling the agent to call ``server_info`` first. ``hardware`` ABSENT from a
+    healthy payload (an older comfy-cli omits the key; an explicit ``null``
+    reads the same) is different from a failed probe and says so: that is
+    routing STEP 3's UNKNOWN, and stating it in the snapshot spares the agent a
+    ``server_info`` round trip that would report the same.
+
+    The dump is scrubbed with :func:`failure_log._scrub_text` before it rides
+    the handshake — hardware fields should never carry a credential URL, but
+    the payload is another program's output and this section is quoted into
+    every conversation, the same standing as the validate relay's masking. The
+    target host gets :func:`target._redact_target_host` for the same reason
+    ``server_info`` applies it: a URL-style ``COMFYUI_HOST`` carries userinfo
+    verbatim.
+    """
+    try:
+        data = _run_comfy("env", timeout=_SNAPSHOT_PROBE_TIMEOUT_S)
+    except (ComfyCliError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    lines = [_SNAPSHOT_HEADER]
+    hardware = data.get("hardware")
+    rendered = (
+        failure_log._scrub_text(json.dumps({"hardware": hardware}, indent=2))
+        if isinstance(hardware, dict)
+        else None
+    )
+    if rendered is not None and len(rendered) > _SNAPSHOT_MAX_HARDWARE_CHARS:
+        # Not a real hardware block — see _SNAPSHOT_MAX_HARDWARE_CHARS.
+        return None
+    if rendered is not None:
+        lines.append(rendered)
+        lines.append(
+            "Route on this `hardware` block directly — it is `server_info`'s own "
+            "field, captured at startup, and the machine's hardware does not "
+            "change while this server runs. Everything ELSE `server_info` "
+            "reports (running server, URL, workspace, freshness, compatibility) "
+            "is LIVE state this snapshot does not carry: still call "
+            "`server_info` for those before assuming a server is up."
+        )
+    else:
+        lines.append(
+            "`comfy env` reported no usable `hardware` block, so the memory "
+            "figure is UNKNOWN — routing STEP 3 applies: ask the user what GPU "
+            "and how much VRAM/RAM they have before the first local generation."
+        )
+    try:
+        resolved_target = target._comfy_target()
+    except ComfyCliError as exc:
+        note = target._malformed_target_note(exc)
+        lines.append(f"Remote target: MALFORMED — {note['error']} {note['note']}")
+    else:
+        if resolved_target is not None:
+            host, port, source = resolved_target
+            endpoint = target._format_target_endpoint(
+                target._redact_target_host(host), port
+            )
+            lines.append(
+                f"A remote ComfyUI target is configured via {source}: "
+                f"{endpoint}. Routing STEP 1 applies — the hardware above "
+                "describes THIS machine, while run_workflow / generate_image / "
+                "run_template and the jobs/queue tools submit to that target."
+            )
+    return "\n".join(lines)
+
+
+def _apply_startup_instructions() -> None:
+    """Put the machine snapshot on the handshake, if the startup probe got one.
+
+    The probe runs on a daemon thread with a bounded join so
+    ``_SNAPSHOT_PROBE_TIMEOUT_S`` caps the WALL-CLOCK stall before the first
+    initialize response, whatever the probe does internally — the
+    once-per-process ``comfy --version`` guard inside ``_run_comfy`` carries
+    its own 30s timeout, so trusting the inner timeouts would budget 45s+
+    against a binary that hangs rather than errors, long enough to trip some
+    clients' initialize deadline. A probe that outlives the join keeps running
+    harmlessly to completion (it only computes a string) and its result is
+    discarded: the instructions are only ever written HERE, on the main
+    thread, before ``mcp.run()`` — never late, never concurrently.
+
+    The SDK exposes ``MCPServer.instructions`` read-only, so the write lands on
+    the low-level server attribute — the field ``create_initialization_options``
+    reads per handshake, which makes a single assignment before ``mcp.run()``
+    sufficient and keeps this the ONE place instructions are ever rebuilt.
+    ``test_machine_snapshot.py`` asserts the public ``mcp.instructions`` getter
+    reflects the write, so an SDK release that moves the attribute fails a test
+    here rather than silently shipping a handshake without the snapshot. A
+    ``None`` block (probe failed) or an overrun probe changes nothing: the
+    static ``instructions.INSTRUCTIONS`` already tell the agent to call
+    ``server_info`` first.
+    """
+    result: list[str | None] = []
+    probe = threading.Thread(
+        # Resolved at call time so the test suite's monkeypatched probe is the
+        # one that runs; the list-append keeps "no result yet" (timed out)
+        # distinct from "returned None" (probe failed) without sharing more
+        # state than one append.
+        target=lambda: result.append(_machine_snapshot_block()),
+        name="comfy-mcp-machine-snapshot",
+        daemon=True,
+    )
+    probe.start()
+    probe.join(_SNAPSHOT_PROBE_TIMEOUT_S)
+    if probe.is_alive() or not result:
+        return
+    block = result[0]
+    if block is None:
+        return
+    mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
+
+
 def main() -> None:
     """Entry point: serve the MCP over stdio.
 
@@ -9880,6 +10239,12 @@ def main() -> None:
     :func:`_require_comfy_bin` do for the child process we spawn.
     """
     try:
+        # Before serving: enrich the handshake instructions with the one-shot
+        # machine snapshot. Runs inside this try on purpose — the
+        # probe swallows its own failures (including a PermissionError, an
+        # OSError subclass) and falls open, so nothing here can keep the
+        # server from starting.
+        _apply_startup_instructions()
         # Name the transport rather than inheriting the SDK's default: the whole
         # stdio design rests on it — `failure_log`'s rule that stdout is the
         # JSON-RPC channel and must never be written to is only true under

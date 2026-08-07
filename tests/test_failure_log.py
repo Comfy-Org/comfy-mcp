@@ -17,6 +17,7 @@ Like the rest of the suite these mock comfy-cli; nothing here needs a real
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
@@ -364,7 +365,7 @@ def test_preflight_validation_raise_logs_nothing(log_path, fake_comfy):
     fake_comfy(stdout=_ERROR_ENVELOPE)
 
     with pytest.raises(server.ComfyCliError):
-        server.get_execution_error("-x")
+        asyncio.run(server.job(action="error", prompt_id="-x"))
 
     assert not log_path.exists()
 

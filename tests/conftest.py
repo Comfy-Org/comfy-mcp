@@ -18,8 +18,8 @@ copy per test file:
   ``communicate``) — ``envelope`` + ``patched_run`` / ``patched_plain_run``;
 * the streaming ``--json-stream`` path
   (``asyncio.create_subprocess_exec`` + incremental stream reads) —
-  ``patched_stream``. ``run_workflow``, ``watch_job`` and ``generate_image``
-  all drive the same NDJSON stream.
+  ``patched_stream``. ``run_workflow``, ``job(action="watch")`` and
+  ``generate_image`` all drive the same NDJSON stream.
 * the plain-JSON ASYNC path (``asyncio.create_subprocess_exec`` + bounded drains
   of both pipes) — ``patched_async_run``, for ``server._run_comfy_async``. Same
   spawn and same real ``StreamReader`` pipes as the streaming fake, but the output
@@ -95,6 +95,22 @@ def _skip_engine_auto_confirm_probe(monkeypatch):
     auto-confirm tests (`test_partner_generate.py`) restore the real function.
     """
     monkeypatch.setattr(server, "_engine_auto_confirms", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _skip_machine_snapshot_probe(monkeypatch):
+    """Pin ``main()``'s startup machine-snapshot probe to its fail-open path.
+
+    ``main()`` runs ``_apply_startup_instructions`` before serving,
+    which shells out to ``comfy env`` once and mutates the module-global
+    handshake instructions. Left live, any test that calls ``server.main()``
+    (the transport/TCC tests in ``test_permissions.py``) would spawn whatever
+    real ``comfy`` this developer machine has AND leak the enriched
+    instructions into every later test's ``mcp.instructions`` assertions. The
+    dedicated snapshot tests (``test_machine_snapshot.py``) restore the real
+    function and stub the spawn instead.
+    """
+    monkeypatch.setattr(server, "_machine_snapshot_block", lambda: None)
 
 
 @pytest.fixture(autouse=True)
