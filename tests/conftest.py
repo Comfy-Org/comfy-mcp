@@ -46,7 +46,7 @@ import os
 
 import pytest
 
-from comfy_mcp import failure_log, server
+from comfy_mcp import failure_log, server, target
 
 
 @pytest.fixture(autouse=True)
@@ -99,7 +99,7 @@ def _clear_comfyui_target_env(monkeypatch):
     """Default every test to the LOCAL target (no configured remote ComfyUI).
 
     The run/queue tools forward ``--host`` / ``--port`` when ``COMFYUI_URL`` /
-    ``COMFYUI_HOST`` is set (see ``server._comfy_target``). A stray value in the
+    ``COMFYUI_HOST`` is set (see ``target._comfy_target``). A stray value in the
     ambient environment would perturb the exact-argv assertions across the suite,
     so clear all three here; the remote-targeting tests set them explicitly.
 
@@ -113,7 +113,7 @@ def _clear_comfyui_target_env(monkeypatch):
         "COMFYUI_URL",
         "COMFYUI_HOST",
         "COMFYUI_PORT",
-        server.REMOTE_SHARED_MODELS_ENV,
+        target.REMOTE_SHARED_MODELS_ENV,
     ):
         monkeypatch.delenv(var, raising=False)
 

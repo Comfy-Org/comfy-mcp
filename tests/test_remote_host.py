@@ -32,21 +32,21 @@ import subprocess
 import pytest
 from conftest import _OK_STREAM, envelope
 
-from comfy_mcp import server
+from comfy_mcp import server, target
 
 # --- _comfy_target env parsing ---------------------------------------------
 
 
 def test_target_none_when_unset():
     """Nothing configured -> None -> local default (byte-identical to today)."""
-    assert server._comfy_target() is None
+    assert target._comfy_target() is None
 
 
 def test_target_from_host_defaults_port(monkeypatch):
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
-    assert server._comfy_target() == (
+    assert target._comfy_target() == (
         "gpu.example",
-        server.DEFAULT_COMFYUI_PORT,
+        target.DEFAULT_COMFYUI_PORT,
         "COMFYUI_HOST",
     )
 
@@ -54,19 +54,19 @@ def test_target_from_host_defaults_port(monkeypatch):
 def test_target_from_host_and_port(monkeypatch):
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "9001")
-    assert server._comfy_target() == ("gpu.example", 9001, "COMFYUI_HOST")
+    assert target._comfy_target() == ("gpu.example", 9001, "COMFYUI_HOST")
 
 
 def test_target_from_url(monkeypatch):
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    assert server._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
+    assert target._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
 
 
 def test_target_from_url_defaults_port(monkeypatch):
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example")
-    assert server._comfy_target() == (
+    assert target._comfy_target() == (
         "gpu.example",
-        server.DEFAULT_COMFYUI_PORT,
+        target.DEFAULT_COMFYUI_PORT,
         "COMFYUI_URL",
     )
 
@@ -74,13 +74,13 @@ def test_target_from_url_defaults_port(monkeypatch):
 def test_target_url_without_scheme(monkeypatch):
     """A scheme-less ``host:port`` still parses (prefixed with ``//`` internally)."""
     monkeypatch.setenv("COMFYUI_URL", "gpu.example:9001")
-    assert server._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
+    assert target._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
 
 
 def test_target_url_ipv6(monkeypatch):
     """An IPv6 URL yields the bare host (comfy-cli re-brackets it for its URLs)."""
     monkeypatch.setenv("COMFYUI_URL", "http://[2001:db8::1]:8188")
-    assert server._comfy_target() == ("2001:db8::1", 8188, "COMFYUI_URL")
+    assert target._comfy_target() == ("2001:db8::1", 8188, "COMFYUI_URL")
 
 
 def test_target_url_wins_over_host(monkeypatch):
@@ -88,41 +88,41 @@ def test_target_url_wins_over_host(monkeypatch):
     monkeypatch.setenv("COMFYUI_URL", "http://from-url.example:1234")
     monkeypatch.setenv("COMFYUI_HOST", "from-host.example")
     monkeypatch.setenv("COMFYUI_PORT", "5678")
-    assert server._comfy_target() == ("from-url.example", 1234, "COMFYUI_URL")
+    assert target._comfy_target() == ("from-url.example", 1234, "COMFYUI_URL")
 
 
 def test_target_url_no_host_raises(monkeypatch):
     monkeypatch.setenv("COMFYUI_URL", "http://:8188")
     with pytest.raises(server.ComfyCliError, match="names no host"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_bad_port_raises(monkeypatch):
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "not-a-number")
     with pytest.raises(server.ComfyCliError, match="COMFYUI_PORT must be an integer"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_port_out_of_range_raises(monkeypatch):
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "70000")
     with pytest.raises(server.ComfyCliError, match="out of range"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_url_https_scheme_rejected(monkeypatch):
     """https:// can't be forwarded (comfy-cli speaks http) -> reject, don't downgrade."""
     monkeypatch.setenv("COMFYUI_URL", "https://gpu.example:8188")
     with pytest.raises(server.ComfyCliError, match="scheme"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_url_with_path_rejected(monkeypatch):
     """A reverse-proxy base path can't be forwarded -> reject, don't silently drop."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/comfyui")
     with pytest.raises(server.ComfyCliError, match="path"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_url_with_query_rejected(monkeypatch):
@@ -134,7 +134,7 @@ def test_target_url_with_query_rejected(monkeypatch):
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/?token=<SECRETTOKEN>")
     with pytest.raises(server.ComfyCliError, match="query or fragment") as excinfo:
-        server._comfy_target()
+        target._comfy_target()
     # The rejection must not echo back the secret it exists to protect.
     assert "SECRETTOKEN" not in str(excinfo.value)
 
@@ -143,7 +143,7 @@ def test_target_url_with_fragment_rejected(monkeypatch):
     """A fragment is dropped just as silently as a query -> same rejection."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/#SECRETFRAG")
     with pytest.raises(server.ComfyCliError, match="query or fragment") as excinfo:
-        server._comfy_target()
+        target._comfy_target()
     assert "SECRETFRAG" not in str(excinfo.value)
 
 
@@ -157,7 +157,7 @@ def test_target_url_with_params_rejected(monkeypatch):
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:8188/;token=<SECRETTOKEN>")
     with pytest.raises(server.ComfyCliError, match="query or fragment") as excinfo:
-        server._comfy_target()
+        target._comfy_target()
     assert "SECRETTOKEN" not in str(excinfo.value)
     # The host:port — the whole diagnostic — survives the cut.
     assert "http://gpu.example:8188/;<redacted>" in str(excinfo.value)
@@ -171,21 +171,21 @@ def test_target_url_root_path_allowed(monkeypatch):
     turn the documented `http://host:port/` form into a hard error.
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001/")
-    assert server._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
+    assert target._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
 
 
 def test_target_url_port_zero_rejected(monkeypatch):
     """`:0` must not silently collapse to 8188 (the COMFYUI_PORT path rejects 0)."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:0")
     with pytest.raises(server.ComfyCliError, match="out of range"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_url_unbalanced_ipv6_raises_comfy_error(monkeypatch):
     """A malformed URL (`http://[::1`) surfaces as ComfyCliError, not raw ValueError."""
     monkeypatch.setenv("COMFYUI_URL", "http://[::1")
     with pytest.raises(server.ComfyCliError, match="malformed"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_target_url_redacts_userinfo_in_error(monkeypatch):
@@ -198,7 +198,7 @@ def test_target_url_redacts_userinfo_in_error(monkeypatch):
     """
     monkeypatch.setenv("COMFYUI_URL", "https://<user>:<sekret>@gpu.example:8188")
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server._comfy_target()
+        target._comfy_target()
     assert "sekret" not in str(excinfo.value)
     assert "***@gpu.example" in str(excinfo.value)
 
@@ -206,9 +206,9 @@ def test_target_url_redacts_userinfo_in_error(monkeypatch):
 def test_target_host_strips_ipv6_brackets(monkeypatch):
     """A bracketed COMFYUI_HOST is normalized bare, matching the URL path's hostname."""
     monkeypatch.setenv("COMFYUI_HOST", "[::1]")
-    assert server._comfy_target() == (
+    assert target._comfy_target() == (
         "::1",
-        server.DEFAULT_COMFYUI_PORT,
+        target.DEFAULT_COMFYUI_PORT,
         "COMFYUI_HOST",
     )
 
@@ -217,7 +217,7 @@ def test_target_port_without_host_raises(monkeypatch):
     """COMFYUI_PORT alone must not silently fall back to the local default."""
     monkeypatch.setenv("COMFYUI_PORT", "9001")
     with pytest.raises(server.ComfyCliError, match="COMFYUI_HOST is not"):
-        server._comfy_target()
+        target._comfy_target()
 
 
 def test_local_only_verb_survives_malformed_config(patched_run, monkeypatch):
@@ -805,7 +805,7 @@ def test_download_model_refuses_configured_url_target(patched_run, monkeypatch, 
     message = str(excinfo.value)
     assert "gpu.example:9001" in message  # names the remote that would miss it
     assert "COMFYUI_URL" in message  # ... and which knob selected it
-    assert server.REMOTE_SHARED_MODELS_ENV in message  # ... and the way out
+    assert target.REMOTE_SHARED_MODELS_ENV in message  # ... and the way out
     # The guard is only worth anything if it lands BEFORE the submit: a started
     # transfer writes to the wrong disk whatever this call then returns.
     assert calls == []
@@ -820,9 +820,9 @@ def test_download_model_refuses_configured_host_target(patched_run, monkeypatch)
         _download(wait=False)
 
     message = str(excinfo.value)
-    assert f"gpu.example:{server.DEFAULT_COMFYUI_PORT}" in message
+    assert f"gpu.example:{target.DEFAULT_COMFYUI_PORT}" in message
     assert "COMFYUI_HOST" in message
-    assert server.REMOTE_SHARED_MODELS_ENV in message
+    assert target.REMOTE_SHARED_MODELS_ENV in message
     assert calls == []
 
 
@@ -854,7 +854,7 @@ def test_download_model_shared_models_optin_downloads_unchanged(
     remote's models volume, proceed."
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, "1")
+    monkeypatch.setenv(target.REMOTE_SHARED_MODELS_ENV, "1")
     submit = {"download_id": "a1b2c3d4e5f6", "dest": "/models/x.safetensors"}
     calls = patched_run(envelope(data=submit))
 
@@ -878,7 +878,7 @@ def test_download_model_shared_models_optin_ignores_malformed_target(
     unconfigured `download_model` ignores `COMFYUI_URL` entirely.
     """
     monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
-    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, "1")
+    monkeypatch.setenv(target.REMOTE_SHARED_MODELS_ENV, "1")
     calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
 
     _download(wait=False)
@@ -896,7 +896,7 @@ def test_download_model_shared_models_optin_fails_closed(
     machine — the failure names the value to set.
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, value)
+    monkeypatch.setenv(target.REMOTE_SHARED_MODELS_ENV, value)
     calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
 
     with pytest.raises(server.ComfyCliError, match="LOCAL-ONLY"):
@@ -909,7 +909,7 @@ def test_download_model_shared_models_optin_fails_closed(
 def test_download_model_shared_models_optin_spellings(patched_run, monkeypatch, value):
     """The documented `1` plus the obvious synonyms, case- and space-insensitive."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    monkeypatch.setenv(server.REMOTE_SHARED_MODELS_ENV, value)
+    monkeypatch.setenv(target.REMOTE_SHARED_MODELS_ENV, value)
     calls = patched_run(envelope(data={"download_id": "a1b2c3d4e5f6"}))
 
     _download(wait=False)
@@ -978,7 +978,7 @@ def test_system_stats_annotates_configured_remote(patched_run, monkeypatch):
 
     note = result["comfy_target_note"]
     assert note["host"] == "gpu.example"
-    assert note["port"] == server.DEFAULT_COMFYUI_PORT
+    assert note["port"] == target.DEFAULT_COMFYUI_PORT
     assert note["source"] == "COMFYUI_HOST"
     assert "NOT necessarily the host/port above" in note["note"]
     # Annotation only — comfy-cli's own payload is passed through untouched.

@@ -81,8 +81,14 @@ def test_server_reads_the_comfyui_vars_and_not_comfy_local_url():
     sources = {path.name: path.read_text(encoding="utf-8") for path in _PACKAGE_SOURCES}
     assert "server.py" in sources, "the package layout moved out from under this test"
 
+    # Any module in the package, not specifically server.py: `_comfy_target` (the
+    # actual reader of these three) lives in target.py post-extraction, and the
+    # ownership claim this guards is about the PACKAGE, not one file within it —
+    # the same reasoning the COMFY_LOCAL_URL check below already applies.
     for ours in ("COMFYUI_URL", "COMFYUI_HOST", "COMFYUI_PORT"):
-        assert _reads_env(sources["server.py"], ours), f"{ours} is no longer read"
+        assert any(_reads_env(source, ours) for source in sources.values()), (
+            f"{ours} is no longer read"
+        )
 
     for name, source in sources.items():
         assert not _reads_env(source, "COMFY_LOCAL_URL"), (
