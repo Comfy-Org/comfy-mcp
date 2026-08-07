@@ -28,7 +28,10 @@ copy per test file:
   ``upload_file`` drive it.
 
 Every path spawns with ``start_new_session=True`` so a timeout can kill the whole
-process group; the fakes model that too (see ``_FakeRunProc``).
+process group; the fakes model that too (see ``_FakeRunProc``). All three also
+accept and record ``cwd`` — the ``COMFY_PROJECT`` anchor ``server._project_root``
+resolves (``None`` when unset) — so `test_project.py` can assert it landed on
+every spawn path without a fourth fake.
 
 The streaming fakes back their pipes with REAL :class:`asyncio.StreamReader`
 objects (``stream_reader``) rather than a hand-rolled awaitable. The reader's
@@ -116,6 +119,22 @@ def _clear_comfyui_target_env(monkeypatch):
         target.REMOTE_SHARED_MODELS_ENV,
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _clear_project_env(monkeypatch):
+    """Default every test to the unanchored default (no ``COMFY_PROJECT``).
+
+    ``server._project_root`` reads ``COMFY_PROJECT`` ONCE per process and
+    caches it (``server._project_root_env``), so an ambient value in the
+    developer's shell — or a value a prior test set — would otherwise leak
+    into every later spawn's ``cwd=`` assertion, or into the resolver's
+    validation before a test ever sets its own value. Clear the env var AND
+    reset the cache back to its unread sentinel; `test_project.py` sets
+    `COMFY_PROJECT` explicitly per test.
+    """
+    monkeypatch.delenv("COMFY_PROJECT", raising=False)
+    monkeypatch.setattr(server, "_project_root_env", server._PROJECT_ENV_UNREAD)
 
 
 @pytest.fixture(autouse=True)
@@ -318,10 +337,12 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
     sweep across every test file.
 
     Each call is recorded as ``{"cmd", "env", "timeout", "encoding", "stdin",
-    "start_new_session", "proc"}`` — a superset of what any caller asserts on —
-    BEFORE ``raises`` fires, so a test for a spawn that blows up can still see
-    the argv it blew up on. ``timeout`` is filled in by ``communicate``, which
-    is where the bound now lands, and ``proc`` is the spawned
+    "start_new_session", "cwd", "proc"}`` — a superset of what any caller
+    asserts on — BEFORE ``raises`` fires, so a test for a spawn that blows up
+    can still see the argv it blew up on. ``timeout`` is filled in by
+    ``communicate``, which is where the bound now lands, ``cwd`` is the
+    ``COMFY_PROJECT`` anchor `_run_comfy_raw` resolved (``None`` when unset —
+    see ``server._project_root``), and ``proc`` is the spawned
     :class:`_FakeRunProc` (absent when the spawn itself raised).
 
     ``on_spawn(cmd)`` models the SIDE EFFECT of a verb whose real answer is not
@@ -333,7 +354,7 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
     """
     canned_stdout, canned_stderr = stdout, stderr
 
-    def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session):
+    def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session, cwd):
         record = {
             "cmd": cmd,
             "env": env,
@@ -341,6 +362,7 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
             "encoding": encoding,
             "stdin": stdin,
             "start_new_session": start_new_session,
+            "cwd": cwd,
         }
         calls.append(record)
         if raises is not None and _raises_at_spawn(raises):
@@ -486,12 +508,20 @@ class _FakeProc:
     """
 
     def __init__(
-        self, cmd, stdout_text, stderr_text="", env=None, stdin=None, limit=None
+        self,
+        cmd,
+        stdout_text,
+        stderr_text="",
+        env=None,
+        stdin=None,
+        limit=None,
+        cwd=None,
     ):
         self.cmd = cmd
         self.env = env
         self.limit = limit  # what `server` asked for, for the argv assertions
         self.stdin_arg = stdin  # what `server` asked for, not a writable pipe
+        self.cwd = cwd  # the COMFY_PROJECT anchor `server` resolved, if any
         self.stdout = stream_reader(stdout_text, limit)
         self.stderr = stream_reader(stderr_text, limit)
         self.returncode = 0
@@ -533,12 +563,14 @@ def patched_stream(monkeypatch):
         procs: list[_FakeProc] = []
 
         async def fake_exec(
-            *cmd, stdout, stderr, env, stdin=None, limit=None, **kwargs
+            *cmd, stdout, stderr, env, stdin=None, limit=None, cwd=None, **kwargs
         ):
             if raises is not None:
                 raise raises
             _encode_argv_like_posix(cmd)
-            proc = _FakeProc(list(cmd), stdout_text, env=env, stdin=stdin, limit=limit)
+            proc = _FakeProc(
+                list(cmd), stdout_text, env=env, stdin=stdin, limit=limit, cwd=cwd
+            )
             procs.append(proc)
             return proc
 
@@ -589,11 +621,13 @@ class _FakeAsyncRunProc:
         env=None,
         stdin=None,
         start_new_session=None,
+        cwd=None,
     ):
         self.cmd = cmd
         self.env = env
         self.stdin_arg = stdin  # what `server` asked for, not a writable pipe
         self.start_new_session = start_new_session
+        self.cwd = cwd  # the COMFY_PROJECT anchor `server` resolved, if any
         self._hang = hang
         self._never = asyncio.Event()
         self._pipes_open = hang
@@ -660,7 +694,7 @@ def patched_async_run(monkeypatch):
         procs: list[_FakeAsyncRunProc] = []
 
         async def fake_exec(
-            *cmd, stdout, stderr, env, stdin=None, start_new_session=None
+            *cmd, stdout, stderr, env, stdin=None, start_new_session=None, cwd=None
         ):
             if raises is not None:
                 raise raises
@@ -676,6 +710,7 @@ def patched_async_run(monkeypatch):
                 env=env,
                 stdin=stdin,
                 start_new_session=start_new_session,
+                cwd=cwd,
             )
             procs.append(proc)
             return proc

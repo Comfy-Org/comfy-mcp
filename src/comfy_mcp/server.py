@@ -309,6 +309,12 @@ _MIN_COMFY_CLI_STR = "1.14.0"
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
 
+# `COMFY_PROJECT`'s raw value, read from the environment at most once per
+# process (see `_project_root`). The sentinel distinguishes "not read yet" from
+# "read and unset" (`None`) without a second flag.
+_PROJECT_ENV_UNREAD = object()
+_project_root_env: str | None = _PROJECT_ENV_UNREAD  # type: ignore[assignment]
+
 
 # How this server identifies itself to comfy-cli, via comfy-cli's documented
 # self-attribution hook (`comfy_cli/caller.py`: `COMFY_USER_AGENT` is the
@@ -449,6 +455,57 @@ def _comfy_env() -> dict[str, str]:
     return env
 
 
+def _project_root() -> str | None:
+    """Resolve the ``COMFY_PROJECT`` anchor root every comfy-cli spawn's ``cwd=`` uses.
+
+    comfy-cli 1.15.0's ``project/1`` convention (``comfy project init`` /
+    ``status``) resolves the GOVERNING project by walking up from its own
+    process ``cwd`` only — no ``--project`` flag, no env var it reads itself.
+    That assumes a persistent shell session; this server's ``cwd`` is whatever
+    the MCP client happened to launch it from, arbitrary and unrelated to any
+    project the user cares about. So this server anchors it from the outside:
+    every spawn (see the five sites below) passes ``cwd=_project_root()`` to
+    its subprocess call, which comfy-cli's own cwd-walk then resolves exactly
+    as if that had been the shell's directory all along.
+
+    ``COMFY_PROJECT`` is read from the environment ONCE per process and cached
+    (mirrors ``_version_checked``'s once-per-process memoization) — a value
+    that changed mid-session must not silently re-anchor calls already in
+    flight to a different root. ``None`` (unset) returns ``None``, so every
+    spawn's ``cwd=`` argument is ``None`` too — identical to not passing ``cwd``
+    at all, i.e. today's behavior, byte for byte.
+
+    A SET value is validated on every call (not cached past the read) — cheap
+    (one ``os.path.isdir`` stat), and unlike the read this deliberately does
+    NOT latch a bad verdict, so an operator who fixes it (``mkdir``) mid-process
+    has the very next spawn pick it up, the same "don't memoize the negative"
+    policy `_check_comfy_version` uses for a too-old CLI. An invalid root
+    raises :class:`ComfyCliError` rather than falling back to unanchored: this
+    feature exists to make project-governed behavior deterministic, and a
+    silent fallback would reintroduce exactly the non-determinism it removes.
+    The root does NOT need to contain ``comfy.yaml`` — an uninitialized
+    directory is valid here; that's what the ``project`` tool's ``init`` action
+    is for.
+    """
+    global _project_root_env
+    if _project_root_env is _PROJECT_ENV_UNREAD:
+        _project_root_env = os.environ.get("COMFY_PROJECT", "").strip() or None
+    root = _project_root_env
+    if root is None:
+        return None
+    if not os.path.isdir(root):
+        raise ComfyCliError(
+            f"COMFY_PROJECT is set to {root!r}, but that is not a directory "
+            "(missing, or not a directory). Every comfy-cli spawn this server "
+            "makes is anchored to it, so this fails closed rather than "
+            "silently running unanchored against the server's own cwd. Fix: "
+            f"unset COMFY_PROJECT, or create the directory (`mkdir -p {root}`) "
+            "— it does not need `comfy.yaml` yet; that's what the `project` "
+            "tool's `init` action is for."
+        )
+    return root
+
+
 def _comfy_bin_candidates() -> list[str]:
     """Every filesystem location ``COMFY_BIN`` could name, as ``which`` would look.
 
@@ -557,6 +614,11 @@ def _spawn_comfy_version() -> subprocess.CompletedProcess:
     different, load-bearing failure policies (fail-open with a latched timeout
     and a macOS TCC translation vs. best-effort ``None``), so each keeps its own
     ``try``/``except`` around this call. Only the invocation itself is shared.
+
+    Carries ``cwd=_project_root()`` like the other four sanctioned spawn sites
+    (see that function) — a no-op for the version probe's own answer, but a
+    ``COMFY_PROJECT`` set-but-invalid must fail closed here too, since this is
+    the first shell-out `_check_comfy_version` makes on every unmemoized call.
     """
     return subprocess.run(
         [COMFY_BIN, "--version"],
@@ -565,6 +627,7 @@ def _spawn_comfy_version() -> subprocess.CompletedProcess:
         errors="replace",  # never crash on undecodable `--version` bytes
         timeout=30.0,
         check=False,
+        cwd=_project_root(),
     )
 
 
@@ -866,6 +929,14 @@ def _run_comfy_raw(
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    # Anchor the child's cwd to the operator-designated COMFY_PROJECT root, if
+    # one is configured (None — the default — is byte-identical to not passing
+    # `cwd` at all). Resolved fresh on every call, right before the spawn, so a
+    # value that is missing/invalid raises here before this real subcommand
+    # ever runs — independent of whether `_check_comfy_version` above ran its
+    # own `_project_root` check this time (it only shells out, and re-validates,
+    # on an unmemoized call). See `_project_root`.
+    cwd = _project_root()
     # ONLY the spawn is wrapped: `communicate()` and everything after it already
     # has the timeout and BaseException handlers below, and a spawn that raised
     # has no child to reap. See `_spawn_failure`.
@@ -891,6 +962,7 @@ def _run_comfy_raw(
             # fix targets, just moved to the reader.
             encoding="utf-8",
             env=env,
+            cwd=cwd,
             # Own process group so a timeout can kill the whole TREE, exactly as
             # the streaming path already does. comfy-cli's long verbs fork
             # real work — `update` runs `git pull` and then a multi-GB
@@ -1734,6 +1806,9 @@ async def _run_comfy_async(
     # a trailing --json errors with "No such option".
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    # Anchor to COMFY_PROJECT if configured; None (the default) is byte-identical
+    # to omitting `cwd`. See `_project_root` / `_run_comfy_raw`.
+    cwd = _project_root()
     # Only the spawn, for the reason `_run_comfy_raw` gives: the `finally` below
     # already reaps everything a STARTED child needs reaped, and a spawn that
     # raised produced none. See `_spawn_failure`.
@@ -1747,6 +1822,7 @@ async def _run_comfy_async(
             # request bytes the client sent us. See _run_comfy_raw.
             stdin=asyncio.subprocess.DEVNULL,
             env=env,
+            cwd=cwd,
             # Own process group so one kill reaps the whole TREE (child +
             # grandchildren) and closes every inherited copy of the pipes —
             # otherwise a grandchild holding an fd keeps the drain from ever
@@ -1862,6 +1938,9 @@ async def _run_comfy_streaming(
     # subcommand; a trailing form errors with "No such option".
     cmd = [COMFY_BIN, "--json-stream", "--where", "local", *args]
     env = _comfy_env()
+    # Anchor to COMFY_PROJECT if configured; None (the default) is byte-identical
+    # to omitting `cwd`. See `_project_root` / `_run_comfy_raw`.
+    cwd = _project_root()
     # Only the spawn — the pump, the drain and the timeout below all belong to a
     # child that actually started. See `_spawn_failure`.
     try:
@@ -1874,6 +1953,7 @@ async def _run_comfy_streaming(
             # _run_comfy_raw.
             stdin=asyncio.subprocess.DEVNULL,
             env=env,
+            cwd=cwd,
             # Own process group so a timeout can kill the whole tree (child +
             # grandchildren) and close every copy of the stderr pipe — otherwise
             # a grandchild that inherited the fd keeps the stderr drain from ever
@@ -2624,6 +2704,10 @@ async def _start_login() -> tuple[_LoginChild | None, dict]:
             # JSON-RPC request bytes. Same reason as both synchronous spawn sites.
             stdin=asyncio.subprocess.DEVNULL,
             env=_comfy_env(),
+            # Anchor to COMFY_PROJECT if configured, like the other four
+            # sanctioned spawn sites; None (the default) is byte-identical to
+            # omitting `cwd`. See `_project_root`.
+            cwd=_project_root(),
             # Own process group so `_kill_proc_tree_async` can take the whole tree
             # and close every copy of the stderr pipe.
             start_new_session=True,
@@ -7452,6 +7536,30 @@ def which() -> Any:
     only when the bare selection is all you want.
     """
     return _run_comfy("which", timeout=60.0)
+
+
+_PROJECT_ACTIONS = ("status", "init")
+
+
+@mcp.tool()
+def project(action: str = "status") -> Any:
+    """Report or create the operator-anchored comfy-cli project (`project/1`).
+
+    `action`: `"status"` -> `comfy project status`; `"init"` -> `comfy project
+    init` (creates `comfy.yaml` + supporting dirs; safe to re-run). comfy-cli
+    finds the governing project by walking up from its OWN cwd; an MCP
+    client's cwd is arbitrary, so with no `COMFY_PROJECT` set (absolute path,
+    read once per process) both act on THIS SERVER's cwd — unanchored.
+    `init`'s `where_default` is comfy-cli's own (1.15.0: `cloud` with no
+    `--where`); this server always pins `--where local`, so routing is
+    unaffected either way.
+    """
+    if action not in _PROJECT_ACTIONS:
+        raise ComfyCliError(
+            f"invalid project action: {action!r} — expected one of "
+            f"{', '.join(repr(name) for name in _PROJECT_ACTIONS)}."
+        )
+    return _run_comfy("project", action, timeout=60.0)
 
 
 # The compact per-row projection returned by the listing. The full detail

@@ -73,7 +73,13 @@ the protocol's y/N prompt — then forwards the answer as `--yes` /
 the command. It stores no consent of its own, and all share one fail-closed body,
 `_elicit_approval`; give a new gate its own `_ApprovalWording`, not a second
 copy. Adding *product* behavior here is still a guardrail breach; adapting
-comfy-cli's contract to an MCP primitive is this repo's job.
+comfy-cli's contract to an MCP primitive is this repo's job. Project anchoring
+(`_project_root`, the `COMFY_PROJECT` env var, the `project` tool) is the same
+kind of adaptation, not a new one: comfy-cli resolves its governing `project/1`
+by walking up from its own process cwd, which assumes a persistent shell
+session an MCP client's arbitrary per-call cwd cannot provide, so this server
+passes `cwd=` on its own spawns instead — the `status`/`init` verdicts
+themselves stay entirely comfy-cli's own.
 
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` —
 differ where the engine's own shape differs, and those differences are

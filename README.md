@@ -62,7 +62,7 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 52 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 53 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -367,6 +367,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
 - [Which address variable do I want?](#which-address-variable-do-i-want)
+- [Project anchoring](#project-anchoring)
 - [Tools](#tools)
 - [Troubleshooting](#troubleshooting)
 - [Failure log (opt-in)](#failure-log-opt-in)
@@ -829,9 +830,51 @@ branding. `COMFYUI_URL` is this server's, and already carries no "local" to stri
 old spelling to accept and no deprecation period to sit through — if you have either variable in an
 MCP client config today, it keeps working unchanged.
 
+## Project anchoring
+
+comfy-cli 1.15.0 ships a `project/1` convention (`comfy project init` / `comfy project status`,
+this server's `project` tool) — a `comfy.yaml` plus `assets/` / `fragments/` / `blueprints/` /
+`outputs/` / `.comfy/` under a root directory, with `status` reporting `recent_runs` and other
+project-scoped state. comfy-cli resolves **which** project governs a call by walking **up** from
+its own process's working directory only — there is no `--project` flag and no env var it reads
+itself. That assumes a persistent shell session sitting inside the project tree; this server's own
+working directory is whatever the MCP client happened to launch it from, arbitrary and unrelated to
+any project the user has in mind — so out of the box, this server cannot participate in projects at
+all.
+
+Set **`COMFY_PROJECT`** to an absolute path to fix that: every comfy-cli spawn this server makes
+then runs with that directory as its `cwd`, so comfy-cli's own cwd-walk resolves it exactly as if a
+shell had `cd`'d there first. Read from the environment **once per process** (a value changed
+mid-session is not picked up until restart) and validated on every spawn: the directory does **not**
+need to contain `comfy.yaml` yet — call `project(action="init")` for that — but it does need to
+**exist**. A set-but-missing (or non-directory) value **fails closed**: the next comfy-cli spawn
+raises rather than silently falling back to the unanchored default, because a silent fallback would
+reintroduce exactly the non-determinism this feature exists to remove. Fix it by unsetting
+`COMFY_PROJECT` or creating the directory.
+
+**Unset (the default): behavior is unchanged.** No `cwd` is passed to any spawn, exactly as before
+this feature existed — every tool keeps acting on this server's own process directory, an unanchored
+`comfy project status` returning comfy-cli's own `project_not_found`.
+
+Set it in the client registration `env` block, same as `COMFY_BIN`:
+
+```json
+{
+  "mcpServers": {
+    "comfy-mcp": {
+      "command": "comfy-mcp",
+      "env": {
+        "COMFY_BIN": "/path/to/venv/bin/comfy",
+        "COMFY_PROJECT": "/Users/you/comfy-projects/my-project"
+      }
+    }
+  }
+}
+```
+
 ## Tools
 
-52 tools, grouped below by what they do. Every tool runs `comfy` with the global
+53 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
@@ -871,6 +914,7 @@ handle is `prompt_id`.
 | `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
 | `auth_login()` | `comfy cloud login --no-browser --timeout 600` | Start Comfy Cloud sign-in and return `{"status": "awaiting_browser", "login_url": …, "expires_in_s": …}` — the URL for the **user** to open, so an agent can get them signed in instead of telling them to run the CLI by hand. Returns as soon as comfy-cli emits the URL; the sign-in keeps running in the background (comfy-cli owns the OAuth flow and the loopback callback, so no OAuth logic lives here). Confirm the result with `auth_status`. Only one sign-in at a time: calling it again while one is pending re-reports the same URL without spawning a second flow, and calling it after the flow ended reports `completed` / `failed` once and then clears. Never returns tokens. |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
+| `project(action="status")` | `comfy project status` / `comfy project init` | Report or create the operator-anchored `project/1` (`action="status"` / `"init"`). See [Project anchoring](#project-anchoring). |
 | `get_logs(tail=200, port=None)` | `comfy logs --tail <tail> [--port <port>]` | Tail the background ComfyUI's captured log (`<workspace>/user/comfyui_<port>.log`) — closes the debugging loop after a detached `launch_comfyui`. Returns `{lines, path, truncated}`; a missing log file returns `{"error": "no_log_file", …}` rather than raising, and on a newer comfy-cli that message lists every candidate path checked. Pass `port` when several instances/ports have run, or after a crash, to force `user/comfyui_<port>.log` resolution. A newer comfy-cli also returns `source` / `port_mismatch` / `mtime` / `size`, forwarded untouched: if `port_mismatch` is true or `source` reports a fallback, the lines may belong to a different server — re-call with an explicit `port` (note `user/comfyui.log`, unsuffixed, is ComfyUI-Manager's log for servers started without an explicit `--port`). A comfy-cli too old to accept `--port` raises an upgrade instruction rather than silently returning the default log. |
 | `discover(schemas_only=True)` | `comfy discover [--schemas-only]` | comfy-cli's self-describing surface — learn the CLI's own contract at runtime. The default `schemas_only=True` returns just the schema bundle (~34 KB / ~9k tokens); `schemas_only=False` adds the full command tree and error codes (~177 KB / ~45k tokens), which is ~1.8x the 25,000 tokens Claude Code's `MAX_MCP_OUTPUT_TOKENS` defaults to — and that cap **truncates** rather than rejects, so the full surface comes back as JSON cut mid-structure unless the cap is raised. Tool-output caps are per-client, not an MCP-wide default, so treat 25,000 as the representative number; the schemas bundle is the mode that fits regardless. |
 

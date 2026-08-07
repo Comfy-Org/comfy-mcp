@@ -537,7 +537,7 @@ def _fake_version(stdout: str, *, stderr: str = "", raises: Exception | None = N
     """A `subprocess.run` stand-in for `comfy --version`; records each call."""
     calls: list[list[str]] = []
 
-    def fake(cmd, capture_output, text, timeout, check, errors=None):
+    def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
         calls.append(cmd)
         if raises is not None:
             raise raises
@@ -696,7 +696,7 @@ def test_spawn_comfy_version_keeps_the_bounded_decode_safe_invocation(monkeypatc
     """The one shared spawn site: right argv, bounded, and decode-safe."""
     seen: dict[str, object] = {}
 
-    def fake(cmd, capture_output, text, errors, timeout, check):
+    def fake(cmd, capture_output, text, errors, timeout, check, cwd=None):
         seen.update(
             cmd=cmd,
             capture_output=capture_output,
@@ -704,6 +704,7 @@ def test_spawn_comfy_version_keeps_the_bounded_decode_safe_invocation(monkeypatc
             errors=errors,
             timeout=timeout,
             check=check,
+            cwd=cwd,
         )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -717,6 +718,7 @@ def test_spawn_comfy_version_keeps_the_bounded_decode_safe_invocation(monkeypatc
         "errors": "replace",
         "timeout": 30.0,
         "check": False,
+        "cwd": None,  # no COMFY_PROJECT configured — see test_project.py
     }
 
 
