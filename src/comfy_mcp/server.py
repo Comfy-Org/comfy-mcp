@@ -4268,8 +4268,9 @@ def auth_status() -> Any:
     BLIND SPOT: a ``COMFY_API_KEY`` in the MCP client's registration env is NOT
     reflected in ``api_key_source`` — whoami inspects only the cloud-purpose key
     slot. ``registration_env_key_present`` (bool presence only, never the value)
-    covers that path and is ALWAYS in the returned mapping, nested under
-    ``whoami`` on the rare non-dict payload.
+    covers that path and is ALWAYS a TOP-LEVEL key in the returned mapping; on
+    the rare non-dict whoami payload it is the raw payload, not the flag, that
+    nests — under ``whoami``.
     """
     data = _run_comfy("cloud", "whoami", timeout=30.0)
     present = bool(os.environ.get("COMFY_API_KEY"))
@@ -4893,26 +4894,28 @@ async def generate_image(
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
 ) -> Any:
-    """Generate an image from a text prompt — the fast on-ramp; same run path and target as ``run_workflow``.
+    """Generate an image from a text prompt — the fast on-ramp.
 
-    Runs ComfyUI's default SD1.5 gallery template via ``comfy run-template``
-    (override with ``COMFY_T2I_TEMPLATE`` + matching prompt/checkpoint slot
-    envs). Targets this machine unless ``COMFYUI_URL``/``COMFYUI_HOST`` points
-    elsewhere — never Comfy Cloud.
+    Runs ComfyUI's default SD1.5 template via ``comfy run-template`` (override
+    with ``COMFY_T2I_TEMPLATE`` + matching slot envs) — same run path/target
+    as ``run_workflow``: this machine unless ``COMFYUI_URL``/``COMFYUI_HOST``
+    says otherwise; never Cloud.
 
     Args:
         checkpoint: swaps the checkpoint model; must already be installed on
             the machine that RUNS the job. Omit for the template's default.
-        wait: True (default) blocks and streams progress; False submits and
-            returns a ``prompt_id`` to poll via ``job_status``/``wait_for_job``.
+        wait: True (default) blocks/streams progress; False submits and
+            returns a ``prompt_id`` to poll via ``job_status``.
+        timeout_seconds: used only when ``wait=True``; ignored (fixed short
+            submit timeout) when ``wait=False``.
 
     Returns: same envelope shape as ``run_workflow`` (``prompt_id`` + outputs).
 
     Gotchas:
-    - Always FREE — a local OSS graph, not a partner model. For paid PARTNER
-      models, use ``partner_generate``.
-    - For a chosen/edited template or hand-authored workflow, use
-      ``search_templates`` -> ``fetch_template`` -> ``run_workflow`` instead.
+    - Always FREE, a local OSS graph — use ``partner_generate`` for paid
+      PARTNER models.
+    - For a chosen template or hand-authored workflow, use
+      ``search_templates`` -> ``fetch_template`` -> ``run_workflow``.
     """
     template, prompt_slot, checkpoint_slot = _t2i_config()
     if not template:
@@ -7157,11 +7160,13 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 
     Args:
         unload_models: True (default) unloads all models from VRAM.
+            ``unload_models=False`` with ``free_memory`` left default
+            requests NOTHING — a deliberate no-op, not "reset cache, keep
+            models".
         free_memory: also resets the executor cache; ``None`` (default)
-            follows ``unload_models``, so a bare call asks for both. Passing
-            ``True`` with ``unload_models=False`` is rejected: ComfyUI cannot
-            reset the cache without unloading everything, so that pair would
-            silently do the opposite of what it says.
+            follows ``unload_models``, so a bare call asks for both.
+            ``True`` with ``unload_models=False`` is rejected: ComfyUI
+            cannot reset the cache without unloading everything.
 
     NOT IMMEDIATE, never destructive: applied when the queue worker next
     iterates — does **not** interrupt a running job, so this cannot stop one
@@ -7855,10 +7860,9 @@ def _launch_comfyui_sync(extra_args: list[str]) -> Any:
 # frame is `comfy_cli/tracking.py:334` — a red herring (the `track_command`
 # passthrough wrapper, not telemetry; typer's pretty exceptions hide the
 # frames above it, and the crash reproduces with `DO_NOT_TRACK=1`). The real
-# exception is `FileNotFoundError: 'comfy'` from the inner re-invocation. See
-# BE-4735. The upstream fix — re-invoking via `sys.executable -m comfy_cli`
-# instead of a bare name — is still desirable, but this server no longer
-# depends on it.
+# exception is `FileNotFoundError: 'comfy'` from the inner re-invocation. The
+# upstream fix — re-invoking via `sys.executable -m comfy_cli` instead of a
+# bare name — is still desirable, but this server no longer depends on it.
 @mcp.tool()
 async def launch_comfyui(
     extra_args: list[str] | None = None,
@@ -9155,24 +9159,27 @@ async def switch_comfyui_version(
     """Move the LOCAL ComfyUI install to a specific version — DESTRUCTIVE, asks first.
 
     Wraps ``comfy update comfy --version <version>``: stashes uncommitted
-    changes, moves the checkout, reinstalls that version's dependencies. Use
-    to roll BACK — ``update_comfyui`` only moves forward.
+    changes, moves the checkout, reinstalls dependencies. Use to roll BACK —
+    ``update_comfyui`` only moves forward.
+
+    Args:
+        version: ``"nightly"``, ``"latest"``, or a release tag with or
+            without the leading ``v`` (``"0.24.0"``/``"v0.24.0"``); anything
+            else is refused before any subprocess runs.
 
     **Canonical flow — this tool does not restart anything**::
 
         stop_comfyui -> switch_comfyui_version -> launch_comfyui -> server_info
 
     Gotchas:
-    - REFUSES while a local ComfyUI is running (reinstalling underneath a
-      live process leaves it serving half-replaced code) — stop it first.
-    - Consent is per call, from the USER: an MCP client prompts even when
-      ``confirm_switch=True``; on one that cannot prompt, that flag is the
-      fallback — set it ONLY when the user has actually agreed.
-    - Shares ``update_comfyui``'s lock — refused immediately if either is
-      already running.
+    - REFUSES while a local ComfyUI is running — stop it first.
+    - Consent is per call, from the USER: an MCP client prompts even with
+      ``confirm_switch=True``; that flag is the no-prompt fallback — set it
+      ONLY when the user has actually agreed.
+    - Shares ``update_comfyui``'s lock — refused if either is already running.
 
     Returns ``{"switched_to", "result", "restart_required": True}`` — always
-    True; the switch never takes effect in an already-running process.
+    True.
     """
     target = _guard_version(version)
     # Everything before the prompt answers one question: could this switch
@@ -10245,17 +10252,16 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
 def discover(schemas_only: bool = True) -> Any:
     """Return comfy-cli's self-describing command surface (its own contract).
 
-    Wraps ``comfy discover`` — commands, argument schemas, and error codes,
-    returned verbatim, so an agent can learn the CLI's contract at runtime
-    instead of hard-coding it.
+    Wraps ``comfy discover`` so an agent can learn the CLI's contract at
+    runtime instead of hard-coding it.
 
-    ``schemas_only`` (default True) forwards ``--schemas-only``: just the
-    schema bundle (~9k tokens) instead of the full surface (~45k tokens, ~5x
-    bigger — measured on comfy-cli 1.13.0). Default is slim because MCP
-    clients cap tool output (e.g. Claude Code's ``MAX_MCP_OUTPUT_TOKENS``,
-    default 25,000) by TRUNCATING mid-JSON — the full tree can silently come
-    back as a broken, unparseable envelope. Pass ``schemas_only=False`` only
-    on a client with a raised or larger cap.
+    ``schemas_only`` (default True) forwards ``--schemas-only``: returns just
+    the schema bundle (~9k tokens) — argument/capability schemas, NOT the
+    ``commands`` tree or ``error_codes``. Pass ``schemas_only=False`` for
+    those too, in the full surface (~45k tokens, ~5x bigger — measured on
+    comfy-cli 1.13.0). Default is slim because MCP clients cap tool output
+    (e.g. Claude Code's ``MAX_MCP_OUTPUT_TOKENS``, default 25,000) by
+    TRUNCATING mid-JSON — the full tree can silently come back broken.
     """
     args = ["discover"]
     if schemas_only:
