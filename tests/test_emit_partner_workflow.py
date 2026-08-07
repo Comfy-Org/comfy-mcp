@@ -31,7 +31,7 @@ import json
 import pytest
 from conftest import envelope
 
-from comfy_mcp import argv, server
+from comfy_mcp import argv, params, server
 
 
 def _emit(*args, **kwargs):
@@ -186,7 +186,7 @@ def test_emit_validation_is_literally_partner_generates(monkeypatch):
     model guard and then changed one copy. This asserts the shared call site.
     """
     seen: list[str] = []
-    monkeypatch.setattr(server, "_validate_generate_model", seen.append)
+    monkeypatch.setattr(params, "_validate_generate_model", seen.append)
 
     with pytest.raises(server.ComfyCliError, match="invalid out_path"):
         _emit("flux-pro", "")

@@ -30,7 +30,7 @@ import pytest
 from conftest import envelope
 from pydantic import ValidationError
 
-from comfy_mcp import argv, errors, server
+from comfy_mcp import argv, errors, params, server
 
 
 def test_list_workflow_slots_argv(patched_run):
@@ -765,10 +765,10 @@ def test_vary_workflow_survives_a_real_recursion_error(patched_run):
     # pass while proving nothing about recursion. Derived from the gate and
     # asserted, so it cannot drift back over if either number changes.
     prefix = "6.text="
-    depth = (server._MAX_PRECHECKED_SLOT_BYTES - len(prefix)) // 2
+    depth = (params._MAX_PRECHECKED_SLOT_BYTES - len(prefix)) // 2
     nested = "[" * depth + "]" * depth
     slot = prefix + nested
-    assert len(slot.encode("utf-8")) <= server._MAX_PRECHECKED_SLOT_BYTES
+    assert len(slot.encode("utf-8")) <= params._MAX_PRECHECKED_SLOT_BYTES
 
     try:
         json.loads(nested)
@@ -884,7 +884,7 @@ def test_vary_workflow_defers_unspawnably_long_slot_to_the_engine(patched_run):
     # an array): forwarding it is only possible if the gate abstained before the
     # parse. A well-formed array here would ride through either way and prove
     # nothing about which branch ran.
-    oversized = '"' + "9" * (server._MAX_PRECHECKED_SLOT_BYTES + 1) + '"'
+    oversized = '"' + "9" * (params._MAX_PRECHECKED_SLOT_BYTES + 1) + '"'
     slot = f"3.seed={oversized}"
     server.vary_workflow("/tmp/flux.json", [slot])
 
@@ -904,11 +904,11 @@ def test_vary_workflow_size_gate_counts_bytes_not_characters(patched_run):
     # A quarter of the byte budget in characters, four bytes each => over it.
     # A JSON string rather than an array, so reaching the parse would REFUSE it
     # and forwarding proves the gate measured bytes and abstained.
-    chars = (server._MAX_PRECHECKED_SLOT_BYTES // 4) + 100
+    chars = (params._MAX_PRECHECKED_SLOT_BYTES // 4) + 100
     value = '"' + "\U0001f600" * chars + '"'
     slot = f"6.text={value}"
-    assert len(slot) < server._MAX_PRECHECKED_SLOT_BYTES  # under, counted wrong
-    assert len(slot.encode("utf-8")) > server._MAX_PRECHECKED_SLOT_BYTES  # over
+    assert len(slot) < params._MAX_PRECHECKED_SLOT_BYTES  # under, counted wrong
+    assert len(slot.encode("utf-8")) > params._MAX_PRECHECKED_SLOT_BYTES  # over
 
     server.vary_workflow("/tmp/flux.json", [slot])
 
@@ -922,7 +922,7 @@ def test_vary_workflow_still_checks_a_slot_just_under_the_spawn_limit(no_spawn):
     for any value large enough to matter.
     """
     # Well-formed JSON, not an array, at a length the gate still inspects.
-    value = '"' + "p" * (server._MAX_PRECHECKED_SLOT_BYTES - 100) + '"'
+    value = '"' + "p" * (params._MAX_PRECHECKED_SLOT_BYTES - 100) + '"'
     with pytest.raises(server.ComfyCliError, match="got str"):
         server.vary_workflow("/tmp/flux.json", [f"6.text={value}"])
 
