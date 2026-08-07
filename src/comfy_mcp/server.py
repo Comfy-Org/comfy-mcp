@@ -4838,7 +4838,7 @@ async def job(
       final payload, or `{"timed_out": True, "status": <last>}` on expiry — a
       TIMEOUT, not a failure.
     - "watch" -> stream live progress via MCP notifications (default 600.0s,
-      same ceiling); same `timed_out` shape, but `status` is a live
+      same ceiling); same `timed_out` (timeout, not failure) shape, but `status` is a live
       `{progress, total, nodes_done}` snapshot, not a raw status dict.
     - "cancel" -> stop a queued/running job.
     - "queue" -> list known jobs (Comfy Cloud-tracked rows filtered out).
