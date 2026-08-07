@@ -39,6 +39,12 @@ dependencies = [
     # Already an mcp dependency; declared explicitly because this server now
     # imports it directly for the elicitation response schema.
     "pydantic>=2",
+    # Already an mcp dependency (the SDK's own tool dispatcher uses it to run a
+    # `def` tool off the event loop); declared explicitly because `job()` now
+    # imports `anyio.to_thread` directly to off-load its blocking branches the
+    # same way, rather than wedging the loop for up to an hour (`action="wait"`).
+    # Floor matches what `mcp` itself requires.
+    "anyio>=4.9",
 ]
 # comfy-cli is intentionally NOT a declared dependency: this server shells out
 # to whatever `comfy` binary PATH/COMFY_BIN resolves to (which may differ from a
@@ -69,8 +75,15 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
+# e2e needs a live local ComfyUI; cli_contract needs a real (unmocked)
+# comfy-cli binary. Deselect both from plain `pytest` so the unit suite never
+# probes the network or shells out to a real binary. Run them explicitly:
+# `pytest -m e2e` / `pytest -m cli_contract` (a command-line -m comes after
+# addopts, so it overrides this default).
+addopts = "-m 'not e2e and not cli_contract'"
 markers = [
-    "e2e: live end-to-end smoke test; needs a running local ComfyUI + comfy-cli (skips otherwise)",
+    "e2e: live end-to-end smoke test; needs a running local ComfyUI + comfy-cli (deselected by default; run with -m e2e)",
+    "cli_contract: live contract check against an installed comfy-cli binary (no ComfyUI needed)",
 ]
 
 [tool.ruff]

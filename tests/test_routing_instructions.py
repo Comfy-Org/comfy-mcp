@@ -31,12 +31,12 @@ import inspect
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 # ``INSTRUCTIONS`` is hard-wrapped prose, so any phrase long enough to matter can
 # straddle a newline. Match against a whitespace-collapsed copy: these tests are
 # guarding that the POLICY is still stated, not where the line breaks fall.
-FLAT = " ".join(server.INSTRUCTIONS.split())
+FLAT = " ".join(instructions.INSTRUCTIONS.split())
 
 _ROUTING_HEADER = "Routing — check the machine before running local diffusion."
 _ROUTING_END = "Everything targets the LOCAL server only"
@@ -76,7 +76,7 @@ def test_the_server_hands_these_instructions_to_the_client():
     connect to a server that advertises no guidance at all and none of the
     content tests would notice.
     """
-    assert server.mcp.instructions == server.INSTRUCTIONS
+    assert server.mcp.instructions == instructions.INSTRUCTIONS
 
 
 def test_instructions_carry_a_routing_block(routing):
@@ -187,7 +187,7 @@ def test_routing_names_every_submitting_tool_as_diverted(routing):
     which is the failure this guards against in both directions: an agent that
     believes ``generate_image`` runs here will apply this machine's VRAM
     thresholds to a job that lands elsewhere, and — worse — will read a
-    ``prompt_not_found`` from ``wait_for_job`` as a broken queue rather than as
+    ``prompt_not_found`` from ``job(action="wait")`` as a broken queue rather than as
     the two calls having been pointed at different servers.
 
     Scoped to the diversion SENTENCE, not the whole block: every one of these
@@ -286,9 +286,9 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     pinning the failure on either one: ``tag`` and ``type`` are separate
     exact-match forwards to ``--tag`` / ``--type``, so ``tag`` alone does not
     constrain the output type and ``type`` alone does not constrain where the
-    model runs. Either way the compact rows omit ``tags`` (see
-    ``test_templates.py``), so the caller cannot tell a local template from an
-    ``API`` one in the results.
+    model runs. The compact rows DO carry ``tags`` (see ``test_templates.py``),
+    but that only confirms what a filtered search returned — it does not
+    replace filtering on both axes to get there.
 
     The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
     with a discrete card follows the discrete-GPU row, and "any Mac" handed that
@@ -389,7 +389,7 @@ def test_instructions_carry_a_paid_vs_free_block(paid_vs_free):
 
     Same tripwire role as ``test_instructions_carry_a_routing_block``: delete
     the block and this fails outright instead of the content checks quietly
-    passing on names (``search_templates``, ``confirm_spend``, ``get_node``)
+    passing on names (``search_templates``, ``confirm_spend``, ``nodes``)
     that pre-existing bullets elsewhere in ``INSTRUCTIONS`` also use.
 
     ``startswith`` would be tautological — the fixture slices from the header's
@@ -471,7 +471,7 @@ def test_paid_vs_free_recommends_exclude_api_for_an_explicitly_free_request(
     noise, and ``exclude_api=True`` is the filter that removes it.
 
     The advice is deliberately pinned to ``search_templates``, which is where
-    that argument exists today; ``search_nodes`` takes no such filter, so the
+    that argument exists today; ``nodes`` takes no such filter, so the
     block tells the caller to screen its rows on the markers by hand instead.
     Naming ``exclude_api`` as if both tools took it would hand an agent a
     ``TypeError`` on the node path — so the asymmetry has to be stated.
@@ -485,7 +485,7 @@ def test_paid_vs_free_recommends_exclude_api_for_an_explicitly_free_request(
     """
     assert "`exclude_api=True` to `search_templates`" in paid_vs_free
     assert "that filter always exists" in paid_vs_free
-    assert "`search_nodes` takes no such argument" in paid_vs_free
+    assert "`nodes` takes no such argument" in paid_vs_free
 
     def params(tool):
         # `@mcp.tool()` may hand back a wrapper; `.fn` is the undecorated tool.
@@ -494,8 +494,8 @@ def test_paid_vs_free_recommends_exclude_api_for_an_explicitly_free_request(
     assert "exclude_api" in params(server.search_templates), (
         "search_templates lost `exclude_api` — the block promises it always exists"
     )
-    assert "exclude_api" not in params(server.search_nodes), (
-        "search_nodes gained `exclude_api` — update the block, which tells "
+    assert "exclude_api" not in params(server.nodes), (
+        "nodes gained `exclude_api` — update the block, which tells "
         "clients to screen its rows on the markers by hand instead"
     )
 
@@ -508,13 +508,13 @@ def test_paid_vs_free_says_paid_options_do_not_bound_the_free_twin(paid_vs_free)
     integer ``width`` / ``height``. An agent that read the paid schema and
     generalised it would tell a user an arbitrary resolution is impossible when
     the free twin accepts it outright — a capability denial with no basis. The
-    answer is to read the free node's OWN schema, which is what ``get_node``
-    returns.
+    answer is to read the free node's OWN schema, which is what
+    ``nodes(action="get")`` returns.
     """
     assert "do NOT carry across" in paid_vs_free
     assert "`resolution` combo does not bound the free one" in paid_vs_free
     assert "`width`/`height`" in paid_vs_free
-    assert "`get_node`" in paid_vs_free
+    assert '`nodes(action="get")`' in paid_vs_free
 
 
 def test_paid_vs_free_does_not_weaken_the_spend_gate(paid_vs_free):
@@ -540,12 +540,10 @@ def test_the_spend_gate_instructions_survive_the_paid_vs_free_block():
     routing-guidance edit that trimmed either one would be a consent regression
     wearing a documentation diff.
     """
-    assert (
-        "set that ONLY when the user has actually agreed to spend credits for "
-        "that call, never just to clear the error, and never because the host "
-        "granted blanket permission to call the tool." in FLAT
-    )
-    assert "comfy-cli's gate fails closed" in FLAT
+    assert "ONLY when the user has actually agreed" in FLAT
+    assert "never just to clear the error" in FLAT
+    assert "never because the host granted blanket tool permission" in FLAT
+    assert "fails OPEN on an old or forked comfy-cli" in FLAT
 
 
 def test_server_info_docstring_points_at_the_routing_guidance():

@@ -2,10 +2,27 @@
 
 Split out of ``test_wrapper.py``, which had grown to own several whole tool
 groups alongside the genuine wrapper core. This file is the
-``download_model`` / ``download_status`` / ``wait_for_download`` /
-``cancel_download`` group: the argument guards, the submit-then-poll
-background flow, the companions, and the legacy synchronous fallback for a
-comfy-cli that predates ``model download --background``.
+``download_model`` group plus the grouped ``download(action=...)`` tool that
+replaced the former ``download_status`` / ``wait_for_download`` /
+``cancel_download`` standalone tools (consolidation commit 2, mirroring
+``job(action=...)`` from commit 1 — see ``test_jobs.py`` for the pattern this
+follows): the argument guards, the submit-then-poll background flow, the
+companions, and the legacy synchronous fallback for a comfy-cli that predates
+``model download --background``.
+
+``download`` stays a plain ``def`` tool (unlike ``job``, which is forced
+``async def`` by its "watch" action): every ``download`` action is a bounded
+``subprocess`` call or a ``time.sleep`` poll loop, none of them genuinely
+async, so there is no branch that needs to stay on the event loop and no
+off-load helper to prove — the MCP SDK's own ``anyio.to_thread.run_sync``
+wrapping around a plain ``def`` tool already covers it.
+
+All three params (``action``, ``download_id``, ``timeout_seconds``) are
+validated up front in ``download``'s own body, before any dispatch — a
+sharper version of the shape ``job`` used, whose per-action ``_job_*_sync``
+helpers each re-ran their own ``argv._guard_prompt_id``. Here the guards run
+exactly once, so a rejection never costs a spawn even on the one branch it
+would have reached.
 
 ``NO_SUCH_OPTION_STDERR`` is shared with ``test_wrapper.py`` — the
 ``_is_missing_option_error`` tests there use it too — so it lives in
@@ -15,14 +32,17 @@ cross-imported between two test modules.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import time
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from conftest import NO_SUCH_OPTION_STDERR, envelope
 
-from comfy_mcp import failure_log, server
+from comfy_mcp import argv, failure_log, server
+
+_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
 
 
 def _download_model(*args, **kwargs):
@@ -213,7 +233,7 @@ def test_download_model_rejects_an_oversized_url(patched_run):
     rather than failing as a clean `ComfyCliError` like every other bad input.
     """
     calls = patched_run(envelope(data=_submit()))
-    oversized = "https://hf.co/" + "u" * server._MAX_URL_LEN
+    oversized = "https://hf.co/" + "u" * argv._MAX_URL_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model(oversized)
@@ -224,8 +244,8 @@ def test_download_model_rejects_an_oversized_url(patched_run):
 
     # The cap is generous enough that the boundary value itself rides through
     # to argv — real signed CivitAI/HuggingFace URLs sit far below it.
-    at_ceiling = "https://hf.co/" + "u" * (server._MAX_URL_LEN - len("https://hf.co/"))
-    assert len(at_ceiling) == server._MAX_URL_LEN
+    at_ceiling = "https://hf.co/" + "u" * (argv._MAX_URL_LEN - len("https://hf.co/"))
+    assert len(at_ceiling) == argv._MAX_URL_LEN
     _download_model(at_ceiling, wait=False)
     assert calls[0]["cmd"][4:8] == ["model", "download", "--url", at_ceiling]
 
@@ -237,7 +257,7 @@ def test_download_model_rejects_an_oversized_relative_path(patched_run):
     and land in argv — the size refusal is what stops it, not the tree guard.
     """
     calls = patched_run(envelope(data=_submit()))
-    oversized = "models/" + "d" * server._MAX_PATH_ARG_LEN
+    oversized = "models/" + "d" * argv._MAX_PATH_ARG_LEN
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model("https://hf.co/x.safetensors", relative_path=oversized)
@@ -245,14 +265,14 @@ def test_download_model_rejects_an_oversized_relative_path(patched_run):
     assert calls == []
     assert oversized not in str(excinfo.value)
     # Generous boundary: the value at exactly the ceiling still passes.
-    at_ceiling = "models/" + "d" * (server._MAX_PATH_ARG_LEN - len("models/"))
-    assert server._guard_model_relative_path(at_ceiling) == at_ceiling
+    at_ceiling = "models/" + "d" * (argv._MAX_PATH_ARG_LEN - len("models/"))
+    assert argv._guard_model_relative_path(at_ceiling) == at_ceiling
 
 
 def test_download_model_rejects_an_oversized_filename(patched_run):
     """An oversized `filename` is capped ahead of the bare-name shape check."""
     calls = patched_run(envelope(data=_submit()))
-    oversized = "f" * (server._MAX_PATH_ARG_LEN + 1) + ".safetensors"
+    oversized = "f" * (argv._MAX_PATH_ARG_LEN + 1) + ".safetensors"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
         _download_model("https://hf.co/x.safetensors", filename=oversized)
@@ -262,8 +282,8 @@ def test_download_model_rejects_an_oversized_filename(patched_run):
     # Generous boundary: the name at exactly the ceiling still passes — the cap
     # is the argv one, deliberately not a NAME_MAX-tight one of its own.
     suffix = ".safetensors"
-    at_ceiling = "f" * (server._MAX_PATH_ARG_LEN - len(suffix)) + suffix
-    assert server._guard_model_filename(at_ceiling) == at_ceiling
+    at_ceiling = "f" * (argv._MAX_PATH_ARG_LEN - len(suffix)) + suffix
+    assert argv._guard_model_filename(at_ceiling) == at_ceiling
 
 
 @pytest.mark.parametrize(
@@ -753,8 +773,8 @@ def test_download_model_omits_empty_string_optionals(patched_run):
 # MCP request open for the whole multi-GB transfer, so the client's deadline
 # fired while the download quietly succeeded — a false failure with no handle to
 # verify it by. It now submits to comfy-cli's background worker and polls the
-# resulting `download_id`, the shape `run_workflow(wait=False)` + `wait_for_job`
-# already use for long generations.
+# resulting `download_id`, the shape `run_workflow(wait=False)` +
+# `job(action="wait")` already use for long generations.
 
 
 def _submit(download_id: str = "a1b2c3d4e5f6", **extra) -> dict:
@@ -1056,8 +1076,8 @@ def test_download_model_attaches_the_id_when_the_poll_raises(monkeypatch):
 
     The id was minted INSIDE this call, so letting the exception through
     untouched leaves a multi-GB download running detached with no handle to
-    enumerate or cancel it. `wait_for_download` needs no such wrapping — its
-    caller passed the id in and still holds it.
+    enumerate or cancel it. `download(action="wait")` needs no such wrapping —
+    its caller passed the id in and still holds it.
     """
 
     def fake_poll(download_id, timeout_seconds):
@@ -1073,7 +1093,7 @@ def test_download_model_attaches_the_id_when_the_poll_raises(monkeypatch):
 
     message = str(excinfo.value)
     assert "a1b2c3d4e5f6" in message  # the handle survives the failure
-    assert "cancel_download" in message
+    assert "download(action='cancel'" in message
     assert "comfy-cli timed out after 1.0s" in message  # original diagnosis kept
     # Structured attributes survive too, so a caller branching on them still can.
     assert excinfo.value.timed_out is True
@@ -1338,20 +1358,31 @@ def test_download_model_wait_false_ignores_the_timeout_argument(monkeypatch):
 
 
 def test_download_status_maps_command_and_returns_data(patched_run):
-    """download_status wraps `comfy model download-status <id>`."""
+    """download(action="status") wraps `comfy model download-status <id>`."""
     payload = _status("downloading", percent=25.0)
     calls = patched_run(envelope(data=payload))
 
-    assert server.download_status("a1b2c3d4e5f6") == payload
+    assert server.download(action="status", download_id="a1b2c3d4e5f6") == payload
     assert calls[0]["cmd"][4:] == ["model", "download-status", "a1b2c3d4e5f6"]
     assert calls[0]["timeout"] == 60.0
 
 
+def test_download_status_is_the_default_action(patched_run):
+    """`action` defaults to "status", the same default `job` uses."""
+    payload = _status("downloading")
+    calls = patched_run(envelope(data=payload))
+
+    assert server.download(download_id="a1b2c3d4e5f6") == payload
+    assert calls[0]["cmd"][4:] == ["model", "download-status", "a1b2c3d4e5f6"]
+
+
 def test_cancel_download_maps_command_and_returns_data(patched_run):
-    """cancel_download wraps `comfy model download-cancel <id>`."""
+    """download(action="cancel") wraps `comfy model download-cancel <id>`."""
     calls = patched_run(envelope(data=_status("cancelled")))
 
-    assert server.cancel_download("a1b2c3d4e5f6")["status"] == "cancelled"
+    assert server.download(action="cancel", download_id="a1b2c3d4e5f6")["status"] == (
+        "cancelled"
+    )
     assert calls[0]["cmd"][4:] == ["model", "download-cancel", "a1b2c3d4e5f6"]
     assert calls[0]["timeout"] == 60.0
 
@@ -1367,7 +1398,7 @@ def test_cancel_download_unknown_id_raises_error_envelope(patched_run):
     )
 
     with pytest.raises(server.ComfyCliError, match="download_not_found"):
-        server.cancel_download("nope")
+        server.download(action="cancel", download_id="nope")
 
 
 # Click's usage error for a verb the installed comfy-cli does not have: exit 2,
@@ -1387,28 +1418,34 @@ _NO_DOWNLOAD_CANCEL = (
 
 
 @pytest.mark.parametrize(
-    "tool, reply, verb",
+    "action, reply, verb",
     [
-        ("download_status", _NO_DOWNLOAD_STATUS, "download-status"),
-        ("wait_for_download", _NO_DOWNLOAD_STATUS, "download-status"),
-        ("cancel_download", _NO_DOWNLOAD_CANCEL, "download-cancel"),
+        ("status", _NO_DOWNLOAD_STATUS, "download-status"),
+        ("wait", _NO_DOWNLOAD_STATUS, "download-status"),
+        ("cancel", _NO_DOWNLOAD_CANCEL, "download-cancel"),
     ],
 )
 def test_download_companions_degrade_on_a_comfy_cli_without_the_verb(
-    patched_run, tool, reply, verb
+    patched_run, action, reply, verb
 ):
     """A missing verb reads as a capability gap, not as a broken MCP.
 
     `download_model` already degrades for the option-shaped half of this same
-    version gap (`--background`); these three are the verb-shaped half. The
-    group is all-or-nothing, so a CLI missing them also rejects `--background`
-    and can never have minted an id — nothing is actually lost, and the message
-    points at the inline `download_model` that DOES work there.
+    version gap (`--background`); these three actions are the verb-shaped
+    half. The group is all-or-nothing, so a CLI missing them also rejects
+    `--background` and can never have minted an id — nothing is actually
+    lost, and the message points at the inline `download_model` that DOES
+    work there.
+
+    R3: the degrade verb is PER-ACTION — "status"/"wait" both poll
+    `download-status`, only "cancel" hits `download-cancel` — pinned directly
+    by asserting the message names *verb* (the parametrized one), not a
+    constant.
     """
     returncode, stdout, stderr = reply
     patched_run(stdout, returncode=returncode, stderr=stderr)
 
-    result = getattr(server, tool)("a1b2c3d4e5f6")
+    result = server.download(action=action, download_id="a1b2c3d4e5f6")
 
     assert result["unsupported"] is True
     assert f"model {verb} unavailable" in result["error"]
@@ -1420,8 +1457,8 @@ def test_download_companions_degrade_on_a_comfy_cli_without_the_verb(
     assert "returned no JSON" not in result["error"]
 
 
-@pytest.mark.parametrize("tool", ["download_status", "wait_for_download"])
-def test_download_companions_keep_a_real_error_raw(patched_run, tool):
+@pytest.mark.parametrize("action", ["status", "wait"])
+def test_download_companions_keep_a_real_error_raw(patched_run, action):
     """A verb comfy-cli DID dispatch must never be waved through as a gap.
 
     An unknown id is a real answer from a working CLI. Degrading it would tell
@@ -1436,18 +1473,20 @@ def test_download_companions_keep_a_real_error_raw(patched_run, tool):
     )
 
     with pytest.raises(server.ComfyCliError, match="download_not_found"):
-        getattr(server, tool)("a1b2c3d4e5f6")
+        server.download(action=action, download_id="a1b2c3d4e5f6")
 
 
 @pytest.mark.parametrize(
-    "tool, verb",
+    "action, verb",
     [
-        ("download_status", "download-status"),
-        ("wait_for_download", "download-status"),
-        ("cancel_download", "download-cancel"),
+        ("status", "download-status"),
+        ("wait", "download-status"),
+        ("cancel", "download-cancel"),
     ],
 )
-def test_download_companions_echoed_phrase_is_not_unsupported(patched_run, tool, verb):
+def test_download_companions_echoed_phrase_is_not_unsupported(
+    patched_run, action, verb
+):
     """A caller cannot forge the version gap through its own `download_id`.
 
     The id is a bare positional and `_guard_download_id` deliberately permits
@@ -1467,19 +1506,19 @@ def test_download_companions_echoed_phrase_is_not_unsupported(patched_run, tool,
     )
 
     with pytest.raises(server.ComfyCliError):
-        getattr(server, tool)(download_id)
+        server.download(action=action, download_id=download_id)
 
 
 @pytest.mark.parametrize(
-    "tool, verb",
+    "action, verb",
     [
-        ("download_status", "download-status"),
-        ("wait_for_download", "download-status"),
-        ("cancel_download", "download-cancel"),
+        ("status", "download-status"),
+        ("wait", "download-status"),
+        ("cancel", "download-cancel"),
     ],
 )
 def test_download_companions_degrade_with_a_colliding_download_id(
-    patched_run, tool, verb
+    patched_run, action, verb
 ):
     """A short id that COLLIDES with Click's phrase must not cost the degrade.
 
@@ -1497,19 +1536,30 @@ def test_download_companions_degrade_with_a_colliding_download_id(
         stderr=f"Usage: comfy model [OPTIONS] COMMAND\nNo such command '{verb}'.",
     )
 
-    assert getattr(server, tool)("a")["unsupported"] is True
+    assert server.download(action=action, download_id="a")["unsupported"] is True
 
 
-@pytest.mark.parametrize("blank", ["", " ", "\t\n"])
+def test_download_rejects_a_missing_download_id_before_the_guard():
+    """An empty `download_id` (the default sentinel) is the "missing required"
+    shape — named by action AND param — not `_guard_download_id`'s generic
+    "invalid download_id" message, mirroring `job`'s `prompt_id` handling."""
+    with pytest.raises(
+        server.ComfyCliError, match=r"download\(action='status'\) requires download_id"
+    ):
+        server.download(action="status")
+
+
+@pytest.mark.parametrize("blank", [" ", "\t\n"])
 def test_download_companions_reject_a_blank_download_id(blank):
-    """A whitespace-only id is the same caller mistake as an empty one.
+    """A whitespace-only id is truthy, so it clears the "missing required"
+    check and reaches `_guard_download_id`'s own `strip()`-based refusal.
 
     `_guard_download_id`'s docstring says an empty id can only be a caller
     mistake, but `" "` is truthy — so it took a `strip()` to refuse it rather
     than forward `comfy model download-status " "`.
     """
     with pytest.raises(server.ComfyCliError, match="invalid download_id"):
-        server.download_status(blank)
+        server.download(action="status", download_id=blank)
 
 
 @pytest.mark.parametrize("dash_led", [" -x", "\t--help"])
@@ -1522,7 +1572,7 @@ def test_download_companions_reject_a_padded_dash_led_id(dash_led):
     detection on the first character.
     """
     with pytest.raises(server.ComfyCliError, match="invalid download_id"):
-        server.download_status(dash_led)
+        server.download(action="status", download_id=dash_led)
 
 
 def test_guard_download_id_reports_a_size_not_an_oversized_value():
@@ -1533,10 +1583,10 @@ def test_guard_download_id_reports_a_size_not_an_oversized_value():
     and the failure log — defeating the "report the length, not the value" rule
     the cap exists to enforce.
     """
-    oversized_blank = " " * (server._MAX_DOWNLOAD_ID_LEN + 50)
+    oversized_blank = " " * (argv._MAX_DOWNLOAD_ID_LEN + 50)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        server._guard_download_id(oversized_blank)
+        argv._guard_download_id(oversized_blank)
 
     assert "exceeds the" in str(excinfo.value)
     assert oversized_blank not in str(excinfo.value)
@@ -1551,27 +1601,31 @@ def test_guard_download_id_rejects_a_non_string(bad):
     error every other bad input produces.
     """
     with pytest.raises(server.ComfyCliError, match="expected a string"):
-        server._guard_download_id(bad)
+        argv._guard_download_id(bad)
 
 
 def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
-    """wait_for_download polls until terminal and returns that final payload."""
+    """download(action="wait") polls until terminal and returns that payload."""
     calls = _sequenced(monkeypatch, [_status("downloading"), _status("completed")])
 
-    assert server.wait_for_download("a1b2c3d4e5f6") == _status("completed")
+    assert server.download(action="wait", download_id="a1b2c3d4e5f6") == _status(
+        "completed"
+    )
     assert calls[0] == ("model", "download-status", "a1b2c3d4e5f6")
     assert len(calls) == 2
 
 
 def test_wait_for_download_returns_a_failure_rather_than_raising(monkeypatch):
-    """Like `wait_for_job`, a terminal failure comes back as a payload to read.
+    """Like `job(action="wait")`, a terminal failure comes back as a payload to
+    read.
 
-    Only `download_model` turns that into a raise — this tool is the polling
-    primitive, and an agent chaining it wants the `status` / `error` fields.
+    Only `download_model` turns that into a raise — this action is the
+    polling primitive, and an agent chaining it wants the `status` / `error`
+    fields.
     """
     _sequenced(monkeypatch, [_status("failed", error="checksum mismatch")])
 
-    result = server.wait_for_download("a1b2c3d4e5f6")
+    result = server.download(action="wait", download_id="a1b2c3d4e5f6")
 
     assert result["status"] == "failed"
     assert result["error"] == "checksum mismatch"
@@ -1584,7 +1638,7 @@ def test_wait_for_download_times_out_cleanly(monkeypatch):
     # A monotonic clock that jumps 10s per read, so the 25s bound expires.
     _install_clock(monkeypatch, start=0.0).tick_per_read(10.0)
 
-    assert server.wait_for_download("a1b2c3d4e5f6") == {
+    assert server.download(action="wait", download_id="a1b2c3d4e5f6") == {
         "timed_out": True,
         "download_id": "a1b2c3d4e5f6",
         "status": _status("downloading"),
@@ -1603,7 +1657,9 @@ def test_wait_for_download_caps_each_poll_to_the_remaining_bound(monkeypatch):
     clock = _install_clock(monkeypatch, start=0.0)
     clock.tick_per_read(1.0)  # the bound drains as the loop consults the clock
 
-    result = server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=5.0)
+    result = server.download(
+        action="wait", download_id="a1b2c3d4e5f6", timeout_seconds=5.0
+    )
 
     assert result["timed_out"] is True
     assert seen == [4.0, 2.0]  # each poll gets only what is left of the 5s bound
@@ -1620,14 +1676,14 @@ def test_wait_for_download_clamps_an_oversized_timeout(monkeypatch, oversized):
         try:
             return next(reads)
         except StopIteration:
-            pytest.fail("wait_for_download kept polling past the clamped ceiling")
+            pytest.fail("download(action='wait') kept polling past the clamped ceiling")
 
     # On the fake clock object, not on the stdlib module `server` imported.
     monkeypatch.setattr(_install_clock(monkeypatch), "monotonic", fake_monotonic)
 
-    assert server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=oversized)[
-        "timed_out"
-    ]
+    assert server.download(
+        action="wait", download_id="a1b2c3d4e5f6", timeout_seconds=oversized
+    )["timed_out"]
 
 
 @pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
@@ -1636,9 +1692,29 @@ def test_wait_for_download_rejects_a_non_positive_or_nan_timeout(monkeypatch, ba
     calls = _sequenced(monkeypatch, [])
 
     with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
-        server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=bad)
+        server.download(action="wait", download_id="a1b2c3d4e5f6", timeout_seconds=bad)
 
     assert calls == []
+
+
+# --- R1: default wait timeout (25.0) --------------------------------------
+
+
+def test_download_wait_default_timeout_is_25_seconds(monkeypatch):
+    """`download(action="wait")` with no `timeout_seconds` defaults to 25.0 —
+    the exact default `wait_for_download` had, and the same number `job(action=
+    "wait")`'s default resolves to."""
+    seen: dict = {}
+
+    def fake_poll_download(download_id, timeout_seconds):
+        seen["timeout_seconds"] = timeout_seconds
+        return _status("completed")
+
+    monkeypatch.setattr(server, "_poll_download", fake_poll_download)
+
+    server.download(action="wait", download_id="a1b2c3d4e5f6")
+
+    assert seen["timeout_seconds"] == 25.0
 
 
 # The download family takes its id as a bare positional exactly as the jobs
@@ -1646,21 +1722,20 @@ def test_wait_for_download_rejects_a_non_positive_or_nan_timeout(monkeypatch, ba
 # reach comfy-cli as an option, a NUL makes `subprocess.Popen` raise a bare
 # ValueError, an empty id can only be a caller mistake, and an oversized one
 # fails in the exec as an OSError nobody converts.
-@pytest.mark.parametrize(
-    "tool",
-    ["download_status", "cancel_download", "wait_for_download"],
-)
+@pytest.mark.parametrize("action", ["status", "cancel", "wait"])
 @pytest.mark.parametrize("bad_id", ["--help", "-o", "", "d\x001", "d" * 129])
-def test_download_tools_reject_an_unusable_download_id(monkeypatch, tool, bad_id):
+def test_download_tools_reject_an_unusable_download_id(monkeypatch, action, bad_id):
     """A dash-led / empty / NUL-bearing / oversized id is refused before any spawn."""
 
     def fake_run(*args, **kwargs):
-        raise AssertionError(f"{tool} spawned comfy-cli with {bad_id!r}")
+        raise AssertionError(
+            f"download(action={action!r}) spawned comfy-cli with {bad_id!r}"
+        )
 
     monkeypatch.setattr(server, "_run_comfy", fake_run)
 
     with pytest.raises(server.ComfyCliError, match="download_id"):
-        getattr(server, tool)(bad_id)
+        server.download(action=action, download_id=bad_id)
 
 
 def test_download_model_guards_the_id_comfy_cli_hands_back(monkeypatch):
@@ -1675,8 +1750,8 @@ def test_download_model_guards_the_id_comfy_cli_hands_back(monkeypatch):
 #
 # A comfy-cli that predates `model download --background` rejects the flag at
 # parse time, and `download_model` falls back to the old one-shot synchronous
-# call. That path keeps the old contract in full, including the BE-3345
-# no-envelope handling below — which is now scoped to it alone, since a
+# call. That path keeps the old contract in full, including the no-envelope
+# handling below — which is now scoped to it alone, since a
 # `--background` submit returns a real envelope. `legacy_comfy_cli` is what
 # makes the installed CLI look that old.
 
@@ -1805,7 +1880,7 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(
 
     `_last_json_object` returns any JSON object (not just `type==envelope`), so a
     diagnostic line that happens to parse must NOT be mistaken for a result
-    envelope and unwrapped into a spurious failure (BE-3345 edge case).
+    envelope and unwrapped into a spurious failure.
     """
     patched_async_run(
         '{"level": "info", "msg": "connection reused"}\n',
@@ -1822,7 +1897,7 @@ def test_download_model_synthesizes_despite_stray_non_envelope_json(
 def test_download_model_envelope_then_diagnostic_keeps_envelope_data(
     patched_async_run, legacy_comfy_cli
 ):
-    """A real envelope FOLLOWED BY a diagnostic JSON line still wins (BE-3345).
+    """A real envelope FOLLOWED BY a diagnostic JSON line still wins.
 
     `_last_json_object` prefers a `type==envelope` object over a later plain JSON
     line, so a trailing diagnostic must NOT null out `real_envelope` and demote a
@@ -1848,7 +1923,7 @@ def test_download_model_error_envelope_then_diagnostic_still_raises(
 
     Even on exit 0, a trailing diagnostic JSON line must not mask an earlier
     error envelope as a synthesized success — the error envelope is preferred and
-    propagates its code (BE-3345).
+    propagates its code.
     """
     patched_async_run(
         '{"type": "envelope", "ok": false, '
@@ -1918,7 +1993,7 @@ def test_download_model_legacy_timeout_kills_the_transfer_and_guides_the_caller(
 ):
     """A waited fallback that overruns its bound kills the transfer and says so.
 
-    This is the BE-5167 shape: the bytes were moving inside THIS call, so unlike
+    The bytes were moving inside THIS call, so unlike
     the `--background` path there is no detached worker left to poll — the
     transfer is dead and a partial file may be on disk with no `download_id` to
     check it with. The error has to carry all of that, plus the way out.
@@ -2093,7 +2168,7 @@ def test_download_model_legacy_non_timeout_failure_propagates_unwrapped(
 def test_download_model_legacy_cancellation_reaps_the_transfer(
     patched_async_run, legacy_comfy_cli, monkeypatch
 ):
-    """Cancelling the tool call must kill the transfer, not orphan it (BE-5167).
+    """Cancelling the tool call must kill the transfer, not orphan it.
 
     This is what `asyncio.to_thread(_run_comfy, …)` could not do: its cancellation
     never reached the thread, so an MCP cancel notification (or a stdio shutdown
@@ -2127,3 +2202,102 @@ def test_download_model_legacy_cancellation_reaps_the_transfer(
 
     assert len(procs) == 1
     assert procs[0].killed is True  # the `finally` fired
+
+
+# --- the grouped `download(action=...)` tool: action enum ---------------------
+#
+# Mirrors `test_jobs.py`'s "action enum" section — `download` replaces
+# `download_status` / `wait_for_download` / `cancel_download` the same way
+# `job` replaced its own six, but stays a plain `def` tool (see this module's
+# docstring for why no off-load proof is needed here).
+
+
+def test_download_rejects_an_unknown_action(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match="invalid download action"):
+        server.download(action="bogus", download_id="a1b2c3d4e5f6")
+
+
+def test_download_bad_action_error_names_the_valid_ones(monkeypatch):
+    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {})
+
+    with pytest.raises(server.ComfyCliError, match=r"'status'.*'wait'.*'cancel'"):
+        server.download(action="delete", download_id="a1b2c3d4e5f6")
+
+
+# --- extraneous-parameter policy: REJECT LOUDLY --------------------------------
+
+
+@pytest.mark.parametrize("action", ["status", "wait", "cancel"])
+def test_download_missing_required_download_id_is_rejected(monkeypatch, action):
+    """Every action requires `download_id`; a missing one is named by ACTION
+    and PARAM rather than falling through to `argv._guard_download_id("")`'s
+    generic message — the exact shape `job`'s `prompt_id` check uses."""
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError(f"{action} spawned comfy-cli with no download_id")
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+
+    with pytest.raises(server.ComfyCliError, match=f"action={action!r}.*download_id"):
+        server.download(action=action)
+
+
+@pytest.mark.parametrize("action", ["status", "cancel"])
+def test_download_rejects_a_supplied_timeout_seconds_where_unused(no_spawn, action):
+    """`timeout_seconds` is only for "wait" — supplying it elsewhere is REJECT
+    LOUDLY, not a silent no-op."""
+    with pytest.raises(
+        server.ComfyCliError,
+        match=rf"download\(action={action!r}\) does not take timeout_seconds",
+    ) as excinfo:
+        server.download(action=action, download_id="a1b2c3d4e5f6", timeout_seconds=5.0)
+    assert "'wait'" in str(excinfo.value)
+
+
+# --- tool docstring budget (<=220 est. tokens) + R6 disambiguation ------------
+
+
+def test_download_tool_docstring_within_its_own_token_budget():
+    tree = ast.parse(_SERVER_SRC.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "download":
+            doc = ast.get_docstring(node)
+            assert doc is not None
+            est_tokens = len(doc) // 4
+            assert est_tokens <= 220, f"download() docstring ~{est_tokens} est. tokens"
+            return
+    pytest.fail("download() tool not found in server.py")
+
+
+def test_download_docstring_disambiguates_from_download_model():
+    """R6: the mis-selection this consolidation makes newly plausible is a
+    caller reaching for `download` to START a transfer — the shape
+    `download_model` alone has, but `download` now shares its NAME'S root
+    word with. The opening sentence has to close that gap before anything
+    else in the docstring, and has to name the tool that actually starts one.
+    """
+    doc = server.download.__doc__ or ""
+    first_line = doc.strip().splitlines()[0]
+
+    assert first_line == (
+        "Track a transfer already started by download_model; does NOT start one."
+    )
+    assert "download_model" in doc
+
+
+def test_download_has_no_url_parameter():
+    """R6 prose tripwire: `download` must never grow a `url` (or similar
+    submit-shaped) parameter — that is exactly the shape that would let
+    `download(url=...)` look like it starts a transfer, the confusion the
+    docstring's opening line exists to head off. Starting one stays
+    `download_model`'s job alone."""
+    import inspect
+
+    params = set(inspect.signature(server.download).parameters)
+    assert "url" not in params
+    assert params == {"action", "download_id", "timeout_seconds"}
