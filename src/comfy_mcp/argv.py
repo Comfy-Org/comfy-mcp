@@ -116,8 +116,8 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
       begins with the node id, which comfy-cli surfaces non-negative via
       ``list_workflow_slots``, so no reachable address starts with ``-``. It also
       costs no capability: ``set_workflow_slot``'s overrides, the structured
-      forms' ``address`` (:func:`_slot_address_arg`), and both param marshalers
-      (:func:`_validate_param_key`) already refuse one, so every other way to
+      forms' ``address`` (:func:`params._slot_address_arg`), and both param marshalers
+      (:func:`params._validate_param_key`) already refuse one, so every other way to
       name a slot in this module rejects it too.
 
     And one deliberate NON-rejection, which is what "nearly" above is doing:
@@ -184,7 +184,7 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
 # declined in that function's docstring. Do not reopen it by tightening this.
 #
 # Measured in CHARACTERS, like every id cap above it and unlike
-# :data:`_MAX_PRECHECKED_SLOT_BYTES`, which encodes first because it is sized
+# :data:`params._MAX_PRECHECKED_SLOT_BYTES`, which encodes first because it is sized
 # against the kernel's per-argument limit DIRECTLY and has to land on that exact
 # boundary. Nothing here does: a character cap is strictly conservative for the
 # hazard it guards. Worst case is 4 bytes/character, so 4096 characters is at

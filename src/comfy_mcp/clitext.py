@@ -920,7 +920,7 @@ def _phrase_is_only_the_caller_s(
       ``relative_path`` and ``filename``, the three ``out_path`` values, the two
       ``out_dir`` values, each entry of ``upload_file``'s ``paths`` and
       ``search_models``' ``folder`` — as ``download_model``'s ``url`` carries
-      ``_MAX_URL_LEN``. (That list and the one at :data:`_MAX_PATH_ARG_LEN` are
+      ``_MAX_URL_LEN``. (That list and the one at :data:`argv._MAX_PATH_ARG_LEN` are
       the same set, and are meant to stay in sync.) Both ceilings sit
       thousands of characters ABOVE the tail and so leave this window exactly as
       open as it was uncapped. That is deliberate — a cap tight enough to close

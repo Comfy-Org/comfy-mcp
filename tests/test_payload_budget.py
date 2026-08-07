@@ -1,11 +1,11 @@
 """Ceiling on the LLM-facing payload: tool docstrings + handshake instructions.
 
 Every MCP session ships every tool description plus INSTRUCTIONS before any
-work happens. That payload was measured at roughly 39k tokens on 2026-08-06
-— a fixed tax on every conversation. This test freezes a ceiling just above
-the measured size so growth is a deliberate decision (bump the constant in
-the same PR, with justification), and the planned docstring diet ratchets
-the constant DOWN as it lands.
+work happens. After a three-pass docstring diet, the payload is approximately
+15.1k estimated tokens — a fixed tax on every conversation. This test freezes
+a ceiling just above the measured size so growth is a deliberate decision (bump
+the constant in the same PR, with justification), and the ceiling ratchets DOWN
+as further trims land.
 
 Token estimate: len(chars) / 4 — crude but stable, and only deltas matter.
 Docstrings are collected via AST rather than SDK introspection so the test

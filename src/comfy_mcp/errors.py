@@ -40,7 +40,7 @@ class ComfyCliError(RuntimeError):
     ``code`` does NOT imply that — a well-formed error envelope may simply omit
     ``error.code`` — so a caller asking "did comfy-cli fail *before* it could
     report structurally?" must check this flag rather than ``code is None``.
-    :func:`_is_missing_verb_error` is exactly that caller.
+    :func:`clitext._is_missing_verb_error` is exactly that caller.
 
     ``returncode`` is the child's exit status wherever :func:`_unwrap_envelope`
     knows it — on the no-envelope path AND on an error envelope — so it is

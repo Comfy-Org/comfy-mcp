@@ -7988,8 +7988,8 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
 
     Gotchas:
         - A bare ``validate_workflow`` is WEAKER than ``local_check``: an old
-          comfy-cli checks ZERO nodes, reporting ``valid: true`` (blind spot 3)
-          — watch ``non_node_key`` warnings with no UI conversion.
+          UI-export file checks ZERO nodes, reporting ``valid: true`` (blind spot 3)
+          — watch ``non_node_key`` warnings with no ``converted_from_ui``.
         - Freshness: CACHED, 24h TTL as of v1.14.0 (this server's floor);
           refresh with ``comfy templates refresh``. NOT read from the local
           install.
