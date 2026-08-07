@@ -38,7 +38,7 @@ from conftest import (
     stream_reader,
 )
 
-from comfy_mcp import errors, failure_log, server, tcc, textutil
+from comfy_mcp import clitext, errors, failure_log, server, tcc, textutil
 
 
 def _launch(*args, **kwargs):
@@ -1758,7 +1758,7 @@ def test_is_missing_option_error_matches_clicks_usage_error(rendered):
         returncode=2,
     )
 
-    assert server._is_missing_option_error(exc, "--background") is True
+    assert clitext._is_missing_option_error(exc, "--background") is True
 
 
 def test_is_missing_option_error_requires_no_envelope():
@@ -1771,7 +1771,7 @@ def test_is_missing_option_error_requires_no_envelope():
         f"stderr: {NO_SUCH_OPTION_STDERR}", no_envelope=False, returncode=2
     )
 
-    assert server._is_missing_option_error(exc, "--background") is False
+    assert clitext._is_missing_option_error(exc, "--background") is False
 
 
 def test_is_missing_option_error_requires_the_usage_exit_status():
@@ -1780,7 +1780,7 @@ def test_is_missing_option_error_requires_the_usage_exit_status():
         f"stderr: {NO_SUCH_OPTION_STDERR}", no_envelope=True, returncode=1
     )
 
-    assert server._is_missing_option_error(exc, "--background") is False
+    assert clitext._is_missing_option_error(exc, "--background") is False
 
 
 def test_is_missing_option_error_does_not_match_a_longer_option_name():
@@ -1792,7 +1792,7 @@ def test_is_missing_option_error_does_not_match_a_longer_option_name():
         returncode=2,
     )
 
-    assert server._is_missing_option_error(exc, "--background") is False
+    assert clitext._is_missing_option_error(exc, "--background") is False
 
 
 def test_validate_workflow_returns_results_for_valid(patched_run):
@@ -4328,7 +4328,7 @@ def test_synthesize_plain_result_masks_a_credential_in_its_captured_text():
     fallback and `partner_generate` on SUCCESS — the one path none of the
     failure-side scrubbing sees.
     """
-    result = server._synthesize_plain_result(
+    result = clitext._synthesize_plain_result(
         ("model", "download", "--url", _CREDENTIALED_URL),
         "",
         f"Downloading {_CREDENTIALED_URL}\nDone in 55.8s",
@@ -4345,7 +4345,7 @@ def test_synthesize_plain_result_masks_a_credential_in_its_captured_text():
 def test_synthesize_plain_result_scrubs_before_its_tail_cap():
     """Capping first would bisect a URL past its scheme, leaving the remainder raw."""
     noise = "n" * 1200
-    result = server._synthesize_plain_result(
+    result = clitext._synthesize_plain_result(
         ("model", "download"), "", f"{noise} fetching {_CREDENTIALED_URL} ok"
     )
 

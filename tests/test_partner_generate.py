@@ -33,7 +33,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp import clitext, server
 
 
 def _generate(*args, **kwargs):
@@ -937,7 +937,7 @@ def _cells(text: str) -> int:
     """Cell width of `text`, computed independently of the server's own helper.
 
     rich measures its line breaks in terminal CELLS, so the renderer below must
-    too — and it must not borrow `server._cell_len`, or a bug in that helper
+    too — and it must not borrow `clitext._cell_len`, or a bug in that helper
     would cancel itself out and every fold test would pass on input the real
     parser cannot handle.
     """
@@ -963,7 +963,7 @@ def _chop(text: str, width: int) -> tuple[str, str]:
 
 
 def _fold(
-    path: str, *, width: int = server._RICH_DEFAULT_WIDTH, indent: str = "  "
+    path: str, *, width: int = clitext._RICH_DEFAULT_WIDTH, indent: str = "  "
 ) -> str:
     """Render one saved path the way rich actually would, at `width` cells.
 
@@ -1096,7 +1096,7 @@ def test_a_path_of_wide_characters_is_measured_in_cells_not_code_points(
     path, so the continuation is dropped and a truncated path is reported.
     """
     path = "/Users/someone/" + "画像フォルダ/" * 6 + "out.png"
-    assert len(path) < server._RICH_DEFAULT_WIDTH  # `len` says it never folded...
+    assert len(path) < clitext._RICH_DEFAULT_WIDTH  # `len` says it never folded...
     rendered = _fold(path)
     assert len(rendered.splitlines()) > 1  # ...but in CELLS it did
     patched_plain_run(0, stdout=f"Saved:\n{rendered}\n")
@@ -1114,7 +1114,7 @@ def test_a_path_left_unfinished_is_dropped_rather_than_truncated(patched_plain_r
     """
     path = "/Users/someone/" + "deeply-nested-directory/" * 4 + "jellyfish.png"
     first_line = _fold(path).splitlines()[0]
-    assert len(first_line) == server._RICH_DEFAULT_WIDTH  # the text stops here
+    assert len(first_line) == clitext._RICH_DEFAULT_WIDTH  # the text stops here
     patched_plain_run(0, stdout=f"Saved:\n  /tmp/a.png\n{first_line}")
 
     result = _generate("flux-pro", confirm_spend=True)
@@ -1125,7 +1125,7 @@ def test_a_path_left_unfinished_is_dropped_rather_than_truncated(patched_plain_r
 def test_an_over_long_path_is_dropped_rather_than_sliced(patched_plain_run):
     """A path past PATH_MAX cannot name a real file, and a prefix of it names a
     DIFFERENT plausible one — so drop it and keep the paths around it."""
-    huge = "/tmp/" + "d" * (server._MAX_SAVED_PATH_CHARS + 10) + ".png"
+    huge = "/tmp/" + "d" * (clitext._MAX_SAVED_PATH_CHARS + 10) + ".png"
     patched_plain_run(0, stdout=f"Saved:\n  /tmp/a.png\n  {huge}\n  /tmp/b.png\n")
 
     result = _generate("flux-pro", confirm_spend=True)
@@ -1157,7 +1157,7 @@ def test_saved_paths_stop_at_unrelated_output_after_a_long_path(patched_plain_ru
     line below it a continuation and hand back a destination that never existed.
     """
     path = "/Users/someone/Pictures/comfy-generations/partner-jellyfish.png"
-    assert 2 + len(path) < server._RICH_DEFAULT_WIDTH  # rendered, it did not fold
+    assert 2 + len(path) < clitext._RICH_DEFAULT_WIDTH  # rendered, it did not fold
     patched_plain_run(0, stdout=f"Saved:\n  {path}\nAll done in 12.4s\n")
 
     result = _generate("flux-pro", confirm_spend=True)
@@ -1218,7 +1218,7 @@ def test_an_unusable_columns_falls_back_to_richs_own_default(monkeypatch, bad):
     """Junk in `COLUMNS` must not make the width nonsense — rich ignores it too."""
     monkeypatch.setenv("COLUMNS", bad)
 
-    assert server._child_console_width() == server._RICH_DEFAULT_WIDTH
+    assert clitext._child_console_width() == clitext._RICH_DEFAULT_WIDTH
 
 
 def test_saved_paths_are_absent_when_nothing_was_saved(patched_plain_run):
@@ -1235,7 +1235,7 @@ def test_saved_paths_are_bounded(patched_plain_run):
 
     result = _generate("flux-pro", confirm_spend=True)
 
-    assert len(result["saved_paths"]) == server._MAX_SAVED_PATHS
+    assert len(result["saved_paths"]) == clitext._MAX_SAVED_PATHS
 
 
 def test_saved_paths_are_not_confused_by_a_long_stderr_line(patched_plain_run):

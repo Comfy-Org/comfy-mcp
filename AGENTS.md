@@ -105,7 +105,7 @@ reads the **user's live install** — custom nodes included — not a static cat
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the
 `--json-stream` machinery, the spend-consent plumbing) and every `@mcp.tool()`.
-Five **leaf** modules sit under it — none imports `server`, so the dependency
+Six **leaf** modules sit under it — none imports `server`, so the dependency
 edges only ever point one way:
 
 | Module | Owns |
@@ -115,6 +115,7 @@ edges only ever point one way:
 | `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` failure log (its config, its module state, and `_log_failure`) **and the URL scrubbers** — `_scrub_text` / `_scrubbed_stream_tail` also mask credentials on the way to the MCP CLIENT, not just to disk |
 | `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — the client-handshake text |
 | `errors.py` | `ComfyCliError`, the "nothing recorded to stop" detector (`_is_no_recorded_server` + its markers), and the `error.details` renderer + per-field char cap (`_render_error_details`, `_MAX_ERROR_FIELD_CHARS`) |
+| `clitext.py` | comfy-cli **human-output** parsing — the text channel for verbs with no envelope: the `Saved:`-block / install-failure extractors and `plain_ok` synthesis (`_extract_saved_paths`, `_extract_install_failures`, `_synthesize_plain_result`), the missing-verb/-option capability probes (`_is_missing_verb_error`, `_is_missing_option_error`, `_normalize_cli_text`), `install_node`'s per-pack verdict (`_classify_install_result`), and the echoed-argv forgery guards (`_phrase_is_only_the_caller_s`, `_is_manager_missing_error`). `_extract_install_failures` / `_extract_saved_paths` are the AGENTS.md-documented cm-cli contract (see "The architecture rule" above) — move or edit them byte-for-byte |
 
 `server` reaches them **module-qualified** (`tcc._tcc_guidance(...)`,
 `failure_log._log_failure(...)`) and re-exports no BEHAVIOR — deliberately: a
