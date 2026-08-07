@@ -167,9 +167,11 @@ polls with). No tool takes a bare `path` or `workflow` argument.
 Routing — check the machine before running local diffusion. `server_info`
 passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a
 `gpu` object carrying `vendor` / `model` / `vram_bytes` / `unified_memory`)
-when the installed comfy-cli reports one. Read it before the first generation
-and work through these steps IN ORDER — a later step never overrides an
-earlier one:
+when the installed comfy-cli reports one. A `Machine snapshot` section at the
+END of these instructions, when present, already carries this block from
+server start — route on it directly; absent means the startup probe failed,
+so use `server_info` instead. Read it before the first generation and work
+through these steps IN ORDER — a later step never overrides an earlier one:
 - STEP 1, is the work even local? `hardware` describes THIS machine, where
   most tools execute. A `comfy_target` block carrying a `host` diverts every
   job-SUBMITTING tool — `run_workflow`, `generate_image`, `run_template` —

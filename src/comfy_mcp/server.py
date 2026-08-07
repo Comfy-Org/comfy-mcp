@@ -10068,6 +10068,160 @@ def vary_workflow(
     return _run_comfy(*args, timeout=120.0)
 
 
+# How long the startup snapshot probe may hold up the handshake, WALL-CLOCK.
+# Enforced by `_apply_startup_instructions`' bounded thread join rather than by
+# the probe's own subprocess timeouts, because those do not compose into a
+# startup budget: in a fresh process `_run_comfy` first runs the once-per-process
+# `comfy --version` guard (its own 30s timeout) before the env call, so summing
+# inner timeouts budgets 45s+ against a wedged binary — measured, not
+# theoretical. The join is the one number that caps the client-visible stall;
+# the probe thread is a daemon and its late result is discarded. Shorter than
+# `server_info`'s 60s on purpose: this runs before the server answers its first
+# initialize, so a wedged comfy binary must cost bounded startup time and then
+# fall open to the static INSTRUCTIONS rather than stall the client.
+_SNAPSHOT_PROBE_TIMEOUT_S = 15.0
+
+_SNAPSHOT_HEADER = "Machine snapshot (`comfy env`, captured once at server start):"
+
+# Upper bound on the rendered `hardware` JSON that rides the handshake. A real
+# block is a few hundred bytes; this exists because the payload is another
+# program's output quoted into EVERY conversation's context, so a drifted or
+# hostile `comfy env` must not be able to bloat the instructions. Oversized
+# means the payload is not what this section was designed for — fall open
+# (drop the snapshot) rather than truncate JSON into something half-parseable.
+_SNAPSHOT_MAX_HARDWARE_CHARS = 4000
+
+
+def _machine_snapshot_block() -> str | None:
+    """The `Machine snapshot` section appended to the handshake, or ``None``.
+
+    The routing policy in ``instructions.INSTRUCTIONS`` keys on ``server_info``'s
+    ``hardware`` block, but that only helps an agent that remembers to CALL the
+    tool before its first generation — and in practice agents skip it and start
+    heavy local runs on machines the policy would have routed to
+    partner/cloud. So the handshake itself carries the data: probe ``comfy env``
+    once at startup and render its ``hardware`` block (plus the resolved remote
+    target, whose presence flips routing STEP 1) into the instructions every
+    client receives.
+
+    Thin-wrapper guardrail (AGENTS.md): nothing is DERIVED here. The block is
+    comfy-cli's own payload quoted verbatim — no VRAM branching, no verdict —
+    into the one surface this repo legitimately owns, the MCP handshake. The
+    probe is best-effort in every direction: any failure (missing binary,
+    timeout, envelope error, undecodable output — the same set
+    :func:`_freshness_report` tolerates) or a drifted payload shape returns
+    ``None``, and the static ``instructions.INSTRUCTIONS`` stand alone, still
+    telling the agent to call ``server_info`` first. ``hardware`` ABSENT from a
+    healthy payload (an older comfy-cli omits the key; an explicit ``null``
+    reads the same) is different from a failed probe and says so: that is
+    routing STEP 3's UNKNOWN, and stating it in the snapshot spares the agent a
+    ``server_info`` round trip that would report the same.
+
+    The dump is scrubbed with :func:`failure_log._scrub_text` before it rides
+    the handshake — hardware fields should never carry a credential URL, but
+    the payload is another program's output and this section is quoted into
+    every conversation, the same standing as the validate relay's masking. The
+    target host gets :func:`target._redact_target_host` for the same reason
+    ``server_info`` applies it: a URL-style ``COMFYUI_HOST`` carries userinfo
+    verbatim.
+    """
+    try:
+        data = _run_comfy("env", timeout=_SNAPSHOT_PROBE_TIMEOUT_S)
+    except (ComfyCliError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    lines = [_SNAPSHOT_HEADER]
+    hardware = data.get("hardware")
+    rendered = (
+        failure_log._scrub_text(json.dumps({"hardware": hardware}, indent=2))
+        if isinstance(hardware, dict)
+        else None
+    )
+    if rendered is not None and len(rendered) > _SNAPSHOT_MAX_HARDWARE_CHARS:
+        # Not a real hardware block — see _SNAPSHOT_MAX_HARDWARE_CHARS.
+        return None
+    if rendered is not None:
+        lines.append(rendered)
+        lines.append(
+            "Route on this `hardware` block directly — it is `server_info`'s own "
+            "field, captured at startup, and the machine's hardware does not "
+            "change while this server runs. Everything ELSE `server_info` "
+            "reports (running server, URL, workspace, freshness, compatibility) "
+            "is LIVE state this snapshot does not carry: still call "
+            "`server_info` for those before assuming a server is up."
+        )
+    else:
+        lines.append(
+            "`comfy env` reported no usable `hardware` block, so the memory "
+            "figure is UNKNOWN — routing STEP 3 applies: ask the user what GPU "
+            "and how much VRAM/RAM they have before the first local generation."
+        )
+    try:
+        resolved_target = target._comfy_target()
+    except ComfyCliError as exc:
+        note = target._malformed_target_note(exc)
+        lines.append(f"Remote target: MALFORMED — {note['error']} {note['note']}")
+    else:
+        if resolved_target is not None:
+            host, port, source = resolved_target
+            endpoint = target._format_target_endpoint(
+                target._redact_target_host(host), port
+            )
+            lines.append(
+                f"A remote ComfyUI target is configured via {source}: "
+                f"{endpoint}. Routing STEP 1 applies — the hardware above "
+                "describes THIS machine, while run_workflow / generate_image / "
+                "run_template and the jobs/queue tools submit to that target."
+            )
+    return "\n".join(lines)
+
+
+def _apply_startup_instructions() -> None:
+    """Put the machine snapshot on the handshake, if the startup probe got one.
+
+    The probe runs on a daemon thread with a bounded join so
+    ``_SNAPSHOT_PROBE_TIMEOUT_S`` caps the WALL-CLOCK stall before the first
+    initialize response, whatever the probe does internally — the
+    once-per-process ``comfy --version`` guard inside ``_run_comfy`` carries
+    its own 30s timeout, so trusting the inner timeouts would budget 45s+
+    against a binary that hangs rather than errors, long enough to trip some
+    clients' initialize deadline. A probe that outlives the join keeps running
+    harmlessly to completion (it only computes a string) and its result is
+    discarded: the instructions are only ever written HERE, on the main
+    thread, before ``mcp.run()`` — never late, never concurrently.
+
+    The SDK exposes ``MCPServer.instructions`` read-only, so the write lands on
+    the low-level server attribute — the field ``create_initialization_options``
+    reads per handshake, which makes a single assignment before ``mcp.run()``
+    sufficient and keeps this the ONE place instructions are ever rebuilt.
+    ``test_machine_snapshot.py`` asserts the public ``mcp.instructions`` getter
+    reflects the write, so an SDK release that moves the attribute fails a test
+    here rather than silently shipping a handshake without the snapshot. A
+    ``None`` block (probe failed) or an overrun probe changes nothing: the
+    static ``instructions.INSTRUCTIONS`` already tell the agent to call
+    ``server_info`` first.
+    """
+    result: list[str | None] = []
+    probe = threading.Thread(
+        # Resolved at call time so the test suite's monkeypatched probe is the
+        # one that runs; the list-append keeps "no result yet" (timed out)
+        # distinct from "returned None" (probe failed) without sharing more
+        # state than one append.
+        target=lambda: result.append(_machine_snapshot_block()),
+        name="comfy-mcp-machine-snapshot",
+        daemon=True,
+    )
+    probe.start()
+    probe.join(_SNAPSHOT_PROBE_TIMEOUT_S)
+    if probe.is_alive() or not result:
+        return
+    block = result[0]
+    if block is None:
+        return
+    mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
+
+
 def main() -> None:
     """Entry point: serve the MCP over stdio.
 
@@ -10085,6 +10239,12 @@ def main() -> None:
     :func:`_require_comfy_bin` do for the child process we spawn.
     """
     try:
+        # Before serving: enrich the handshake instructions with the one-shot
+        # machine snapshot. Runs inside this try on purpose — the
+        # probe swallows its own failures (including a PermissionError, an
+        # OSError subclass) and falls open, so nothing here can keep the
+        # server from starting.
+        _apply_startup_instructions()
         # Name the transport rather than inheriting the SDK's default: the whole
         # stdio design rests on it — `failure_log`'s rule that stdout is the
         # JSON-RPC channel and must never be written to is only true under
