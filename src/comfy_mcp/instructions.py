@@ -70,7 +70,7 @@ flows:
   node CLASS and you do not know which pack provides it, `workflow_deps`
   names the packs a workflow's classes come from and which are missing:
   `validate_workflow` -> `workflow_deps` -> `install_node` ->
-  `restart_comfyui`. `search_nodes` cannot answer this — it only ever finds
+  `restart_comfyui`. `nodes(action="search")` cannot answer this — it only ever finds
   classes already installed. A `workflow_deps` key that is a repo URL rather
   than a registry id is NOT installable by `install_node`; hand those to the
   USER. A missing MODEL is `download_model`.
@@ -124,7 +124,7 @@ flows:
   partner-API nodes, in which case `run_workflow` carries the same
   `confirm_spend` gate. Discover partner models here, never in a terminal:
   `list_partner_models()` (filter with `style=`/`partner=`) and
-  `partner_model_schema(alias)`; `discover`/`search_nodes`/`search_templates`
+  `partner_model_schema(alias)`; `discover`/`nodes`/`search_templates`
   do not carry the partner alias set, and neither does shelling out to
   `comfy generate list`.
   Every spending call confirms with the USER first: on a client that
@@ -152,8 +152,8 @@ workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `vary_workflow`); output files use `out_path` (`fetch_template`,
 `partner_generate`, `emit_partner_workflow`); output directories use
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
-(`get_template`, `get_node`, `nodes_upstream`/`nodes_downstream`,
-`run_template`); job handles use `prompt_id` (`job`, `fetch_outputs`); and
+(`get_template`, `nodes`, `run_template`); job handles use `prompt_id`
+(`job`, `fetch_outputs`); and
 download handles use `download_id` (`download`, and the id `download_model`
 polls with). No tool takes a bare `path` or `workflow` argument.
 

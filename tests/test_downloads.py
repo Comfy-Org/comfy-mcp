@@ -773,8 +773,8 @@ def test_download_model_omits_empty_string_optionals(patched_run):
 # MCP request open for the whole multi-GB transfer, so the client's deadline
 # fired while the download quietly succeeded — a false failure with no handle to
 # verify it by. It now submits to comfy-cli's background worker and polls the
-# resulting `download_id`, the shape `run_workflow(wait=False)` + `wait_for_job`
-# already use for long generations.
+# resulting `download_id`, the shape `run_workflow(wait=False)` +
+# `job(action="wait")` already use for long generations.
 
 
 def _submit(download_id: str = "a1b2c3d4e5f6", **extra) -> dict:

@@ -104,7 +104,7 @@ promises a REGISTRY pack. `restart_comfyui`'s kill gate is STATE-scoped
 instead, firing mid-sequence once a launch loses the port. Mirror the engine's
 contract per tool; never generalize one gate onto another.
 
-The local differentiator: discovery (`search_nodes`, `get_node`, `search_models`)
+The local differentiator: discovery (`nodes`, `search_models`)
 reads the **user's live install** — custom nodes included — not a static catalog.
 
 ## Module layout

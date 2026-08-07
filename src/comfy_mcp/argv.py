@@ -864,7 +864,7 @@ _MAX_NODE_PACK_ID_LEN = 128
 # same hazard as `relative_path`.
 #
 # What remains deliberately UNCAPPED is the FREE-FORM half: `search_models`'
-# `--text` query, the enumerated `search_templates` / `search_nodes` filter
+# `--text` query, the enumerated `search_templates` / `nodes` filter
 # values, the params `_generate_param_args` renders, and `vary_workflow`'s /
 # `set_workflow_slot`'s JSON slot. Those are prompt- and query-shaped rather
 # than path-shaped, so a path-sized ceiling would be the wrong instrument — it

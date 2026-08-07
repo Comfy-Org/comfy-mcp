@@ -163,7 +163,7 @@ def test_routing_names_every_submitting_tool_as_diverted(routing):
     which is the failure this guards against in both directions: an agent that
     believes ``generate_image`` runs here will apply this machine's VRAM
     thresholds to a job that lands elsewhere, and — worse — will read a
-    ``prompt_not_found`` from ``wait_for_job`` as a broken queue rather than as
+    ``prompt_not_found`` from ``job(action="wait")`` as a broken queue rather than as
     the two calls having been pointed at different servers.
 
     Scoped to the diversion SENTENCE, not the whole block: every one of these

@@ -1400,7 +1400,7 @@ def test_the_handshake_instructions_teach_the_install_flow():
     missing", which is precisely the dead end this tool removes: an agent that
     learned the wall at handshake never discovers the tool that resolves it. The
     restart is part of the same clause because installing without restarting looks
-    like a no-op from `search_nodes`.
+    like a no-op from `nodes(action="search")`.
     """
     flat = " ".join(instructions.INSTRUCTIONS.split())
 

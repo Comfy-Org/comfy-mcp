@@ -3673,7 +3673,7 @@ def list_partner_models(
     """List the hosted PARTNER models ``partner_generate`` can run.
 
     Wraps ``comfy generate list`` — the ONLY source of the partner alias
-    catalog (``search_nodes``/``search_templates`` read the local install).
+    catalog (``nodes``/``search_templates`` read the local install).
 
     Args:
         style/partner/query: filters forwarded to comfy-cli, exact/substring;
@@ -3822,7 +3822,7 @@ async def partner_generate(
     Args:
         params: the model's own inputs (``prompt``, ``aspect_ratio``, ``seed``,
             …), forwarded verbatim. Discover them with ``list_partner_models()``
-            and ``partner_model_schema(model)`` — not ``search_nodes`` /
+            and ``partner_model_schema(model)`` — not ``nodes`` /
             ``search_templates``, which answer a local-install question.
         confirm_spend: this call ALWAYS spends credits. Set True ONLY when the
             user has actually agreed to spend on this call — never merely to
@@ -7262,7 +7262,7 @@ def _install_node_unavailable(reason: str | None) -> dict[str, Any]:
     Same shape and same environment description as ``workflow_deps``' — see
     :func:`_manager_state_clause`. What differs is only the ROUTING, because the
     two tools have different ways out: a class this install already has is still
-    described by ``get_node``, whereas a pack it does not have cannot be
+    described by ``nodes``, whereas a pack it does not have cannot be
     installed by any tool on this server.
 
     The route named for a legacy clone is ComfyUI-Manager's own UI, which is a
@@ -7385,7 +7385,7 @@ async def install_node(
     """Install custom node packs into the LOCAL ComfyUI — runs third-party code, asks first.
 
     Wraps ``comfy node install <name...> --exit-on-fail``. Feed it registry pack
-    ids (e.g. ``"comfyui-impact-pack"``) from ``search_nodes`` /
+    ids (e.g. ``"comfyui-impact-pack"``) from ``nodes`` /
     ``workflow_deps`` — never a node CLASS name (convert it with
     ``workflow_deps`` first); a git URL or an ``@version`` pin is refused
     before anything runs (run ``comfy node install`` in a terminal for those).
@@ -8217,74 +8217,20 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     }
 
 
-@mcp.tool()
-def search_nodes(query: str) -> Any:
-    """Search node classes in the LOCAL ComfyUI's live ``object_info``.
-
-    Wraps ``comfy nodes search <query>``. Includes the user's INSTALLED
-    custom nodes, not a static catalog. Find a class name (e.g. "KSampler",
-    "load image") before authoring/repairing a graph; pass it to ``get_node``
-    for the full schema.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional: a leading-dash query is read as an option, not a search
-    # term (argument injection).
-    argv._reject_option_like(
-        "query", query, expected="a search term (e.g. 'KSampler' or 'load image')"
-    )
-    argv._reject_nul("query", query)
+def _nodes_search_sync(query: str) -> Any:
+    """``nodes(action="search")``'s body — the exact ``search_nodes`` this replaced."""
     return _run_comfy("nodes", "search", query, timeout=60.0)
 
 
-@mcp.tool()
-def get_node(name: str) -> Any:
-    """Return one node class's full input/output schema from the live local catalog.
-
-    Wraps ``comfy nodes show <ClassName>``. ``name`` is the class name (from
-    ``search_nodes``). Reflects the live install, so custom-node classes
-    resolve too.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional: a leading-dash name is read as an option rather than the
-    # node class to show (argument injection).
-    argv._reject_option_like(
-        "name", name, expected="a node class name (e.g. 'KSampler')"
-    )
-    argv._reject_nul("name", name)
+def _nodes_get_sync(name: str) -> Any:
+    """``nodes(action="get")``'s body — the exact ``get_node`` this replaced."""
     return _run_comfy("nodes", "show", name, timeout=60.0)
 
 
-@mcp.tool()
-def list_nodes(
-    produces: str = "",
-    accepts: str = "",
-    category: str = "",
-    pack: str = "",
-    label: str = "",
+def _nodes_list_sync(
+    produces: str, accepts: str, category: str, pack: str, label: str
 ) -> Any:
-    """List node classes from the live local ``object_info``, with optional filters.
-
-    Wraps ``comfy nodes ls``; empty args are omitted (bare call lists all).
-    Includes installed custom nodes — the broad "what nodes can do X?"
-    companion to ``search_nodes``' name search.
-
-    Args:
-        produces/accepts: filter by output/input connection ``TYPE`` (e.g.
-            ``IMAGE``, ``MODEL``).
-        category: glob on the category path (``loaders*``, ``sampling/*``).
-        pack: custom-node pack name, matched case-insensitively.
-        label: one of comfy-cli's curated behavioral labels
-            (``WritesToDisk``, ``NetworkAccess``, ``ReadsArbitraryFile``, …),
-            exact match, only on nodes comfy-cli annotates — not a name
-            search (use ``search_nodes``).
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
+    """``nodes(action="list")``'s body — the exact ``list_nodes`` this replaced."""
     args = ["nodes", "ls"]
     for flag, value in (
         ("--produces", produces),
@@ -8294,90 +8240,30 @@ def list_nodes(
         ("--label", label),
     ):
         if value:
-            # Same guarded loop as `search_templates`' filters, for the same two
-            # reasons: a dash-leading filter is input hygiene (Click reads an
-            # option's value verbatim, so this is a caller mistake worth naming
-            # rather than an injection vector — see `argv._reject_option_like`), and a
-            # NUL would otherwise escape as `subprocess`' bare ValueError instead
-            # of a `ComfyCliError`.
-            argv._reject_option_like(f"{flag} value", value)
-            argv._reject_nul(f"{flag} value", value)
             args += [flag, value]
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
-def nodes_upstream(name: str, limit: int | None = None) -> Any:
-    """List node classes whose outputs can feed ``name``'s inputs.
-
-    Wraps ``comfy nodes upstream <name> [--limit N]`` — "what can I wire INTO
-    this node?", computed against the live local ``object_info`` (custom
-    nodes included). ``limit`` caps the result count; omit for the full set.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional, and it sits beside this command's own `--limit`: a
-    # leading-dash name is read as an option (argument injection).
-    argv._reject_option_like(
-        "name", name, expected="a node class name (e.g. 'KSampler')"
-    )
-    argv._reject_nul("name", name)
+def _nodes_upstream_sync(name: str, limit: int | None) -> Any:
+    """``nodes(action="upstream")``'s body — the exact ``nodes_upstream`` this replaced."""
     args = ["nodes", "upstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
-def nodes_downstream(name: str, limit: int | None = None) -> Any:
-    """List node classes that accept ``name``'s output types.
-
-    Wraps ``comfy nodes downstream <name> [--limit N]`` — "what can I wire
-    this node INTO?", computed against the live local ``object_info`` (custom
-    nodes included). ``limit`` caps the result count; omit for the full set.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Bare positional, and it sits beside this command's own `--limit`: a
-    # leading-dash name is read as an option (argument injection).
-    argv._reject_option_like(
-        "name", name, expected="a node class name (e.g. 'KSampler')"
-    )
-    argv._reject_nul("name", name)
+def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
+    """``nodes(action="downstream")``'s body — the exact ``nodes_downstream`` this replaced."""
     args = ["nodes", "downstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
-def nodes_path(
-    from_type: str, to_type: str, max_depth: int = 6, max_paths: int = 10
+def _nodes_path_sync(
+    from_type: str, to_type: str, max_depth: int, max_paths: int
 ) -> Any:
-    """Find node chains that route a value from ``from_type`` to ``to_type``.
-
-    Wraps ``comfy nodes path <FROM> <TO> --max-depth N --max-paths N`` over
-    the live local ``object_info`` graph (e.g. ``MODEL`` -> ``IMAGE``).
-    ``max_depth`` bounds chain length, ``max_paths`` caps how many routes
-    come back.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
-    # Two bare positionals ahead of `--max-depth` / `--max-paths`: a leading-dash
-    # type is read as an option and shifts every later token up a slot, so the
-    # second type could land in the first's place (argument injection).
-    # `max_depth` / `max_paths` need no guard: they are typed ints (so they
-    # cannot carry an arbitrary caller string at all) and they ride behind
-    # `--max-depth` / `--max-paths` as option values, which Click takes
-    # verbatim — even the `"-1"` a negative bound would render as.
-    for label, value in (("from_type", from_type), ("to_type", to_type)):
-        argv._reject_option_like(
-            label, value, expected="a connection type (e.g. 'MODEL' or 'IMAGE')"
-        )
-        argv._reject_nul(label, value)
+    """``nodes(action="path")``'s body — the exact ``nodes_path`` this replaced."""
     return _run_comfy(
         "nodes",
         "path",
@@ -8391,32 +8277,228 @@ def nodes_path(
     )
 
 
-@mcp.tool()
-def nodes_types() -> Any:
-    """List every connection type in the live local graph, ranked by connectivity.
-
-    Wraps ``comfy nodes types`` — edge types (``MODEL``, ``IMAGE``,
-    ``LATENT``, …) across installed nodes, most-connective first: the
-    vocabulary you wire with. Includes custom-node types.
-
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
-    install lists outdated nodes.
-    """
+def _nodes_types_sync() -> Any:
+    """``nodes(action="types")``'s body — the exact ``nodes_types`` this replaced."""
     return _run_comfy("nodes", "types", timeout=60.0)
 
 
+def _nodes_categories_sync() -> Any:
+    """``nodes(action="categories")``'s body — the exact ``nodes_categories`` this replaced."""
+    return _run_comfy("nodes", "categories", timeout=60.0)
+
+
+# The eight actions `nodes` dispatches, in the order their old standalone tools
+# used to appear (search, get, list, upstream, downstream, path, types,
+# categories). An unknown value is rejected before anything else runs —
+# mirrors `job`/`download`'s bad-action shape.
+_NODES_ACTIONS = (
+    "search",
+    "get",
+    "list",
+    "upstream",
+    "downstream",
+    "path",
+    "types",
+    "categories",
+)
+
+# Which actions consume each of `nodes`' union params — the REJECT LOUDLY
+# policy's tables, same shape as `job`'s: a param supplied for an action that
+# does not consume it is refused rather than silently ignored.
+_NODES_ACTIONS_TAKING_QUERY = ("search",)
+_NODES_ACTIONS_TAKING_NAME = ("get", "upstream", "downstream")
+# The five `list_nodes` filters share one consumer, so one table covers all
+# five rather than five identical one-element tuples.
+_NODES_ACTIONS_TAKING_LIST_FILTERS = ("list",)
+_NODES_ACTIONS_TAKING_LIMIT = ("upstream", "downstream")
+# `from_type`/`to_type` are both REQUIRED by, and only consumed by, "path".
+_NODES_ACTIONS_TAKING_PATH_TYPES = ("path",)
+# `max_depth`/`max_paths` are optional (sentinel `None` resolves to comfy-cli's
+# own defaults, 6 and 10 — R4) and only "path" consumes either.
+_NODES_ACTIONS_TAKING_DEPTH_PATHS = ("path",)
+
+
 @mcp.tool()
-def nodes_categories() -> Any:
-    """Return the node category tree from the live local ``object_info``.
+def nodes(
+    action: str = "search",
+    query: str = "",
+    name: str = "",
+    produces: str = "",
+    accepts: str = "",
+    category: str = "",
+    pack: str = "",
+    label: str = "",
+    limit: int | None = None,
+    from_type: str = "",
+    to_type: str = "",
+    max_depth: int | None = None,
+    max_paths: int | None = None,
+) -> Any:
+    """Search, inspect, filter, or graph-walk node classes in the LOCAL live catalog.
 
-    Wraps ``comfy nodes categories`` — the menu-category hierarchy (loaders,
-    sampling, image, …) for browsing by area rather than by name. Includes
-    custom-node categories.
+    Wraps the `comfy nodes` family (`object_info`, incl. custom nodes).
+    `action`:
+    - "search" (default) -> `nodes search <query>`: find a class name by
+      keyword (e.g. "KSampler", "load image").
+    - "get" -> `nodes show <name>`: one class's full input/output schema.
+    - "list" -> `nodes ls [--produces/--accepts/--category/--pack/--label]`:
+      filtered browse; bare call lists all.
+    - "upstream"/"downstream" -> `nodes upstream|downstream <name>
+      [--limit N]`: what feeds INTO / is fed FROM `name`.
+    - "path" -> `nodes path <from_type> <to_type> --max-depth N
+      --max-paths N`: chains between two types; depth/paths default 6/10.
+    - "types" -> `nodes types`: connection types by connectivity.
+    - "categories" -> `nodes categories`: the category tree.
 
-    Freshness: LIVE — read from ``object_info`` every call; an outdated
+    `query` only for "search"; `name` for "get"/"upstream"/"downstream";
+    the five list filters only for "list"; `limit` only for
+    "upstream"/"downstream"; `from_type`/`to_type`/`max_depth`/`max_paths`
+    only for "path" — elsewhere each is rejected.
+
+    Freshness: LIVE — read from `object_info` every call; an outdated
     install lists outdated nodes.
     """
-    return _run_comfy("nodes", "categories", timeout=60.0)
+    if action not in _NODES_ACTIONS:
+        raise ComfyCliError(
+            f"invalid nodes action: {action!r} — expected one of "
+            f"{', '.join(repr(candidate) for candidate in _NODES_ACTIONS)}."
+        )
+
+    wants_query = action in _NODES_ACTIONS_TAKING_QUERY
+    wants_name = action in _NODES_ACTIONS_TAKING_NAME
+    wants_list_filters = action in _NODES_ACTIONS_TAKING_LIST_FILTERS
+    wants_limit = action in _NODES_ACTIONS_TAKING_LIMIT
+    wants_path_types = action in _NODES_ACTIONS_TAKING_PATH_TYPES
+    wants_depth_paths = action in _NODES_ACTIONS_TAKING_DEPTH_PATHS
+
+    # Missing a REQUIRED param is named by action AND param — deliberately not
+    # left to fall through to a generic guard's own message, which would not
+    # say which action needed it. Mirrors `job`/`download`.
+    if wants_query and not query:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) requires query, but none was given."
+        )
+    if wants_name and not name:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) requires name, but none was given."
+        )
+    if wants_path_types:
+        missing = [
+            param
+            for param, value in (("from_type", from_type), ("to_type", to_type))
+            if not value
+        ]
+        if missing:
+            raise ComfyCliError(
+                f"nodes(action={action!r}) requires from_type and to_type, but "
+                f"{' and '.join(missing)} {'were' if len(missing) > 1 else 'was'} "
+                "not given."
+            )
+
+    # Supplied-but-ignored params are REJECT LOUDLY, not silently dropped —
+    # same policy as `job`/`download`.
+    if not wants_query and query:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take query — query is used by "
+            f"action in {', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_QUERY)}."
+        )
+    if not wants_name and name:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take name — name is used by "
+            f"action in {', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_NAME)}."
+        )
+    if not wants_list_filters:
+        for param, value in (
+            ("produces", produces),
+            ("accepts", accepts),
+            ("category", category),
+            ("pack", pack),
+            ("label", label),
+        ):
+            if value:
+                raise ComfyCliError(
+                    f"nodes(action={action!r}) does not take {param} — {param} "
+                    "is used by action in "
+                    f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_LIST_FILTERS)}."
+                )
+    if not wants_limit and limit is not None:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take limit — limit is used by "
+            f"action in {', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_LIMIT)}."
+        )
+    if not wants_path_types:
+        for param, value in (("from_type", from_type), ("to_type", to_type)):
+            if value:
+                raise ComfyCliError(
+                    f"nodes(action={action!r}) does not take {param} — {param} "
+                    "is used by action in "
+                    f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_PATH_TYPES)}."
+                )
+    if not wants_depth_paths:
+        for param, value in (("max_depth", max_depth), ("max_paths", max_paths)):
+            if value is not None:
+                raise ComfyCliError(
+                    f"nodes(action={action!r}) does not take {param} — {param} "
+                    "is used by action in "
+                    f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_DEPTH_PATHS)}."
+                )
+
+    # ALL params validated up front, before ANY dispatch — `download`'s shape
+    # (commit 2), not `job`'s: a rejection never costs a spawn even on the
+    # branch it would have reached. Per-param guards run in the SAME order the
+    # eight standalone tools ran them in.
+    if wants_query:
+        argv._reject_option_like(
+            "query", query, expected="a search term (e.g. 'KSampler' or 'load image')"
+        )
+        argv._reject_nul("query", query)
+    if wants_name:
+        argv._reject_option_like(
+            "name", name, expected="a node class name (e.g. 'KSampler')"
+        )
+        argv._reject_nul("name", name)
+    if wants_list_filters:
+        for flag, value in (
+            ("--produces", produces),
+            ("--accepts", accepts),
+            ("--category", category),
+            ("--pack", pack),
+            ("--label", label),
+        ):
+            if value:
+                argv._reject_option_like(f"{flag} value", value)
+                argv._reject_nul(f"{flag} value", value)
+    if wants_path_types:
+        for field, value in (("from_type", from_type), ("to_type", to_type)):
+            argv._reject_option_like(
+                field, value, expected="a connection type (e.g. 'MODEL' or 'IMAGE')"
+            )
+            argv._reject_nul(field, value)
+    # `max_depth` / `max_paths` need no guard: they are typed ints (so they
+    # cannot carry an arbitrary caller string at all) and they ride behind
+    # `--max-depth` / `--max-paths` as option values, which Click takes
+    # verbatim — even the `"-1"` a negative bound would render as.
+
+    if action == "search":
+        return _nodes_search_sync(query)
+    if action == "get":
+        return _nodes_get_sync(name)
+    if action == "list":
+        return _nodes_list_sync(produces, accepts, category, pack, label)
+    if action == "upstream":
+        return _nodes_upstream_sync(name, limit)
+    if action == "downstream":
+        return _nodes_downstream_sync(name, limit)
+    if action == "path":
+        return _nodes_path_sync(
+            from_type,
+            to_type,
+            6 if max_depth is None else max_depth,
+            10 if max_paths is None else max_paths,
+        )
+    if action == "types":
+        return _nodes_types_sync()
+    return _nodes_categories_sync()
 
 
 # Freshness: the installed-pack half is LIVE (re-read off disk and diffed
@@ -8427,8 +8509,8 @@ def nodes_categories() -> Any:
 def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """Report a custom node pack's Python dependency requirements vs the installed venv (read-only).
 
-    Wraps ``comfy node deps``. Separate from ``get_node``/``search_nodes``
-    (those read live ``object_info``; this reads the venv's ``pip list``) —
+    Wraps ``comfy node deps``. Separate from ``nodes``
+    (that reads live ``object_info``; this reads the venv's ``pip list``) —
     nothing is installed or changed.
 
     Args:
@@ -8444,7 +8526,7 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """
     args = ["node", "deps"]
     # `pack` is a bare positional and `registry_id` is `--registry`'s value, so
-    # the same guarded pattern `get_node` / `list_nodes` use applies to both: a
+    # the same guarded pattern `nodes` uses applies to both: a
     # dash-leading positional is read as an option (argument injection), a
     # dash-leading option value is a caller mistake worth naming, and a NUL would
     # otherwise escape as `subprocess`' bare ValueError instead of a
@@ -8803,8 +8885,8 @@ async def workflow_deps(workflow_path: str) -> Any:
                         "deps-in-workflow' resolves node classes to packs "
                         f"through Manager's map. {_MANAGER_VENV_REMEDY} Until "
                         "then a class this install already has is still "
-                        "described by `get_node`/`search_nodes`, which read the "
-                        "running ComfyUI directly and never touch Manager. "
+                        "described by `nodes`, which reads the "
+                        "running ComfyUI directly and never touches Manager. "
                         "`install_node` is NOT a way around this, though: "
                         "`comfy node install` goes through the same `cm-cli`, "
                         "so it fails on this install too — installing Manager "

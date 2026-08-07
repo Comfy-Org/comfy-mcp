@@ -681,7 +681,7 @@ def _is_missing_option_error(exc: ComfyCliError, option: str) -> bool:
 # The two error codes `install_node` reports per failed pack. `pack_not_found` is
 # the one a caller can act on without reading prose — it means the id is not in
 # the registry channel this install reads, so retrying is pointless and the fix is
-# a different id (`search_nodes` / `workflow_deps` are where a real one comes
+# a different id (`nodes(action="search")` / `workflow_deps` are where a real one comes
 # from). Everything else — a clone failure, a dependency conflict, an unreachable
 # registry — is `install_failed`, where the engine's own `error` text is the only
 # thing that distinguishes them and a retry may well work.

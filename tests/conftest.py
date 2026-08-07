@@ -18,8 +18,8 @@ copy per test file:
   ``communicate``) — ``envelope`` + ``patched_run`` / ``patched_plain_run``;
 * the streaming ``--json-stream`` path
   (``asyncio.create_subprocess_exec`` + incremental stream reads) —
-  ``patched_stream``. ``run_workflow``, ``watch_job`` and ``generate_image``
-  all drive the same NDJSON stream.
+  ``patched_stream``. ``run_workflow``, ``job(action="watch")`` and
+  ``generate_image`` all drive the same NDJSON stream.
 * the plain-JSON ASYNC path (``asyncio.create_subprocess_exec`` + bounded drains
   of both pipes) — ``patched_async_run``, for ``server._run_comfy_async``. Same
   spawn and same real ``StreamReader`` pipes as the streaming fake, but the output
