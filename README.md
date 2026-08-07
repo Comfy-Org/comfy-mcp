@@ -1022,8 +1022,9 @@ a temp out_dir.
 
 It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`)
 **and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
-rather than fails, so it's safe to run anywhere — and the plain `pytest` gate stays
-green on CI runners that have neither.
+rather than fails. The e2e tests are deselected by default from plain `pytest`
+runs, so it's safe to run anywhere — and the `pytest` gate stays green on CI
+runners that have neither.
 
 ## Contributing
 

@@ -69,8 +69,12 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
+# e2e needs a live local ComfyUI; deselect it from plain `pytest` so the unit
+# suite never probes the network. Run it explicitly: `pytest -m e2e` (a
+# command-line -m comes after addopts, so it overrides this default).
+addopts = "-m 'not e2e'"
 markers = [
-    "e2e: live end-to-end smoke test; needs a running local ComfyUI + comfy-cli (skips otherwise)",
+    "e2e: live end-to-end smoke test; needs a running local ComfyUI + comfy-cli (deselected by default; run with -m e2e)",
 ]
 
 [tool.ruff]
