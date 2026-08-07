@@ -1022,6 +1022,33 @@ def test_get_logs_unrelated_usage_error_keeps_its_own_message(patched_run):
     assert "upgrade" not in str(excinfo.value)
 
 
+def test_get_logs_scrubs_credential_urls(patched_run):
+    """Relayed log lines pass the module's masking invariant, like every relay.
+
+    ComfyUI-Manager and custom nodes log the model URLs they fetch, token
+    query-params and userinfo included. get_logs is a relay of third-party
+    output into model context, so it gets the same failure_log._scrub_text
+    treatment as error tails, validate echoes, and the deps manifest —
+    scrub BEFORE cap, so the clip can never slice the URL ahead of the
+    scrubber's https:// anchor.
+    """
+    lines = [
+        "fetching https://<user>:<pass>@civitai.example/api/download/models/1",
+        "downloading https://civitai.example/api/download/models/2?token=s3cr3t",
+        "a plain line that must survive untouched",
+    ]
+    calls = patched_run(envelope(data={"lines": lines, "path": "/tmp/x.log"}))
+
+    result = server.get_logs()
+
+    assert "logs" in calls[0]["cmd"]
+    joined = "\n".join(result["lines"])
+    assert "<pass>" not in joined
+    assert "s3cr3t" not in joined
+    assert "civitai.example" in joined  # host survives; only the secret is masked
+    assert "a plain line that must survive untouched" in joined
+
+
 def test_cancel_job_maps_command_and_returns_data(patched_run):
     """cancel_job wraps `comfy jobs cancel <id>` and returns the envelope data."""
     calls = patched_run(envelope(data={"cancelled": "abc"}))

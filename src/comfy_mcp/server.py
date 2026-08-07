@@ -11017,8 +11017,13 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
     if isinstance(data, dict) and isinstance(data.get("lines"), list):
         # Charge the truncation marker against the cap so a capped line's TOTAL
         # length (content + marker) never exceeds `_MAX_LOG_LINE_CHARS`.
+        # Scrubbed BEFORE the cap, same ordering as _bounded_report_value: a clipped
+        # URL loses the anchor the scrubber matches on.
         content_limit = _MAX_LOG_LINE_CHARS - len(_TRACEBACK_TRUNCATION_MARKER)
-        data["lines"] = [_cap_text(line, content_limit) for line in data["lines"]]
+        data["lines"] = [
+            _cap_text(failure_log._scrub_text(line), content_limit)
+            for line in data["lines"]
+        ]
     return data
 
 
