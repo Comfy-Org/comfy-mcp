@@ -235,8 +235,8 @@ through these steps IN ORDER — a later step never overrides an earlier one:
   `API`-tagged video templates and `emit_partner_workflow`. Reach them with
   `search_templates(tag="API", type="video")` — filter on BOTH axes, because
   neither alone isolates partner-run video (`tag` doesn't constrain output
-  type, `type` doesn't constrain WHERE the model runs); each row's `api`
-  boolean then confirms which side of the line it fell on.
+  type, `type` doesn't constrain WHERE the model runs); the results carry an
+  `api` boolean that confirms which side of the line each row fell on.
 - Model choice: pick models via `search_templates` / `search_models` instead
   of assuming a classic default (e.g. SDXL) — current templates track current
   models.
