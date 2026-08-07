@@ -117,7 +117,7 @@ def test_oversized_argv_records_a_spawn_failed_entry(patched_run, log_path):
 def test_embedded_nul_valueerror_is_converted(patched_run):
     """``subprocess``'s bare ``ValueError`` is named as the embedded NUL it is.
 
-    The backstop under :func:`server._reject_nul`, which normally refuses a NUL
+    The backstop under :func:`argv._reject_nul`, which normally refuses a NUL
     first and names the argument — this covers a value shape it does not reach.
     """
     patched_run(raises=ValueError("embedded null byte"))
@@ -210,8 +210,8 @@ def test_streaming_runner_converts_an_unencodable_argument(patched_stream):
     """The unencodable branch on the streaming spawn, driven at the runner.
 
     Deliberately NOT through a tool: no streaming tool forwards a raw free-form
-    string to argv today. ``run_workflow`` / ``watch_job`` take only path- and
-    id-shaped values, which ``_guard_arg_len`` / ``_guard_prompt_id`` already
+    string to argv today. ``run_workflow`` / ``job(action="watch")`` take only
+    path- and id-shaped values, which ``_guard_arg_len`` / ``_guard_prompt_id`` already
     refuse first and name; ``run_template``'s params are ``json.dumps``-encoded
     with the default ``ensure_ascii=True``, which escapes an unencodable
     character to a pure-ASCII ``\\uXXXX`` before it ever reaches the spawn. The

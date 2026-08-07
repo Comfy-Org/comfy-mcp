@@ -31,7 +31,7 @@ import json
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import params, server
 
 # A representative slice of the real `comfy generate list` payload
 # (comfy_cli/schemas/generate_list.json): one record per model, `count`, and the
@@ -491,7 +491,7 @@ def test_generate_reserved_targets_are_unchanged():
     above all stays blocked: it is the spend gate's configuration surface, and a
     tool whose contract is "run a MODEL" must not be a way in to it.
     """
-    assert server._GENERATE_RESERVED_TARGETS == frozenset(
+    assert params._GENERATE_RESERVED_TARGETS == frozenset(
         {"list", "schema", "refresh", "upload", "resume", "consent"}
     )
 

@@ -34,7 +34,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 
 def _switch(*args, **kwargs):
@@ -679,5 +679,5 @@ def test_an_in_flight_update_refuses_before_the_prompt(patched_plain_run):
 
 def test_instructions_teach_the_rollback_flow():
     """The server INSTRUCTIONS carry the flow, next to the lifecycle guidance."""
-    assert "switch_comfyui_version" in server.INSTRUCTIONS
-    assert "confirm_switch=True" in server.INSTRUCTIONS
+    assert "switch_comfyui_version" in instructions.INSTRUCTIONS
+    assert "confirm_switch=True" in instructions.INSTRUCTIONS

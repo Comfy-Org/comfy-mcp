@@ -72,16 +72,19 @@ def _skip_reason() -> str | None:
     return None
 
 
-_SKIP_REASON = _skip_reason()
+# Marked `e2e` and DESELECTED by default (pyproject addopts). The live-prereq
+# probe runs lazily, inside the fixture, never at import: collection of a
+# plain `pytest` run must not open sockets or stall on a wedged port — module
+# import happens during collection even for deselected tests.
+pytestmark = [pytest.mark.e2e]
 
-# Marked `e2e` (run in isolation via `-m e2e`) and skipped unless the live
-# prerequisites are present, so a plain `pytest` in CI collects it and skips.
-pytestmark = [
-    pytest.mark.e2e,
-    pytest.mark.skipif(
-        _SKIP_REASON is not None, reason=_SKIP_REASON or "prereqs present"
-    ),
-]
+
+@pytest.fixture(scope="module", autouse=True)
+def _live_prereqs():
+    """Skip the module unless comfy-cli and a live ComfyUI are reachable."""
+    reason = _skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 def _extract_prompt_id(result: object) -> str | None:

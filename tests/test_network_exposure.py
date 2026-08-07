@@ -41,7 +41,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp import argv, server
 
 
 def _launch(*args, **kwargs):
@@ -471,7 +471,7 @@ def test_too_many_extra_args_is_a_named_error(patched_run, drive):
     calls = patched_run(envelope(data={}))
 
     with pytest.raises(server.ComfyCliError, match="entry maximum"):
-        drive(["--cpu"] * (server._MAX_EXTRA_ARGS + 1))
+        drive(["--cpu"] * (argv._MAX_EXTRA_ARGS + 1))
 
     assert calls == []
 
@@ -482,7 +482,7 @@ def test_oversized_extra_arg_entry_is_a_named_error(patched_run, drive):
     calls = patched_run(envelope(data={}))
 
     with pytest.raises(server.ComfyCliError, match="character maximum"):
-        drive(["--listen", "1" * (server._MAX_EXTRA_ARG_LEN + 1)])
+        drive(["--listen", "1" * (argv._MAX_EXTRA_ARG_LEN + 1)])
 
     assert calls == []
 
