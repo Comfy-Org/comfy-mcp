@@ -7563,11 +7563,10 @@ def project(action: str = "status") -> Any:
     `action="status"` -> `comfy project status`; `"init"` -> `comfy project
     init` (creates `comfy.yaml` + dirs; `project_already_exists` if already
     governed — try `action="status"` first). comfy-cli walks up from ITS OWN
-    cwd to find the governing project; an MCP client's cwd cannot pin that, so
-    with no `COMFY_PROJECT` set (absolute path, read once per process) both
-    act on this server's cwd, unanchored. `init`'s `where_default` is
-    comfy-cli's own (`cloud` by default); this server pins `--where local`
-    regardless.
+    cwd; an MCP client's cwd can't pin that, so with no `COMFY_PROJECT` set
+    (absolute path, read once per process) both act on this server's cwd,
+    unanchored — relative `workflow_path`/`out_path`/`out_dir` args land there
+    too. `where_default` is comfy-cli's own; routing stays `--where local`.
     """
     if action not in _PROJECT_ACTIONS:
         raise ComfyCliError(

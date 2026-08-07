@@ -855,6 +855,11 @@ spawn raises rather than silently falling back to the unanchored default, becaus
 would reintroduce exactly the non-determinism this feature exists to remove. Fix it by setting an
 absolute path, unsetting `COMFY_PROJECT`, or creating the directory.
 
+**This also moves where relative tool arguments land.** Relative path arguments (`workflow_path`,
+`out_path`, `out_dir`, …) resolve against whatever directory comfy-cli's `cwd` is — the project root
+once `COMFY_PROJECT` is set, not this server's original launch directory. Pass absolute paths when
+you mean somewhere else.
+
 Calling `project(action="init")` on a root that is **already** governed by a project (its own or an
 ancestor's `comfy.yaml`) is not a no-op: comfy-cli raises `project_already_exists` rather than
 re-initializing it. Call `project(action="status")` first when unsure whether a root is already
