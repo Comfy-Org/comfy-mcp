@@ -70,6 +70,10 @@ by walking up from its own process cwd, assuming a persistent shell session an M
 arbitrary per-call cwd can't provide, so this server passes `cwd=` on its own spawns instead
 — the `status`/`init` verdicts stay entirely comfy-cli's own.
 
+The second MCP-surface capability is the startup **machine snapshot**
+(`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
+handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
+
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` — differ where
 the engine's own shape differs, and those differences are load-bearing: `comfy generate`
 always spends, so it always prompts and honors `spend.auto_confirm`, while `comfy
