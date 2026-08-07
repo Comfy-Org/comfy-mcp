@@ -30,7 +30,7 @@ import pytest
 from conftest import envelope
 from pydantic import ValidationError
 
-from comfy_mcp import server
+from comfy_mcp import errors, server
 
 
 def test_list_workflow_slots_argv(patched_run):
@@ -411,8 +411,8 @@ def test_option_like_rejection_bounds_the_value_it_echoes():
     the 4096-character ceiling is legal input to `_reject_option_like`, whose
     echo has the widest reach in the module — most of its twenty-odd call sites
     guard values with no length cap at all. It renders through
-    `_clip_for_error`, so the message honors `_MAX_ERROR_FIELD_CHARS` like every
-    other field that quotes caller input.
+    `_clip_for_error`, so the message honors `errors._MAX_ERROR_FIELD_CHARS`
+    like every other field that quotes caller input.
     """
     at_ceiling = "-" + "w" * (server._MAX_PATH_ARG_LEN - 1)
 
@@ -422,7 +422,7 @@ def test_option_like_rejection_bounds_the_value_it_echoes():
     message = str(excinfo.value)
     assert at_ceiling not in message
     # A few words of prose around the bounded field, not 4 KB of `w`.
-    assert len(message) < server._MAX_ERROR_FIELD_CHARS + 200
+    assert len(message) < errors._MAX_ERROR_FIELD_CHARS + 200
 
 
 def test_option_like_rejection_is_unchanged_for_an_ordinary_value():
@@ -831,7 +831,7 @@ def test_clip_for_error_never_exceeds_the_cap(text):
     Checked directly rather than through a message, because the cap is this
     helper's whole contract and the call sites add their own fixed prose on top.
     """
-    assert len(server._clip_for_error(text)) <= server._MAX_ERROR_FIELD_CHARS
+    assert len(server._clip_for_error(text)) <= errors._MAX_ERROR_FIELD_CHARS
 
 
 def test_clip_for_error_matches_an_unsliced_repr():
@@ -859,7 +859,7 @@ def test_clip_for_error_quote_style_follows_the_slice():
     an already-truncated preview — but asserted rather than assumed, so it stays
     a quoting difference and does not quietly become an escaping one.
     """
-    cap = server._MAX_ERROR_FIELD_CHARS
+    cap = errors._MAX_ERROR_FIELD_CHARS
     text = "a" * (cap + 100) + "'"
 
     clipped = server._clip_for_error(text)

@@ -105,7 +105,7 @@ reads the **user's live install** — custom nodes included — not a static cat
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the
 `--json-stream` machinery, the spend-consent plumbing) and every `@mcp.tool()`.
-Four **leaf** modules sit under it — none imports `server`, so the dependency
+Five **leaf** modules sit under it — none imports `server`, so the dependency
 edges only ever point one way:
 
 | Module | Owns |
@@ -114,12 +114,19 @@ edges only ever point one way:
 | `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
 | `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` failure log (its config, its module state, and `_log_failure`) **and the URL scrubbers** — `_scrub_text` / `_scrubbed_stream_tail` also mask credentials on the way to the MCP CLIENT, not just to disk |
 | `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — the client-handshake text |
+| `errors.py` | `ComfyCliError`, the "nothing recorded to stop" detector (`_is_no_recorded_server` + its markers), and the `error.details` renderer + per-field char cap (`_render_error_details`, `_MAX_ERROR_FIELD_CHARS`) |
 
 `server` reaches them **module-qualified** (`tcc._tcc_guidance(...)`,
-`failure_log._log_failure(...)`) and re-exports nothing — deliberately: a test
-patching a moved name on `server` would otherwise silently patch a name nothing
-reads. **Patch the owning module** — `monkeypatch.setattr(failure_log,
-"_FAILURE_LOG_PATH", …)`, not `server`; the wrong one now raises `AttributeError`.
+`failure_log._log_failure(...)`) and re-exports no BEHAVIOR — deliberately: a
+test patching a moved name on `server` would otherwise silently patch a name
+nothing reads. **Patch the owning module** — `monkeypatch.setattr(failure_log,
+"_FAILURE_LOG_PATH", …)`, not `server`; the wrong one now raises
+`AttributeError`. The one carve-out: public exception and model TYPES are
+name-imported (`from .errors import ComfyCliError`) rather than reached
+module-qualified — `ComfyCliError` rides hundreds of `except`/`isinstance`
+sites, and a type has no mutable state a test could silently patch the wrong
+copy of, so the failure mode the module-qualified rule guards against does not
+apply to it.
 
 ## Toolchain
 

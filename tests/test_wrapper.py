@@ -38,7 +38,7 @@ from conftest import (
     stream_reader,
 )
 
-from comfy_mcp import failure_log, server, tcc, textutil
+from comfy_mcp import errors, failure_log, server, tcc, textutil
 
 
 def _launch(*args, **kwargs):
@@ -2082,7 +2082,7 @@ def test_validate_workflow_bounds_a_huge_string(patched_run):
 
     hint = server.validate_workflow("broken.json")["errors"][0]["hint"]
 
-    assert len(hint) == server._MAX_ERROR_FIELD_CHARS + 1
+    assert len(hint) == errors._MAX_ERROR_FIELD_CHARS + 1
     assert hint.endswith("…")
 
 
@@ -3329,7 +3329,7 @@ def test_error_envelope_bounds_a_huge_code():
     with pytest.raises(server.ComfyCliError) as excinfo:
         server._unwrap_envelope(envelope, ("env",), 1, "")
 
-    assert f"[{'z' * server._MAX_ERROR_FIELD_CHARS}]" in str(excinfo.value)
+    assert f"[{'z' * errors._MAX_ERROR_FIELD_CHARS}]" in str(excinfo.value)
 
 
 def test_no_envelope_error_masks_credentials_on_both_streams(patched_plain_run):
@@ -4380,7 +4380,7 @@ def test_cmd_for_message_bounds_a_huge_argv_from_the_head():
 
     rendered = server._cmd_for_message(cmd)
 
-    assert len(rendered) == server._MAX_ERROR_FIELD_CHARS + len("...")
+    assert len(rendered) == errors._MAX_ERROR_FIELD_CHARS + len("...")
     assert rendered.endswith("...")
     assert rendered.startswith(
         f"{server.COMFY_BIN} --json --where local run --workflow"
@@ -4419,7 +4419,7 @@ def test_timeout_message_stays_bounded_on_a_huge_argv(monkeypatch):
 
     message = str(error)
     # cmd + both tails, each capped, plus the fixed prose around them.
-    assert len(message) < 4 * server._MAX_ERROR_FIELD_CHARS
+    assert len(message) < 4 * errors._MAX_ERROR_FIELD_CHARS
     assert f"{server.COMFY_BIN} --json --where local run" in message  # head survives
 
 
@@ -4866,8 +4866,8 @@ def test_stop_comfyui_plain_no_comfyui_running_carries_no_structured_code(
 
     assert excinfo.value.code is None  # nothing structured to branch on
     assert excinfo.value.no_envelope is True
-    assert server._NO_RECORDED_SERVER_CODE not in str(excinfo.value)
-    assert server._is_no_recorded_server(excinfo.value)  # matched on the text
+    assert errors._NO_RECORDED_SERVER_CODE not in str(excinfo.value)
+    assert errors._is_no_recorded_server(excinfo.value)  # matched on the text
 
 
 @pytest.mark.parametrize(
@@ -4894,7 +4894,7 @@ def test_stop_comfyui_plain_no_comfyui_running_carries_no_structured_code(
 )
 def test_is_no_recorded_server_matches_wording_drift(message):
     """The benign case is matched on the stable phrase, not one exact sentence."""
-    assert server._is_no_recorded_server(server.ComfyCliError(message))
+    assert errors._is_no_recorded_server(server.ComfyCliError(message))
 
 
 @pytest.mark.parametrize(
@@ -4937,7 +4937,7 @@ def test_is_no_recorded_server_matches_wording_drift(message):
 )
 def test_is_no_recorded_server_rejects_other_failures(message):
     """Every OTHER stop failure stays outside the benign net."""
-    assert not server._is_no_recorded_server(server.ComfyCliError(message))
+    assert not errors._is_no_recorded_server(server.ComfyCliError(message))
 
 
 def test_is_no_recorded_server_lets_a_structured_code_outrank_the_text():
@@ -4946,7 +4946,7 @@ def test_is_no_recorded_server_lets_a_structured_code_outrank_the_text():
         "No ComfyUI is running in the background.", code="permission_denied"
     )
 
-    assert not server._is_no_recorded_server(exc)
+    assert not errors._is_no_recorded_server(exc)
 
 
 def test_is_no_recorded_server_rejects_a_stop_we_timed_out():
@@ -4957,7 +4957,7 @@ def test_is_no_recorded_server_rejects_a_stop_we_timed_out():
         timed_out=True,
     )
 
-    assert not server._is_no_recorded_server(exc)
+    assert not errors._is_no_recorded_server(exc)
 
 
 @pytest.mark.parametrize(
@@ -4980,7 +4980,7 @@ def test_is_no_recorded_server_rejects_a_stop_we_timed_out():
 )
 def test_is_no_recorded_server_gate_outranks_the_literal_marker_too(exc):
     """A quoted marker does not make a timeout or a coded failure benign."""
-    assert not server._is_no_recorded_server(exc)
+    assert not errors._is_no_recorded_server(exc)
 
 
 def test_is_no_recorded_server_accepts_an_envelope_without_a_code():
@@ -4990,7 +4990,7 @@ def test_is_no_recorded_server_accepts_an_envelope_without_a_code():
     )
 
     assert exc.no_envelope is False  # not gated on provenance, only on code
-    assert server._is_no_recorded_server(exc)
+    assert errors._is_no_recorded_server(exc)
 
 
 @pytest.fixture(autouse=True)

@@ -87,7 +87,8 @@ from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
 
-from . import failure_log, instructions, tcc, textutil
+from . import errors, failure_log, instructions, tcc, textutil
+from .errors import ComfyCliError
 
 mcp = MCPServer("comfy-mcp", instructions=instructions.INSTRUCTIONS)
 
@@ -388,7 +389,7 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
       copying the hygiene guard into it.
 
     The echoed value is rendered through :func:`_clip_for_error`, so this message
-    honors the module's :data:`_MAX_ERROR_FIELD_CHARS` bound like every other
+    honors the module's :data:`errors._MAX_ERROR_FIELD_CHARS` bound like every other
     field that quotes caller input. It is the widest-reach echo in the module —
     over twenty call sites, most of them values with no length cap of their own —
     and a bare ``{value!r}`` would mirror one back whole, ``repr`` escaping
@@ -946,66 +947,6 @@ def _comfy_env() -> dict[str, str]:
     return env
 
 
-class ComfyCliError(RuntimeError):
-    """comfy-cli was missing, timed out, or returned an error envelope.
-
-    ``code`` carries the envelope's structured ``error.code`` when the failure
-    came from an error envelope (used to drive the bounded credential retry in
-    ``run_workflow``); it is ``None`` for local failures the wrapper raises
-    itself (missing binary, timeout, no-JSON output), so callers can branch on a
-    specific code without string-matching the message — e.g. ``get_logs``
-    swallows ``no_log_file`` but re-raises the rest.
-
-    ``no_envelope`` is the stronger, unambiguous provenance signal: ``True`` only
-    when comfy-cli ran to completion and emitted NO envelope at all. A null
-    ``code`` does NOT imply that — a well-formed error envelope may simply omit
-    ``error.code`` — so a caller asking "did comfy-cli fail *before* it could
-    report structurally?" must check this flag rather than ``code is None``.
-    :func:`_is_missing_verb_error` is exactly that caller.
-
-    ``returncode`` is the child's exit status wherever :func:`_unwrap_envelope`
-    knows it — on the no-envelope path AND on an error envelope — so it is
-    genuinely independent of ``no_envelope`` rather than a proxy for it. It
-    distinguishes *how* comfy-cli failed: a usage error the argument parser
-    rejected before dispatch versus a failure partway through a command it did
-    accept, which the message text alone cannot tell you. It stays ``None`` for
-    the failures raised without ever reading a child's status (missing binary,
-    timeout).
-
-    ``timed_out`` marks the one failure that is not comfy-cli misbehaving but us
-    running out of patience: the child's whole process group was killed at the
-    ``timeout=`` we handed ``communicate``. A caller that *chose* that budget
-    can then tell its own deadline firing from a genuine comfy-cli error without
-    matching on the message — :func:`wait_for_job`, which caps each poll to the
-    time left on the caller's bound, is exactly that caller.
-
-    ``data`` is the failed envelope's own ``data`` payload, for the commands that
-    carry a STRUCTURED result alongside a negative verdict: ``comfy validate``
-    emits its full ``{valid, errors, warnings}`` report as ``data`` and sets the
-    envelope's ``ok`` to ``valid``, so "the workflow does not fit this install"
-    arrives here as an error whose payload is the actual answer. It is ``None``
-    for every failure that has no payload, which is what lets a caller tell a
-    real verdict from a check that could not run at all
-    (:func:`_local_template_check`).
-    """
-
-    def __init__(
-        self,
-        *args: object,
-        code: str | None = None,
-        no_envelope: bool = False,
-        returncode: int | None = None,
-        timed_out: bool = False,
-        data: Any = None,
-    ) -> None:
-        super().__init__(*args)
-        self.code = code
-        self.no_envelope = no_envelope
-        self.returncode = returncode
-        self.timed_out = timed_out
-        self.data = data
-
-
 def _comfy_bin_candidates() -> list[str]:
     """Every filesystem location ``COMFY_BIN`` could name, as ``which`` would look.
 
@@ -1184,7 +1125,7 @@ def _check_comfy_version() -> None:
             # warning naming a configured server URL can land on this stderr,
             # and the asymmetry is not worth preserving.
             "Original error: "
-            f"{failure_log._scrubbed_stream_tail(proc.stderr, _MAX_ERROR_FIELD_CHARS)}"
+            f"{failure_log._scrubbed_stream_tail(proc.stderr, errors._MAX_ERROR_FIELD_CHARS)}"
         )
     version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
     if version is not None and version < _MIN_COMFY_CLI:
@@ -1198,117 +1139,6 @@ def _check_comfy_version() -> None:
             f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
         )
     _version_checked = True
-
-
-# comfy-cli's error code for "I have no server pid recorded to stop" — the one
-# stop failure ``restart_comfyui`` treats as benign (see its docstring).
-_NO_RECORDED_SERVER_CODE = "no_recorded_server"
-
-# The same marker as it appears rendered INSIDE a message (e.g. "comfy stop
-# failed [no_recorded_server]: none"), for the failures that carry it as text
-# without a structured ``code``. Word-bounded rather than a bare substring test
-# so a longer, unrelated code that merely starts with it — ``no_recorded_server_pid``
-# — is not read as this one. (``_`` is a word character, so ``\b`` does not fire
-# between "server" and "_pid".)
-_NO_RECORDED_SERVER_CODE_RE = re.compile(rf"\b{re.escape(_NO_RECORDED_SERVER_CODE)}\b")
-
-# The SAME condition as comfy-cli actually prints it in the common case: `comfy
-# stop` with no recorded background server prints "No ComfyUI is running in the
-# background." and exits 1 WITHOUT an envelope (comfy-cli 1.12.0 `cmdline.stop`),
-# so there is no structured ``code`` for the check above to see and the literal
-# marker string never appears in the message either. That gap is what stopped
-# ``restart_comfyui`` from recycling a server it did not background-launch — a
-# foreground ``comfy launch``, the desktop app, a manual ``python main.py``, or
-# nothing running at all — even though its docstring has always promised to
-# swallow "nothing to stop".
-#
-# Matched with a case-insensitive REGEX on the stable part of the phrase rather
-# than by equality against the exact sentence: this is comfy-cli's human output,
-# free to drift in capitalization, punctuation, or an inserted word ("No ComfyUI
-# *server* is running in the background"), and pinning the exact bytes is what
-# made the original check brittle in the first place. It is deliberately still
-# narrow — it requires BOTH halves, a negated ComfyUI subject AND "running in the
-# background", within one short clause — so it identifies "nothing was recorded to
-# stop" and nothing else. A permission error, a process that could not be killed,
-# or any other comfy-cli malfunction still re-raises: none of them claim no
-# ComfyUI is running.
-#
-# Two details keep "one short clause" honest, because the string it runs against
-# is the wrapper's ``stderr: … | stdout: …`` rendering of BOTH streams, not one
-# tidy sentence:
-#
-#   * The subject must OPEN a message, a line, or a field — start-of-string, a
-#     newline, the ``:`` / ``|`` the wrapper delimits streams with, or the
-#     ``...`` ``textutil._stream_tail`` prefixes a clipped capture with (a
-#     truncation marker is where a field begins, not prose). comfy-cli prints
-#     this sentence on its own; a hint buried mid-sentence in some other failure
-#     ("…, and ensure no ComfyUI is running in the background") is advice, not a
-#     report that nothing was recorded, and must not be swallowed.
-#   * The two halves must be joined by the GRAMMAR of the sentence, not merely
-#     sit near each other: at most two inserted words and an optional copula
-#     ("No ComfyUI *server is* running…", "No ComfyUI running…"). Because that
-#     gap is built from ``\s`` and ``\w`` only, it cannot cross ANY punctuation —
-#     so the halves can never be stitched out of two different streams
-#     (``… | stdout: …``), two different clauses ("No ComfyUI process could be
-#     stopped; it is still running in the background"), or across a conjunction
-#     or dash ("No ComfyUI process was stopped and remains running in the
-#     background"). Every one of those reports a stop that FAILED — the exact
-#     opposite case — and none of them survives this shape.
-#
-#     A character-class gap was tried first and is what this replaces: excluding
-#     punctuation one mark at a time is whack-a-mole, whereas admitting only
-#     word characters is closed by construction. Newlines still pass (``\s``
-#     covers them), so a Rich soft-wrap inside the sentence still matches — a
-#     wrap is not a clause break.
-_NO_RECORDED_SERVER_TEXT_RE = re.compile(
-    r"(?:\A|[\n|:]|\.\.\.)\s*no\s+comfyui\b"
-    r"(?:\s+\w+){0,2}(?:\s+(?:is|was))?\s+running\s+in\s+the\s+background\b",
-    re.IGNORECASE,
-)
-
-
-def _is_no_recorded_server(exc: ComfyCliError) -> bool:
-    """True when ``exc`` is comfy-cli's benign 'nothing recorded to stop' error.
-
-    Prefers the structured ``code`` and falls back to the message so it also
-    recognizes the error when only the human-readable string carries it — either
-    as the literal marker code, or as comfy-cli's own printed phrasing on the
-    bare non-zero exit that emits no envelope (see
-    :data:`_NO_RECORDED_SERVER_TEXT_RE`).
-
-    The text fallback searches the whole rendered message rather than a single
-    stream, and is deliberately NOT gated on ``exc.no_envelope``: the phrase
-    itself is the signal, and which reporting path comfy-cli happens to use for
-    it is exactly the detail that should not matter here. It genuinely varies —
-    comfy-cli prints this one through Rich, i.e. on STDOUT, while the wrapper's
-    no-envelope message renders stdout and stderr side by side, and an envelope
-    that carries the sentence but omits ``error.code`` is the same benign case.
-
-    BOTH text reads — the marker and the phrase — are gated on the two signals
-    that outrank anything in the message, because reading text over them would
-    let a real failure be swallowed:
-
-    * ``exc.code`` set to something else. comfy-cli told us structurally what
-      went wrong; text in the message does not overrule it (the
-      ``code == _NO_RECORDED_SERVER_CODE`` branch above already took the benign
-      case).
-    * ``exc.timed_out``. We killed the stop at our own deadline, so whatever it
-      printed before dying says nothing about whether a server is recorded — and
-      a stop that never finished is precisely the case ``restart_comfyui`` must
-      not relaunch over.
-
-    The gate therefore sits ABOVE both reads rather than between them: a
-    timed-out stop whose output happens to quote the marker is still a timeout.
-    """
-    if exc.code == _NO_RECORDED_SERVER_CODE:
-        return True
-    if exc.code is not None or exc.timed_out:
-        return False
-    message = str(exc)
-    return (
-        _NO_RECORDED_SERVER_CODE_RE.search(message) is not None
-        or _NO_RECORDED_SERVER_TEXT_RE.search(message) is not None
-    )
 
 
 def _strip_brackets(host: str) -> str:
@@ -1641,7 +1471,7 @@ def _cmd_for_message(cmd: list[str]) -> str:
     reason (and scrubs its captured text, which omitting args does not cover).
     Everything that is not URL-shaped survives byte-for-byte, so the flags
     and the subcommand stay legible. The result is also bounded to
-    :data:`_MAX_ERROR_FIELD_CHARS` like every other field of that message —
+    :data:`errors._MAX_ERROR_FIELD_CHARS` like every other field of that message —
     ``run_workflow``'s rendered ``--param`` values are caller-supplied and can
     inflate one argv arbitrarily, and it was the last unbounded piece of the
     timeout sentence. The slice takes the HEAD, not the tail: the identifying
@@ -1649,8 +1479,9 @@ def _cmd_for_message(cmd: list[str]) -> str:
     everything a head slice can cut has already been scrubbed, so a URL it
     bisects has no userinfo or query left to leak (the same scrub-then-cap
     ordering :func:`failure_log._scrubbed_stream_tail` documents). The cap is
-    read at call time, so its definition sitting further down the module is
-    fine.
+    read at call time via :data:`errors._MAX_ERROR_FIELD_CHARS`, not an
+    import-bound copy, so it does not matter that the constant's home is
+    ``errors.py`` rather than this module.
 
     A cut is MARKED with a trailing ``...``, like every other bounded field in
     the same sentence (:func:`textutil._stream_tail` prefixes one onto a tail
@@ -1660,8 +1491,8 @@ def _cmd_for_message(cmd: list[str]) -> str:
     describes the argv itself.
     """
     rendered = failure_log._scrub_text(" ".join(cmd))
-    if len(rendered) > _MAX_ERROR_FIELD_CHARS:
-        return rendered[:_MAX_ERROR_FIELD_CHARS] + "..."
+    if len(rendered) > errors._MAX_ERROR_FIELD_CHARS:
+        return rendered[: errors._MAX_ERROR_FIELD_CHARS] + "..."
     return rendered
 
 
@@ -1707,8 +1538,8 @@ def _timeout_failure(
     """
     message = (
         f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
-        f"stderr tail: {failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)}; "
-        f"stdout tail: {failure_log._scrubbed_stream_tail(stdout, _MAX_ERROR_FIELD_CHARS)}"
+        f"stderr tail: {failure_log._scrubbed_stream_tail(stderr, errors._MAX_ERROR_FIELD_CHARS)}; "
+        f"stdout tail: {failure_log._scrubbed_stream_tail(stdout, errors._MAX_ERROR_FIELD_CHARS)}"
     )
     # `exit_code=None`: the child was killed at the deadline, so it never
     # reported one. The log keeps a longer slice of both streams than the
@@ -1754,7 +1585,7 @@ def _spawn_failure(
     is by definition the oversized or unencodable one. The rendering is
     :func:`_cmd_for_message`, the same one :func:`_timeout_failure` uses, so the
     argv is credential-scrubbed and head-clipped to
-    :data:`_MAX_ERROR_FIELD_CHARS`: a megabyte-long "query" cannot come back
+    :data:`errors._MAX_ERROR_FIELD_CHARS`: a megabyte-long "query" cannot come back
     whole, while the identifying ``comfy --json --where local <subcommand>``
     prefix still tells a reader WHICH call could not be started. A value short
     enough to fit inside that clip does appear, exactly as it does in the timeout
@@ -2283,7 +2114,7 @@ def _unwrap_envelope(
                 # stderr, so it gets the scrub too (`_scrubbed_tcc_path`) — a no-op
                 # on any real path, which is the only thing that lands there.
                 "Original error: "
-                f"{failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)}"
+                f"{failure_log._scrubbed_stream_tail(stderr, errors._MAX_ERROR_FIELD_CHARS)}"
             )
             # Still `no_json` — a TCC denial is the *reason* comfy-cli emitted no
             # envelope, not a different kind of failure. Unlike the message, the
@@ -2310,8 +2141,8 @@ def _unwrap_envelope(
         # client renders.
         message = (
             f"comfy-cli returned no JSON (exit {returncode}). "
-            f"stderr: {failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)} | "
-            f"stdout: {failure_log._scrubbed_stream_tail(stdout, _MAX_ERROR_FIELD_CHARS)}"
+            f"stderr: {failure_log._scrubbed_stream_tail(stderr, errors._MAX_ERROR_FIELD_CHARS)} | "
+            f"stdout: {failure_log._scrubbed_stream_tail(stdout, errors._MAX_ERROR_FIELD_CHARS)}"
         )
         failure_log._log_failure(
             "no_json",
@@ -2387,9 +2218,11 @@ def _unwrap_envelope(
         raw_message = err.get("message")
         message = str(raw_message).strip() if raw_message else ""
         message = (
-            failure_log._scrub_text(message)[:_MAX_ERROR_FIELD_CHARS]
+            failure_log._scrub_text(message)[: errors._MAX_ERROR_FIELD_CHARS]
             if message
-            else failure_log._scrubbed_stream_tail(stderr, _MAX_ERROR_FIELD_CHARS)
+            else failure_log._scrubbed_stream_tail(
+                stderr, errors._MAX_ERROR_FIELD_CHARS
+            )
         )
         # `_cmd_for_message` renders the argv with the same masking, so a
         # `model download --url https://<user>:<pass>@host/x?token=…` reads back
@@ -2408,7 +2241,7 @@ def _unwrap_envelope(
         # (`_RETRYABLE_*`) and a `jq 'select(.error_code == …)'` keep matching
         # comfy-cli's literal value rather than a redacted echo of it.
         rendered_code = (
-            failure_log._scrub_text(code)[:_MAX_ERROR_FIELD_CHARS]
+            failure_log._scrub_text(code)[: errors._MAX_ERROR_FIELD_CHARS]
             if code
             else "unknown"
         )
@@ -2418,9 +2251,9 @@ def _unwrap_envelope(
         hint = err.get("hint")
         if hint:
             parts.append(
-                f"hint: {failure_log._scrub_text(str(hint))[:_MAX_ERROR_FIELD_CHARS]}"
+                f"hint: {failure_log._scrub_text(str(hint))[: errors._MAX_ERROR_FIELD_CHARS]}"
             )
-        detail_str = _render_error_details(err.get("details"))
+        detail_str = errors._render_error_details(err.get("details"))
         if detail_str:
             parts.append(detail_str)
         text = "\n".join(parts)
@@ -2961,40 +2794,6 @@ def _plain_message(result: Any) -> str:
     return ""
 
 
-# Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
-# message. ``partner_nodes`` names the offending nodes on a partner-credential
-# failure; keep the set small so a large envelope can't bloat the message.
-_SURFACED_DETAIL_KEYS = ("partner_nodes",)
-
-# Per-field cap for the rendered error message (mirrors the stderr cap) so a
-# multi-KB `message`/`hint` or a huge `partner_nodes` array can't produce an
-# unbounded error string in the MCP client / logs.
-_MAX_ERROR_FIELD_CHARS = 500
-
-
-def _render_error_details(details: Any) -> str | None:
-    """Render the useful keys of an envelope's ``error.details`` for the message.
-
-    Scrubbed before the cap like every other envelope-derived field
-    :func:`_unwrap_envelope` renders — today ``_SURFACED_DETAIL_KEYS`` is only
-    node names, so it masks nothing in practice, but this string lands in the
-    same client-facing sentence as ``error.message``/``hint`` and a later key
-    added to that tuple should not have to remember to redact separately.
-    """
-    if not isinstance(details, dict):
-        return None
-    parts: list[str] = []
-    for key in _SURFACED_DETAIL_KEYS:
-        value = details.get(key)
-        if not value:
-            continue
-        if isinstance(value, (list, tuple)):
-            value = ", ".join(str(v) for v in value)
-        rendered = failure_log._scrub_text(str(value))[:_MAX_ERROR_FIELD_CHARS]
-        parts.append(f"{key}: {rendered}")
-    return "; ".join(parts) if parts else None
-
-
 def _last_json_object(stdout: str) -> dict | None:
     """Return the last JSON object on stdout, preferring a ``type==envelope`` one."""
     best: dict | None = None
@@ -3529,8 +3328,8 @@ async def _run_comfy_streaming(
                 # Scrubbed, not raw: comfy-cli echoes the URL it is fetching to
                 # stderr, and this sentence goes straight to the MCP client. See
                 # `_timeout_failure`, whose two fragments this mirrors.
-                f"stderr tail: {failure_log._scrubbed_stream_tail(stderr_text, _MAX_ERROR_FIELD_CHARS)}; "
-                f"stdout tail: {failure_log._scrubbed_stream_tail(timeout_stdout, _MAX_ERROR_FIELD_CHARS)}"
+                f"stderr tail: {failure_log._scrubbed_stream_tail(stderr_text, errors._MAX_ERROR_FIELD_CHARS)}; "
+                f"stdout tail: {failure_log._scrubbed_stream_tail(timeout_stdout, errors._MAX_ERROR_FIELD_CHARS)}"
             )
             failure_log._log_failure(
                 "timeout",
@@ -7651,7 +7450,7 @@ def stop_comfyui() -> Any:
 # original error is re-raised verbatim either way.
 #
 # The subject and the complaint must be joined grammatically, by the same
-# word-characters-only gap :data:`_NO_RECORDED_SERVER_TEXT_RE` uses and for the
+# word-characters-only gap :data:`errors._NO_RECORDED_SERVER_TEXT_RE` uses and for the
 # same reason: it cannot cross punctuation, so a `port` mentioned in one rendered
 # stream (or in a `--port` echoed back from the command) can never be stitched to
 # an `already in use` belonging to some other failure in another — `stderr: ...
@@ -8133,7 +7932,7 @@ def _restart_comfyui_locked(
     try:
         stop_comfyui()
     except ComfyCliError as exc:
-        if not _is_no_recorded_server(exc):
+        if not errors._is_no_recorded_server(exc):
             raise
         nothing_to_stop = True
     try:
@@ -10218,9 +10017,9 @@ def _bounded_report_value(value: Any, depth: int = 0) -> Any:
         return _VALIDATE_TOO_DEEP
     if isinstance(value, str):
         scrubbed = failure_log._scrub_text(value)
-        if len(scrubbed) <= _MAX_ERROR_FIELD_CHARS:
+        if len(scrubbed) <= errors._MAX_ERROR_FIELD_CHARS:
             return scrubbed
-        return scrubbed[:_MAX_ERROR_FIELD_CHARS] + "…"
+        return scrubbed[: errors._MAX_ERROR_FIELD_CHARS] + "…"
     if isinstance(value, list):
         return [
             _bounded_report_value(item, depth + 1)
@@ -10282,7 +10081,7 @@ def _relayed_validation_report(report: dict) -> dict:
 
 def _clean_finding_text(value: Any) -> str:
     """One engine-supplied fragment, credential-masked then length-clipped."""
-    return failure_log._scrub_text(str(value))[:_MAX_ERROR_FIELD_CHARS]
+    return failure_log._scrub_text(str(value))[: errors._MAX_ERROR_FIELD_CHARS]
 
 
 def _finding_line(finding: Any) -> str:
@@ -10349,7 +10148,7 @@ def _local_template_check(workflow_path: str) -> dict:
                 "running). The template was still written. Start ComfyUI with "
                 "`launch_comfyui`, then re-check with "
                 "`validate_workflow(workflow_path=...)`. "
-                f"Details: {str(exc)[:_MAX_ERROR_FIELD_CHARS]}",
+                f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}",
                 "check_unavailable",
             )
 
@@ -10362,7 +10161,7 @@ def _local_template_check(workflow_path: str) -> dict:
             "unexpected_payload",
         )
 
-    errors = report["errors"]
+    validation_errors = report["errors"]
     warnings = report.get("warnings")
     warnings = warnings if isinstance(warnings, list) else []
     # A comfy-cli too old to lower a UI-export workflow to API format checks ZERO
@@ -10394,12 +10193,12 @@ def _local_template_check(workflow_path: str) -> dict:
         )
     else:
         summary = (
-            f"{len(errors)} problem(s): this template needs a node class or an "
-            "input option your ComfyUI install does not have — a template served "
-            "from the gallery can be newer than your install. Update ComfyUI and "
-            "its custom nodes (`update_comfyui`), or pick another template. "
-            f"First: {_finding_line(errors[0])}"
-            if errors
+            f"{len(validation_errors)} problem(s): this template needs a node "
+            "class or an input option your ComfyUI install does not have — a "
+            "template served from the gallery can be newer than your install. "
+            "Update ComfyUI and its custom nodes (`update_comfyui`), or pick "
+            f"another template. First: {_finding_line(validation_errors[0])}"
+            if validation_errors
             else (
                 "this template did not validate against your ComfyUI install, "
                 "though comfy-cli listed no specific problem."
@@ -10410,8 +10209,10 @@ def _local_template_check(workflow_path: str) -> dict:
         "checked": True,
         "runnable": report["valid"],
         "summary": summary,
-        "error_count": len(errors),
-        "errors": [_finding_line(e) for e in errors[:_TEMPLATE_CHECK_MAX_FINDINGS]],
+        "error_count": len(validation_errors),
+        "errors": [
+            _finding_line(e) for e in validation_errors[:_TEMPLATE_CHECK_MAX_FINDINGS]
+        ],
     }
     if warnings:
         check["warnings"] = [
@@ -10438,7 +10239,7 @@ def _check_template_by_name(name: str) -> dict:
             return _unchecked(
                 "could not check this template against your ComfyUI install: "
                 "fetching its workflow failed. "
-                f"Details: {str(exc)[:_MAX_ERROR_FIELD_CHARS]}",
+                f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}",
                 "template_fetch_failed",
             )
         return _local_template_check(path)
@@ -12980,7 +12781,7 @@ def _clip_for_error(text: str) -> str:
     (``\\x00``, ``\\uXXXX``, ``\\U000XXXXX``), so clipping the raw text first and
     quoting after would let 500 such characters land as ~2000+ in the message —
     the bound would read as if it held while the field blew past it. Clipping the
-    rendered form is what :func:`_render_error_details` does too.
+    rendered form is what :func:`errors._render_error_details` does too.
 
     The source text is sliced BEFORE ``repr`` so an MB-sized value never
     materializes an expanded copy just to have it thrown away. That is safe for
@@ -12993,10 +12794,10 @@ def _clip_for_error(text: str) -> str:
     is already truncated. The ellipsis is counted inside the cap, so the
     returned field never exceeds it.
     """
-    rendered = repr(text[:_MAX_ERROR_FIELD_CHARS])
-    if len(rendered) <= _MAX_ERROR_FIELD_CHARS:
+    rendered = repr(text[: errors._MAX_ERROR_FIELD_CHARS])
+    if len(rendered) <= errors._MAX_ERROR_FIELD_CHARS:
         return rendered
-    return rendered[: _MAX_ERROR_FIELD_CHARS - 1] + "…"
+    return rendered[: errors._MAX_ERROR_FIELD_CHARS - 1] + "…"
 
 
 def _reject_non_json_array_slot(index: int, slot: str) -> None:

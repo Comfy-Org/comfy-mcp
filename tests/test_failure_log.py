@@ -28,7 +28,7 @@ import threading
 import pytest
 from conftest import _FakeProc
 
-from comfy_mcp import failure_log, server, tcc, textutil
+from comfy_mcp import errors, failure_log, server, tcc, textutil
 
 # A failing envelope/1 result, the most common recorded failure.
 _ERROR_ENVELOPE = json.dumps(
@@ -299,7 +299,7 @@ def test_schema_mismatch_is_recorded(log_path, fake_comfy):
 
 def test_tail_cap_is_larger_than_the_message_cap():
     """The log keeps MORE output than an error message can — its reason to exist."""
-    assert failure_log._FAILURE_LOG_TAIL_CHARS > server._MAX_ERROR_FIELD_CHARS
+    assert failure_log._FAILURE_LOG_TAIL_CHARS > errors._MAX_ERROR_FIELD_CHARS
 
 
 def test_long_stream_is_tail_truncated_with_a_marker(log_path, fake_comfy):
