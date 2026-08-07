@@ -376,8 +376,8 @@ def _guard_download_id(download_id: str) -> str:
     """Reject a ``download_id`` comfy-cli would mis-read or ``subprocess`` can't carry.
 
     The :func:`_guard_prompt_id` treatment for the download family
-    (``download_status`` / ``wait_for_download`` / ``cancel_download``, and the
-    id ``download_model`` polls with). Same three hazards, for the same reasons:
+    (``download(action="status"/"wait"/"cancel")``, and the id
+    ``download_model`` polls with). Same three hazards, for the same reasons:
     every ``model download-*`` verb takes the id as a bare positional, so a
     leading dash reaches comfy-cli as an option rather than an id; an embedded
     NUL is a legal MCP string that makes ``subprocess.Popen`` raise a bare

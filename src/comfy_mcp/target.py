@@ -426,8 +426,8 @@ def _reject_remote_model_download() -> None:
         "(shared storage — an NFS / tailnet mount), set "
         f"{REMOTE_SHARED_MODELS_ENV}=1 to allow the download, or (3) unset "
         "COMFYUI_URL/COMFYUI_HOST to work entirely locally. Already-submitted "
-        "downloads are unaffected: download_status, wait_for_download and "
-        "cancel_download keep working."
+        "downloads are unaffected: download(action='status'/'wait'/'cancel') "
+        "keeps working."
     )
 
 

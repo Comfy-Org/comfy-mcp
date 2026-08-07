@@ -887,8 +887,9 @@ def _phrase_is_only_the_caller_s(
     OWN phrase whenever the value happened to be a substring of it — and the
     values that collide are ordinary, not crafted: ``filename="background"``
     erases the flag out of ``No such option: --background``,
-    ``workflow_path="notes"`` and ``download_status("a")`` do the same to
-    ``No such command 'notes'`` and ``'download-status'``. A value that does not
+    ``workflow_path="notes"`` and ``download(action="status",
+    download_id="a")`` do the same to ``No such command 'notes'`` and
+    ``'download-status'``. A value that does not
     contain the phrase cannot have forged the phrase, so there is nothing to
     discount and it is left alone. The cost of getting this wrong is not
     symmetric: at the verb sites an over-subtraction only costs the friendly

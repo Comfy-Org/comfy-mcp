@@ -944,9 +944,9 @@ def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
     calls = patched_run(envelope(data={"status": "completed"}))
 
-    server.download_status("a1b2c3d4e5f6")
-    server.wait_for_download("a1b2c3d4e5f6", timeout_seconds=1.0)
-    server.cancel_download("a1b2c3d4e5f6")
+    server.download(action="status", download_id="a1b2c3d4e5f6")
+    server.download(action="wait", download_id="a1b2c3d4e5f6", timeout_seconds=1.0)
+    server.download(action="cancel", download_id="a1b2c3d4e5f6")
 
     assert [call["cmd"][4:6] for call in calls] == [
         ["model", "download-status"],

@@ -22,9 +22,10 @@ flows:
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
   does not block.
 - Large model downloads: `download_model` submits to a background worker and
-  returns a `download_id`; poll `wait_for_download` / `download_status`, or
-  `cancel_download` to stop one. With a remote target configured,
-  `download_model` refuses outright — see the VRAM/remote note below.
+  returns a `download_id`; poll `download(action="wait")` /
+  `download(action="status")`, or `download(action="cancel")` to stop one.
+  With a remote target configured, `download_model` refuses outright — see
+  the VRAM/remote note below.
 - Start from a template: `search_templates(query=...)` to find one, then
   `fetch_template` to save its workflow JSON, then — only once `local_check`
   (returned by `fetch_template`/`get_template`) has CLEARED — `run_workflow`
@@ -153,8 +154,8 @@ workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
 (`get_template`, `get_node`, `nodes_upstream`/`nodes_downstream`,
 `run_template`); job handles use `prompt_id` (`job`, `fetch_outputs`); and
-download handles use `download_id` (`download_status`, `wait_for_download`,
-`cancel_download`). No tool takes a bare `path` or `workflow` argument.
+download handles use `download_id` (`download`, and the id `download_model`
+polls with). No tool takes a bare `path` or `workflow` argument.
 
 Routing — check the machine before running local diffusion. `server_info`
 passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a

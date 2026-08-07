@@ -129,9 +129,9 @@ _MAX_WATCH_TIMEOUT = 3600.0
 _MAX_RUN_WORKFLOW_TIMEOUT = 3600.0
 
 # Hard ceiling for one bounded wait on an already-submitted background model
-# download — `wait_for_download` and `download_model(wait=True)` share it, for
-# the same reason `_MAX_WATCH_TIMEOUT` exists on the jobs side: an `inf` bound
-# would keep re-spawning `comfy model download-status` forever.
+# download — `download(action="wait")` and `download_model(wait=True)` share
+# it, for the same reason `_MAX_WATCH_TIMEOUT` exists on the jobs side: an
+# `inf` bound would keep re-spawning `comfy model download-status` forever.
 _MAX_DOWNLOAD_WAIT_TIMEOUT = 3600.0
 
 # Budget for the `model download --background` SUBMIT. It is metadata-only — the
@@ -4949,8 +4949,8 @@ def _resource_verb_upgrade_error(
     reads like a broken MCP rather than the one-command capability gap it is.
 
     Returning a *new* error (rather than degrading to an `unsupported: True`
-    payload the way `download_status` does) is deliberate: those tools have a
-    working alternative to point at, whereas here the missing verb IS the whole
+    payload the way `download(action="status")` does) is deliberate: that tool
+    has a working alternative to point at, whereas here the missing verb IS the whole
     call — there is no partial answer to hand back, so failing loudly with the
     fix in the message is the honest shape, and it matches how every other tool
     surfaces a `ComfyCliError`.
@@ -8969,8 +8969,8 @@ def _legacy_download_partial(relative_path: str | None, filename: str | None) ->
 
     comfy-cli writes straight to the final path while transferring, so a
     foreground download killed at its bound leaves an incomplete file behind. The
-    caller cannot ask ``download_status`` about it (that path never mints an id),
-    which is why the timeout message has to name it.
+    caller cannot ask ``download(action="status")`` about it (that path never
+    mints an id), which is why the timeout message has to name it.
 
     How precisely it can be named depends on the arguments: with ``filename`` the
     exact path is known, without it comfy-cli derives the basename from the URL,
@@ -9119,8 +9119,8 @@ async def _legacy_foreground_download(
         # so the kill stopped a real transfer — unlike the `--background`
         # path, where a timeout leaves a detached worker still going. Say so,
         # and say where the incomplete file is: the caller cannot check
-        # `download_status` (no id exists) and a partial model on disk looks
-        # exactly like a complete one to `search_models`. APPEND to the
+        # `download(action="status")` (no id exists) and a partial model on
+        # disk looks exactly like a complete one to `search_models`. APPEND to the
         # original message so the stderr/stdout tails survive.
         #
         # Not deleted for them: the exact path is only fully known when
@@ -9232,8 +9232,9 @@ def _download_verb_unsupported(
 def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     """Poll ``comfy model download-status`` until terminal or ``timeout_seconds``.
 
-    The blocking half of ``wait_for_download`` and of ``download_model``'s wait
-    path, shared so the two can never disagree about what a bound expiring means.
+    The blocking half of ``download(action="wait")`` and of ``download_model``'s
+    wait path, shared so the two can never disagree about what a bound expiring
+    means.
     Runs on ``_poll_until_terminal``, the same bounded-poll loop
     ``job(action="wait")`` (:func:`_job_wait_sync`) uses — see it for why each
     poll is capped to the time left on the caller's bound, why the floor
@@ -9270,8 +9271,8 @@ async def download_model(
     [--filename <name>] --background`` (the singular ``model`` verb, not the
     ``models`` catalog ``search_models`` reads). Fetches a known URL, no hub
     search. The transfer is SUBMITTED, not held open: comfy-cli detaches a
-    worker and returns a ``download_id``, the handle for ``download_status`` /
-    ``wait_for_download`` / ``cancel_download``.
+    worker and returns a ``download_id``, the handle for
+    ``download(action="status"/"wait"/"cancel")``.
 
     Args:
         relative_path: workspace-relative; first segment must be ``models``
@@ -9289,7 +9290,7 @@ async def download_model(
 
     Gotchas:
         - comfy-cli writes straight to the FINAL path while transferring, so a
-          present file proves nothing. ``download_status`` reporting
+          present file proves nothing. ``download(action="status")`` reporting
           ``completed`` is the only proof the model is usable.
         - REFUSES when a remote ComfyUI is configured (``COMFYUI_URL``/
           ``COMFYUI_HOST``): this always writes LOCALLY, so a remote target
@@ -9436,19 +9437,20 @@ async def download_model(
         # to it — it was minted inside this call, so letting the exception through
         # untouched orphans a multi-GB download with no way to enumerate or stop
         # it. Re-raise carrying the id (and every structured attribute, so a
-        # caller branching on `code` / `timed_out` still can). `wait_for_download`
-        # needs no such wrapping: its caller passed the id in and still holds it.
+        # caller branching on `code` / `timed_out` still can). `download(action=
+        # "wait")` needs no such wrapping: its caller passed the id in and still
+        # holds it.
         #
-        # No `_download_verb_unsupported` degrade HERE, unlike the three standalone
-        # download tools: the submit above already parsed `--background`, so this
-        # CLI ships the whole verb group. A missing-verb read at this point would
-        # therefore be spurious — and claiming "nothing is broken" over a transfer
-        # that is genuinely running detached is the one thing that degrade must
-        # never do.
+        # No `_download_verb_unsupported` degrade HERE, unlike the grouped
+        # `download` tool: the submit above already parsed `--background`, so
+        # this CLI ships the whole verb group. A missing-verb read at this point
+        # would therefore be spurious — and claiming "nothing is broken" over a
+        # transfer that is genuinely running detached is the one thing that
+        # degrade must never do.
         raise ComfyCliError(
             f"{exc} (the background download is still running — check it with "
-            f"`download_status({download_id!r})` or stop it with "
-            f"`cancel_download({download_id!r})`)",
+            f"`download(action='status', download_id={download_id!r})` or stop "
+            f"it with `download(action='cancel', download_id={download_id!r})`)",
             code=exc.code,
             no_envelope=exc.no_envelope,
             returncode=exc.returncode,
@@ -9469,80 +9471,118 @@ async def download_model(
     return result
 
 
-@mcp.tool()
-def download_status(download_id: str) -> Any:
-    """Check a background model download's progress (starting / downloading / …).
-
-    Wraps ``comfy model download-status <download_id>``. Returns ``status``,
-    ``completed_bytes``/``total_bytes``/``percent``, ``elapsed_seconds``,
-    ``dest``, and ``error`` when failed. Poll after ``download_model(wait=False)``
-    or a ``timed_out`` result.
-
-    This is the SOURCE OF TRUTH for whether a model is usable: comfy-cli
-    writes the file straight to ``dest`` as it transfers, so the path
-    existing proves nothing until ``status`` reads ``completed`` (``failed``/
-    ``cancelled`` are the other terminals).
-
-    On a comfy-cli too old for the verb, returns ``{"error", "unsupported":
-    True}`` instead of raising.
-    """
-    download_id = argv._guard_download_id(download_id)
-    try:
-        return _run_comfy("model", "download-status", download_id, timeout=60.0)
-    except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-status", download_id)
-        if degraded is None:
-            raise
-        return degraded
+def _download_status_sync(download_id: str) -> Any:
+    """``download(action="status")``'s body — the exact ``download_status`` this replaced."""
+    return _run_comfy("model", "download-status", download_id, timeout=60.0)
 
 
-@mcp.tool()
-def wait_for_download(download_id: str, timeout_seconds: float = 25.0) -> Any:
-    """Wait (bounded) for a background model download to finish.
+def _download_wait_sync(download_id: str, timeout_seconds: float) -> Any:
+    """``download(action="wait")``'s body — the exact ``wait_for_download`` this replaced."""
+    return _poll_download(download_id, timeout_seconds)
 
-    Polls ``comfy model download-status <download_id>`` until a terminal
-    state (completed/failed/cancelled) or ``timeout_seconds`` elapses
-    (clamped to a sane max; non-positive/NaN rejected). Chain several short
-    calls (checking ``download_status`` in between) rather than one long
-    block — a multi-GB checkpoint outlasts any single MCP request.
 
-    Returns the final status, or ``{"timed_out": True, "download_id": ...,
-    "status": <last payload>}`` on expiry — this is PROGRESS, not an error:
-    keep polling, do NOT re-download. A terminal FAILURE is returned, not
-    raised — read ``status``/``error`` off the payload. ``download_status``
-    is the only proof a model is actually usable.
+def _download_cancel_sync(download_id: str) -> Any:
+    """``download(action="cancel")``'s body — the exact ``cancel_download`` this replaced."""
+    return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
 
-    On a comfy-cli too old for the verb, returns ``{"error", "unsupported":
-    True}`` instead of raising.
-    """
-    download_id = argv._guard_download_id(download_id)
-    timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_DOWNLOAD_WAIT_TIMEOUT)
-    try:
-        return _poll_download(download_id, timeout_seconds)
-    except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-status", download_id)
-        if degraded is None:
-            raise
-        return degraded
+
+# The three actions `download` dispatches, in the order their old standalone
+# tools used to appear (status, wait, cancel). An unknown value is rejected
+# before anything else runs — mirrors `job`'s bad-action shape.
+_DOWNLOAD_ACTIONS = ("status", "wait", "cancel")
+
+# Only "wait" takes `timeout_seconds`; `download_id` is required by every
+# action, so it has no analogous "which actions want it" table. REJECT
+# LOUDLY policy, same as `job`: `download(action="status", timeout_seconds=5)`
+# looking like it shortened the status call (it would not have) is exactly
+# the silent-drop failure mode this guards against.
+_DOWNLOAD_ACTIONS_TAKING_TIMEOUT = ("wait",)
+
+# The `_download_verb_unsupported` verb each action's underlying comfy-cli
+# call degrades against — R3: "status"/"wait" both poll `download-status`,
+# only "cancel" hits `download-cancel`. Pinned as a table (not inlined at
+# each `except`) so a fourth action cannot reach the dispatch below without
+# also declaring which verb its own degrade checks.
+_DOWNLOAD_ACTION_VERB = {
+    "status": "download-status",
+    "wait": "download-status",
+    "cancel": "download-cancel",
+}
 
 
 @mcp.tool()
-def cancel_download(download_id: str) -> Any:
-    """Cancel a running background model download and delete its partial file.
+def download(
+    action: str = "status",
+    download_id: str = "",
+    timeout_seconds: float | None = None,
+) -> Any:
+    """Track a transfer already started by download_model; does NOT start one.
 
-    Wraps ``comfy model download-cancel <download_id>``. Use to stop a
-    transfer from ``download_model`` — wrong URL, wrong quant, an oversized
-    file. Cancelling an unknown or already-finished id surfaces comfy-cli's
-    own answer (error envelope, or the unchanged terminal status).
+    Wraps `comfy model download-status`/`download-cancel`. `action`:
+    - "status" (default) -> status, completed_bytes/total_bytes/percent,
+      elapsed_seconds, dest, error. comfy-cli writes to `dest` while
+      transferring, so a present file proves nothing until status reads
+      "completed" -- the only proof a model is usable.
+    - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns
+      the final payload, or `{"timed_out": True, "download_id": ...,
+      "status": <last>}` on expiry -- a TIMEOUT, not a failure.
+    - "cancel" -> stop a running transfer and its partial file.
 
-    On a comfy-cli too old for the verb, returns ``{"error", "unsupported":
-    True}`` instead of raising.
+    `download_id` required for every action; `timeout_seconds` only for
+    "wait" -- rejected elsewhere. Too-old comfy-cli: `{"error",
+    "unsupported": True}` instead of raising.
     """
+    if action not in _DOWNLOAD_ACTIONS:
+        raise ComfyCliError(
+            f"invalid download action: {action!r} — expected one of "
+            f"{', '.join(repr(name) for name in _DOWNLOAD_ACTIONS)}."
+        )
+
+    wants_timeout = action in _DOWNLOAD_ACTIONS_TAKING_TIMEOUT
+
+    # Missing the REQUIRED param is named by action AND param — deliberately
+    # not left to fall through to `argv._guard_download_id("")`'s generic
+    # "expected a string"/empty message, which would not say which action
+    # needed it. Every action here takes `download_id`, unlike `job`'s
+    # `prompt_id` (which "queue" skips), so there is no per-action table to
+    # consult — just the one check.
+    if not download_id:
+        raise ComfyCliError(
+            f"download(action={action!r}) requires download_id, but none was given."
+        )
+    # Supplied-but-ignored `timeout_seconds` is REJECT LOUDLY, not silently
+    # dropped — see `_DOWNLOAD_ACTIONS_TAKING_TIMEOUT` above for why.
+    if not wants_timeout and timeout_seconds is not None:
+        raise ComfyCliError(
+            f"download(action={action!r}) does not take timeout_seconds — "
+            "timeout_seconds is used by action in "
+            f"{', '.join(repr(name) for name in _DOWNLOAD_ACTIONS_TAKING_TIMEOUT)}."
+        )
+
+    # ALL params validated up front, before ANY dispatch — the symmetric
+    # shape `job` did not quite have (its per-action `_job_*_sync` helpers
+    # each re-ran their own `argv._guard_prompt_id`). Validating here instead
+    # means a rejection never costs a spawn even on the one branch it would
+    # have reached, and the two guards below run in the SAME order the three
+    # standalone tools ran them in (`download_id` first, then the bound).
     download_id = argv._guard_download_id(download_id)
+    bound = 25.0
+    if wants_timeout:
+        bound = argv._bounded_timeout(
+            25.0 if timeout_seconds is None else timeout_seconds,
+            _MAX_DOWNLOAD_WAIT_TIMEOUT,
+        )
+
     try:
-        return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
+        if action == "status":
+            return _download_status_sync(download_id)
+        if action == "cancel":
+            return _download_cancel_sync(download_id)
+        return _download_wait_sync(download_id, bound)
     except ComfyCliError as exc:
-        degraded = _download_verb_unsupported(exc, "download-cancel", download_id)
+        degraded = _download_verb_unsupported(
+            exc, _DOWNLOAD_ACTION_VERB[action], download_id
+        )
         if degraded is None:
             raise
         return degraded
