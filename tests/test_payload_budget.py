@@ -22,11 +22,12 @@ from comfy_mcp import server
 _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
 
 # Ceiling, in estimated tokens (chars/4). Measured 2026-08-06 after diet pass
-# 1 (the 12 largest tool docstrings cut to agent-contract size): ~27k.
+# 2 (the remaining 40 tool docstrings cut to agent-contract size, on top of
+# pass 1's 12 largest): ~16.4k.
 # Set ~10% above the measurement so ordinary edits never trip it while real
 # growth does. Ratchet DOWN as the docstring diet lands; never bump without
 # stating why in the same PR.
-_BUDGET_TOKENS = 30_000
+_BUDGET_TOKENS = 18_000
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
