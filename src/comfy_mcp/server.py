@@ -256,7 +256,9 @@ earlier one:
   place, ASK the user which machine it is rather than guessing (a hostname
   can be this box; a loopback host can be a tunnel to a remote GPU). Check
   the reported `server` URL too: `COMFY_LOCAL_URL` can repoint comfy-cli at
-  another host WITHOUT producing any `comfy_target` block.
+  another host WITHOUT producing any `comfy_target` block. For a genuine
+  remote, ask the user about that machine rather than routing its work off
+  local hardware.
 - STEP 2, get a memory figure. The sizes are BYTES — divide by 1073741824.
   A driver reports a little under the advertised size, so read a SMALL
   shortfall — within ~10% of a nominal size — as that nominal capacity
