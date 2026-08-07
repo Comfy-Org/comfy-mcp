@@ -32,7 +32,7 @@ import textwrap
 
 import pytest
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 # The node tools, all of which resolve against the live local `object_info`.
 LIVE_NODE_TOOLS = (
@@ -365,7 +365,7 @@ def test_server_instructions_agree_with_the_per_tool_freshness_policy():
     happened while ``INSTRUCTIONS`` still called the gallery "served fresh" and
     walked an agent from ``fetch_template`` straight to ``run_workflow``.
     """
-    text = " ".join(server.INSTRUCTIONS.split())
+    text = " ".join(instructions.INSTRUCTIONS.split())
     assert "served fresh" not in text, (
         "INSTRUCTIONS still calls the gallery live; it is comfy-cli's CACHED "
         "gallery (see the template tools' `Freshness:` blocks)."

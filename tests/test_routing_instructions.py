@@ -23,12 +23,12 @@ from __future__ import annotations
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 # ``INSTRUCTIONS`` is hard-wrapped prose, so any phrase long enough to matter can
 # straddle a newline. Match against a whitespace-collapsed copy: these tests are
 # guarding that the POLICY is still stated, not where the line breaks fall.
-FLAT = " ".join(server.INSTRUCTIONS.split())
+FLAT = " ".join(instructions.INSTRUCTIONS.split())
 
 _ROUTING_HEADER = "Routing — check the machine before running local diffusion."
 _ROUTING_END = "Everything targets the LOCAL server only"
@@ -52,7 +52,7 @@ def test_the_server_hands_these_instructions_to_the_client():
     connect to a server that advertises no guidance at all and none of the
     content tests would notice.
     """
-    assert server.mcp.instructions == server.INSTRUCTIONS
+    assert server.mcp.instructions == instructions.INSTRUCTIONS
 
 
 def test_instructions_carry_a_routing_block(routing):

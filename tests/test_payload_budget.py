@@ -17,7 +17,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from comfy_mcp import server
+from comfy_mcp import instructions
 
 _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
 
@@ -55,12 +55,12 @@ def test_llm_payload_within_budget():
                 doc_chars += len(ast.get_docstring(node) or "")
     assert tool_count > 40, f"tool discovery broke: found {tool_count} tools"
 
-    total_chars = doc_chars + len(server.INSTRUCTIONS)
+    total_chars = doc_chars + len(instructions.INSTRUCTIONS)
     est_tokens = total_chars // 4
     assert est_tokens <= _BUDGET_TOKENS, (
         f"LLM payload grew to ~{est_tokens} est. tokens "
         f"({tool_count} tool docstrings {doc_chars} chars + "
-        f"INSTRUCTIONS {len(server.INSTRUCTIONS)} chars) — budget is "
+        f"INSTRUCTIONS {len(instructions.INSTRUCTIONS)} chars) — budget is "
         f"{_BUDGET_TOKENS}. Trim the docstring (agent contract only; "
         "maintainer rationale goes in comments) or, if growth is deliberate, "
         "bump _BUDGET_TOKENS in this same PR and say why."

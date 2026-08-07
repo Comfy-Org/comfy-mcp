@@ -18,7 +18,7 @@ import json
 
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 # The UUID doubles as the instance node's `type` — the discriminator that makes
 # a workflow "subgraphed" in the frontend format.
@@ -59,7 +59,7 @@ def test_instructions_teach_that_subgraph_templates_are_supported():
     """The word "subgraph" must appear in INSTRUCTIONS — the guidance that stops
     an agent from preemptively refusing a subgraph template. A rewrite that
     drops it silently reintroduces the refusal failure mode."""
-    assert "subgraph" in server.INSTRUCTIONS.lower()
+    assert "subgraph" in instructions.INSTRUCTIONS.lower()
 
 
 def test_fetch_template_writes_subgraph_json_untouched(monkeypatch, tmp_path):

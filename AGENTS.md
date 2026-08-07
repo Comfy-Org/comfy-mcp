@@ -105,7 +105,7 @@ reads the **user's live install** — custom nodes included — not a static cat
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the
 `--json-stream` machinery, the spend-consent plumbing) and every `@mcp.tool()`.
-Three **leaf** modules sit under it — none imports `server`, so the dependency
+Four **leaf** modules sit under it — none imports `server`, so the dependency
 edges only ever point one way:
 
 | Module | Owns |
@@ -113,6 +113,7 @@ edges only ever point one way:
 | `textutil.py` | pure text helpers: `_tail` / `_stream_tail` (bounded stream tails) and `_redact_url` (userinfo masking) |
 | `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
 | `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` failure log (its config, its module state, and `_log_failure`) **and the URL scrubbers** — `_scrub_text` / `_scrubbed_stream_tail` also mask credentials on the way to the MCP CLIENT, not just to disk |
+| `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — the client-handshake text |
 
 `server` reaches them **module-qualified** (`tcc._tcc_guidance(...)`,
 `failure_log._log_failure(...)`) and re-exports nothing — deliberately: a test

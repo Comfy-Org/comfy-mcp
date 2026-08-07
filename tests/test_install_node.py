@@ -57,7 +57,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp import instructions, server
 
 # Captured before any test patches it, so the one test that wants the REAL
 # `comfy env` pre-flight can put it back and drive the probe end to end through
@@ -1402,7 +1402,7 @@ def test_the_handshake_instructions_teach_the_install_flow():
     restart is part of the same clause because installing without restarting looks
     like a no-op from `search_nodes`.
     """
-    flat = " ".join(server.INSTRUCTIONS.split())
+    flat = " ".join(instructions.INSTRUCTIONS.split())
 
     assert "install_node" in flat
     assert "`install_node` -> `restart_comfyui`" in flat
