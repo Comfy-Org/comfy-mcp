@@ -39,6 +39,12 @@ dependencies = [
     # Already an mcp dependency; declared explicitly because this server now
     # imports it directly for the elicitation response schema.
     "pydantic>=2",
+    # Already an mcp dependency (the SDK's own tool dispatcher uses it to run a
+    # `def` tool off the event loop); declared explicitly because `job()` now
+    # imports `anyio.to_thread` directly to off-load its blocking branches the
+    # same way, rather than wedging the loop for up to an hour (`action="wait"`).
+    # Floor matches what `mcp` itself requires.
+    "anyio>=4.9",
 ]
 # comfy-cli is intentionally NOT a declared dependency: this server shells out
 # to whatever `comfy` binary PATH/COMFY_BIN resolves to (which may differ from a

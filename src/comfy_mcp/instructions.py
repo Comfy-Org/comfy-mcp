@@ -17,9 +17,10 @@ flows:
 
 - Call `server_info` FIRST, before anything else, to confirm the local
   ComfyUI is up and see whether a `comfy_target` remote is configured.
-- Long generations: `run_workflow(wait=False)` -> poll `wait_for_job` /
-  `job_status` (or stream live via `watch_job`) -> `fetch_outputs`. Prefer
-  this over `run_workflow(wait=True)` so a slow run does not block.
+- Long generations: `run_workflow(wait=False)` -> poll `job(action="wait")` /
+  `job(action="status")` (or stream live via `job(action="watch")`) ->
+  `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
+  does not block.
 - Large model downloads: `download_model` submits to a background worker and
   returns a `download_id`; poll `wait_for_download` / `download_status`, or
   `cancel_download` to stop one. With a remote target configured,
@@ -72,11 +73,12 @@ flows:
   classes already installed. A `workflow_deps` key that is a repo URL rather
   than a registry id is NOT installable by `install_node`; hand those to the
   USER. A missing MODEL is `download_model`.
-- Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
+- Manage in-flight work with `job(action="queue")` (list jobs) and
+  `job(action="cancel")`.
 - VRAM is shared with everything else on the machine. Before a heavy run,
   read `system_stats` for per-device `vram_free`; if it's short, call
-  `free_memory` (does not interrupt a running job — use `cancel_job` for
-  that) and re-read `system_stats` to confirm, allowing for the same
+  `free_memory` (does not interrupt a running job — use `job(action="cancel")`
+  for that) and re-read `system_stats` to confirm, allowing for the same
   worker-iteration lag. `free_memory` cannot touch VRAM held by ANOTHER
   process — a local LLM runtime (Ollama/LM Studio/llama.cpp) has to be
   unloaded by whoever owns it, not this server. `system_stats` and
@@ -150,8 +152,7 @@ workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `partner_generate`, `emit_partner_workflow`); output directories use
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
 (`get_template`, `get_node`, `nodes_upstream`/`nodes_downstream`,
-`run_template`); job handles use `prompt_id` (`job_status`, `wait_for_job`,
-`watch_job`, `fetch_outputs`, `cancel_job`, `get_execution_error`); and
+`run_template`); job handles use `prompt_id` (`job`, `fetch_outputs`); and
 download handles use `download_id` (`download_status`, `wait_for_download`,
 `cancel_download`). No tool takes a bare `path` or `workflow` argument.
 
@@ -164,7 +165,7 @@ earlier one:
 - STEP 1, is the work even local? `hardware` describes THIS machine, where
   most tools execute. A `comfy_target` block carrying a `host` diverts every
   job-SUBMITTING tool — `run_workflow`, `generate_image`, `run_template` —
-  plus the queue/`jobs` tools (`fetch_outputs` still works against a remote
+  plus the `job` tool (`fetch_outputs` still works against a remote
   job; see its docstring), so the thresholds below govern generation only
   while the target is THIS machine. Count the target as another machine only
   when its `host` is neither a loopback address (`127.0.0.0/8`, `localhost`,

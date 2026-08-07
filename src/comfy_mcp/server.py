@@ -14,9 +14,9 @@ that above a background record, and ``127.0.0.1:8188`` last. There is
 deliberately no HTTP client and no code shared with the Comfy Cloud MCP —
 comfy-cli is the engine.
 
-Tools so far: the run -> get-output core loop plus job management
-(``job_status`` / ``wait_for_job`` / ``watch_job`` / ``get_execution_error`` /
-``cancel_job`` / ``get_queue``), the ``launch_comfyui`` / ``stop_comfyui`` /
+Tools so far: the run -> get-output core loop plus job management via the
+grouped ``job(action=...)`` tool (``"status"`` / ``"wait"`` / ``"watch"`` /
+``"error"`` / ``"cancel"`` / ``"queue"``), the ``launch_comfyui`` / ``stop_comfyui`` /
 ``restart_comfyui`` lifecycle trio (``comfy launch --background`` /
 ``comfy stop`` / stop-then-launch — the two that forward ``extra_args`` ask the
 user to confirm any flag that would publish the unauthenticated local ComfyUI to
@@ -81,6 +81,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
+import anyio.to_thread
 from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
@@ -115,15 +116,16 @@ ENVELOPE_SCHEMA_MAJOR = 1
 MIN_COMFY_CLI_VERSION = os.environ.get("COMFY_CLI_MIN_VERSION") or None
 
 # Hard ceiling for a single bounded wait on an already-submitted job — the
-# streaming `watch_job` and the polling `wait_for_job` share it — so
-# `float('inf')` / an absurd value can't hold a `comfy jobs watch` child open,
-# or keep re-spawning `comfy jobs status`, effectively forever (1 hour).
+# streaming `job(action="watch")` and the polling `job(action="wait")` share
+# it — so `float('inf')` / an absurd value can't hold a `comfy jobs watch`
+# child open, or keep re-spawning `comfy jobs status`, effectively forever
+# (1 hour).
 _MAX_WATCH_TIMEOUT = 3600.0
 
 # Hard ceiling for one waited `run_workflow`, so a `float('inf')` / absurd value
 # can't hold the `comfy run --wait` child open effectively forever. Matches the
-# other per-tool ceilings (partner_generate, run_template, watch_job) at an
-# hour; the docstring already steers genuinely long runs to `wait=False`.
+# other per-tool ceilings (partner_generate, run_template, `job(action="watch")`)
+# at an hour; the docstring already steers genuinely long runs to `wait=False`.
 _MAX_RUN_WORKFLOW_TIMEOUT = 3600.0
 
 # Hard ceiling for one bounded wait on an already-submitted background model
@@ -163,7 +165,7 @@ _DOWNLOAD_SYNC_TIMEOUT = 1800.0
 _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 
 # Sleep between polls in the shared bounded-poll loop (`_poll_until_terminal`) —
-# `wait_for_job`'s `jobs status` polls and `_poll_download`'s
+# `job(action="wait")`'s `jobs status` polls and `_poll_download`'s
 # `model download-status` polls run on the same cadence: a job's queue state and
 # a download's state file are each rewritten at most once a second, so polling
 # faster buys nothing. One named constant rather than two identical 2.0s that
@@ -171,7 +173,7 @@ _MIN_LEGACY_DOWNLOAD_TIMEOUT = 1.0
 _POLL_INTERVAL = 2.0
 
 # Per-poll subprocess budget for the shared bounded-poll loop's calls
-# (`wait_for_job`'s `comfy jobs status`, `_poll_download`'s
+# (`job(action="wait")`'s `comfy jobs status`, `_poll_download`'s
 # `comfy model download-status`), and the smallest slice worth spawning one for.
 # Each poll is capped to whatever is left of the caller's own bound, so a wedged
 # status call can't hold a one-second wait open for the full budget; the floor
@@ -1177,7 +1179,14 @@ def _kill_proc_tree_async(proc: Any) -> None:
             pass
 
 
-async def _reap_async(proc: Any, timeout: float = 5.0) -> None:
+# ASYNC109 (below, and on the three functions after it) is a false positive:
+# these four `timeout` parameters predate this file importing `anyio.to_thread`
+# (for `job`'s off-load, see R2 in the job-tool consolidation) and are plain
+# `asyncio.wait_for` users, not anyio's. Ruff's flake8-async plugin detects the
+# framework per FILE, from its imports — so the `anyio` import alone flips
+# these four from "ignored, asyncio target < 3.11" to "flagged, use
+# anyio.fail_after", despite none of them using anyio at all.
+async def _reap_async(proc: Any, timeout: float = 5.0) -> None:  # noqa: ASYNC109
     """Reap a (killed) async-spawned child without blocking forever.
 
     The :func:`_reap` twin for :class:`asyncio.subprocess.Process`. Same reason
@@ -1714,7 +1723,7 @@ async def _drain_timed_out_async(
     proc: Any,
     stdout_sink: list[bytes],
     stderr_sink: list[bytes],
-    timeout: float = 2.0,
+    timeout: float = 2.0,  # noqa: ASYNC109 - see the note above _reap_async
 ) -> None:
     """Top up a killed async child's captured output with whatever is left in its pipes.
 
@@ -1765,7 +1774,7 @@ async def _drain_timed_out_async(
 
 async def _run_comfy_async(
     *args: str,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     plain_ok: bool = False,
     stdout_cap: int | None = None,
 ) -> Any:
@@ -1922,7 +1931,7 @@ async def _run_comfy_async(
 async def _run_comfy_streaming(
     *args: str,
     ctx: Context | None = None,
-    timeout: float | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     raise_on_timeout: bool = True,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
@@ -1938,7 +1947,7 @@ async def _run_comfy_streaming(
     :class:`ComfyCliError` (the run-workflow contract); pass
     ``raise_on_timeout=False`` for a bounded *tail* that should instead return a
     ``{"timed_out": True, "status": <progress snapshot>}`` payload (mirroring
-    :func:`wait_for_job`) rather than surface the deadline as an error.
+    ``job(action="wait")``) rather than surface the deadline as an error.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -1947,7 +1956,7 @@ async def _run_comfy_streaming(
     await asyncio.to_thread(_check_comfy_version)
     # Forward --host/--port into the subcommand for a configured remote ComfyUI
     # (no-op for the local default; see target._with_target). run_workflow(wait=True)
-    # -> `run` and watch_job -> `jobs watch` are both target-aware verbs.
+    # -> `run` and job(action="watch") -> `jobs watch` are both target-aware verbs.
     args = target._with_target(args)
     # --json-stream is a global flag and, like --json/--where, MUST precede the
     # subcommand; a trailing form errors with "No such option".
@@ -2111,8 +2120,9 @@ async def _run_comfy_streaming(
             message = (
                 f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
                 f"Progress so far: {tracker.snapshot()}. The run may still be "
-                "going — check `job_status`, or for long generations submit "
-                "with `wait=False` and poll `wait_for_job` / `watch_job`. "
+                'going — check `job(action="status")`, or for long generations '
+                'submit with `wait=False` and poll `job(action="wait")` / '
+                '`job(action="watch")`. '
                 # Scrubbed, not raw: comfy-cli echoes the URL it is fetching to
                 # stderr, and this sentence goes straight to the MCP client. See
                 # `_timeout_failure`, whose two fragments this mirrors.
@@ -2891,10 +2901,10 @@ async def run_workflow(
         wait: if True (default), block until the run finishes, streaming
             progress as MCP notifications, and return the full result. If
             False, submit and return with a ``prompt_id`` to poll via
-            ``job_status``.
+            ``job(action="status")``.
         timeout_seconds: used only when ``wait=True``; default 110s sits under
             a typical client's ~120s budget. For a longer run, prefer
-            ``wait=False`` + ``wait_for_job``/``watch_job``.
+            ``wait=False`` + ``job(action="wait")``/``job(action="watch")``.
         confirm_spend: SOME workflows (partner-API nodes from
             ``emit_partner_workflow``, or an ``API``-tagged template) spend
             credits when run. Set True ONLY when the user has actually agreed
@@ -3072,7 +3082,7 @@ async def generate_image(
         checkpoint: swaps the checkpoint model; must already be installed on
             the machine that RUNS the job. Omit for the template's default.
         wait: True (default) blocks/streams progress; False submits and
-            returns a ``prompt_id`` to poll via ``job_status``.
+            returns a ``prompt_id`` to poll via ``job(action="status")``.
         timeout_seconds: used only when ``wait=True``; ignored (fixed short
             submit timeout) when ``wait=False``.
 
@@ -4421,25 +4431,11 @@ async def run_template(
     return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
 
 
-@mcp.tool()
-def job_status(prompt_id: str) -> Any:
-    """Check a submitted job's status (queued / running / completed / error).
-
-    Wraps ``comfy jobs status <prompt_id>``. Returns status and, when finished,
-    output references. Poll after ``run_workflow(wait=False)``.
-
-    A server crash mid-run (e.g. an OOM kill) still makes this call SUCCEED;
-    see ``get_execution_error`` for the ``server_died`` verdict and the
-    recovery steps (check ``get_logs``, relaunch, shrink allocations).
-    """
-    prompt_id = argv._guard_prompt_id(prompt_id)
-    return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
-
-
-# How many trailing traceback frames survive into a get_execution_error verdict.
-# A full ComfyUI traceback can run hundreds of frames; the tail carries the
-# actual failure site. Mirrors comfy-cli's execution_errors._TRACEBACK_TAIL_FRAMES
-# (a smaller tail there — this tool is the deliberate deep-dive companion).
+# How many trailing traceback frames survive into a `job(action="error")`
+# verdict. A full ComfyUI traceback can run hundreds of frames; the tail
+# carries the actual failure site. Mirrors comfy-cli's
+# execution_errors._TRACEBACK_TAIL_FRAMES (a smaller tail there — this tool is
+# the deliberate deep-dive companion).
 _TRACEBACK_TAIL_FRAMES = 20
 
 # Character cap on the joined traceback tail, so a pathological (megabyte)
@@ -4503,11 +4499,12 @@ def _cap_text(value: Any, limit: int = _EXCEPTION_TEXT_MAX_CHARS) -> Any:
     return value
 
 
-@mcp.tool()
-def get_execution_error(prompt_id: str) -> Any:
-    """Diagnostics companion to ``job_status``: normalized failure verdict for a run.
+def _execution_error_verdict(prompt_id: str, status: Any) -> Any:
+    """Normalize a ``jobs status`` payload into a flat failure verdict.
 
-    Wraps ``comfy jobs status <prompt_id>`` and flattens ComfyUI's raw
+    The body ``job(action="error")`` runs after fetching ``status`` itself
+    (extracted verbatim from the tool this replaced, ``get_execution_error``,
+    so the shape below is unchanged). Flattens ComfyUI's raw
     ``execution_error``. On a healthy prompt (no error) returns
     ``{"prompt_id", "status", "error": None}`` — safe to call speculatively.
 
@@ -4524,10 +4521,6 @@ def get_execution_error(prompt_id: str) -> Any:
     - Either way the live server lost the run's history — check ``get_logs``
       (survives the crash) before relaunching and shrinking allocations.
     """
-    prompt_id = argv._guard_prompt_id(prompt_id)
-
-    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
-
     error = status.get("error") if isinstance(status, dict) else None
     reported = status.get("status") if isinstance(status, dict) else None
     if not error:
@@ -4634,8 +4627,9 @@ def _poll_until_terminal(
 ) -> Any:
     """Poll ``comfy <args>`` until ``is_terminal`` or ``timeout_seconds`` expires.
 
-    The one bounded-poll loop behind :func:`wait_for_job` (``jobs status``) and
-    :func:`_poll_download` (``model download-status``). Those two ran
+    The one bounded-poll loop behind ``job(action="wait")`` (``jobs status``,
+    via :func:`_job_wait_sync`) and :func:`_poll_download` (``model
+    download-status``). Those two ran
     statement-for-statement identical loops and differ only in argv, in the
     terminal predicate, and in the extra keys their timed-out payload carries —
     so the timing rules below hold identically for both, and cannot drift apart.
@@ -4724,26 +4718,32 @@ def _poll_until_terminal(
         time.sleep(min(_POLL_INTERVAL, remaining))
 
 
-@mcp.tool()
-def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
-    """Wait (bounded) for a submitted job to reach a terminal status.
+def _job_status_sync(prompt_id: str) -> Any:
+    """``job(action="status")``'s body — the exact ``job_status`` this replaced."""
+    prompt_id = argv._guard_prompt_id(prompt_id)
+    return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
-    Polls ``comfy jobs status <prompt_id>`` until it finishes (completed /
-    error / cancelled) or ``timeout_seconds`` elapses (clamped to a sane max,
-    same ceiling as ``watch_job``; non-positive/NaN is rejected). Use after
-    ``run_workflow(wait=False)``.
 
-    Returns the final status payload, or ``{"timed_out": True, "status": <last
-    payload>}`` on expiry — a TIMEOUT, not a failure. The wait is bounded by
-    design: chain several short calls (checking ``job_status`` in between)
-    rather than one long block.
+def _job_error_sync(prompt_id: str) -> Any:
+    """``job(action="error")``'s body — fetch, then :func:`_execution_error_verdict`."""
+    prompt_id = argv._guard_prompt_id(prompt_id)
+    status = _run_comfy("jobs", "status", prompt_id, timeout=60.0)
+    return _execution_error_verdict(prompt_id, status)
+
+
+def _job_wait_sync(prompt_id: str, timeout_seconds: float) -> Any:
+    """``job(action="wait")``'s body — the exact ``wait_for_job`` this replaced.
+
+    ``timeout_seconds`` arrives already defaulted (25.0 when the caller passed
+    none) but NOT yet bounded — the guard order below (prompt_id, then the
+    bound) matches every other branch's, and matches what ``wait_for_job`` did.
+    "Bounded by design" only holds if the bound itself is bounded. Left raw,
+    `inf` keeps `remaining` positive forever and NaN makes every comparison
+    False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
+    yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
+    `comfy jobs status` until the client gives up. See `argv._bounded_timeout`.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
-    # "Bounded by design" only holds if the bound itself is bounded. Left raw,
-    # `inf` keeps `remaining` positive forever and NaN makes every comparison
-    # False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
-    # yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
-    # `comfy jobs status` until the client gives up. See `argv._bounded_timeout`.
     timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
     return _poll_until_terminal(
         "jobs",
@@ -4754,45 +4754,8 @@ def wait_for_job(prompt_id: str, timeout_seconds: float = 25.0) -> Any:
     )
 
 
-@mcp.tool()
-async def watch_job(
-    prompt_id: str,
-    timeout_seconds: float = 600.0,
-    ctx: Context | None = None,
-) -> Any:
-    """Tail a submitted job's live execution, streaming progress.
-
-    Wraps ``comfy jobs watch <prompt_id>``, forwarding per-node/sampler events
-    as MCP progress notifications and returning the final result on
-    completion. Streaming counterpart to the polled ``wait_for_job`` — use for
-    a job already submitted via ``run_workflow(wait=False)``.
-
-    Bounded by ``timeout_seconds`` (clamped to a sane max) so it never blocks
-    forever; on expiry it's a TIMEOUT, not a failure — same
-    ``{"timed_out": True, "status": ...}`` shape as ``wait_for_job``, except
-    ``status`` here is a live snapshot (``{progress, total, nodes_done}``), not
-    a raw ``jobs status`` dict.
-    """
-    prompt_id = argv._guard_prompt_id(prompt_id)
-    timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
-    return await _run_comfy_streaming(
-        "jobs",
-        "watch",
-        prompt_id,
-        ctx=ctx,
-        timeout=timeout_seconds,
-        raise_on_timeout=False,
-    )
-
-
-@mcp.tool()
-def cancel_job(prompt_id: str) -> Any:
-    """Cancel a queued or running job.
-
-    Wraps ``comfy jobs cancel <prompt_id>``. Use this to stop a job you
-    submitted via ``run_workflow(wait=False)`` before it finishes; cancelling an
-    unknown or already-finished ``prompt_id`` surfaces comfy-cli's error envelope.
-    """
+def _job_cancel_sync(prompt_id: str) -> Any:
+    """``job(action="cancel")``'s body — the exact ``cancel_job`` this replaced."""
     prompt_id = argv._guard_prompt_id(prompt_id)
     return _run_comfy("jobs", "cancel", prompt_id, timeout=60.0)
 
@@ -4830,20 +4793,127 @@ def _drop_cloud_jobs(data: Any) -> Any:
     return {**data, "jobs": kept, "count": len(kept)}
 
 
-@mcp.tool()
-def get_queue() -> Any:
-    """List known jobs with their status (pending / running / completed).
-
-    Wraps ``comfy jobs ls``, merging on-disk job state with the running
-    server's queue — find a ``prompt_id`` to inspect with ``job_status`` or
-    stop with ``cancel_job``.
-
-    NO CLOUD JOBS: rows comfy-cli tracks from a CLOUD run are dropped (only
-    rows POSITIVELY marked ``"cloud"``; other payload shapes pass through
-    untouched) — this server only drives a ComfyUI the user runs themselves,
-    and those ids would not resolve here anyway.
-    """
+def _job_queue_sync() -> Any:
+    """``job(action="queue")``'s body — the exact ``get_queue`` this replaced."""
     return _drop_cloud_jobs(_run_comfy("jobs", "ls", timeout=60.0))
+
+
+# The six actions `job` dispatches, in the order their old standalone tools
+# used to appear (status, error, wait, watch, cancel, queue). An unknown value
+# is rejected before anything else runs — mirrors `project`'s bad-action shape.
+_JOB_ACTIONS = ("status", "error", "wait", "watch", "cancel", "queue")
+
+# Which actions consume each of `job`'s union params. Every action but
+# "queue" takes `prompt_id`; only "wait"/"watch" take `timeout_seconds`. This
+# is the REJECT LOUDLY policy's table: a param supplied for an action that
+# does not consume it is refused rather than silently ignored, the same way
+# an unrecognized `action` is refused rather than falling back to "status" —
+# `job(action="queue", prompt_id="p1")` looking like it filtered the queue
+# by id (it would not have) is exactly the silent-drop failure mode this
+# guards against. Tuples, not frozensets: membership testing is the same
+# either way, but these are also formatted straight into the error messages
+# below, and a set's iteration order is hash-dependent (so unstable ACROSS
+# RUNS, not just unordered) — a tuple keeps that message deterministic.
+_JOB_ACTIONS_TAKING_PROMPT_ID = ("status", "error", "wait", "watch", "cancel")
+_JOB_ACTIONS_TAKING_TIMEOUT = ("wait", "watch")
+
+
+@mcp.tool()
+async def job(
+    action: str = "status",
+    prompt_id: str = "",
+    timeout_seconds: float | None = None,
+    ctx: Context | None = None,
+) -> Any:
+    """Inspect, wait on, watch, or cancel a submitted job — one action per call.
+
+    Wraps the `comfy jobs` family. `action`:
+    - "status" (default) -> `comfy jobs status <prompt_id>`: status + outputs.
+    - "error" -> same call, normalized: `error_code` (comfy-cli's own code, e.g.
+      "server_died" for a crash mid-run, such as an OOM kill — check `get_logs`
+      before relaunching; `None` on an ordinary node failure),
+      `exception_type`/`exception_message`, `node_id`/`node_type`, a capped
+      `traceback_tail`. `error: None` when healthy — safe to call speculatively.
+    - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns the
+      final payload, or `{"timed_out": True, "status": <last>}` on expiry — a
+      TIMEOUT, not a failure.
+    - "watch" -> stream live progress via MCP notifications (default 600.0s,
+      same ceiling); same `timed_out` shape, but `status` is a live
+      `{progress, total, nodes_done}` snapshot, not a raw status dict.
+    - "cancel" -> stop a queued/running job.
+    - "queue" -> list known jobs (Comfy Cloud-tracked rows filtered out).
+
+    `prompt_id` is required for every action but "queue"; `timeout_seconds` only
+    for "wait"/"watch" — either where unused is rejected.
+    """
+    if action not in _JOB_ACTIONS:
+        raise ComfyCliError(
+            f"invalid job action: {action!r} — expected one of "
+            f"{', '.join(repr(name) for name in _JOB_ACTIONS)}."
+        )
+
+    wants_prompt_id = action in _JOB_ACTIONS_TAKING_PROMPT_ID
+    wants_timeout = action in _JOB_ACTIONS_TAKING_TIMEOUT
+
+    # Missing a REQUIRED param is named by action AND param — deliberately not
+    # left to fall through to `argv._guard_prompt_id("")`, whose generic
+    # "empty or leading '-'" message would not say which action needed it.
+    if wants_prompt_id and not prompt_id:
+        raise ComfyCliError(
+            f"job(action={action!r}) requires prompt_id, but none was given."
+        )
+    # Supplied-but-ignored params are REJECT LOUDLY, not silently dropped —
+    # see `_JOB_ACTIONS_TAKING_PROMPT_ID` above for why.
+    if not wants_prompt_id and prompt_id:
+        raise ComfyCliError(
+            f"job(action={action!r}) does not take prompt_id — prompt_id is "
+            "used by action in "
+            f"{', '.join(repr(name) for name in _JOB_ACTIONS_TAKING_PROMPT_ID)}."
+        )
+    if not wants_timeout and timeout_seconds is not None:
+        raise ComfyCliError(
+            f"job(action={action!r}) does not take timeout_seconds — "
+            "timeout_seconds is used by action in "
+            f"{', '.join(repr(name) for name in _JOB_ACTIONS_TAKING_TIMEOUT)}."
+        )
+
+    if action == "watch":
+        # The one branch that stays on the event loop: `_run_comfy_streaming`
+        # is genuinely async (asyncio subprocess + stream reads, see the note
+        # above its definition) — never a blocking call, so it needs no
+        # off-load.
+        prompt_id = argv._guard_prompt_id(prompt_id)
+        bound = argv._bounded_timeout(
+            600.0 if timeout_seconds is None else timeout_seconds, _MAX_WATCH_TIMEOUT
+        )
+        return await _run_comfy_streaming(
+            "jobs",
+            "watch",
+            prompt_id,
+            ctx=ctx,
+            timeout=bound,
+            raise_on_timeout=False,
+        )
+
+    # Every other branch is a blocking `subprocess` call or a `time.sleep`
+    # poll loop (up to `_MAX_WATCH_TIMEOUT` = 3600s for "wait") — off-loaded to
+    # a worker thread via `anyio.to_thread.run_sync`, exactly what the SDK
+    # itself does to run a plain `def` tool (`func_metadata.py`), so `job`
+    # being `async def` (forced by the "watch" branch above) never wedges the
+    # event loop for the other five. R2 in the job-tool consolidation; mirrors
+    # `_in_generate_pool` / `_GENERATE_EXECUTOR`'s reasoning for
+    # `partner_generate`'s own blocking run.
+    if action == "status":
+        return await anyio.to_thread.run_sync(_job_status_sync, prompt_id)
+    if action == "error":
+        return await anyio.to_thread.run_sync(_job_error_sync, prompt_id)
+    if action == "cancel":
+        return await anyio.to_thread.run_sync(_job_cancel_sync, prompt_id)
+    if action == "queue":
+        return await anyio.to_thread.run_sync(_job_queue_sync)
+    # action == "wait"
+    bound = 25.0 if timeout_seconds is None else timeout_seconds
+    return await anyio.to_thread.run_sync(_job_wait_sync, prompt_id, bound)
 
 
 # `comfy system-stats` and `comfy free` landed in comfy-cli 1.14.0, which is also
@@ -4951,7 +5021,7 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 
     NOT IMMEDIATE, never destructive: applied when the queue worker next
     iterates — does **not** interrupt a running job, so this cannot stop one
-    (``cancel_job`` does). Returns what was REQUESTED, not a measurement —
+    (``job(action="cancel")`` does). Returns what was REQUESTED, not a measurement —
     re-check ``system_stats``. NOT diverted by ``COMFYUI_URL``/``COMFYUI_HOST``
     — same ``comfy_target_note`` behavior as ``system_stats``.
     """
@@ -7429,7 +7499,7 @@ _MAX_LOG_TAIL = 10000
 # COUNT, but a single pathological line — a base64 blob or tensor dump from a
 # buggy or hostile custom node — could still be megabytes and flood an agent's
 # context. Cap each line individually, mirroring the `_cap_text` guard on
-# get_execution_error's free-text fields. This is a TOTAL cap: the truncation
+# job(action="error")'s free-text fields. This is a TOTAL cap: the truncation
 # marker is charged against it (see get_logs) so a capped line never exceeds it.
 _MAX_LOG_LINE_CHARS = 4000
 
@@ -9164,16 +9234,17 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 
     The blocking half of ``wait_for_download`` and of ``download_model``'s wait
     path, shared so the two can never disagree about what a bound expiring means.
-    Runs on ``_poll_until_terminal``, the same bounded-poll loop ``wait_for_job``
-    uses — see it for why each poll is capped to the time left on the caller's
-    bound, why the floor exists, and why a poll killed at that cap yields the
-    ``timed_out`` payload instead of an error.
+    Runs on ``_poll_until_terminal``, the same bounded-poll loop
+    ``job(action="wait")`` (:func:`_job_wait_sync`) uses — see it for why each
+    poll is capped to the time left on the caller's bound, why the floor
+    exists, and why a poll killed at that cap yields the ``timed_out`` payload
+    instead of an error.
 
     Returns the terminal status payload, or ``{"timed_out": True, "download_id":
     ..., "status": <last payload>}`` on expiry. A ``failed`` / ``cancelled``
     payload is returned like any other terminal one; only ``download_model``
-    turns that into a raise, matching ``wait_for_job``, which likewise hands back
-    a failed job's status rather than raising on it.
+    turns that into a raise, matching ``job(action="wait")``, which likewise
+    hands back a failed job's status rather than raising on it.
     """
     return _poll_until_terminal(
         "model",

@@ -53,7 +53,12 @@ def test_llm_payload_within_budget():
             if _is_tool_decorated(node):
                 tool_count += 1
                 doc_chars += len(ast.get_docstring(node) or "")
-    assert tool_count > 40, f"tool discovery broke: found {tool_count} tools"
+    # Was `> 40`: the tool-consolidation series (six job tools into one grouped
+    # `job(action=...)` here, `download`/`nodes` in later commits) walks the
+    # live count from 53 down to 39. Relaxed rather than pinned exactly, so
+    # this stays a discovery sanity check, not a second copy of
+    # `test_the_readme_tool_count_matches_live_tool_set`.
+    assert tool_count >= 35, f"tool discovery broke: found {tool_count} tools"
 
     total_chars = doc_chars + len(instructions.INSTRUCTIONS)
     est_tokens = total_chars // 4

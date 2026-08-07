@@ -13,9 +13,9 @@ comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, every
 3. Byte-identical local behavior when nothing is configured.
 4. ``server_info`` surfacing the configured ``comfy_target``.
 5. Submit and poll agreeing on ONE server: a ``generate_image`` / ``run_template``
-   submission and the ``wait_for_job`` that follows it must carry the same
-   ``--host`` / ``--port``, or the ``prompt_id`` from one is meaningless to the
-   other.
+   submission and the ``job(action="wait")`` that follows it must carry the
+   same ``--host`` / ``--port``, or the ``prompt_id`` from one is meaningless
+   to the other.
 6. The tools that CANNOT be diverted saying so themselves: ``download_model``
    refusing outright, and ``system_stats`` / ``free_memory`` annotating their
    payload with a ``comfy_target_note`` — and, since a probe that cannot reach
@@ -305,7 +305,7 @@ def test_generate_image_submit_forwards_host_port(patched_run, monkeypatch):
 
     The whole ticket in one assertion: this is the easiest text-to-image
     on-ramp, it goes through `run-template`, and while that verb was off the
-    allowlist the run happened HERE while `wait_for_job` polled THERE.
+    allowlist the run happened HERE while `job(action="wait")` polled THERE.
     """
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "9001")
@@ -636,12 +636,12 @@ def test_run_workflow_stream_forwards_host_port(patched_stream, monkeypatch):
     ]
 
 
-def test_watch_job_stream_forwards_host_port(patched_stream, monkeypatch):
-    """watch_job tails `comfy jobs watch <id>` with --host/--port forwarded."""
+def test_job_watch_stream_forwards_host_port(patched_stream, monkeypatch):
+    """job(action="watch") tails `comfy jobs watch <id>` with --host/--port forwarded."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
     procs = patched_stream(_OK_STREAM)
 
-    asyncio.run(server.watch_job("pid"))
+    asyncio.run(server.job(action="watch", prompt_id="pid"))
 
     assert procs[0].cmd[4:] == [
         "jobs",
@@ -707,18 +707,19 @@ def _target_flags(cmd: list[str]) -> list[str]:
 
 
 @pytest.mark.parametrize("submit_argv", ["generate_image", "run_template"])
-def test_submit_then_wait_for_job_hit_the_same_server(
+def test_submit_then_job_wait_hit_the_same_server(
     patched_run, monkeypatch, submit_argv
 ):
     """The end-to-end break: submit and poll must land on the SAME ComfyUI.
 
     This is the reported failure, not merely "the run happened on the wrong
-    machine". `wait_for_job` goes through the `jobs` verb, which was already
-    forwarded, while the submit went through `run-template`, which was not — so a
-    client got a `prompt_id` from a LOCAL run and then asked the REMOTE queue
-    about it, where it had never been submitted, and got `prompt_not_found`. The
-    invariant that has to hold is agreement, so assert the two argvs carry the
-    SAME target rather than re-asserting one tool's flags.
+    machine". `job(action="wait")` goes through the `jobs` verb, which was
+    already forwarded, while the submit went through `run-template`, which was
+    not — so a client got a `prompt_id` from a LOCAL run and then asked the
+    REMOTE queue about it, where it had never been submitted, and got
+    `prompt_not_found`. The invariant that has to hold is agreement, so assert
+    the two argvs carry the SAME target rather than re-asserting one tool's
+    flags.
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
     calls = patched_run(envelope(data={"prompt_id": "p1", "status": "completed"}))
@@ -727,7 +728,7 @@ def test_submit_then_wait_for_job_hit_the_same_server(
         submitted = asyncio.run(server.generate_image("a cat", wait=False))
     else:
         submitted = asyncio.run(server.run_template("image_flux2", wait=False))
-    polled = server.wait_for_job(submitted["prompt_id"])
+    polled = asyncio.run(server.job(action="wait", prompt_id=submitted["prompt_id"]))
 
     assert polled["status"] == "completed"  # no `prompt_not_found`
     assert calls[0]["cmd"][4] == "run-template"
@@ -1299,8 +1300,8 @@ def test_resource_tool_timeout_keeps_the_note_and_its_timed_out_flag(
     """A timeout is a verdict from a child that ran, so it is annotated too.
 
     And `timed_out` — the one attribute the envelope fixtures leave at its
-    default on both sides — has to survive the rewrite: `wait_for_job` branches
-    on it instead of matching the message.
+    default on both sides — has to survive the rewrite: `job(action="wait")`
+    branches on it instead of matching the message.
     """
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     patched_run(

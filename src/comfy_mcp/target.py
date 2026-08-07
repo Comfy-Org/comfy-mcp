@@ -96,8 +96,8 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
 # It backs both ``run_template`` and ``generate_image``, and while it was absent
 # the submit-then-poll flow did not merely run on the wrong box, it could not
-# complete at all: the run executed locally, ``wait_for_job`` (a ``jobs`` verb,
-# forwarded) polled the configured remote, and the local ``prompt_id`` came back
+# complete at all: the run executed locally, ``job(action="wait")`` (a ``jobs``
+# verb, forwarded) polled the configured remote, and the local ``prompt_id`` came back
 # ``prompt_not_found`` from a queue it was never submitted to. Adding a verb here
 # is only safe when comfy-cli actually accepts the flags on it — otherwise the
 # forward turns every call into "No such option". There is no such window for
