@@ -57,7 +57,7 @@ from mcp.server.elicitation import (
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp import argv, clitext, instructions, server
 
 # Captured before any test patches it, so the one test that wants the REAL
 # `comfy env` pre-flight can put it back and drive the probe end to end through
@@ -241,7 +241,7 @@ def test_a_batch_that_joins_too_long_is_refused(patched_plain_run):
     the real pack past a truncation marker.
     """
     calls = patched_plain_run(0, stderr="installed")
-    names = [f"pack-{n}-" + "x" * 120 for n in range(server._MAX_NODE_PACK_NAMES)]
+    names = [f"pack-{n}-" + "x" * 120 for n in range(argv._MAX_NODE_PACK_NAMES)]
     ctx = _FakeCtx()
 
     with pytest.raises(server.ComfyCliError) as excinfo:
@@ -249,7 +249,7 @@ def test_a_batch_that_joins_too_long_is_refused(patched_plain_run):
 
     message = str(excinfo.value)
     assert "smaller batches" in message
-    assert str(server._MAX_NODE_PACK_NAMES_CHARS) in message
+    assert str(argv._MAX_NODE_PACK_NAMES_CHARS) in message
     assert calls == []
     assert ctx.elicitations == []  # nobody was asked to approve an unreadable list
 
@@ -262,7 +262,7 @@ def test_a_full_size_batch_of_real_looking_ids_still_installs(patched_plain_run)
     a limitation rather than keeping its own prompt readable.
     """
     calls = patched_plain_run(0, stderr="installed")
-    names = [f"comfyui-node-pack-{n:02d}" for n in range(server._MAX_NODE_PACK_NAMES)]
+    names = [f"comfyui-node-pack-{n:02d}" for n in range(argv._MAX_NODE_PACK_NAMES)]
 
     result = _install(names, ctx=(ctx := _FakeCtx()))
 
@@ -274,7 +274,7 @@ def test_a_full_size_batch_of_real_looking_ids_still_installs(patched_plain_run)
 def test_too_many_packs_is_refused_so_the_prompt_stays_readable(patched_plain_run):
     """An approval the user cannot actually read is not an approval."""
     calls = patched_plain_run(0, stderr="installed")
-    names = [f"pack-{n}" for n in range(server._MAX_NODE_PACK_NAMES + 1)]
+    names = [f"pack-{n}" for n in range(argv._MAX_NODE_PACK_NAMES + 1)]
 
     with pytest.raises(server.ComfyCliError, match="exceeds the"):
         _install(names, ctx=_FakeCtx())
@@ -587,7 +587,7 @@ def test_the_sentence_still_has_to_name_something():
     pip log prints about "installing" a wheel flip an install to `ok: False`.
     """
     assert (
-        server._extract_install_failures(
+        clitext._extract_install_failures(
             "ERROR: An error occurred while installing the wheel for torch\n"
         )
         == []
@@ -615,13 +615,13 @@ def test_a_flood_on_one_stream_cannot_evict_the_real_failure(patched_plain_run):
     flood = "".join(
         f"ERROR: An error occurred while installing 'noise-{index}'.\n"
         "Failed to clone repository\n"
-        for index in range(server._MAX_INSTALL_FAILURES * 2)
+        for index in range(clitext._MAX_INSTALL_FAILURES * 2)
     )
     patched_plain_run(0, stdout=_NOT_FOUND_OUTPUT, stderr=flood)
 
     result = _install(["no-such-pack-xyz"], ctx=_FakeCtx())
 
-    assert len(result["result"]["failures"]) == server._MAX_INSTALL_FAILURES
+    assert len(result["result"]["failures"]) == clitext._MAX_INSTALL_FAILURES
     assert result["installed"] == []
     assert result["failed"][0]["name"] == "no-such-pack-xyz"
 
@@ -726,7 +726,7 @@ def test_an_unreadable_failures_field_degrades_to_the_success_payload(failures):
     pack(s) failed" alongside an empty list would be a worse lie than the one this
     replaced.
     """
-    result = server._classify_install_result(
+    result = clitext._classify_install_result(
         ["comfyui-impact-pack"], {"ok": True, "failures": failures}
     )
 
@@ -742,7 +742,7 @@ def test_a_record_with_unusable_fields_still_counts_as_a_failure():
     reported (with an empty name) rather than dropped — the same one-directional
     choice the extractor makes when cm-cli's sentence carried no usable name.
     """
-    result = server._classify_install_result(
+    result = clitext._classify_install_result(
         ["comfyui-impact-pack"],
         {"ok": False, "failures": [{"pack": 7, "reason": None}]},
     )
@@ -1400,9 +1400,9 @@ def test_the_handshake_instructions_teach_the_install_flow():
     missing", which is precisely the dead end this tool removes: an agent that
     learned the wall at handshake never discovers the tool that resolves it. The
     restart is part of the same clause because installing without restarting looks
-    like a no-op from `search_nodes`.
+    like a no-op from `nodes(action="search")`.
     """
-    flat = " ".join(server.INSTRUCTIONS.split())
+    flat = " ".join(instructions.INSTRUCTIONS.split())
 
     assert "install_node" in flat
     assert "`install_node` -> `restart_comfyui`" in flat
