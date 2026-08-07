@@ -681,7 +681,7 @@ def _is_missing_option_error(exc: ComfyCliError, option: str) -> bool:
 # The two error codes `install_node` reports per failed pack. `pack_not_found` is
 # the one a caller can act on without reading prose — it means the id is not in
 # the registry channel this install reads, so retrying is pointless and the fix is
-# a different id (`search_nodes` / `workflow_deps` are where a real one comes
+# a different id (`nodes(action="search")` / `workflow_deps` are where a real one comes
 # from). Everything else — a clone failure, a dependency conflict, an unreachable
 # registry — is `install_failed`, where the engine's own `error` text is the only
 # thing that distinguishes them and a retry may well work.
@@ -887,8 +887,9 @@ def _phrase_is_only_the_caller_s(
     OWN phrase whenever the value happened to be a substring of it — and the
     values that collide are ordinary, not crafted: ``filename="background"``
     erases the flag out of ``No such option: --background``,
-    ``workflow_path="notes"`` and ``download_status("a")`` do the same to
-    ``No such command 'notes'`` and ``'download-status'``. A value that does not
+    ``workflow_path="notes"`` and ``download(action="status",
+    download_id="a")`` do the same to ``No such command 'notes'`` and
+    ``'download-status'``. A value that does not
     contain the phrase cannot have forged the phrase, so there is nothing to
     discount and it is left alone. The cost of getting this wrong is not
     symmetric: at the verb sites an over-subtraction only costs the friendly

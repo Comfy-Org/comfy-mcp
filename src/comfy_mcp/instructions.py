@@ -17,13 +17,15 @@ flows:
 
 - Call `server_info` FIRST, before anything else, to confirm the local
   ComfyUI is up and see whether a `comfy_target` remote is configured.
-- Long generations: `run_workflow(wait=False)` -> poll `wait_for_job` /
-  `job_status` (or stream live via `watch_job`) -> `fetch_outputs`. Prefer
-  this over `run_workflow(wait=True)` so a slow run does not block.
+- Long generations: `run_workflow(wait=False)` -> poll `job(action="wait")` /
+  `job(action="status")` (or stream live via `job(action="watch")`) ->
+  `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
+  does not block.
 - Large model downloads: `download_model` submits to a background worker and
-  returns a `download_id`; poll `wait_for_download` / `download_status`, or
-  `cancel_download` to stop one. With a remote target configured,
-  `download_model` refuses outright — see the VRAM/remote note below.
+  returns a `download_id`; poll `download(action="wait")` /
+  `download(action="status")`, or `download(action="cancel")` to stop one.
+  With a remote target configured, `download_model` refuses outright — see
+  the VRAM/remote note below.
 - Start from a template: `search_templates(query=...)` to find one, then
   `fetch_template` to save its workflow JSON, then — only once `local_check`
   (returned by `fetch_template`/`get_template`) has CLEARED — `run_workflow`
@@ -51,6 +53,13 @@ flows:
   the partner-models bullet below for what that gate does and does not
   guarantee. For the quickest text-to-image path, `generate_image(prompt)`
   runs the same way, free, no API key.
+- Model families often ship BOTH a free local template and a paid `API` one
+  under identical titles (e.g. two "MiniMax H3: Text to Video" rows) — check
+  BOTH routes (row `tags`, or a second `search_templates(exclude_api=True)`)
+  before claiming a family has no free route; when both exist, ASK the user
+  which they want rather than picking one silently, and never read parameter
+  limits across routes — each route's own graph/schema governs, never the
+  other's.
 - Subgraph templates (UUID-typed nodes plus a `definitions.subgraphs` block)
   are FULLY supported — `run_workflow`/`run_template` expand them
   client-side and `list_workflow_slots` addresses their interior inputs.
@@ -68,15 +77,16 @@ flows:
   node CLASS and you do not know which pack provides it, `workflow_deps`
   names the packs a workflow's classes come from and which are missing:
   `validate_workflow` -> `workflow_deps` -> `install_node` ->
-  `restart_comfyui`. `search_nodes` cannot answer this — it only ever finds
+  `restart_comfyui`. `nodes(action="search")` cannot answer this — it only ever finds
   classes already installed. A `workflow_deps` key that is a repo URL rather
   than a registry id is NOT installable by `install_node`; hand those to the
   USER. A missing MODEL is `download_model`.
-- Manage in-flight work with `get_queue` (list jobs) and `cancel_job`.
+- Manage in-flight work with `job(action="queue")` (list jobs) and
+  `job(action="cancel")`.
 - VRAM is shared with everything else on the machine. Before a heavy run,
   read `system_stats` for per-device `vram_free`; if it's short, call
-  `free_memory` (does not interrupt a running job — use `cancel_job` for
-  that) and re-read `system_stats` to confirm, allowing for the same
+  `free_memory` (does not interrupt a running job — use `job(action="cancel")`
+  for that) and re-read `system_stats` to confirm, allowing for the same
   worker-iteration lag. `free_memory` cannot touch VRAM held by ANOTHER
   process — a local LLM runtime (Ollama/LM Studio/llama.cpp) has to be
   unloaded by whoever owns it, not this server. `system_stats` and
@@ -121,7 +131,7 @@ flows:
   partner-API nodes, in which case `run_workflow` carries the same
   `confirm_spend` gate. Discover partner models here, never in a terminal:
   `list_partner_models()` (filter with `style=`/`partner=`) and
-  `partner_model_schema(alias)`; `discover`/`search_nodes`/`search_templates`
+  `partner_model_schema(alias)`; `discover`/`nodes`/`search_templates`
   do not carry the partner alias set, and neither does shelling out to
   `comfy generate list`.
   Every spending call confirms with the USER first: on a client that
@@ -149,22 +159,23 @@ workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `vary_workflow`); output files use `out_path` (`fetch_template`,
 `partner_generate`, `emit_partner_workflow`); output directories use
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
-(`get_template`, `get_node`, `nodes_upstream`/`nodes_downstream`,
-`run_template`); job handles use `prompt_id` (`job_status`, `wait_for_job`,
-`watch_job`, `fetch_outputs`, `cancel_job`, `get_execution_error`); and
-download handles use `download_id` (`download_status`, `wait_for_download`,
-`cancel_download`). No tool takes a bare `path` or `workflow` argument.
+(`get_template`, `nodes`, `run_template`); job handles use `prompt_id`
+(`job`, `fetch_outputs`); and
+download handles use `download_id` (`download`, and the id `download_model`
+polls with). No tool takes a bare `path` or `workflow` argument.
 
 Routing — check the machine before running local diffusion. `server_info`
 passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a
 `gpu` object carrying `vendor` / `model` / `vram_bytes` / `unified_memory`)
-when the installed comfy-cli reports one. Read it before the first generation
-and work through these steps IN ORDER — a later step never overrides an
-earlier one:
+when the installed comfy-cli reports one. A `Machine snapshot` section at the
+END of these instructions, when present, already carries this block from
+server start — route on it directly; absent means the startup probe failed,
+so use `server_info` instead. Read it before the first generation and work
+through these steps IN ORDER — a later step never overrides an earlier one:
 - STEP 1, is the work even local? `hardware` describes THIS machine, where
   most tools execute. A `comfy_target` block carrying a `host` diverts every
   job-SUBMITTING tool — `run_workflow`, `generate_image`, `run_template` —
-  plus the queue/`jobs` tools (`fetch_outputs` still works against a remote
+  plus the `job` tool (`fetch_outputs` still works against a remote
   job; see its docstring), so the thresholds below govern generation only
   while the target is THIS machine. Count the target as another machine only
   when its `host` is neither a loopback address (`127.0.0.0/8`, `localhost`,
@@ -224,9 +235,8 @@ earlier one:
   `API`-tagged video templates and `emit_partner_workflow`. Reach them with
   `search_templates(tag="API", type="video")` — filter on BOTH axes, because
   neither alone isolates partner-run video (`tag` doesn't constrain output
-  type, `type` doesn't constrain WHERE the model runs), and the compact
-  rows omit `tags` so you can't tell a local template from an `API` one in
-  the results.
+  type, `type` doesn't constrain WHERE the model runs); the rows' own `tags`
+  then confirm what came back.
 - Model choice: pick models via `search_templates` / `search_models` instead
   of assuming a classic default (e.g. SDXL) — current templates track current
   models.

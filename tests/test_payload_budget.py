@@ -21,13 +21,14 @@ from comfy_mcp import instructions
 
 _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
 
-# Ceiling, in estimated tokens (chars/4). Measured 2026-08-06 after diet pass
-# 3 (INSTRUCTIONS deduped against the now-slimmed docstrings, on top of pass
-# 1's 12 largest docstrings and pass 2's remaining 40): ~15.1k.
-# Set ~10% above the measurement so ordinary edits never trip it while real
-# growth does. Ratchet DOWN as the docstring diet lands; never bump without
-# stating why in the same PR.
-_BUDGET_TOKENS = 17_000
+# Ceiling, in estimated tokens (chars/4). Measured 2026-08-07 after the
+# tool-consolidation series' third and final commit (`nodes(action=...)`,
+# 47 -> 39 tools): ~13.84k (39 tool docstrings, 40248 doc chars + INSTRUCTIONS
+# 15126 chars). Ratcheted 17,000 -> 15,000 accordingly — comfortably above the
+# measurement so ordinary edits never trip it while real growth does. Ratchet
+# DOWN as the docstring diet lands; never bump without stating why in the same
+# PR.
+_BUDGET_TOKENS = 15_000
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -53,7 +54,12 @@ def test_llm_payload_within_budget():
             if _is_tool_decorated(node):
                 tool_count += 1
                 doc_chars += len(ast.get_docstring(node) or "")
-    assert tool_count > 40, f"tool discovery broke: found {tool_count} tools"
+    # Was `> 40`: the tool-consolidation series (six job tools into one grouped
+    # `job(action=...)` here, `download`/`nodes` in later commits) walks the
+    # live count from 53 down to 39. Relaxed rather than pinned exactly, so
+    # this stays a discovery sanity check, not a second copy of
+    # `test_the_readme_tool_count_matches_live_tool_set`.
+    assert tool_count >= 35, f"tool discovery broke: found {tool_count} tools"
 
     total_chars = doc_chars + len(instructions.INSTRUCTIONS)
     est_tokens = total_chars // 4
