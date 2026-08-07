@@ -262,9 +262,9 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     pinning the failure on either one: ``tag`` and ``type`` are separate
     exact-match forwards to ``--tag`` / ``--type``, so ``tag`` alone does not
     constrain the output type and ``type`` alone does not constrain where the
-    model runs. Either way the compact rows omit ``tags`` (see
-    ``test_templates.py``), so the caller cannot tell a local template from an
-    ``API`` one in the results.
+    model runs. The compact rows DO carry ``tags`` (see ``test_templates.py``),
+    but that only confirms what a filtered search returned — it does not
+    replace filtering on both axes to get there.
 
     The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
     with a discrete card follows the discrete-GPU row, and "any Mac" handed that

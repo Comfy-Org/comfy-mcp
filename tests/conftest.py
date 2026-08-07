@@ -98,6 +98,22 @@ def _skip_engine_auto_confirm_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _skip_machine_snapshot_probe(monkeypatch):
+    """Pin ``main()``'s startup machine-snapshot probe to its fail-open path.
+
+    ``main()`` runs ``_apply_startup_instructions`` before serving,
+    which shells out to ``comfy env`` once and mutates the module-global
+    handshake instructions. Left live, any test that calls ``server.main()``
+    (the transport/TCC tests in ``test_permissions.py``) would spawn whatever
+    real ``comfy`` this developer machine has AND leak the enriched
+    instructions into every later test's ``mcp.instructions`` assertions. The
+    dedicated snapshot tests (``test_machine_snapshot.py``) restore the real
+    function and stub the spawn instead.
+    """
+    monkeypatch.setattr(server, "_machine_snapshot_block", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_comfyui_target_env(monkeypatch):
     """Default every test to the LOCAL target (no configured remote ComfyUI).
 

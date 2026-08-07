@@ -53,6 +53,13 @@ flows:
   the partner-models bullet below for what that gate does and does not
   guarantee. For the quickest text-to-image path, `generate_image(prompt)`
   runs the same way, free, no API key.
+- Model families often ship BOTH a free local template and a paid `API` one
+  under identical titles (e.g. two "MiniMax H3: Text to Video" rows) — check
+  BOTH routes (row `tags`, or a second `search_templates(exclude_api=True)`)
+  before claiming a family has no free route; when both exist, ASK the user
+  which they want rather than picking one silently, and never read parameter
+  limits across routes — each route's own graph/schema governs, never the
+  other's.
 - Subgraph templates (UUID-typed nodes plus a `definitions.subgraphs` block)
   are FULLY supported — `run_workflow`/`run_template` expand them
   client-side and `list_workflow_slots` addresses their interior inputs.
@@ -160,9 +167,11 @@ polls with). No tool takes a bare `path` or `workflow` argument.
 Routing — check the machine before running local diffusion. `server_info`
 passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a
 `gpu` object carrying `vendor` / `model` / `vram_bytes` / `unified_memory`)
-when the installed comfy-cli reports one. Read it before the first generation
-and work through these steps IN ORDER — a later step never overrides an
-earlier one:
+when the installed comfy-cli reports one. A `Machine snapshot` section at the
+END of these instructions, when present, already carries this block from
+server start — route on it directly; absent means the startup probe failed,
+so use `server_info` instead. Read it before the first generation and work
+through these steps IN ORDER — a later step never overrides an earlier one:
 - STEP 1, is the work even local? `hardware` describes THIS machine, where
   most tools execute. A `comfy_target` block carrying a `host` diverts every
   job-SUBMITTING tool — `run_workflow`, `generate_image`, `run_template` —
@@ -226,9 +235,8 @@ earlier one:
   `API`-tagged video templates and `emit_partner_workflow`. Reach them with
   `search_templates(tag="API", type="video")` — filter on BOTH axes, because
   neither alone isolates partner-run video (`tag` doesn't constrain output
-  type, `type` doesn't constrain WHERE the model runs), and the compact
-  rows omit `tags` so you can't tell a local template from an `API` one in
-  the results.
+  type, `type` doesn't constrain WHERE the model runs); the rows' own `tags`
+  then confirm what came back.
 - Model choice: pick models via `search_templates` / `search_models` instead
   of assuming a classic default (e.g. SDXL) — current templates track current
   models.
