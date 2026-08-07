@@ -4748,28 +4748,29 @@ async def run_workflow(
 
     Args:
         wait: if True (default), block until the run finishes, streaming
-            per-node/sampler progress as MCP notifications, and return the
-            full result. If False, submit and return with a ``prompt_id`` to
-            poll via ``job_status``.
+            progress as MCP notifications, and return the full result. If
+            False, submit and return with a ``prompt_id`` to poll via
+            ``job_status``.
         timeout_seconds: used only when ``wait=True``; default 110s sits under
             a typical client's ~120s budget. For a longer run, prefer
             ``wait=False`` + ``wait_for_job``/``watch_job``.
         confirm_spend: SOME workflows (partner-API nodes from
-            ``emit_partner_workflow``, or an ``API``-tagged template) spend the
-            user's Comfy credits when run. Set True ONLY when the user has
-            actually agreed to spend — never merely to clear an error. Free
-            workflows are never gated by this.
+            ``emit_partner_workflow``, or an ``API``-tagged template) spend
+            credits when run. Set True ONLY when the user has actually agreed
+            to spend — never merely to clear an error. Free workflows are
+            never gated by this.
 
     Gotchas:
         - Without consent, a paid workflow fails CLOSED
-          (``spend_consent_required``, nothing spent); free workflows are
-          unaffected.
-        - A workflow requesting a huge allocation (e.g. an oversized
-          ``EmptyLatentImage``) can pass validation and then crash the whole
-          ComfyUI process on OOM — surfaced as connection-loss/timeout, not a
-          node error; ``get_logs`` still reads the log across the crash.
+          (``spend_consent_required``, nothing spent) on a comfy-cli carrying
+          the gate — the enforced floor; a source build past the fail-open
+          floor check may lack it and still spend.
+        - A workflow requesting a huge allocation can pass validation and then
+          crash the whole ComfyUI process on OOM — surfaced as
+          connection-loss/timeout, not a node error; ``get_logs`` still reads
+          the log across the crash.
         - Partner-API nodes need a Comfy credential (``COMFY_API_KEY``);
-          transient credential failures retry automatically.
+          transient failures retry automatically.
     """
     # Guarded HERE rather than inside `_attempt` so it covers BOTH the
     # `wait=False` submit and the streaming path, and so a bad path fails once
@@ -6023,21 +6024,22 @@ async def emit_partner_workflow(
     Args:
         model: only FIVE aliases map to a node — ``flux-2``, ``flux-pro``,
             ``kling-i2v``, ``nano-banana``, ``seedance``. Everything else
-            raises; route it to ``partner_generate`` instead (narrow coverage,
+            raises; route to ``partner_generate`` instead (narrow coverage,
             not "unsupported").
         params: the model's own inputs, same validation as ``partner_generate``;
-            optional even where the proxy requires them (the node has its own
-            defaults, fillable later via ``set_workflow_slot``).
+            optional even where the proxy requires them (defaults fillable
+            later via ``set_workflow_slot``).
         out_path: the workflow JSON to write. comfy-cli OVERWRITES it in place
-            with no existence check — name a fresh file, not one worth keeping.
+            with no existence check — name a fresh file.
 
     Returns:
         comfy-cli's own ``{"out": ..., "model": ..., "nodes": ...}``.
 
     Gotchas:
-        - No ``confirm_spend`` here, deliberately: this call itself never
-          spends. RUNNING the emitted graph is what bills — pass
-          ``confirm_spend=True`` to that ``run_workflow`` call, not this one.
+        - No ``confirm_spend`` here: this call never spends. RUNNING the
+          emitted graph is what bills — pass ``confirm_spend=True`` to that
+          ``run_workflow`` call, and do not read its absence as protection: a
+          comfy-cli lacking the spend gate runs and bills silently regardless.
     """
     _validate_generate_model(model)
     if not out_path:
@@ -10266,9 +10268,9 @@ async def install_node(
 
     Wraps ``comfy node install <name...> --exit-on-fail``. Feed it registry pack
     ids (e.g. ``"comfyui-impact-pack"``) from ``search_nodes`` /
-    ``workflow_deps`` — never a node CLASS name, a git URL, or an ``@version``
-    pin; all three are refused before anything runs (get pack ids from
-    ``workflow_deps`` first, then run terminal-only for a URL/pin).
+    ``workflow_deps`` — never a node CLASS name (convert it with
+    ``workflow_deps`` first); a git URL or an ``@version`` pin is refused
+    before anything runs (run ``comfy node install`` in a terminal for those).
 
     Args:
         confirm_install: on a client that supports MCP elicitation, the user is
