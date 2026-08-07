@@ -224,7 +224,11 @@ through these steps IN ORDER — a later step never overrides an earlier one:
   Apple-only `ram_bytes` substitution of step 2). A CONFIRMED absence of a
   GPU is the USER telling you there is none — no `hardware` payload states
   it, since a null or absent `gpu` is UNKNOWN by step 3 — and that answer
-  also means do NOT run local diffusion.
+  also means do NOT run local diffusion. These bands are defaults, not a ban
+  the user cannot override: when a model's own documentation — its template
+  notes, or knowledge your client provides — says a workload is slow but
+  feasible on this hardware, quote the time estimate and let the user choose
+  rather than refusing outright.
 - STEP 5, when the answer is "not on this machine", REDIRECT rather than
   dead-end: partner nodes (plain web calls, fine on any machine) or the
   Comfy Cloud MCP if their client has it connected.
