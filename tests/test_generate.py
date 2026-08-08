@@ -341,7 +341,7 @@ def test_generate_image_other_errors_pass_through_unchanged(monkeypatch):
     assert exc.value.__cause__ is not exc.value
 
 
-def test_generate_image_refuses_checkpoint_without_a_slot(monkeypatch):
+def test_generate_image_refuses_checkpoint_without_a_slot(no_spawn):
     """`checkpoint=` on a split-loader graph is refused BY NAME, before submitting.
 
     The built-in on-ramp template loads weights through UNETLoader/CLIPLoader/
@@ -349,12 +349,6 @@ def test_generate_image_refuses_checkpoint_without_a_slot(monkeypatch):
     reach comfy-cli and come back as `workflow_slot_invalid` — an error about
     slot syntax for what is really an unsupported argument on this graph.
     """
-
-    def boom(*a, **k):
-        raise AssertionError("no comfy-cli child may be spawned")
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
-    monkeypatch.setattr(server, "_run_comfy_streaming", boom)
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(server.generate_image("a cat", checkpoint="sd_xl.safetensors"))

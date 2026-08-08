@@ -3164,7 +3164,13 @@ def _t2i_missing_template_hint(
             for r in rows
             if isinstance(r, dict)
             and r.get("name")
-            and "API" not in (r.get("tags") or [])
+            # Case-insensitive, matching `search_templates`' own
+            # `t.lower() == "api"`: an exact-case test would let a paid row slip
+            # into a list of FREE suggestions, which is the one thing this hint
+            # must not do.
+            and not any(
+                isinstance(t, str) and t.lower() == "api" for t in (r.get("tags") or [])
+            )
         )
         suggestions = [n for n in names if "text_to_image" in n or "t2i" in n][
             :8
@@ -8208,7 +8214,13 @@ def search_templates(
 
     Args:
         query: free-text match over name/title/description/tags/models.
-            Tokenized: EVERY word must prefix a word in the row, so
+            Two passes. A PHRASE pass first — the words must appear
+            consecutively — so ``image to image`` stays img2img rather than
+            matching every ``text to image`` row. Only if that finds nothing
+            does an all-words pass run, and the reply then carries
+            ``match: "all-words"`` so a widened result is never mistaken for an
+            exact one. In the all-words pass: EVERY word must prefix a word in
+            the row, so
             ``MiniMax Text to Video`` finds ``MiniMax H3: Text to Video``, and
             each extra word only narrows. Word-anchored, so ``flux`` finds
             ``flux2`` but ``ext`` does not match ``text``. When nothing matches,
@@ -10621,6 +10633,14 @@ def set_workflow_slot(
     # caught, and one extra `workflow slots` call is cheap next to a corrupted
     # workflow. Best-effort: a probe that cannot run must not block a write that
     # would otherwise be fine, so any failure to inspect falls through.
+    #
+    # COST, accepted deliberately: this doubles the child processes for every
+    # slot write, including the overwhelmingly common clean case. One extra
+    # `workflow slots` is cheap next to silently writing a user's value into the
+    # wrong field of their graph — a corruption that reports success, leaves
+    # `validate_workflow` reporting valid: true, and survives the obvious
+    # read-back check. If the probe ever shows up in a profile, cache it per
+    # (path, mtime) rather than dropping it.
     # The probe is suppressed; the REFUSAL is raised outside it. Raising inside
     # the `suppress` would have it swallow its own exception and write anyway —
     # turning the guard into a no-op that still costs a subprocess.

@@ -1375,6 +1375,23 @@ def test_list_workflow_slots_leaves_clean_payloads_alone(patched_run):
 
     assert "suspect_slots" not in result
     assert "warning" not in result
+    # And the payload is returned WHOLE: absence of the new keys would still
+    # hold if the flagger had mutated the slots it was handed.
+    assert result["slots"] == [
+        {"address": "3.seed", "name": "seed", "type": "INT", "current_value": "42"},
+        {
+            "address": "6.text",
+            "name": "text",
+            "type": "STRING",
+            "current_value": "a cat",
+        },
+        {
+            "address": "4.ckpt",
+            "name": "ckpt",
+            "type": "COMBO",
+            "current_value": "sd.safetensors",
+        },
+    ]
 
 
 def test_set_workflow_slot_refuses_a_mispaired_target(patched_run):
