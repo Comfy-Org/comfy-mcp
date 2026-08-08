@@ -91,6 +91,11 @@ jobs:
       # PyPI is configured to trust this repository + this workflow filename,
       # so there is no long-lived credential to leak or rotate.
       id-token: write
+      # A job-level permissions block zeroes every permission it does not name,
+      # including the workflow-level `contents: read` — without this line the
+      # job's own checkout fails on a private repo with "repository not found"
+      # (how v0.7.0's first publish attempt died).
+      contents: read
     steps:
       - uses: actions/checkout@v6
 

@@ -282,6 +282,21 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     assert "cannot tell a local template" not in routing
 
 
+def test_routing_lets_the_user_override_a_slow_band_with_a_time_estimate(routing):
+    """The VRAM bands in STEP 4 are defaults an informed user can override.
+
+    The model team's guidance: for some current models, low VRAM means SLOW,
+    not infeasible. An agent that reads STEP 4's bands as a hard floor refuses
+    a run the user might knowingly want to wait for. This repo carries no model
+    knowledge to act on that guidance directly, so the block instead tells the
+    agent to defer to whatever the model's own documentation (template notes,
+    or knowledge the client provides) says, quote the time estimate, and let
+    the user decide — rather than treating the band as a ban.
+    """
+    assert "defaults, not a ban" in routing
+    assert "quote the time estimate" in routing
+
+
 def test_routing_steers_model_choice_to_discovery_not_a_hardcoded_default(routing):
     """No model registry lives in this repo — the agent searches for one.
 
