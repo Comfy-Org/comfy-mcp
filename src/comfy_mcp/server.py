@@ -4270,10 +4270,21 @@ async def emit_partner_workflow(
         fetch_outputs(prompt_id)
 
     Args:
-        model: only FIVE aliases map to a node — ``flux-2``, ``flux-pro``,
-            ``kling-i2v``, ``nano-banana``, ``seedance``. Everything else
-            raises; route to ``partner_generate`` instead (narrow coverage,
-            not "unsupported").
+        model: only a few aliases map to a NODE, which is what an emitted graph
+            needs. Verified against comfy-cli 1.15.0: ``flux-2``,
+            ``flux-ultra``, ``kling-i2v``, ``nano-banana``, ``seedance``.
+            Everything else raises; route to ``partner_generate`` instead
+            (narrow coverage, not "unsupported").
+
+            NOTE ``flux-pro`` is NOT emittable despite being a valid partner
+            alias — it has no node mapping, so it fails with
+            ``emit_workflow_failed``. This list was previously wrong in exactly
+            that way, naming ``flux-pro`` and omitting ``flux-ultra``.
+
+            comfy-cli owns this mapping, so the list here can drift as it
+            changes: ``list_partner_models`` reports every alias that EXISTS
+            (52 on 1.15.0), which is a strictly larger set than the ones that
+            emit. Attempting the emit is the authoritative check.
         params: the model's own inputs, same validation as ``partner_generate``;
             optional even where the proxy requires them (defaults fillable
             later via ``set_workflow_slot``).
