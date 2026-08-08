@@ -540,6 +540,37 @@ in the client registration `env` block (shown in every
 the `comfy auth set comfy-cloud-api-key --key …` fallback and the list of offending nodes; the
 server also retries a transient credential failure briefly before surfacing it.
 
+## Confirmation prompts on clients that can't show them
+
+Several tools ask you to confirm before they act: `install_node`,
+`update_comfyui(target="all")`, `switch_comfyui_version`, `restart_comfyui` when it must stop a
+server it did not start, and `launch_comfyui` with `--listen` (which exposes an unauthenticated
+ComfyUI to your network). Each raises an MCP *elicitation* and **fails closed** if it is not
+approved.
+
+Some MCP clients answer that request without ever showing you a prompt. When that happens the
+tool refuses and tells you so — nothing is changed, and the error names the equivalent terminal
+command you can run instead.
+
+If you would rather pre-authorize specific gates, set `COMFY_MCP_ASSUME_CONSENT` in the server's
+environment — the `env` block of your client registration, alongside `COMFY_BIN`:
+
+```jsonc
+"env": { "COMFY_MCP_ASSUME_CONSENT": "install_node,update_all" }
+```
+
+Accepted names: `install_node`, `update_all`, `version_switch`, `kill_untracked`,
+`network_exposure` — or `all` for every one of them. List only what you want; authorizing node
+installs should not silently also authorize binding ComfyUI to every network interface.
+
+This is a setting **you** write, in a file the model cannot edit. That is the point: an agent
+cannot grant itself permission by passing an argument, which is why no tool parameter does this.
+
+**Spending credits is deliberately excluded.** No value — including `all` — pre-authorizes
+`partner_generate`, `run_template` or `run_workflow`. Money keeps a single owner: comfy-cli's own
+durable consent (`comfy generate consent always`). See
+[Spending credits on partner models](#spending-credits-on-partner-models).
+
 ## Spending credits on partner models
 
 `partner_generate` is the one tool whose *whole purpose* is to spend: it wraps `comfy generate

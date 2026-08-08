@@ -3635,6 +3635,10 @@ class _ApprovalWording(NamedTuple):
     #: Optional trailing sentence naming another route for a client that cannot
     #: be prompted. Begins with a space — it is concatenated, not joined.
     escape_hatch: str = ""
+    #: The name an OPERATOR types in ``COMFY_MCP_ASSUME_CONSENT`` to
+    #: pre-authorize this gate. EMPTY means the gate can never be pre-authorized
+    #: — which is how the spend gates are held out of the mechanism entirely.
+    consent_token: str = ""
 
 
 _SPEND_APPROVAL_WORDING = _ApprovalWording(
@@ -3668,6 +3672,63 @@ _OPTIN_SPEND_APPROVAL_WORDING = _ApprovalWording(
 )
 
 
+# Operator-set pre-authorization for the per-call consent gates.
+#
+# WHY THIS EXISTS. Every gate raises an MCP elicitation and fails closed when it
+# is not affirmatively approved — correct, and unchanged. But the clients agents
+# actually run under (Claude Code, Codex CLI, both verified) answer the
+# elicitation WITHOUT rendering a prompt, so in practice no human is ever asked
+# and five tools are unusable: install_node, update_comfyui(target="all"),
+# switch_comfyui_version, restart_comfyui's kill-untracked, and launch with
+# --listen. The terminal escape hatch each error names is a real answer, but it
+# is not one an agent can take.
+#
+# WHY AN ENVIRONMENT VARIABLE, and not a tool argument. A tool argument is set by
+# the AGENT, so honouring one would let the agent consent on the user's behalf —
+# exactly what these gates exist to prevent, and what the fallback comments
+# elsewhere in this file warn against. This variable lives in the SERVER's
+# environment, written by whoever configured the MCP server (mcp.json, a shell
+# profile, a container spec). The model cannot set it. So it is a human granting
+# consent out-of-band at configuration time, which is the property the
+# elicitation was reaching for in the first place.
+#
+# WHY SPEND IS EXCLUDED. The spend gates carry no `consent_token`, so no value of
+# this variable — including "all" — can pre-authorize them. Money already has a
+# durable, human-set route in comfy-cli itself (`comfy generate consent always`,
+# read via `_engine_auto_confirms`), and a second mechanism would split that
+# policy across two places. Keeping one owner for the spend decision matters more
+# than the symmetry.
+#
+# The value is a COMMA-SEPARATED LIST of gate tokens, or "all". A list rather than
+# a boolean so the operator states what they are authorizing: enabling node
+# installs should not silently also authorize binding ComfyUI to every interface.
+_ASSUME_CONSENT_ENV = "COMFY_MCP_ASSUME_CONSENT"
+
+
+def _preauthorized_gates() -> frozenset[str]:
+    """Gate tokens the operator pre-authorized, lowercased.
+
+    Read per call rather than latched at import, so a test (or a client that
+    re-execs with different env) sees the current value — the same convention
+    `_t2i_config` follows.
+    """
+    raw = os.environ.get(_ASSUME_CONSENT_ENV, "")
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def _is_preauthorized(wording: _ApprovalWording) -> bool:
+    """Whether this gate was pre-authorized out-of-band by the operator.
+
+    A gate with no token is never pre-authorizable, which is what holds the spend
+    gates out of this mechanism no matter what the variable says.
+    """
+    token = wording.consent_token
+    if not token:
+        return False
+    granted = _preauthorized_gates()
+    return "all" in granted or token.lower() in granted
+
+
 async def _elicit_approval(
     ctx: Context, message: str, schema: type, wording: _ApprovalWording
 ) -> bool:
@@ -3688,6 +3749,17 @@ async def _elicit_approval(
       action, an auto-answer). Failing closed is the same; claiming a human
       refused is not, so that wording is not available to the caller at all.
     """
+    if _is_preauthorized(wording):
+        # Checked BEFORE contacting the client: the operator has already decided,
+        # so prompting would be theatre — and on a client that cannot render one,
+        # it would fail closed against a human who already said yes. Logged so the
+        # approval is auditable rather than invisible.
+        logging.getLogger(__name__).info(
+            "consent pre-authorized for gate %r via %s",
+            wording.consent_token,
+            _ASSUME_CONSENT_ENV,
+        )
+        return True
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message=message, schema=schema),
@@ -5759,6 +5831,7 @@ _NETWORK_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run "
         "`comfy launch --background -- <flags>` in a terminal instead."
     ),
+    consent_token="network_exposure",
 )
 
 
@@ -6321,6 +6394,7 @@ _KILL_UNTRACKED_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run `comfy stop --port <PORT>` in a "
         "terminal instead."
     ),
+    consent_token="kill_untracked",
 )
 
 
@@ -6735,6 +6809,7 @@ _UPDATE_ALL_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run `comfy update all` in a "
         "terminal instead."
     ),
+    consent_token="update_all",
 )
 
 # Said in the prompt AND in the cannot-be-prompted refusal, because both have to
@@ -6931,6 +7006,7 @@ _SWITCH_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run "
         "`comfy update comfy --version <VERSION>` in a terminal instead."
     ),
+    consent_token="version_switch",
 )
 
 
@@ -7287,6 +7363,7 @@ _INSTALL_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run "
         "`comfy node install <name>` in a terminal instead."
     ),
+    consent_token="install_node",
 )
 
 
