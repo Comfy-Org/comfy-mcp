@@ -544,3 +544,28 @@ def test_stamping_is_best_effort(tmp_path):
         server._stamp_partner_provenance(str(tmp_path / "missing.json"), "flux-2")
         is None
     )
+
+
+def test_stamping_never_destroys_the_emitted_workflow(tmp_path, monkeypatch):
+    """A failed stamp must leave the original graph intact.
+
+    Opening `out_path` with "w" truncates BEFORE the write completes, so a
+    failure part-way (full disk, a serialization error) would replace a
+    perfectly good workflow with a stump — and the emit that produced it has
+    already returned, so there is nothing to retry. The write goes to a sibling
+    temp file and is swapped in with os.replace.
+    """
+    out = tmp_path / "flux.json"
+    original = json.dumps(_EMITTED)
+    out.write_text(original)
+
+    def exploding_dump(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(server.json, "dump", exploding_dump)
+
+    assert server._stamp_partner_provenance(str(out), "flux-2") is None
+    # The caller's file is byte-identical, not truncated.
+    assert out.read_text() == original
+    # And no temp file is left behind.
+    assert list(tmp_path.glob("*.tmp")) == []

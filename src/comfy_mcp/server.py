@@ -1474,8 +1474,10 @@ def _unwrap_envelope(
                 "<workspace> switch master`), then retry. To move between "
                 "releases instead, use `switch_comfyui_version`, which does not "
                 "need a branch. `server_info` reports the workspace path.\n\n"
-                "Original error: "
+                "Original error: stderr: "
                 f"{failure_log._scrubbed_stream_tail(stderr, errors._MAX_ERROR_FIELD_CHARS)}"
+                " | stdout: "
+                f"{failure_log._scrubbed_stream_tail(stdout, errors._MAX_ERROR_FIELD_CHARS)}"
             )
             failure_log._log_failure(
                 "no_json",
@@ -3183,7 +3185,11 @@ def _t2i_missing_template_hint(
         f"generate_image is configured to run template {template!r}, which is not in "
         f"the gallery.{tail} Set COMFY_T2I_TEMPLATE (with COMFY_T2I_PROMPT_SLOT, and "
         "COMFY_T2I_CHECKPOINT_SLOT if the graph has one) to a template that exists, "
-        "or use search_templates -> fetch_template -> run_workflow directly."
+        "or use search_templates -> fetch_template -> run_workflow directly.",
+        # Preserve comfy-cli's structured code, the way `_t2i_slot_hint` does:
+        # rewriting the prose must not silently drop the field a caller branches
+        # on (`template_not_found`).
+        code=getattr(exc, "code", None),
     )
 
 
@@ -3272,8 +3278,10 @@ async def generate_image(
         # unsupported argument on this graph.
         raise ComfyCliError(
             f"generate_image(checkpoint=...) is not supported by template "
-            f"{template!r}: it loads weights through UNETLoader/CLIPLoader/"
-            "VAELoader, so there is no checkpoint slot to set. Omit `checkpoint` "
+            f"{template!r}: no checkpoint slot is configured for it, so there is "
+            "nothing to set. (The built-in on-ramp template loads weights through "
+            "UNETLoader/CLIPLoader/VAELoader rather than CheckpointLoaderSimple, "
+            "which is now the gallery norm.) Omit `checkpoint` "
             "to use the template's own weights, or point the on-ramp at a "
             "CheckpointLoaderSimple graph by setting COMFY_T2I_TEMPLATE, "
             "COMFY_T2I_PROMPT_SLOT and COMFY_T2I_CHECKPOINT_SLOT together "
@@ -4331,10 +4339,24 @@ def _stamp_partner_provenance(out_path: str, model: str) -> dict[str, Any] | Non
             meta = {}
             node["_meta"] = meta
         meta[_PROVENANCE_KEY] = block
+    # ATOMIC, because the alternative destroys the caller's file. Opening
+    # `out_path` with "w" truncates the emitted workflow before `json.dump`
+    # finishes; a failure part-way (full disk, a serialization error) would
+    # leave a half-written or empty graph where a perfectly good one was, and
+    # the emit that produced it has already returned. Write a sibling temp file,
+    # fsync it, then `os.replace` — which is atomic on the same filesystem, so
+    # a reader sees either the original or the stamped version, never a stump.
+    tmp_path = f"{out_path}.comfy-mcp.tmp"
     try:
-        with open(out_path, "w", encoding="utf-8") as fh:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump(graph, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, out_path)
     except OSError:
+        # Best-effort cleanup; the original file is untouched either way.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
         return None
     return block
 
@@ -10344,7 +10366,7 @@ def _flag_mispaired_slots(data: Any) -> Any:
     suspect = [
         str(s.get("address"))
         for s in slots
-        if _slot_pairing_is_broken(s) and isinstance(s, dict)
+        if isinstance(s, dict) and _slot_pairing_is_broken(s)
     ]
     if not suspect:
         return data
