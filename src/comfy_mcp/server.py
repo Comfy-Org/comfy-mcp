@@ -7716,19 +7716,29 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
 
 
 @mcp.tool()
-def discover(schemas_only: bool = True) -> Any:
+def discover(schemas_only: bool = True, command: str = "") -> Any:
     """Return comfy-cli's self-describing command surface (its own contract).
 
     Wraps ``comfy discover`` so an agent can learn the CLI's contract at
     runtime instead of hard-coding it.
 
-    ``schemas_only`` (default True) forwards ``--schemas-only``: returns just
-    the schema bundle (~9k tokens) — argument/capability schemas, NOT the
-    ``commands`` tree or ``error_codes``. Pass ``schemas_only=False`` for
-    those too, in the full surface (~45k tokens, ~5x bigger — measured on
-    comfy-cli 1.13.0). Default is slim because MCP clients cap tool output
-    (e.g. Claude Code's ``MAX_MCP_OUTPUT_TOKENS``, default 25,000) by
-    TRUNCATING mid-JSON — the full tree can silently come back broken.
+    Args:
+        schemas_only: forwards ``--schemas-only`` to the CLI (default True).
+        command: return ONE schema body by name instead of the index.
+
+    Sizes matter here because MCP clients cap tool output (e.g. Claude Code's
+    ``MAX_MCP_OUTPUT_TOKENS``, default 25,000) by TRUNCATING mid-JSON, so an
+    oversized reply comes back broken rather than short:
+
+    - ``discover()`` — the default. Capabilities, version, command schemas, and
+      a ``schema_index`` of names. A couple of KB; always under the cap.
+    - ``discover(command="run")`` — one schema body (~1.6 KB).
+    - ``discover(schemas_only=False)`` — the entire surface, ``commands`` tree
+      and ``error_codes`` included. Big; only for a client with a raised cap.
+
+    The default USED to return all 35 schema bodies — ~63 KB from the CLI and
+    ~109 KB once pretty-printed, which exceeded a standard cap and made the tool
+    uncallable at its own default. Measured on comfy-cli 1.15.0.
     """
     args = ["discover"]
     if schemas_only:
@@ -7736,7 +7746,47 @@ def discover(schemas_only: bool = True) -> Any:
         # shipped in the same comfy-cli commit that introduced `discover`, so
         # any build carrying the command carries the flag.
         args.append("--schemas-only")
-    return _run_comfy(*args, timeout=60.0)
+    data = _run_comfy(*args, timeout=60.0)
+
+    # Everything below narrows what comes BACK; the child call is unchanged.
+    #
+    # Measured on comfy-cli 1.15.0: the default payload is ~63 KB of compact JSON
+    # from the CLI, and ~109 KB once a client pretty-prints it — over a standard
+    # 25,000-token cap, so the tool was rejected outright and could not be called
+    # AT ALL at its default setting. `schemas` is ~95% of that (35 entries,
+    # ~1.6 KB each) while `capabilities`/`version`/`command_schemas` together are
+    # ~2.7 KB.
+    #
+    # So the default now returns an INDEX of the schema names instead of every
+    # schema body. That is a deliberate response-shape change: a tool that
+    # exceeds the client cap returns nothing usable, and a truncated mid-JSON
+    # reply is worse than a small complete one. Any single schema is one more
+    # call away via `command=`, and `schemas_only=False` still returns the whole
+    # surface for a client that can take it.
+    if not isinstance(data, dict):
+        return data
+    schemas = data.get("schemas")
+    if not isinstance(schemas, dict):
+        return data
+    if command:
+        entry = schemas.get(command)
+        if entry is None:
+            raise ComfyCliError(
+                f"discover: no schema named {command!r}. Available: "
+                f"{', '.join(sorted(schemas))}."
+            )
+        return {"schema": entry, "version": data.get("version")}
+    if schemas_only:
+        slim = {k: v for k, v in data.items() if k != "schemas"}
+        slim["schema_index"] = sorted(schemas)
+        slim["hint"] = (
+            f"{len(schemas)} schema bodies omitted (~"
+            f"{len(json.dumps(schemas, separators=(',', ':'))) // 1024} KB, over a "
+            'typical MCP client\'s output cap). Call discover(command="<name>") '
+            "for one, or discover(schemas_only=False) for the whole surface."
+        )
+        return slim
+    return data
 
 
 @mcp.tool()
