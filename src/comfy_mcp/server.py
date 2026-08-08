@@ -7769,23 +7769,100 @@ _TEMPLATE_LIST_FIELDS = (
 _TEMPLATE_LIST_MAX_LIMIT = 200
 
 
-def _template_matches(row: dict, query_lower: str) -> bool:
-    """True if ``query_lower`` (already lowercased) matches a template ``row``.
+# Words, for query tokenizing and row indexing. Splitting on anything that is not
+# alphanumeric is what lets `MiniMax H3: Text to Video` be found by
+# `MiniMax Text to Video` — the colon and the `H3` no longer have to be typed.
+_TEMPLATE_WORD_RE = re.compile(r"[a-z0-9]+")
 
-    Case-insensitive substring match over the free-text fields ``name`` /
-    ``title`` / ``description`` plus the string items inside the ``tags`` and
-    ``models`` list values — deliberately NOT every string value, so a query
-    like ``"image"`` does not hit ``output_type`` on hundreds of rows.
+
+def _template_words(row: dict) -> list[str]:
+    """Every searchable word in a template ``row``, lowercased.
+
+    ``name``/``title``/``description`` plus the string items inside ``tags`` and
+    ``models`` — deliberately NOT every string value, so a query like ``image``
+    does not hit ``output_type`` on hundreds of rows.
     """
+    words: list[str] = []
     for key in ("name", "title", "description"):
         value = row.get(key)
-        if isinstance(value, str) and query_lower in value.lower():
-            return True
+        if isinstance(value, str):
+            words += _TEMPLATE_WORD_RE.findall(value.lower())
     for key in ("tags", "models"):
         for item in row.get(key) or []:
-            if isinstance(item, str) and query_lower in item.lower():
-                return True
+            if isinstance(item, str):
+                words += _TEMPLATE_WORD_RE.findall(item.lower())
+    return words
+
+
+def _template_phrase_matches(row: dict, query_lower: str) -> bool:
+    """True if the query's words appear CONSECUTIVELY in ``row``.
+
+    The precise pass. Word-anchored rather than a raw substring test, so
+    ``image to image`` still means img2img and does not also match the
+    ``text to image`` rows, while the mid-word fragment ``ext to imag`` — which
+    the old substring test happily matched inside ``text to image`` — cannot
+    match anything.
+
+    The final token may be a PREFIX so that partial typing keeps working while
+    the phrase is still being typed (``image to ima`` finds img2img); every
+    earlier token must be a whole word, which is what preserves the ordering.
+    """
+    tokens = _TEMPLATE_WORD_RE.findall(query_lower)
+    if not tokens:
+        return True
+    words = _template_words(row)
+    last = len(tokens) - 1
+    for start in range(len(words) - len(tokens) + 1):
+        if all(
+            words[start + i].startswith(tok) if i == last else words[start + i] == tok
+            for i, tok in enumerate(tokens)
+        ):
+            return True
     return False
+
+
+def _template_matches(row: dict, query_lower: str) -> bool:
+    """True if every word of ``query_lower`` prefixes some word in ``row``.
+
+    WAS a raw substring test over the same fields, which failed in both
+    directions on the gallery's primary discovery path:
+
+    * FALSE NEGATIVES — the first phrasing anyone types. ``basic text to image``,
+      ``text image`` and ``MiniMax Text to Video`` all returned 0, the last one
+      despite ``MiniMax H3: Text to Video`` existing, because the stored title
+      has ``H3:`` in the middle and a substring test needs the phrase contiguous.
+      A clean ``total: 0`` is indistinguishable from "no such capability", so the
+      failure reads as absence rather than as a bad query.
+    * FALSE POSITIVES — mid-word fragments. ``ext to imag`` matched the same 91
+      rows as ``text to image``, and ``o Image`` matched 118 by landing inside
+      ``two images``.
+
+    Tokenized AND-matching fixes the first; anchoring each token at a WORD START
+    fixes the second while keeping the partial typing people rely on (``flux``
+    still finds ``flux2``, and ``t2v`` still finds ``t2v``). An all-tokens-must-
+    match rule means adding a word can only ever narrow, which is what makes
+    refining a search behave predictably.
+    """
+    tokens = _TEMPLATE_WORD_RE.findall(query_lower)
+    if not tokens:
+        return True
+    words = _template_words(row)
+    return all(any(word.startswith(token) for word in words) for token in tokens)
+
+
+def _unmatched_template_tokens(rows: list[dict], query_lower: str) -> list[str]:
+    """Query words that prefix NO word in any row — why a search came back empty.
+
+    A bare ``total: 0`` cannot distinguish "this capability does not exist" from
+    "one word of your query was wrong", and on a discovery tool that difference
+    decides whether an agent reports a feature missing. Naming the dead words
+    turns the retry into an obvious one.
+    """
+    tokens = _TEMPLATE_WORD_RE.findall(query_lower)
+    if not tokens:
+        return []
+    vocabulary = {word for row in rows for word in _template_words(row)}
+    return [t for t in tokens if not any(word.startswith(t) for word in vocabulary)]
 
 
 @mcp.tool()
@@ -7810,6 +7887,11 @@ def search_templates(
 
     Args:
         query: free-text match over name/title/description/tags/models.
+            Tokenized: EVERY word must prefix a word in the row, so
+            ``MiniMax Text to Video`` finds ``MiniMax H3: Text to Video``, and
+            each extra word only narrows. Word-anchored, so ``flux`` finds
+            ``flux2`` but ``ext`` does not match ``text``. When nothing matches,
+            the reply carries ``unmatched_query_words`` naming the dead words.
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
         exclude_api: drop ``API``-tagged rows.
@@ -7870,20 +7952,51 @@ def search_templates(
                 isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
             )
         ]
+    unmatched: list[str] = []
+    relaxed = False
     if query:
         q = query.lower()
-        rows = [r for r in rows if _template_matches(r, q)]
+        candidates = rows
+        # TWO PASSES, precise first. The phrase pass keeps a multi-word query
+        # meaning what it says (`image to image` is img2img, not every
+        # `text to image` row); the token pass is what rescues the phrasings the
+        # old substring test dropped to a bare `total: 0` — a title with
+        # something in the middle (`MiniMax H3: Text to Video` for
+        # `MiniMax Text to Video`) or words the author never wrote contiguously.
+        # Falling back only when the precise pass finds NOTHING means recall is
+        # gained without ever diluting a query that already worked.
+        rows = [r for r in candidates if _template_phrase_matches(r, q)]
+        if not rows:
+            rows = [r for r in candidates if _template_matches(r, q)]
+            relaxed = bool(rows)
+        if not rows:
+            # Only computed on the empty path, where it is the whole value: a
+            # populated result needs no explanation.
+            unmatched = _unmatched_template_tokens(candidates, q)
 
     total = len(rows)
     offset = max(0, offset)
     page = rows[offset : offset + limit]
     projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
-    return {
+    result = {
         "total": total,
         "shown": len(projected),
         "offset": offset,
         "rows": projected,
     }
+    if relaxed:
+        # Say so rather than silently widening: these rows contain every query
+        # word but not as the phrase that was typed, which is worth knowing
+        # before picking one.
+        result["match"] = "all-words"
+    if unmatched:
+        result["unmatched_query_words"] = unmatched
+        result["hint"] = (
+            f"No template matched every word. These matched nothing in the gallery: "
+            f"{', '.join(unmatched)}. Drop or reword them and search again — all "
+            "query words must match, so each extra word only narrows the result."
+        )
+    return result
 
 
 # Cap on how many validator findings ride back in a template's `local_check` —

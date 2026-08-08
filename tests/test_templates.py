@@ -755,3 +755,89 @@ def test_get_template_reports_an_unfetchable_template_as_unchecked(monkeypatch):
 
     assert check["checked"] is False
     assert check["reason"] == "template_fetch_failed"
+
+
+# --- QA 0.8.0: search_templates returned confidently wrong results -------------
+# The gallery's primary discovery path. A raw case-insensitive substring test
+# failed in BOTH directions, and every miss came back as a clean `total: 0` that
+# is indistinguishable from "this capability does not exist".
+
+_QA_ROWS = [
+    {
+        "name": "video_minimax_h3_t2v",
+        "title": "MiniMax H3: Text to Video",
+        "description": "Open-weights text to video.",
+        "tags": [],
+        "models": [],
+        "output_type": "video",
+        "category_title": "Video",
+    },
+    {
+        "name": "image_flux2_text_to_image",
+        "title": "Flux2: Text to Image",
+        "description": "Basic text to image with Flux2.",
+        "tags": [],
+        "models": ["flux2_dev_fp8mixed.safetensors"],
+        "output_type": "image",
+        "category_title": "Image",
+    },
+]
+
+
+def test_search_templates_finds_a_title_with_something_in_the_middle(monkeypatch):
+    """`MiniMax Text to Video` finds `MiniMax H3: Text to Video`.
+
+    The report's sharpest false negative: it returned 0 while
+    `MiniMax H3: Text to Video` returned 2, because a substring test needs the
+    typed phrase to be contiguous and the stored title has `H3:` inside it.
+    """
+    _patch_ls(monkeypatch, _QA_ROWS)
+
+    result = server.search_templates("MiniMax Text to Video")
+
+    assert _names(result) == ["video_minimax_h3_t2v"]
+    # Flagged as the widened match, not silently passed off as an exact one.
+    assert result["match"] == "all-words"
+
+
+def test_search_templates_rejects_mid_word_fragments(monkeypatch):
+    """`ext to imag` matches nothing — it used to match every `text to image` row."""
+    _patch_ls(monkeypatch, _QA_ROWS)
+
+    result = server.search_templates("ext to imag")
+
+    assert result["total"] == 0
+    # And it says WHICH word was dead, so the retry is obvious.
+    assert result["unmatched_query_words"] == ["ext"]
+    assert "ext" in result["hint"]
+
+
+def test_search_templates_phrase_beats_all_words(monkeypatch):
+    """A query that matches as a phrase is not diluted by the all-words fallback."""
+    _patch_ls(monkeypatch, _QA_ROWS)
+
+    result = server.search_templates("text to image")
+
+    assert _names(result) == ["image_flux2_text_to_image"]
+    # The precise pass answered, so no widening happened.
+    assert "match" not in result
+
+
+def test_search_templates_partial_word_still_works(monkeypatch):
+    """`flux` still finds `Flux2` — word-anchored, not whole-word-only."""
+    _patch_ls(monkeypatch, _QA_ROWS)
+
+    assert _names(server.search_templates("flux")) == ["image_flux2_text_to_image"]
+
+
+def test_search_templates_finds_a_weight_filename(monkeypatch):
+    """The on-disk weight name routes to the template that loads it.
+
+    Without this there is no route from "what I have on disk" to "what I can
+    run": the row's `models` list carries the exact UNET filename.
+    """
+    _patch_ls(monkeypatch, _QA_ROWS)
+
+    assert _names(server.search_templates("flux2_dev_fp8mixed")) == [
+        "image_flux2_text_to_image"
+    ]
