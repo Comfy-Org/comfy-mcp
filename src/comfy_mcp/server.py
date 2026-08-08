@@ -2956,10 +2956,15 @@ async def run_workflow(
     accepts an API-format or UI-export file.
 
     Args:
-        wait: if True (default), block until the run finishes, streaming
-            progress as MCP notifications, and return the full result. If
-            False, submit and return with a ``prompt_id`` to poll via
-            ``job(action="status")``.
+        wait: if True (default), block until the run finishes and return the
+            full result. If False, submit and return with a ``prompt_id`` to
+            poll via ``job(action="status")``.
+
+            Progress notifications are EMITTED WHEN THE ENGINE REPORTS ANY —
+            do not rely on them. comfy-cli 1.15.0's stream carries no
+            per-step events for this verb, so in practice a run is silent
+            until it finishes. Poll ``job(action="status")`` from a second
+            call if you need progress.
         timeout_seconds: used only when ``wait=True``; default 110s sits under
             a typical client's ~120s budget. For a longer run, prefer
             ``wait=False`` + ``job(action="wait")``/``job(action="watch")``.
@@ -5104,9 +5109,9 @@ async def job(
     - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns the
       final payload, or `{"timed_out": True, "status": <last>}` on expiry — a
       TIMEOUT, not a failure.
-    - "watch" -> stream live progress via MCP notifications (default 600.0s,
-      same ceiling); same `timed_out` (timeout, not failure) shape, but `status` is a live
-      `{progress, total, nodes_done}` snapshot, not a raw status dict.
+    - "watch" -> relay progress notifications while waiting (default 600.0s,
+      same ceiling); `status` is a `{progress, total, nodes_done}` snapshot.
+      comfy-cli 1.15.0 sends no per-step events: expect `progress: null`.
     - "cancel" -> stop a queued/running job.
     - "queue" -> list known jobs (Comfy Cloud-tracked rows filtered out).
 
