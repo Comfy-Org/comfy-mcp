@@ -28,6 +28,7 @@ Built on the [Model Context Protocol](https://modelcontextprotocol.io) and
   <a href="#comfy-cloud-mcp-connection">Set up cloud</a> ·
   <a href="#configure-your-ai-client">Configure your client</a> ·
   <a href="#tools">Tools</a> ·
+  <a href="https://docs.comfy.org/agent-tools/mcp">Docs</a> ·
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -109,6 +110,8 @@ cloud queue, no cross-session cloud batches. For those, add the
 - [Troubleshooting](#troubleshooting)
 - [Failure log (opt-in)](#failure-log-opt-in)
 - [Smoke test](#smoke-test)
+- [Related resources](#related-resources)
+- [Feedback](#feedback)
 - [Contributing](#contributing)
 - [License](#license)
 - [Trademarks](#trademarks)
@@ -1172,6 +1175,26 @@ runs, so it's safe to run anywhere — and the `pytest` gate stays green on CI
 runners that have neither.
 
 </details>
+
+## Related resources
+
+- **[Comfy MCP docs](https://docs.comfy.org/agent-tools/mcp)** — the full user guide for both
+  connections: setup for every client, FAQs, and the cloud tool list.
+- **[Comfy Skills](https://github.com/Comfy-Org/comfy-skills)** — Claude Code plugin marketplace
+  and community skill library for Comfy (the **comfy-cloud** plugin lives here).
+- **[Comfy CLI](https://docs.comfy.org/comfy-cli/getting-started)** — the terminal engine this
+  server wraps; use it directly for scripts, CI, and batch jobs.
+
+## Feedback
+
+Comfy MCP is in public beta — tell us what works and what doesn't:
+
+- **[Feedback survey](https://links.comfy.org/cloudmcpbeta)** — report bugs, request features, or
+  share general impressions.
+- **[GitHub issues](https://github.com/Comfy-Org/comfy-mcp/issues)** — bugs and feature requests
+  for this server specifically.
+- **Discord** — [#comfy-mcp-and-cli](https://discord.gg/xWJn6nhE3R) on the Comfy Discord for
+  questions and discussion.
 
 ## Contributing
 
