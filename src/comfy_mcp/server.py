@@ -10147,6 +10147,78 @@ def validate_workflow(workflow_path: str) -> Any:
     return _relayed_validation_report(report)
 
 
+def _slot_pairing_is_broken(slot: Any) -> bool:
+    """True when a slot's declared TYPE contradicts the value sitting in it.
+
+    Detects `comfy workflow slots` mis-pairing names onto values. comfy-cli zips
+    a node's input names (from ``object_info``) positionally against its
+    ``widgets_values``, so a node whose ``object_info`` under-reports its inputs
+    shifts every later pairing. Observed on the dynamic-combo partner nodes as a
+    class — ``MinimaxHailuo03TextToVideoNode`` exposes 3 inputs against 8
+    ``widgets_values``, which lands ``"MiniMax H3"`` in the ``INT`` slot
+    ``23.seed`` and ``"768P"`` in the ``BOOLEAN`` slot ``23.watermark``.
+
+    That is comfy-cli's bug, not this server's — reproduced with `comfy workflow
+    slots` directly, no MCP involved — and it cannot be repaired here: the true
+    pairing is not recoverable from a payload that has already lost it. What CAN
+    be done is refuse to pass it off as fact, because the failure is otherwise
+    entirely silent: ``validate_workflow`` still reports ``valid: true``, and
+    ``set_workflow_slot`` would write the user's value into the WRONG field.
+
+    Deliberately CONSERVATIVE — only flat contradictions, so a legitimate slot is
+    never flagged. A numeric string in an ``INT`` (``"42"``) and any string in a
+    ``COMBO``/``STRING`` are normal and pass.
+    """
+    if not isinstance(slot, dict):
+        return False
+    declared = str(slot.get("type") or "").upper()
+    value = slot.get("current_value")
+    if not isinstance(value, str):
+        return False
+    if declared in ("INT", "FLOAT"):
+        try:
+            float(value)
+        except ValueError:
+            return True
+    elif declared == "BOOLEAN" and value.strip().lower() not in ("true", "false"):
+        return True
+    return False
+
+
+def _flag_mispaired_slots(data: Any) -> Any:
+    """Annotate a `workflow slots` payload with any mis-paired slots it carries.
+
+    Additive: every original slot is relayed untouched, so nothing an agent
+    already reads disappears. The flag is what turns a silent wrong answer into a
+    visible suspect one.
+    """
+    if not isinstance(data, dict):
+        return data
+    slots = data.get("slots")
+    if not isinstance(slots, list):
+        return data
+    suspect = [
+        str(s.get("address"))
+        for s in slots
+        if _slot_pairing_is_broken(s) and isinstance(s, dict)
+    ]
+    if not suspect:
+        return data
+    for slot in slots:
+        if isinstance(slot, dict) and _slot_pairing_is_broken(slot):
+            slot["pairing_suspect"] = True
+    data["suspect_slots"] = suspect
+    data["warning"] = (
+        f"{len(suspect)} slot(s) hold a value that contradicts their declared type: "
+        f"{', '.join(suspect)}. comfy-cli pairs slot names onto values positionally, "
+        "and a node whose object_info under-reports its inputs shifts every later "
+        "pairing — so these names and values do NOT belong together. Do not set them: "
+        "the write would land in a different field. Edit the workflow JSON directly, "
+        "or use a template without dynamic-combo partner nodes."
+    )
+    return data
+
+
 @mcp.tool()
 def list_workflow_slots(workflow_path: str) -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
@@ -10168,7 +10240,8 @@ def list_workflow_slots(workflow_path: str) -> Any:
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
     argv._guard_workflow_path(workflow_path, frontend=True)
-    return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    data = _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    return _flag_mispaired_slots(data)
 
 
 @mcp.tool()
@@ -10295,6 +10368,40 @@ def set_workflow_slot(
         )
         argv._reject_nul("override", o)
         rendered.append(o)
+    # REFUSE to write into a slot whose name and value were mis-paired upstream.
+    # This is the half of the mis-pairing bug that actually destroys data: the
+    # write itself "succeeds", `applied` names the address the caller asked for,
+    # and the value silently lands in a DIFFERENT field of the node — with
+    # `validate_workflow` still reporting `valid: true` afterwards. Reading the
+    # slots back (the obvious check) shows the address the caller named, so
+    # nothing looks wrong. Failing closed here is the only point where it can be
+    # caught, and one extra `workflow slots` call is cheap next to a corrupted
+    # workflow. Best-effort: a probe that cannot run must not block a write that
+    # would otherwise be fine, so any failure to inspect falls through.
+    # The probe is suppressed; the REFUSAL is raised outside it. Raising inside
+    # the `suppress` would have it swallow its own exception and write anyway —
+    # turning the guard into a no-op that still costs a subprocess.
+    targeted: list[str] = []
+    with contextlib.suppress(Exception):
+        probe = _flag_mispaired_slots(
+            _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+        )
+        if isinstance(probe, dict):
+            suspect = {str(a) for a in probe.get("suspect_slots") or []}
+            targeted = sorted(
+                a for a in suspect if any(r.startswith(f"{a}=") for r in rendered)
+            )
+    if targeted:
+        raise ComfyCliError(
+            f"refusing to set {', '.join(targeted)}: comfy-cli reports these "
+            "slots with a value that contradicts their declared type, which "
+            "means their names were paired onto the wrong values (positional "
+            "zip against a node whose object_info under-reports its inputs). "
+            "The write would land in a different field and validate_workflow "
+            "would still say valid: true. Edit the workflow JSON directly, or "
+            "use a template without dynamic-combo partner nodes. "
+            "list_workflow_slots names every affected slot."
+        )
     args = ["workflow", "set-slot", workflow_path, *rendered]
     if stdout:
         args.append("--stdout")

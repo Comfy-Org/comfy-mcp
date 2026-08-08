@@ -214,7 +214,7 @@ def test_set_workflow_slot_argv_default_stdout(patched_run):
     )
     assert result == {"modified": True}
 
-    assert calls[0]["cmd"][4:] == [
+    assert calls[-1]["cmd"][4:] == [
         "workflow",
         "set-slot",
         "/tmp/flux.json",
@@ -230,7 +230,7 @@ def test_set_workflow_slot_stdout_false_writes_in_place(patched_run):
 
     server.set_workflow_slot("/tmp/flux.json", ["3.seed=7"], stdout=False)
 
-    cmd = calls[0]["cmd"]
+    cmd = calls[-1]["cmd"]
     assert cmd[4:] == ["workflow", "set-slot", "/tmp/flux.json", "3.seed=7"]
     assert "--stdout" not in cmd
 
@@ -286,14 +286,9 @@ def test_workflow_path_guard_allows_dot_slash_dash_name(patched_run):
     server.set_workflow_slot("./-flux.json", ["6.text=x"])
     server.list_workflow_notes("./-flux.json")
 
-    assert calls[0]["cmd"][4:] == [
-        "workflow",
-        "set-slot",
-        "./-flux.json",
-        "6.text=x",
-        "--stdout",
-    ]
-    assert calls[1]["cmd"][4:] == ["workflow", "notes", "./-flux.json"]
+    argvs = [c["cmd"][4:] for c in calls]
+    assert ["workflow", "set-slot", "./-flux.json", "6.text=x", "--stdout"] in argvs
+    assert ["workflow", "notes", "./-flux.json"] in argvs
 
 
 # The six tools that take a `workflow_path`. One guard covers all of them, so
@@ -491,7 +486,7 @@ def test_set_workflow_slot_guard_leaves_valid_overrides_alone(patched_run):
 
     server.set_workflow_slot("/tmp/flux.json", ["6.text=x", "4.ckpt=sd-xl --turbo"])
 
-    assert calls[0]["cmd"][4:] == [
+    assert calls[-1]["cmd"][4:] == [
         "workflow",
         "set-slot",
         "/tmp/flux.json",
@@ -946,7 +941,7 @@ def test_set_workflow_slot_structured_override_serializes_to_addr_json(patched_r
     )
     assert result == {"modified": True}
 
-    assert calls[0]["cmd"][4:] == [
+    assert calls[-1]["cmd"][4:] == [
         "workflow",
         "set-slot",
         "/tmp/flux.json",
@@ -982,7 +977,7 @@ def test_set_workflow_slot_structured_override_preserves_value_type(
 
     server.set_workflow_slot("/tmp/flux.json", [{"address": "6.text", "value": value}])
 
-    override = calls[0]["cmd"][4:][3]
+    override = calls[-1]["cmd"][4:][3]
     assert override == f"6.text={encoded}"
     # ...and comfy-cli's own parse of that entry yields the value we were sent.
     assert json.loads(override.partition("=")[2]) == value
@@ -999,7 +994,7 @@ def test_set_workflow_slot_string_override_still_passes_through_verbatim(patched
 
     server.set_workflow_slot("/tmp/flux.json", ["6.text=true", "3.seed=42"])
 
-    assert calls[0]["cmd"][4:] == [
+    assert calls[-1]["cmd"][4:] == [
         "workflow",
         "set-slot",
         "/tmp/flux.json",
@@ -1023,7 +1018,7 @@ def test_set_workflow_slot_mixes_string_and_structured_overrides(patched_run):
         stdout=False,
     )
 
-    assert calls[0]["cmd"][4:] == [
+    assert calls[-1]["cmd"][4:] == [
         "workflow",
         "set-slot",
         "/tmp/flux.json",
@@ -1160,7 +1155,7 @@ def test_structured_slot_address_is_stripped(patched_run):
 
     server.set_workflow_slot("/tmp/flux.json", [{"address": "  6.text\n", "value": 1}])
 
-    assert calls[0]["cmd"][4:][3] == "6.text=1"
+    assert calls[-1]["cmd"][4:][3] == "6.text=1"
 
 
 def test_structured_slot_value_must_be_json_data(no_spawn):
@@ -1242,7 +1237,7 @@ def test_structured_slot_items_deserialize_through_the_mcp_boundary(patched_run)
             },
         )
     )
-    assert calls[0]["cmd"][4:] == [
+    assert calls[-1]["cmd"][4:] == [
         "workflow",
         "set-slot",
         "/tmp/flux.json",
@@ -1260,12 +1255,16 @@ def test_structured_slot_items_deserialize_through_the_mcp_boundary(patched_run)
             },
         )
     )
-    assert calls[1]["cmd"][4:] == [
-        "workflow",
-        "vary",
-        "/tmp/flux.json",
-        "--slot",
-        '6.text=["a cat", "a dog"]',
+    # Indexed by verb, not position: set_workflow_slot above now probes
+    # `workflow slots` before writing, so positional indices are not stable.
+    assert [c["cmd"][4:] for c in calls if c["cmd"][5:6] == ["vary"]] == [
+        [
+            "workflow",
+            "vary",
+            "/tmp/flux.json",
+            "--slot",
+            '6.text=["a cat", "a dog"]',
+        ]
     ]
 
 
@@ -1288,3 +1287,117 @@ def test_vary_workflow_string_form_still_allows_an_empty_array(patched_run):
         "--slot",
         "6.text=[]",
     ]
+
+
+# --- QA 0.8.0: mis-paired slot names --------------------------------------
+# `comfy workflow slots` zips a node's input NAMES (from object_info) positionally
+# against its `widgets_values`. A node whose object_info under-reports its inputs
+# shifts every later pairing. Verbatim from `comfy workflow slots` on
+# api_minimax_h3_t2v (comfy-cli 1.15.0) — reproduced with no MCP involved, so the
+# bug is comfy-cli's; what this server can do is refuse to relay it as fact.
+_MISPAIRED = {
+    "workflow": "/tmp/h3.json",
+    "count": 4,
+    "slots": [
+        {
+            "address": "8.filename_prefix",
+            "name": "filename_prefix",
+            "type": "STRING",
+            "current_value": "video/MiniMax_H3_t2v",
+        },
+        {
+            "address": "8.format",
+            "name": "format",
+            "type": "COMBO",
+            "current_value": "auto",
+        },
+        {
+            "address": "23.seed",
+            "name": "seed",
+            "type": "INT",
+            "current_value": "MiniMax H3",
+        },
+        {
+            "address": "23.watermark",
+            "name": "watermark",
+            "type": "BOOLEAN",
+            "current_value": "768P",
+        },
+    ],
+}
+
+
+def test_list_workflow_slots_flags_mispaired_slots(patched_run):
+    """The INT holding a title and the BOOLEAN holding a resolution are named."""
+    patched_run(envelope(data=_MISPAIRED))
+
+    result = server.list_workflow_slots("/tmp/h3.json")
+
+    assert result["suspect_slots"] == ["23.seed", "23.watermark"]
+    assert "do NOT belong together" in result["warning"]
+    # Additive: the original slots are all still there, plus a per-slot flag.
+    assert len(result["slots"]) == 4
+    assert result["slots"][2]["pairing_suspect"] is True
+    # And the genuinely fine ones are untouched.
+    assert "pairing_suspect" not in result["slots"][0]
+
+
+def test_list_workflow_slots_leaves_clean_payloads_alone(patched_run):
+    """No false positives: a numeric string in an INT is normal, not corruption."""
+    patched_run(
+        envelope(
+            data={
+                "slots": [
+                    {
+                        "address": "3.seed",
+                        "name": "seed",
+                        "type": "INT",
+                        "current_value": "42",
+                    },
+                    {
+                        "address": "6.text",
+                        "name": "text",
+                        "type": "STRING",
+                        "current_value": "a cat",
+                    },
+                    {
+                        "address": "4.ckpt",
+                        "name": "ckpt",
+                        "type": "COMBO",
+                        "current_value": "sd.safetensors",
+                    },
+                ]
+            }
+        )
+    )
+
+    result = server.list_workflow_slots("/tmp/ok.json")
+
+    assert "suspect_slots" not in result
+    assert "warning" not in result
+
+
+def test_set_workflow_slot_refuses_a_mispaired_target(patched_run):
+    """The half that destroys data: the write would land in a DIFFERENT field.
+
+    comfy-cli reports success, `applied` names the requested address, and
+    validate_workflow still says valid: true — so nothing looks wrong afterwards.
+    Failing closed here is the only point it can be caught.
+    """
+    patched_run(envelope(data=_MISPAIRED))
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server.set_workflow_slot("/tmp/h3.json", ["23.seed=42"])
+
+    message = str(exc.value)
+    assert "refusing to set 23.seed" in message
+    assert "would land in a different field" in message
+
+
+def test_set_workflow_slot_allows_an_unaffected_slot(patched_run):
+    """Only the mis-paired addresses are blocked — the rest of the graph still works."""
+    calls = patched_run(envelope(data=_MISPAIRED))
+
+    server.set_workflow_slot("/tmp/h3.json", ["8.filename_prefix=out"])
+
+    assert calls[-1]["cmd"][4:][:2] == ["workflow", "set-slot"]
