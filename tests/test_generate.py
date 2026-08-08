@@ -43,8 +43,8 @@ def test_generate_image_streams_and_maps_command(patched_stream):
     # per-event deadline — capped at comfy-cli's own 120s default, never raised.
     assert cmd[4:] == [
         "run-template",
-        "default",
-        '--param=6.text="a red fox in snow"',
+        "image_z_image_turbo",
+        '--param=57.text="a red fox in snow"',
         "--timeout=120",
     ]
     # Nothing spend-related: the default template is a free local OSS graph.
@@ -53,16 +53,24 @@ def test_generate_image_streams_and_maps_command(patched_stream):
     assert "generate" not in cmd
 
 
-def test_generate_image_forwards_checkpoint_when_streaming(patched_stream):
-    """A checkpoint fills the template's `ckpt_name` slot, after the prompt."""
+def test_generate_image_forwards_checkpoint_when_streaming(patched_stream, monkeypatch):
+    """A checkpoint fills the template's `ckpt_name` slot, after the prompt.
+
+    Retargeted at a CheckpointLoaderSimple graph via env: the built-in on-ramp
+    template no longer has a checkpoint slot (the gallery moved to split
+    UNET/CLIP/VAE loaders), so forwarding is only meaningful for a graph that
+    still has one. The refusal on the default is asserted separately by
+    ``test_generate_image_refuses_checkpoint_without_a_slot``.
+    """
+    monkeypatch.setenv("COMFY_T2I_CHECKPOINT_SLOT", "ckpt_name")
     procs = patched_stream(_OK_STREAM)
 
     asyncio.run(server.generate_image("a cat", checkpoint="sd_xl.safetensors"))
 
     assert procs[0].cmd[4:] == [
         "run-template",
-        "default",
-        '--param=6.text="a cat"',
+        "image_z_image_turbo",
+        '--param=57.text="a cat"',
         '--param=ckpt_name="sd_xl.safetensors"',
         "--timeout=120",
     ]
@@ -76,8 +84,8 @@ def test_generate_image_leading_dash_prompt_is_not_parsed_as_flag(patched_stream
 
     assert procs[0].cmd[4:] == [
         "run-template",
-        "default",
-        '--param=6.text="--not-a-flag, just text"',
+        "image_z_image_turbo",
+        '--param=57.text="--not-a-flag, just text"',
         "--timeout=120",
     ]
     # The whole prompt is one argv token, so comfy-cli's parser never sees a
@@ -114,8 +122,8 @@ def test_generate_image_wait_false_uses_plain_json_no_stream(monkeypatch):
     assert result == {"prompt_id": "p1"}
     assert seen["args"] == (
         "run-template",
-        "default",
-        '--param=6.text="a red fox in snow"',
+        "image_z_image_turbo",
+        '--param=57.text="a red fox in snow"',
         "--timeout=60",
         "--async",
     )
@@ -136,6 +144,7 @@ def test_generate_image_wait_false_forwards_checkpoint(monkeypatch):
 
     monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
 
+    monkeypatch.setenv("COMFY_T2I_CHECKPOINT_SLOT", "ckpt_name")
     server_result = asyncio.run(
         server.generate_image("a dog", checkpoint="dreamshaper.safetensors", wait=False)
     )
@@ -143,8 +152,8 @@ def test_generate_image_wait_false_forwards_checkpoint(monkeypatch):
     assert server_result == {"prompt_id": "p2"}
     assert seen["args"] == (
         "run-template",
-        "default",
-        '--param=6.text="a dog"',
+        "image_z_image_turbo",
+        '--param=57.text="a dog"',
         '--param=ckpt_name="dreamshaper.safetensors"',
         "--timeout=60",
         "--async",
@@ -179,7 +188,7 @@ def test_generate_image_env_template_override_alone_keeps_default_slots(
     asyncio.run(server.generate_image("a cat"))
 
     assert procs[0].cmd[4:6] == ["run-template", "some_other_template"]
-    assert procs[0].cmd[6] == '--param=6.text="a cat"'
+    assert procs[0].cmd[6] == '--param=57.text="a cat"'
 
 
 def test_generate_image_rejects_option_like_template(monkeypatch):
@@ -215,7 +224,7 @@ def test_generate_image_slot_error_names_the_env_knobs(monkeypatch):
 
     def fake_run_comfy(*args, timeout=None):
         raise server.ComfyCliError(
-            "--param key '6.text' matches no slot in this template",
+            "--param key '57.text' matches no slot in this template",
             code="workflow_slot_invalid",
         )
 
@@ -236,6 +245,9 @@ def test_generate_image_slot_error_names_the_env_knobs(monkeypatch):
 
 def test_generate_image_slot_error_names_checkpoint_only_when_filled(monkeypatch):
     """With a checkpoint actually filled, the hint names that knob too."""
+    # A checkpoint slot has to EXIST for a checkpoint to be forwarded at all —
+    # the built-in on-ramp graph no longer has one.
+    monkeypatch.setenv("COMFY_T2I_CHECKPOINT_SLOT", "ckpt_name")
 
     def fake_run_comfy(*args, timeout=None):
         raise server.ComfyCliError(
@@ -286,7 +298,7 @@ def test_generate_image_colliding_slots_are_fine_without_a_checkpoint(
 
     assert procs[0].cmd[4:] == [
         "run-template",
-        "default",
+        "image_z_image_turbo",
         '--param=6.text="a cat"',
         "--timeout=120",
     ]
@@ -327,3 +339,60 @@ def test_generate_image_other_errors_pass_through_unchanged(monkeypatch):
     assert "COMFY_T2I_PROMPT_SLOT" not in str(exc.value)
     # Re-raised bare, so it carries no self-referential __cause__ chain.
     assert exc.value.__cause__ is not exc.value
+
+
+def test_generate_image_refuses_checkpoint_without_a_slot(no_spawn):
+    """`checkpoint=` on a split-loader graph is refused BY NAME, before submitting.
+
+    The built-in on-ramp template loads weights through UNETLoader/CLIPLoader/
+    VAELoader, so there is no `ckpt_name` to address. Forwarding anyway would
+    reach comfy-cli and come back as `workflow_slot_invalid` — an error about
+    slot syntax for what is really an unsupported argument on this graph.
+    """
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(server.generate_image("a cat", checkpoint="sd_xl.safetensors"))
+
+    message = str(exc.value)
+    assert "not supported by template" in message
+    assert "COMFY_T2I_CHECKPOINT_SLOT" in message
+
+
+def test_generate_image_default_template_is_not_the_retired_one():
+    """Regression guard for the `default`-template rot.
+
+    `generate_image` shelled out to `comfy run-template default` long after
+    `default` left the gallery, so the documented on-ramp failed on every call —
+    and the suite stayed green because its tests asserted the same dead constant.
+    Naming the retired value here is what makes a silent re-introduction fail.
+    """
+    template, prompt_slot, _checkpoint_slot = server._t2i_config()
+    assert template != "default"
+    assert template and prompt_slot
+
+
+def test_generate_image_missing_template_error_is_actionable(monkeypatch):
+    """A template that is not in the gallery yields names, not a dead-end hint.
+
+    comfy-cli's own text says only "try `comfy templates ls --name <substring>`",
+    which does not say WHICH name — and the caller never chose the template that
+    failed. This is the durable half of the fix: the next gallery rotation
+    surfaces as one actionable error.
+    """
+
+    def fake_run_comfy(*args, timeout=None):
+        if args[:2] == ("templates", "ls"):
+            return {"rows": [{"name": "image_flux2_text_to_image", "tags": []}]}
+        raise server.ComfyCliError("no template named 'gone' in the gallery")
+
+    monkeypatch.setenv("COMFY_T2I_TEMPLATE", "gone")
+    monkeypatch.setattr(server, "_run_comfy", fake_run_comfy)
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_run_comfy)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(server.generate_image("a cat", wait=False))
+
+    message = str(exc.value)
+    assert "not in the gallery" in message
+    assert "image_flux2_text_to_image" in message
+    assert "COMFY_T2I_TEMPLATE" in message
