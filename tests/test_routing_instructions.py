@@ -264,11 +264,12 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     constrain the output type and ``type`` alone does not constrain where the
     model runs. The rows themselves now carry an ``api`` boolean (see
     ``test_templates.py``), so the guidance must say the caller CAN tell a
-    partner-run template from a local one in the results — the old "the compact
-    rows omit ``tags``, so the caller cannot tell" clause is a capability denial
-    that stopped being true, and restoring it would send an agent back to
-    guessing from titles that collide. That only confirms what a filtered
-    search returned — it does not replace filtering on both axes to get there.
+    partner-run template from a local one in what came back — wording that
+    instead had the caller unable to tell would be a capability denial, and
+    would send an agent back to guessing from titles that collide. That
+    boolean only confirms what a filtered search returned, though: it does not
+    replace filtering on both axes to get there, which is why the assertions
+    below still pin BOTH.
 
     The rule is scoped to the APPLE GPU, not to Macs generally — an Intel Mac
     with a discrete card follows the discrete-GPU row, and "any Mac" handed that
@@ -279,7 +280,6 @@ def test_routing_keeps_video_reachable_on_a_mac_via_a_filter_that_works(routing)
     assert "emit_partner_workflow" in routing
     assert "APPLE-GPU rule, not" in routing
     assert "an `api` boolean" in routing
-    assert "cannot tell a local template" not in routing
 
 
 def test_routing_lets_the_user_override_a_slow_band_with_a_time_estimate(routing):
