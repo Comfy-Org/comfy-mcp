@@ -3020,11 +3020,27 @@ async def run_workflow(
             await asyncio.sleep(backoff)
 
 
-# The gallery template `generate_image` runs: ComfyUI's own default graph — the
-# basic SD1.5 text-to-image workflow whose CheckpointLoaderSimple default is
-# `v1-5-pruned-emaonly-fp16.safetensors`. Free (core nodes only, no partner-API
-# node, no `API` gallery tag), so the run never trips comfy-cli's spend gate.
-_T2I_TEMPLATE = "default"
+# The gallery template `generate_image` runs. Free (core nodes only, no
+# partner-API node, no `API` gallery tag), so the run never trips comfy-cli's
+# spend gate.
+#
+# WAS `"default"`, which no longer exists in the gallery — `comfy run-template
+# default` failed with `no template named 'default' in the gallery` on EVERY
+# call, making the documented on-ramp dead. That was not a stale-cache problem:
+# it reproduces on a fresh install with the cache refreshed, and independently on
+# both macOS/MPS and Linux/CUDA hosts. The gallery moved on and this constant
+# rotted with it; the shipped package carries no `default` and no `get_started`.
+#
+# `image_z_image_turbo` is verified present and runnable end to end (a real
+# 512x512 PNG on an RTX 4070 Ti). NOTE it is a SUBGRAPH template: the positive
+# prompt is a promoted proxy widget on instance node 57, hence the `57.text`
+# address rather than a bare `text` — see _T2I_PROMPT_SLOT.
+#
+# Whatever this names must actually exist in the gallery. A hardcoded gallery
+# name is inherently rot-prone, which is exactly how this bug happened, so
+# `_t2i_missing_template_hint` is the durable half of the fix: it turns the next
+# rotation into one actionable error instead of a dead-end hint.
+_T2I_TEMPLATE = "image_z_image_turbo"
 
 # Slot keys for that template's prompt + checkpoint inputs. These VERSION WITH
 # `_T2I_TEMPLATE` — they are properties of that one graph, verified with
@@ -3039,8 +3055,73 @@ _T2I_TEMPLATE = "default"
 # (`workflow_slot_invalid`) rather than guessing which one is the positive
 # prompt. `ckpt_name` is unique in this graph, so the name form is used there —
 # it survives a template revision that renumbers nodes.
-_T2I_PROMPT_SLOT = "6.text"
-_T2I_CHECKPOINT_SLOT = "ckpt_name"
+#
+# The addresses above described the retired `default` graph. `image_z_image_turbo`
+# is a subgraph template and exposes its positive prompt as a promoted proxy
+# widget on instance node 57, so the address is `57.text`.
+_T2I_PROMPT_SLOT = "57.text"
+# EMPTY on purpose. `image_z_image_turbo` loads its weights through
+# UNETLoader/CLIPLoader/VAELoader, not CheckpointLoaderSimple, so there is no
+# `ckpt_name` slot to point `checkpoint=` at — and this is not peculiar to this
+# template: the split-loader layout is now the gallery norm, with NONE of the
+# current free `*_text_to_image` templates carrying a CheckpointLoaderSimple.
+# Left empty so `generate_image(checkpoint=...)` REFUSES by name (see the guard
+# in that tool) instead of addressing a slot the graph does not have, which
+# comfy-cli would reject as `workflow_slot_invalid` mid-run. Set
+# COMFY_T2I_CHECKPOINT_SLOT together with COMFY_T2I_TEMPLATE to re-enable it for
+# a checkpoint-style graph.
+_T2I_CHECKPOINT_SLOT = ""
+
+
+def _t2i_missing_template_hint(
+    exc: ComfyCliError, template: str
+) -> ComfyCliError | None:
+    """Turn comfy-cli's dead-end "no template named" into an actionable error.
+
+    Returns None when ``exc`` is some other failure, so the caller re-raises the
+    original untouched.
+
+    This is the durable half of the `default`-template regression. comfy-cli's own
+    text ends with ``try `comfy templates ls --name <substring>` to search``,
+    which is a dead end for an agent: it does not say WHICH name to search for,
+    and the failure is in a constant the caller never chose. Naming the free
+    text-to-image rows that actually exist turns a hard stop into a next step —
+    and, because the lookup only runs on the failure path, it costs nothing on
+    every healthy call.
+    """
+    if "no template named" not in str(exc).lower():
+        return None
+    try:
+        data = _run_comfy("templates", "ls", "--type", "image", timeout=60.0)
+        rows = data.get("rows", []) if isinstance(data, dict) else []
+        names = sorted(
+            str(r.get("name"))
+            for r in rows
+            if isinstance(r, dict)
+            and r.get("name")
+            and "API" not in (r.get("tags") or [])
+        )
+        suggestions = [n for n in names if "text_to_image" in n or "t2i" in n][
+            :8
+        ] or names[:8]
+    except (ComfyCliError, OSError, ValueError, TypeError, KeyError):
+        # A gallery lookup that itself fails must not mask the real error the
+        # caller came here with — fall back to naming only the broken constant.
+        # Narrow rather than bare `Exception` so a genuine bug in this hint path
+        # still surfaces instead of being swallowed into a vaguer message.
+        suggestions = []
+    tail = (
+        f" Free text-to-image templates currently in the gallery include: "
+        f"{', '.join(suggestions)}."
+        if suggestions
+        else ""
+    )
+    return ComfyCliError(
+        f"generate_image is configured to run template {template!r}, which is not in "
+        f"the gallery.{tail} Set COMFY_T2I_TEMPLATE (with COMFY_T2I_PROMPT_SLOT, and "
+        "COMFY_T2I_CHECKPOINT_SLOT if the graph has one) to a template that exists, "
+        "or use search_templates -> fetch_template -> run_workflow directly."
+    )
 
 
 def _t2i_config() -> tuple[str, str, str]:
@@ -3120,6 +3201,22 @@ async def generate_image(
     # `params` (see module docstring / imports), and a same-named local here
     # would shadow it for the rest of this function.
     template_params: dict[str, Any] = {prompt_slot: prompt}
+    if checkpoint and not checkpoint_slot:
+        # The configured template loads weights through split loaders and has no
+        # checkpoint slot. Refusing by name beats forwarding `checkpoint` to an
+        # empty address, which comfy-cli rejects mid-run as `workflow_slot_invalid`
+        # after the submit — an error about slot syntax for what is really an
+        # unsupported argument on this graph.
+        raise ComfyCliError(
+            f"generate_image(checkpoint=...) is not supported by template "
+            f"{template!r}: it loads weights through UNETLoader/CLIPLoader/"
+            "VAELoader, so there is no checkpoint slot to set. Omit `checkpoint` "
+            "to use the template's own weights, or point the on-ramp at a "
+            "CheckpointLoaderSimple graph by setting COMFY_T2I_TEMPLATE, "
+            "COMFY_T2I_PROMPT_SLOT and COMFY_T2I_CHECKPOINT_SLOT together "
+            "(list a candidate's slots with `comfy templates fetch <name> -o "
+            "wf.json && comfy workflow slots wf.json`)."
+        )
     if checkpoint:
         if checkpoint_slot == prompt_slot:
             # Same key for both slots would have the checkpoint overwrite the
@@ -3153,6 +3250,9 @@ async def generate_image(
         # same verb, so it spends the budget the same way.
         return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
     except ComfyCliError as exc:
+        missing = _t2i_missing_template_hint(exc, template)
+        if missing is not None:
+            raise missing from exc
         hinted = _t2i_slot_hint(
             exc, template, prompt_slot, checkpoint_slot if checkpoint else None
         )
