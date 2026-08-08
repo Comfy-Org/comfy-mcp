@@ -4,8 +4,8 @@
 
 <h1>Comfy MCP</h1>
 
-**Drive [ComfyUI](https://github.com/comfyanonymous/ComfyUI) from Claude Code, Claude Desktop, Cursor, or any
-MCP-speaking AI agent — on your own machine or on Comfy Cloud.**
+**Connect any AI agent to [ComfyUI](https://github.com/comfyanonymous/ComfyUI), on Comfy Cloud GPUs
+or on your own machine.**
 
 Built on the [Model Context Protocol](https://modelcontextprotocol.io) and
 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).
@@ -25,7 +25,7 @@ Built on the [Model Context Protocol](https://modelcontextprotocol.io) and
 <p>
   <a href="#two-connections"><strong>Which connection?</strong></a> ·
   <a href="#quickstart">Quickstart (local)</a> ·
-  <a href="#comfy-cloud-mcp">Set up cloud</a> ·
+  <a href="#comfy-cloud-mcp-connection">Set up cloud</a> ·
   <a href="#configure-your-ai-client">Configure your client</a> ·
   <a href="#tools">Tools</a> ·
   <a href="#contributing">Contributing</a>
@@ -46,16 +46,17 @@ anywhere else to pick one.
 | Runs on | Comfy Cloud GPUs | Your machine, or a ComfyUI you host |
 | Needs ComfyUI | No | Yes, your own |
 | Models & nodes | The Comfy Cloud catalog | Whatever you have installed, custom nodes included |
-| Cost | Credits (subscription) | Free — it is your hardware |
-| Set it up | [Comfy Cloud MCP](#comfy-cloud-mcp) | [Quickstart](#quickstart) |
+| Cost | Subscription for paid runs; new users get 5 free runs | Free — it is your hardware (partner models spend credits) |
+| Set it up | [Comfy Cloud MCP Connection](#comfy-cloud-mcp-connection) | [Quickstart](#quickstart) |
 
-**Which one do I want?** If you already run ComfyUI, or you work in a coding agent (Claude Code,
-Cursor, Codex), start **local**. Otherwise start on **cloud** — and in claude.ai, ChatGPT or the
-Claude Desktop chat app, cloud is the only option, because those accept remote connectors only.
+**Which one do I want?** For new users, we recommend starting with the **cloud** connection: it is
+the simplest setup, and the more compatible choice in claude.ai, ChatGPT, or the Claude Desktop
+chat app. If you already run ComfyUI locally or in your own deployed environment, or you work
+mostly in a coding agent (Claude Code, Cursor, Codex), start **local**.
 
-**On a Mac, start on cloud even if you already have ComfyUI installed.** Current image and video
+**On a Mac, if you plan to run open-source models, use the cloud connection.** Today's open-weight
 models are too large to run at a workable speed on the Apple GPU. The local connection is still
-worth adding for your own nodes and assets — just expect the generating to happen on ours. See
+worth adding for your own nodes and assets; just expect the generating to happen on ours. See
 [When to use this server](#when-to-use-this-server) for the full hardware routing.
 
 Running both at once is normal, and most clients host two MCP servers happily. They sign in to the
@@ -81,7 +82,7 @@ nodes](#partner-api-nodes) let a locally-executed workflow call those same hoste
 you control. Both connections can spend credits on partner models, so that is not the dividing
 line. What this server has **no** path to is Comfy Cloud itself — no cloud-hosted execution, no
 cloud queue, no cross-session cloud batches. For those, add the
-[cloud connection](#comfy-cloud-mcp) alongside it.
+[cloud connection](#comfy-cloud-mcp-connection) alongside it.
 
 > **Status:** beta. 39 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
@@ -93,7 +94,7 @@ cloud queue, no cross-session cloud batches. For those, add the
 - [Quickstart](#quickstart)
 - [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
 - [Configure your AI client](#configure-your-ai-client)
-- [Comfy Cloud MCP](#comfy-cloud-mcp)
+- [Comfy Cloud MCP Connection](#comfy-cloud-mcp-connection)
 - [Prerequisites](#prerequisites)
 - [When to use this server](#when-to-use-this-server)
 - [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
@@ -304,19 +305,19 @@ Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a proje
 }
 ```
 
-## Comfy Cloud MCP
+## Comfy Cloud MCP Connection
 
-Everything above sets up **this** server, which runs on your machine. Comfy also runs a **hosted**
-MCP server — **Comfy Cloud MCP** — and it is a good fit when the machine can't carry local
-diffusion, or when you'd rather not install ComfyUI at all. It lives at:
+The hosted connection, linking your agent to your **Comfy Cloud** account: nothing to install, no
+ComfyUI of your own, and workflows run on Comfy Cloud GPUs. It lives at:
 
 ```
 https://cloud.comfy.org/mcp
 ```
 
-Your client connects to that URL over **remote HTTP** (no subprocess, nothing to `pip install`) and
-workflows execute on **Comfy Cloud GPUs**. You need a [Comfy Cloud](https://cloud.comfy.org)
-account — sign up first if you don't have one, since the sign-in below uses it.
+Your client connects to that URL over **remote HTTP** (no subprocess, nothing to `pip install`).
+You need a [Comfy Cloud](https://cloud.comfy.org) account before connecting. Sign up if you do not
+have one yet; new users get **5 free runs** to try it out, and running generations requires an
+active Comfy Cloud subscription.
 
 **Two ways to authenticate.** **OAuth** is the default: your client opens a browser, you pick a
 workspace, and tokens refresh themselves. For clients that don't speak MCP OAuth (Cursor today) and
@@ -403,30 +404,6 @@ https://cloud.comfy.org/mcp` and `openclaw mcp set` / `openclaw mcp login` — i
 docs](https://docs.comfy.org/agent-tools/mcp), which is also where the screenshot walkthroughs, the
 full cloud tool list, and the slash-command/prompt tables live.
 
-## Table of contents
-
-- [Quickstart](#quickstart)
-- [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
-- [Configure your AI client](#configure-your-ai-client)
-- [Comfy Cloud MCP](#comfy-cloud-mcp)
-- [Prerequisites](#prerequisites)
-- [When to use this server](#when-to-use-this-server)
-- [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
-- [Partner-API nodes](#partner-api-nodes)
-- [Spending credits on partner models](#spending-credits-on-partner-models)
-- [Templates your install can't run](#templates-your-install-cant-run)
-- [Driving a remote ComfyUI](#driving-a-remote-comfyui)
-- [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
-- [Which address variable do I want?](#which-address-variable-do-i-want)
-- [Project anchoring](#project-anchoring)
-- [Tools](#tools)
-- [Troubleshooting](#troubleshooting)
-- [Failure log (opt-in)](#failure-log-opt-in)
-- [Smoke test](#smoke-test)
-- [Contributing](#contributing)
-- [License](#license)
-- [Trademarks](#trademarks)
-
 ## Prerequisites
 
 - **Python ≥ 3.10.**
@@ -487,7 +464,7 @@ keeps working.
 
 </details>
 
-> **Stuck on anything below? Hand this page to your agent.**
+> **Stuck on anything below? The best way is to hand this page to your agent and ask for help.**
 
 ## When to use this server
 
@@ -507,7 +484,7 @@ section is simply absent and the instructions fall back to `server_info`. The th
 |---|---|
 | Discrete GPU, **≥ 24 GB** VRAM | Local generation is a good default. |
 | Discrete GPU, **8 GB to under 24 GB** VRAM | Images are fine (prefer current, smaller models); video will be slow or infeasible. |
-| **< 8 GB** VRAM, or the user confirming there is no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the [Comfy Cloud MCP](#comfy-cloud-mcp) if your client has it connected. |
+| **< 8 GB** VRAM, or the user confirming there is no GPU | Don't run local diffusion. Use partner nodes (plain web calls, fine on any machine) or the [cloud connection](#comfy-cloud-mcp-connection) if your client has it connected. |
 | **Apple Silicon**, any unified-memory size | Don't run local diffusion — go partner/cloud. Current image and video models are too large to run at a workable speed on the Apple GPU, and the older ones that still fit aren't worth reaching for. |
 
 The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card on a ROCm/XPU
