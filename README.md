@@ -487,7 +487,12 @@ keeps working.
 
 </details>
 
+> **Stuck on anything below? Hand this page to your agent.**
+
 ## When to use this server
+
+<details>
+<summary>Hardware routing — the VRAM thresholds and the ordered procedure the agent follows</summary>
 
 Local diffusion is only a good default on a machine that can carry it, so the server's client
 instructions tell your agent to read `server_info`'s `hardware` block (`os`, `arch`,
@@ -546,7 +551,12 @@ agent at `search_templates` / `search_models` rather than a hardcoded default th
 current-model guidance lives in
 **[Comfy-Org/comfy-skills](https://github.com/Comfy-Org/comfy-skills)**.
 
+</details>
+
 ## Using with local LLMs (VRAM coordination)
+
+<details>
+<summary>The unload → run → reload recipe when a local LLM and ComfyUI share one GPU</summary>
 
 A local LLM (Ollama, LM Studio, llama.cpp) and ComfyUI on the same GPU compete for the same
 VRAM — and the LLM is usually the one holding it when the image job needs it. This server
@@ -595,7 +605,12 @@ Caveats:
   Both payloads then carry a `comfy_target_note` key naming that divergence; a malformed remote
   config yields an error-shaped note without breaking these local calls.
 
+</details>
+
 ## Partner-API nodes
+
+<details>
+<summary>Credential resolution order, and agent-driven sign-in via <code>auth_login</code></summary>
 
 Some ComfyUI nodes call out to Comfy's partner APIs (Seedream / Seedance / Nano Banana /
 Gemini / Veo / Kling / …). Running one **locally** still needs a Comfy credential, which
@@ -618,7 +633,12 @@ a run fails with `partner_node_requires_credential`, the error carries comfy-cli
 verbatim, including the `comfy auth set` fallback and the list of offending nodes; transient
 credential failures are retried briefly before surfacing.
 
+</details>
+
 ## Spending credits on partner models
+
+<details>
+<summary>When credits are spent, the consent prompts, and comfy-cli's persistent consent setting</summary>
 
 `partner_generate` wraps `comfy generate <model>`, which calls a hosted partner API and
 **spends your Comfy credits** — so every call is confirmed with you first
@@ -678,7 +698,12 @@ the prompt rather than an interlock. The server probes for `--allow-spend` and o
 unsupported, so an approved run still runs; `pip install -U comfy-cli` closes the residual
 case.
 
+</details>
+
 ## Templates your install can't run
+
+<details>
+<summary>The <code>local_check</code> block — what <code>runnable</code> true / false / unchecked means</summary>
 
 The template gallery is served fresh from `Comfy-Org/workflow_templates`, while your ComfyUI is
 whatever version you installed — so the catalog can offer a template your install can't run yet
@@ -697,7 +722,12 @@ catalog.
 The check is advisory and fails open: the workflow file is written either way, `path` always
 comes back, and nothing is ever refused on its account. Pass `check_local=False` to skip it.
 
+</details>
+
 ## Driving a remote ComfyUI
+
+<details>
+<summary><code>COMFYUI_URL</code> / <code>COMFYUI_HOST</code> — what follows the remote and what stays local</summary>
 
 By default the server drives the ComfyUI on the local `127.0.0.1:8188`. Point it at one running
 **elsewhere** — e.g. a GPU box over a private network (Tailscale) — by setting one of:
@@ -754,7 +784,12 @@ configured target under a `comfy_target` block.
   the boundary); the server does not authenticate to it, and `server_info` does not live-probe
   it — reachability surfaces on the first run/job call.
 
+</details>
+
 ## Targeting a non-default ComfyUI address
+
+<details>
+<summary><code>COMFY_LOCAL_URL</code> — accepted values, verifying it took, precedence</summary>
 
 The section above drives a ComfyUI on **another machine**. This one is for a ComfyUI on
 **this** machine that simply isn't on the default `127.0.0.1:8188` — most often a port clash,
@@ -805,7 +840,12 @@ variable silently.
 **Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port`
 flag → `COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.
 
+</details>
+
 ## Which address variable do I want?
+
+<details>
+<summary><code>COMFYUI_URL</code> vs <code>COMFY_LOCAL_URL</code> — two owners, one table</summary>
 
 Two variables point ComfyUI work at an address, their names are similar, and they are **not**
 alternative spellings of each other — they belong to **different programs** and are read at
@@ -832,7 +872,12 @@ nothing reads; its "local" means comfy-cli's local target (as opposed to its clo
 this project's branding. `COMFYUI_URL` is this server's, and carries no "local" to strip. If
 you have either variable in an MCP client config today, it keeps working unchanged.
 
+</details>
+
 ## Project anchoring
+
+<details>
+<summary><code>COMFY_PROJECT</code> — anchoring comfy-cli's project resolution for a subprocess server</summary>
 
 comfy-cli 1.15.0 ships a `project/1` convention (`comfy project init` / `comfy project status`,
 this server's `project` tool) — a `comfy.yaml` plus `assets/` / `fragments/` / `blueprints/` /
@@ -887,6 +932,8 @@ Set it in the client registration `env` block, same as `COMFY_BIN`:
 }
 ```
 
+</details>
+
 ## Tools
 
 39 tools, grouped below by what they do. Every tool runs `comfy` with the global
@@ -898,6 +945,9 @@ file is `out_path`, an output directory is `out_dir`, a registry lookup key is `
 handle is `prompt_id`.
 
 ### Confirmation gates
+
+<details>
+<summary>Four rules every consent prompt follows, and which tool carries which gate</summary>
 
 A handful of tools can spend money, expose this machine to the network, or run third-party
 code. Those never proceed on the agent's say-so alone — they confirm with **you**, through
@@ -925,6 +975,8 @@ Code and Claude Desktop support it), and the same four rules apply to every one 
 | `confirm_install` | `install_node` | installing a pack runs third-party code |
 | `confirm_switch` | `switch_comfyui_version` | destructive version move (stash + dependency reinstall) |
 | `confirm_kill_untracked` | `restart_comfyui` | stopping a ComfyUI that comfy-cli did not start |
+
+</details>
 
 ### Run and monitor
 
