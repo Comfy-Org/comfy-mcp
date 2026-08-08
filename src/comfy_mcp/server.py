@@ -3607,6 +3607,15 @@ async def _elicit_approval(
     ``target="all"``), and the launch pair's network-exposure gate. Only the
     message, the answer schema, and ``wording`` differ; the fail-closed handling
     below must not. True = the user affirmatively approved.
+
+    Three outcomes, not two — the distinction the QA pass found missing:
+
+    * True — a person saw the prompt and approved.
+    * False — a person saw the prompt and DECLINED (``action == "decline"``).
+      Only here may a caller say "the user declined".
+    * raises — the client never got a decision to us (``"cancel"``, a missing
+      action, an auto-answer). Failing closed is the same; claiming a human
+      refused is not, so that wording is not available to the caller at all.
     """
     try:
         result = await asyncio.wait_for(
@@ -3630,8 +3639,27 @@ async def _elicit_approval(
     # Every read is a `getattr`: a non-conforming client can return an object
     # with no `.action`/`.data`, and an AttributeError here would escape as an
     # uncaught crash instead of the refusal this contract promises.
-    if getattr(result, "action", None) != "accept":
-        return False
+    action = getattr(result, "action", None)
+    if action != "accept":
+        # "DECLINE" is a person saying no. Anything else — "cancel", a missing
+        # action, a client that resolves the request without ever rendering it —
+        # is NOT a decision, and reporting it as one is a lie about a human.
+        #
+        # This is the bug behind "the user declined ..." appearing in sessions
+        # where no prompt was ever displayed, across four different gates: every
+        # non-accept answer collapsed into the same False, and each caller then
+        # raised its "the user declined" text. Failing closed was right; naming a
+        # refusal nobody made was not — it sends the reader to argue with a user
+        # who was never asked, and hides that the client is the thing that needs
+        # fixing.
+        if action == "decline":
+            return False
+        raise ComfyCliError(
+            f"{wording.subject} not confirmed: the client did not present the "
+            f"confirmation prompt (it answered {action!r} without a user "
+            f"decision), so nobody was asked. {wording.nothing_done}"
+            f"{wording.escape_hatch}"
+        )
     return getattr(getattr(result, "data", None), "approve", False) is True
 
 

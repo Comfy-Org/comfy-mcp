@@ -557,3 +557,36 @@ def test_prompt_and_refusal_do_not_overstate_what_the_detector_knows(
     message = str(excinfo.value)
     assert "could not confirm" in message
     assert "may bind" in message
+
+
+# --- QA 0.8.0: a refusal nobody made ----------------------------------------
+# Four gates reported "the user declined ..." in sessions where no prompt was
+# ever displayed. Failing closed was correct; naming a human refusal was not —
+# it sends the reader to argue with a user who was never asked, and hides that
+# the CLIENT is what needs fixing.
+
+
+def test_cancelled_elicitation_does_not_claim_the_user_declined():
+    """A cancelled/auto-answered prompt is not a decision by anyone."""
+    ctx = _FakeCtx(action="cancel")
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    message = str(exc.value)
+    assert "did not present the confirmation prompt" in message
+    assert "nobody was asked" in message
+    # The specific lie this guards against.
+    assert "declined" not in message
+    # Still fails closed.
+    assert "not confirmed" in message
+
+
+def test_declined_elicitation_still_says_the_user_declined():
+    """An actual decline keeps the accurate wording — the fix is not a blanket rename."""
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    assert "declined" in str(exc.value)
