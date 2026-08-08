@@ -477,3 +477,70 @@ def test_docstring_states_the_coverage_limit_and_the_fallback():
         assert alias in doc
     assert "partner_generate" in doc  # the fallback for everything else
     assert "run_workflow" in doc and "fetch_outputs" in doc  # the intended chain
+
+
+# --- QA 0.8.0: the emitted file carried no cost provenance -------------------
+# 521 bytes, 2 nodes, no price, credit estimate, billing key, confirm_spend,
+# warning or Note node. The file's whole purpose is to be handed to
+# run_workflow, where billing happens — quite possibly by someone who never saw
+# the tool response, since that is where every scrap of provenance lived.
+
+_EMITTED = {
+    "1": {
+        "class_type": "Flux2ProImageNode",
+        "_meta": {"title": "Flux2ProImageNode (flux-2)"},
+        "inputs": {"prompt": "a red fox"},
+    },
+    "2": {
+        "class_type": "SaveImage",
+        "_meta": {"title": "save generated image"},
+        "inputs": {"images": ["1", 0]},
+    },
+}
+
+
+def test_stamped_provenance_marks_the_billing_node(tmp_path):
+    """The graph says, on disk, that running it spends money."""
+    out = tmp_path / "flux.json"
+    out.write_text(json.dumps(_EMITTED))
+
+    block = server._stamp_partner_provenance(str(out), "flux-2")
+
+    assert block["spends_credits"] is True
+    assert block["partner_model"] == "flux-2"
+    assert "confirm_spend=True" in block["requires"]
+
+    written = json.loads(out.read_text())
+    stamp = written["1"]["_meta"]["comfy_mcp"]
+    assert stamp["spends_credits"] is True
+    assert "BILLS Comfy credits" in stamp["warning"]
+    # The SaveImage node is not a billing node and is left alone.
+    assert "comfy_mcp" not in written["2"]["_meta"]
+
+
+def test_stamping_preserves_the_runnable_graph(tmp_path):
+    """The stamp must not change what the graph DOES.
+
+    `_meta` is frontend passthrough — ComfyUI reads `_meta.title` and ignores the
+    rest — so class_types, inputs and wiring must come back byte-identical.
+    Verified against a real ComfyUI too: `comfy validate` reports valid: true
+    with zero errors and zero warnings, stamped or not.
+    """
+    out = tmp_path / "flux.json"
+    out.write_text(json.dumps(_EMITTED))
+
+    server._stamp_partner_provenance(str(out), "flux-2")
+
+    written = json.loads(out.read_text())
+    for nid, node in _EMITTED.items():
+        assert written[nid]["class_type"] == node["class_type"]
+        assert written[nid]["inputs"] == node["inputs"]
+        assert written[nid]["_meta"]["title"] == node["_meta"]["title"]
+
+
+def test_stamping_is_best_effort(tmp_path):
+    """A file that cannot be read must not turn a successful emit into an error."""
+    assert (
+        server._stamp_partner_provenance(str(tmp_path / "missing.json"), "flux-2")
+        is None
+    )

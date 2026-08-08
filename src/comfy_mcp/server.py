@@ -1063,6 +1063,28 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     return _unwrap_envelope(real_envelope, args, returncode, stderr, stdout=stdout)
 
 
+# git's own wording, and the state it describes. Matched on BOTH streams because
+# comfy-cli splits diagnostics unpredictably — the traceback lands on stderr
+# while a status line can land on stdout.
+_DETACHED_HEAD_MARKERS = (
+    "you are not currently on a branch",
+    "detached head",
+)
+
+
+def _looks_like_detached_head(stderr: str, stdout: str) -> bool:
+    """True when a failed comfy-cli run is really "this checkout has no branch".
+
+    Deliberately narrow: it must ALSO look like the git pull path, so an
+    unrelated failure that happens to quote the phrase (a log line, a node pack
+    README) cannot claim this branch and hide its own cause.
+    """
+    blob = f"{stderr}\n{stdout}".lower()
+    if not any(marker in blob for marker in _DETACHED_HEAD_MARKERS):
+        return False
+    return "git" in blob and ("pull" in blob or "branch" in blob)
+
+
 def _envelope_schema(envelope: dict) -> str | None:
     """The envelope's declared ``schema`` string (e.g. ``"envelope/1"``), or None."""
     value = envelope.get("schema")
@@ -1419,6 +1441,42 @@ def _unwrap_envelope(
             # envelope, not a different kind of failure. Unlike the message, the
             # record keeps the raw stdout too: a diagnostic trail is read after
             # the fact, when a curated guidance string is no longer enough.
+            failure_log._log_failure(
+                "no_json",
+                args,
+                exit_code=returncode,
+                message=message,
+                stdout=stdout,
+                stderr=stderr,
+                streaming=streaming,
+            )
+            raise ComfyCliError(message, no_envelope=True, returncode=returncode)
+        if _looks_like_detached_head(stderr, stdout):
+            # comfy-cli runs `git pull` and, on failure, raises
+            # CalledProcessError — discarding git's own stderr, which already
+            # said exactly what is wrong ("You are not currently on a branch").
+            # What reaches the client is a raw Python traceback in rich
+            # box-drawing frames wrapped as "returned no JSON (exit 1)": the one
+            # actionable sentence is buried, and may be clipped away entirely by
+            # the field cap below.
+            #
+            # A detached HEAD is a NORMAL state — it is what a tag-pinned install
+            # looks like, and `switch_comfyui_version` produces one — so this is
+            # a routine condition being reported as a crash. Named here for the
+            # same reason the TCC branch above is: the cause is identifiable, so
+            # the caller should get the fix rather than the stack.
+            message = (
+                f"update_comfyui cannot pull (exit {returncode}): this ComfyUI "
+                "checkout is on a DETACHED HEAD, so `git pull` has no branch to "
+                "pull into. That is the normal state of a version-pinned "
+                "install — `switch_comfyui_version` leaves one behind.\n\n"
+                "Fix: check out a branch before updating (e.g. `git -C "
+                "<workspace> switch master`), then retry. To move between "
+                "releases instead, use `switch_comfyui_version`, which does not "
+                "need a branch. `server_info` reports the workspace path.\n\n"
+                "Original error: "
+                f"{failure_log._scrubbed_stream_tail(stderr, errors._MAX_ERROR_FIELD_CHARS)}"
+            )
             failure_log._log_failure(
                 "no_json",
                 args,
@@ -4192,7 +4250,88 @@ async def emit_partner_workflow(
     # the 120s backstop fires. On the default executor a run of cancelled calls
     # would pin those workers and starve every other tool that off-loads through
     # `to_thread`. See `_GENERATE_EXECUTOR`.
-    return await _in_generate_pool(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
+    result = await _in_generate_pool(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
+    # Stamp cost provenance INTO the file. Everything that says this graph bills
+    # — the model, the billing node, the confirm_spend requirement — otherwise
+    # lives only in this response, and the file outlives the session that
+    # produced it. Its whole purpose is to be handed to `run_workflow`, where the
+    # billing actually happens, quite possibly by someone who never saw this
+    # reply; on disk the only hint was a class name.
+    stamped = await asyncio.to_thread(_stamp_partner_provenance, out_path, model)
+    if isinstance(result, dict) and stamped:
+        result["provenance"] = stamped
+    return result
+
+
+# Marker key for the provenance block stamped into an emitted partner workflow.
+# It rides inside each node's `_meta`, which is frontend passthrough metadata:
+# ComfyUI's executor reads `_meta.title` and ignores everything else, so this
+# cannot change what the graph DOES. A top-level key was not an option — an
+# API-format graph is a dict keyed by NODE ID, so a non-numeric sibling key is
+# read as a malformed node and rejected by /prompt.
+_PROVENANCE_KEY = "comfy_mcp"
+
+
+def _stamp_partner_provenance(out_path: str, model: str) -> dict[str, Any] | None:
+    """Record, in the emitted file, that running it SPENDS money.
+
+    Returns the stamped block (also handed back in the tool response), or None if
+    the file could not be read or carried no partner node.
+
+    Best-effort by design: the emit already SUCCEEDED by the time this runs, and
+    the graph is usable without the annotation, so a stamping failure must not
+    turn a good result into an error. What it must not do is silently claim to
+    have stamped when it did not — hence the return value.
+    """
+    try:
+        with open(out_path, encoding="utf-8") as fh:
+            graph = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(graph, dict):
+        return None
+    # The partner node is the one comfy-cli titled with the alias; fall back to
+    # any node whose class name looks like an API node so a title format change
+    # does not silently drop the stamp.
+    billing_nodes = [
+        (nid, node)
+        for nid, node in graph.items()
+        if isinstance(node, dict)
+        and (
+            model in str((node.get("_meta") or {}).get("title", ""))
+            or "Node" in str(node.get("class_type", ""))
+            and "Save" not in str(node.get("class_type", ""))
+        )
+    ]
+    if not billing_nodes:
+        return None
+    block = {
+        "spends_credits": True,
+        "partner_model": model,
+        "billing_nodes": sorted(str(nid) for nid, _ in billing_nodes),
+        "billing_class_types": sorted(
+            {str(node.get("class_type")) for _, node in billing_nodes}
+        ),
+        "emitted_by": "comfy-mcp",
+        "warning": (
+            "Running this workflow BILLS Comfy credits — the partner node calls a "
+            "hosted API. It is not a local graph. run_workflow refuses it unless "
+            "confirm_spend=True is passed explicitly."
+        ),
+        "requires": "run_workflow(confirm_spend=True)",
+    }
+    for _nid, node in billing_nodes:
+        meta = node.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            node["_meta"] = meta
+        meta[_PROVENANCE_KEY] = block
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(graph, fh, indent=2)
+    except OSError:
+        return None
+    return block
 
 
 # Hard ceiling for one template run (video templates are the slow end), so a
