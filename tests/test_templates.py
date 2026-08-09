@@ -841,3 +841,65 @@ def test_search_templates_finds_a_weight_filename(monkeypatch):
     assert _names(server.search_templates("flux2_dev_fp8mixed")) == [
         "image_flux2_text_to_image"
     ]
+
+
+def test_a_filter_can_never_widen_the_result(monkeypatch):
+    """`exclude_api=True` on "image to image" returned 133 rows instead of 2.
+
+    Found by walking the suite as a first-time user. The filter stripped the only
+    phrase matches, the phrase pass came back empty, and the all-words fallback
+    then matched every `X to Video` row on the word "to" — so asking for a FREE
+    img2img template returned a screenful of video workflows and no correct
+    answer. A filter is a precision instruction; it must not be able to widen.
+    """
+    rows = [
+        {
+            "name": "api_luma_photon_i2i",
+            "title": "Luma Photon: Image to Image",
+            "description": "",
+            "tags": ["API"],
+            "models": [],
+        },
+        {
+            "name": "video_minimax_h3_i2v",
+            "title": "MiniMax H3: Image to Video",
+            "description": "",
+            "tags": [],
+            "models": [],
+        },
+        {
+            "name": "video_ltx2_3_t2v",
+            "title": "LTX 2.3: Text to Video",
+            "description": "",
+            "tags": [],
+            "models": [],
+        },
+    ]
+    _patch_ls(monkeypatch, rows)
+
+    # Unfiltered: the phrase matches exactly the img2img row.
+    assert _names(server.search_templates("image to image")) == ["api_luma_photon_i2i"]
+
+    # Filtered: that row is excluded, and the honest answer is EMPTY — not every
+    # row containing the word "to".
+    filtered = server.search_templates("image to image", exclude_api=True)
+    assert filtered["total"] == 0
+    assert "match" not in filtered  # no silent widening
+
+    # The same must hold for a forwarded filter, not just exclude_api. The fake
+    # CLI here ignores `type` (it replays a fixed payload), so this cannot assert
+    # an empty result — what it CAN pin is the invariant that matters: a filter
+    # never widens, and never silently relaxes to all-words.
+    forwarded = server.search_templates("image to image", type="video")
+    assert forwarded["total"] <= 1
+    assert "match" not in forwarded
+
+
+def test_the_fallback_still_rescues_a_phrasing_miss(monkeypatch):
+    """Guard the fix's blast radius: with NO filter, widening still happens."""
+    _patch_ls(monkeypatch, _QA_ROWS)
+
+    result = server.search_templates("MiniMax Text to Video")
+
+    assert _names(result) == ["video_minimax_h3_t2v"]
+    assert result["match"] == "all-words"

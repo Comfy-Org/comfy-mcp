@@ -8316,8 +8316,17 @@ def search_templates(
                 isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
             )
         ]
-    unmatched: list[str] = []
     relaxed = False
+    # A FILTER is a precision instruction, so it must not be able to WIDEN the
+    # result. `exclude_api=True` on "image to image" used to turn 2 correct rows
+    # into 133 wrong ones: the filter removed the only phrase matches, the phrase
+    # pass came back empty, and the all-words fallback then matched every
+    # `X to Video` row on the word "to". The fallback exists to rescue a PHRASING
+    # miss (`MiniMax Text to Video` vs `MiniMax H3: Text to Video`), never a
+    # filtering one — when a filter is what emptied the result, "nothing matches
+    # your filters" is the true answer and 133 videos is not.
+    filtered = exclude_api or bool(tag or type or model or provider)
+    unmatched: list[str] = []
     if query:
         q = query.lower()
         candidates = rows
@@ -8330,7 +8339,7 @@ def search_templates(
         # Falling back only when the precise pass finds NOTHING means recall is
         # gained without ever diluting a query that already worked.
         rows = [r for r in candidates if _template_phrase_matches(r, q)]
-        if not rows:
+        if not rows and not filtered:
             rows = [r for r in candidates if _template_matches(r, q)]
             relaxed = bool(rows)
         if not rows:
