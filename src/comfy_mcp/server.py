@@ -5555,6 +5555,26 @@ def fetch_outputs(
     comfy-cli's metadata first, then the image files (capped at
     ``_INLINE_IMAGE_MAX_COUNT`` files / ``_INLINE_IMAGE_MAX_BYTES`` aggregate;
     on-disk copies are never capped).
+
+    Returns:
+        ``url_only=False`` -> ``{"prompt_id", "out_dir", "files": [{"url",
+        "path", "size"}]}``; ``url_only=True`` -> ``{"prompt_id", "urls": [...]}``.
+        ``path`` is always the local copy under ``out_dir``.
+
+        DO NOT ASSUME ``url``/``urls`` IS A URL. It carries whatever comfy-cli
+        recorded for the output, which depends on WHERE the job ran, and the
+        field name does not change with it:
+
+        * job ran on a REMOTE ComfyUI -> an HTTP URL
+          (``http://host:8188/view?filename=…``), fetchable.
+        * job ran on THIS machine -> an absolute FILESYSTEM PATH
+          (``/root/comfy/ComfyUI/output/x_00002_.png``), NOT fetchable.
+
+        Verified live on a same-host ComfyUI: both shapes came back holding a
+        local path under the `url` name. So `requests.get(url)` breaks on the
+        local case and `open(url)` breaks on the remote one — branch on the
+        value (``str.startswith("http")``), not on the key. When you just want
+        the bytes, use ``path``, which is unambiguous.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
