@@ -5934,3 +5934,64 @@ def test_guard_model_filename_rejects(value):
     """A refused value raises `ComfyCliError` naming the bare-filename rule."""
     with pytest.raises(server.ComfyCliError, match=r"must be a bare filename"):
         argv._guard_model_filename(value)
+
+
+# --- QA 0.8.0: detached-HEAD update leaked a traceback ------------------------
+
+
+def test_detached_head_pull_gets_an_actionable_error():
+    """comfy-cli discards git's own diagnosis; this puts the fix back.
+
+    `comfy update comfy` runs `git pull` and, on failure, raises
+    CalledProcessError — throwing away git's stderr, which already said exactly
+    what was wrong. What reached the client was a raw Python traceback in rich
+    box-drawing frames, wrapped as "returned no JSON (exit 1)".
+
+    A detached HEAD is a NORMAL state: it is what a version-pinned install looks
+    like, and switch_comfyui_version leaves one behind.
+    """
+    stderr = (
+        "Traceback (most recent call last):\n"
+        "  File 'comfy_cli/command/update.py', line 42, in update\n"
+        "    subprocess.check_call(['git', 'pull'])\n"
+        "fatal: You are not currently on a branch.\n"
+        "subprocess.CalledProcessError: Command '['git', 'pull']' returned "
+        "non-zero exit status 1."
+    )
+
+    assert server._looks_like_detached_head(stderr, "") is True
+
+
+def test_detached_head_detector_is_narrow():
+    """An unrelated failure that merely quotes the phrase cannot claim the branch."""
+    # No git context at all — a node pack's README text, say.
+    assert server._looks_like_detached_head("see docs: detached head mode", "") is False
+    # And an ordinary failure is untouched.
+    assert server._looks_like_detached_head("ConnectionError: refused", "") is False
+
+
+def test_detached_head_message_reaches_the_caller(patched_run):
+    """End to end: the actionable text replaces the traceback wrapper.
+
+    Drives the real no-envelope path with the stderr comfy-cli actually emits,
+    so this covers the branch selection and the message, not just the detector.
+    """
+    stderr = (
+        "Traceback (most recent call last):\n"
+        "fatal: You are not currently on a branch.\n"
+        "subprocess.CalledProcessError: Command '['git', 'pull']' returned "
+        "non-zero exit status 1."
+    )
+    patched_run(stdout="", returncode=1, stderr=stderr)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        asyncio.run(server.update_comfyui(target="comfy"))
+
+    msg = str(excinfo.value)
+    assert "DETACHED HEAD" in msg
+    assert "switch master" in msg
+    assert "switch_comfyui_version" in msg  # the branch-free alternative
+    # The generic wrapper no longer speaks for this failure.
+    assert "returned no JSON" not in msg
+    # Git's own words are still there rather than replaced.
+    assert "not currently on a branch" in msg

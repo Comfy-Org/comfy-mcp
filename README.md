@@ -125,17 +125,17 @@ Four steps take you from a fresh install to your first generated image.
    ```bash
    pip install "comfy-cli>=1.14.0"  # the engine (>= 1.14.0 required)
    comfy install                  # create a ComfyUI workspace (skip if you have one)
-   pip install .                  # this MCP server → the `comfy-mcp` command
+   pip install comfy-mcp          # this MCP server → the `comfy-mcp` command
    ```
 
-   Run that last one from a checkout of this repo (`pip install -e .` for a working copy).
-   `pip install .` puts a `comfy-mcp` console script on your `PATH`; that command is what you
-   point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
+   `pip install comfy-mcp` puts a `comfy-mcp` console script on your `PATH`; that command is
+   what you point your AI client at in step 3. (Contributing, or working from a checkout?
+   `pip install .` there, or `pip install -e .` for a working copy.) (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
 
    > Installed this server back when it was called `comfy-local-mcp`? Do
-   > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — `pip install .`
-   > alone will **not** clean up after the old name.
+   > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — installing
+   > `comfy-mcp` alone will **not** clean up after the old name.
 
 2. **Launch ComfyUI** and leave it running:
 
@@ -172,7 +172,7 @@ the originals stay in the ComfyUI workspace.
 
 This server used to be called **`comfy-local-mcp`**. It was never published to PyPI under that
 name, so this only affects you if you installed it from a source checkout — but for those installs
-the rename is **not** something `pip install .` finishes on its own, because `comfy-mcp` is a
+the rename is **not** something installing `comfy-mcp` finishes on its own, because `comfy-mcp` is a
 *different distribution*, not a new version of the old one. Four things moved:
 
 | Was | Is now |
@@ -188,7 +188,7 @@ the rename is **not** something `pip install .` finishes on its own, because `co
    `ModuleNotFoundError`:
 
    ```bash
-   pip uninstall comfy-local-mcp   # then: pip install .   (or `pip install -e .`)
+   pip uninstall comfy-local-mcp   # then: pip install comfy-mcp   (or `pip install .` from a checkout)
    ```
 
 2. **Change `"command"` to `comfy-mcp`** in every MCP client config that starts this server
@@ -521,8 +521,9 @@ The instructions walk these as an ordered procedure:
 
 The Apple row rules out that GPU, not the capability: `API`-tagged video templates
 (`search_templates(tag="API", type="video")` — both filters, since neither alone isolates
-partner-run video; the rows' `tags` then confirm what came back) and `emit_partner_workflow` run the model on partner infrastructure, so they
-work on any machine. See **[Partner-API nodes](#partner-api-nodes)**.
+partner-run video; each row's `api` boolean then confirms which side of the line it fell on) and
+`emit_partner_workflow` run the model on partner infrastructure, so they work on any machine.
+See **[Partner-API nodes](#partner-api-nodes)**.
 
 The `hardware` block comes straight through from `comfy env` (an older comfy-cli simply omits
 it), and there is no HTTP client or cloud code here — the cloud/partner steer is guidance text
@@ -614,6 +615,37 @@ verbatim, including the `comfy auth set` fallback and the list of offending node
 credential failures are retried briefly before surfacing.
 
 </details>
+
+## Confirmation prompts on clients that can't show them
+
+Several tools ask you to confirm before they act: `install_node`,
+`update_comfyui(target="all")`, `switch_comfyui_version`, `restart_comfyui` when it must stop a
+server it did not start, and `launch_comfyui` with `--listen` (which exposes an unauthenticated
+ComfyUI to your network). Each raises an MCP *elicitation* and **fails closed** if it is not
+approved.
+
+Some MCP clients answer that request without ever showing you a prompt. When that happens the
+tool refuses and tells you so — nothing is changed, and the error names the equivalent terminal
+command you can run instead.
+
+If you would rather pre-authorize specific gates, set `COMFY_MCP_ASSUME_CONSENT` in the server's
+environment — the `env` block of your client registration, alongside `COMFY_BIN`:
+
+```jsonc
+"env": { "COMFY_MCP_ASSUME_CONSENT": "install_node,update_all" }
+```
+
+Accepted names: `install_node`, `update_all`, `version_switch`, `kill_untracked`,
+`network_exposure` — or `all` for every one of them. List only what you want; authorizing node
+installs should not silently also authorize binding ComfyUI to every network interface.
+
+This is a setting **you** write, in a file the model cannot edit. That is the point: an agent
+cannot grant itself permission by passing an argument, which is why no tool parameter does this.
+
+**Spending credits is deliberately excluded.** No value — including `all` — pre-authorizes
+`partner_generate`, `run_template` or `run_workflow`. Money keeps a single owner: comfy-cli's own
+durable consent (`comfy generate consent always`). See
+[Spending credits on partner models](#spending-credits-on-partner-models).
 
 ## Spending credits on partner models
 
@@ -1026,7 +1058,7 @@ Code and Claude Desktop support it), and the same four rules apply to every one 
 
 | Tool | Wraps | What it does |
 |---|---|---|
-| `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type,tags,category_title}]}`. A row's `API` tag marks a paid hosted-API template; the gallery often titles its free open-source sibling **identically** (e.g. two "MiniMax H3: Text to Video" rows), so `tags`/`category_title` — never the title — are what tell the two routes apart. |
+| `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type,tags,category_title,api}]}`. A row's `API` tag marks a paid hosted-API template that spends credits (`run_template` fails it closed without `confirm_spend=True`); the gallery often titles its free open-source sibling **identically** (e.g. two "MiniMax H3: Text to Video" rows), so `tags`/`category_title`/`api` — never the title — are what tell the two routes apart. The derived `api` boolean is the one bit of `tags` you don't have to scan the list for yourself. |
 | `get_template(name, check_local=True)` | `comfy templates show <name>` (+ `comfy validate`) | Show one template's details/schema before fetching it, plus a `local_check` block cross-checking its graph against the live `object_info` of your install — see [Templates your install can't run](#templates-your-install-cant-run). `check_local=False` skips the check (metadata only, one call). |
 | `fetch_template(name, out_path, check_local=True)` | `comfy templates fetch <name> --out <path>` (+ `comfy validate`) | Write a template's runnable workflow JSON to `out_path`; returns `{path, local_check}` — `path` is the absolute path for `run_workflow`, `local_check` is the same cross-check run on the file just written. The file is written either way. |
 | `nodes(action="search", query="", name="", produces="", accepts="", category="", pack="", label="", limit=None, from_type="", to_type="", max_depth=None, max_paths=None)` | `comfy nodes search/show/ls/upstream/downstream/path/types/categories` | Node introspection over the **live local** `object_info` (installed custom nodes included) — pick a behavior with `action`. `"search"` (default) finds a class by keyword; `"get"` returns one class's full input/output schema; `"list"` filters by `produces` / `accepts` / `category` / `pack` / `label`; `"upstream"` / `"downstream"` list what can feed `name`'s inputs / accept its outputs; `"path"` finds node chains from `from_type` to `to_type` (defaults 6 deep / 10 paths); `"types"` and `"categories"` list the connection types and the category tree. Each param is scoped to the actions that use it — passing one elsewhere is rejected, not ignored. |

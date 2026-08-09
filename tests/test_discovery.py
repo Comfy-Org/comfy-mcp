@@ -773,7 +773,9 @@ def test_discover_defaults_to_schemas_only(patched_run):
     Defaulting to the slim mode is what keeps this tool's response parseable.
     """
     calls = patched_run(envelope(data={"schemas": {}}))
-    assert server.discover() == {"schemas": {}}
+    # The schema BODIES are replaced by an index (see the oversized-default fix);
+    # what this test pins is the forwarded flag, asserted below.
+    assert server.discover()["schema_index"] == []
     assert calls[0]["cmd"] == [
         server.COMFY_BIN,
         "--json",
@@ -1409,3 +1411,63 @@ def test_workflow_deps_cancel_mid_read_waits_for_the_reader(
     # The cancellation still landed, and the temp directory was removed —
     # after the thread finished, not under it.
     assert not os.path.exists(os.path.dirname(_output_path(procs[0].cmd)))
+
+
+# --- QA 0.8.0: discover was uncallable at its own default ---------------------
+# ~63 KB from the CLI, ~109 KB pretty-printed — over a standard 25,000-token cap,
+# so the client REJECTED the call outright. `schemas` was ~95% of the payload.
+
+_DISCOVER_PAYLOAD = {
+    "version": "1.15.0",
+    "capabilities": {"stream": True},
+    "schemas": {
+        "run": {"name": "run", "title": "Run", "schema": {"x": "y" * 400}},
+        "jobs": {"name": "jobs", "title": "Jobs", "schema": {"x": "z" * 400}},
+    },
+}
+
+
+def test_discover_default_omits_schema_bodies(patched_run):
+    """The default returns an index, not 35 schema bodies."""
+    patched_run(envelope(data=_DISCOVER_PAYLOAD))
+
+    result = server.discover()
+
+    assert result["schema_index"] == ["jobs", "run"]
+    assert "schemas" not in result
+    # The parts that were never the problem survive.
+    assert result["capabilities"] == {"stream": True}
+    assert result["version"] == "1.15.0"
+    # And it says how to get a body.
+    assert "discover(command=" in result["hint"]
+
+
+def test_discover_command_returns_one_schema(patched_run):
+    """`command=` fetches a single body — the escape hatch the index points at."""
+    patched_run(envelope(data=_DISCOVER_PAYLOAD))
+
+    result = server.discover(command="run")
+
+    assert result["schema"]["name"] == "run"
+    assert "jobs" not in json.dumps(result)
+
+
+def test_discover_unknown_command_lists_the_real_ones(patched_run):
+    """A wrong name names the right ones rather than returning empty."""
+    patched_run(envelope(data=_DISCOVER_PAYLOAD))
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        server.discover(command="nope")
+
+    assert "no schema named 'nope'" in str(exc.value)
+    assert "jobs, run" in str(exc.value)
+
+
+def test_discover_full_surface_is_untouched(patched_run):
+    """`schemas_only=False` still returns everything for a client that can take it."""
+    patched_run(envelope(data=_DISCOVER_PAYLOAD))
+
+    result = server.discover(schemas_only=False)
+
+    assert "schemas" in result
+    assert "schema_index" not in result

@@ -1063,6 +1063,28 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     return _unwrap_envelope(real_envelope, args, returncode, stderr, stdout=stdout)
 
 
+# git's own wording, and the state it describes. Matched on BOTH streams because
+# comfy-cli splits diagnostics unpredictably — the traceback lands on stderr
+# while a status line can land on stdout.
+_DETACHED_HEAD_MARKERS = (
+    "you are not currently on a branch",
+    "detached head",
+)
+
+
+def _looks_like_detached_head(stderr: str, stdout: str) -> bool:
+    """True when a failed comfy-cli run is really "this checkout has no branch".
+
+    Deliberately narrow: it must ALSO look like the git pull path, so an
+    unrelated failure that happens to quote the phrase (a log line, a node pack
+    README) cannot claim this branch and hide its own cause.
+    """
+    blob = f"{stderr}\n{stdout}".lower()
+    if not any(marker in blob for marker in _DETACHED_HEAD_MARKERS):
+        return False
+    return "git" in blob and ("pull" in blob or "branch" in blob)
+
+
 def _envelope_schema(envelope: dict) -> str | None:
     """The envelope's declared ``schema`` string (e.g. ``"envelope/1"``), or None."""
     value = envelope.get("schema")
@@ -1419,6 +1441,44 @@ def _unwrap_envelope(
             # envelope, not a different kind of failure. Unlike the message, the
             # record keeps the raw stdout too: a diagnostic trail is read after
             # the fact, when a curated guidance string is no longer enough.
+            failure_log._log_failure(
+                "no_json",
+                args,
+                exit_code=returncode,
+                message=message,
+                stdout=stdout,
+                stderr=stderr,
+                streaming=streaming,
+            )
+            raise ComfyCliError(message, no_envelope=True, returncode=returncode)
+        if _looks_like_detached_head(stderr, stdout):
+            # comfy-cli runs `git pull` and, on failure, raises
+            # CalledProcessError — discarding git's own stderr, which already
+            # said exactly what is wrong ("You are not currently on a branch").
+            # What reaches the client is a raw Python traceback in rich
+            # box-drawing frames wrapped as "returned no JSON (exit 1)": the one
+            # actionable sentence is buried, and may be clipped away entirely by
+            # the field cap below.
+            #
+            # A detached HEAD is a NORMAL state — it is what a tag-pinned install
+            # looks like, and `switch_comfyui_version` produces one — so this is
+            # a routine condition being reported as a crash. Named here for the
+            # same reason the TCC branch above is: the cause is identifiable, so
+            # the caller should get the fix rather than the stack.
+            message = (
+                f"update_comfyui cannot pull (exit {returncode}): this ComfyUI "
+                "checkout is on a DETACHED HEAD, so `git pull` has no branch to "
+                "pull into. That is the normal state of a version-pinned "
+                "install — `switch_comfyui_version` leaves one behind.\n\n"
+                "Fix: check out a branch before updating (e.g. `git -C "
+                "<workspace> switch master`), then retry. To move between "
+                "releases instead, use `switch_comfyui_version`, which does not "
+                "need a branch. `server_info` reports the workspace path.\n\n"
+                "Original error: stderr: "
+                f"{failure_log._scrubbed_stream_tail(stderr, errors._MAX_ERROR_FIELD_CHARS)}"
+                " | stdout: "
+                f"{failure_log._scrubbed_stream_tail(stdout, errors._MAX_ERROR_FIELD_CHARS)}"
+            )
             failure_log._log_failure(
                 "no_json",
                 args,
@@ -2898,10 +2958,15 @@ async def run_workflow(
     accepts an API-format or UI-export file.
 
     Args:
-        wait: if True (default), block until the run finishes, streaming
-            progress as MCP notifications, and return the full result. If
-            False, submit and return with a ``prompt_id`` to poll via
-            ``job(action="status")``.
+        wait: if True (default), block until the run finishes and return the
+            full result. If False, submit and return with a ``prompt_id`` to
+            poll via ``job(action="status")``.
+
+            Progress notifications are EMITTED WHEN THE ENGINE REPORTS ANY —
+            do not rely on them. comfy-cli 1.15.0's stream carries no
+            per-step events for this verb, so in practice a run is silent
+            until it finishes. Poll ``job(action="status")`` from a second
+            call if you need progress.
         timeout_seconds: used only when ``wait=True``; default 110s sits under
             a typical client's ~120s budget. For a longer run, prefer
             ``wait=False`` + ``job(action="wait")``/``job(action="watch")``.
@@ -3020,11 +3085,27 @@ async def run_workflow(
             await asyncio.sleep(backoff)
 
 
-# The gallery template `generate_image` runs: ComfyUI's own default graph — the
-# basic SD1.5 text-to-image workflow whose CheckpointLoaderSimple default is
-# `v1-5-pruned-emaonly-fp16.safetensors`. Free (core nodes only, no partner-API
-# node, no `API` gallery tag), so the run never trips comfy-cli's spend gate.
-_T2I_TEMPLATE = "default"
+# The gallery template `generate_image` runs. Free (core nodes only, no
+# partner-API node, no `API` gallery tag), so the run never trips comfy-cli's
+# spend gate.
+#
+# WAS `"default"`, which no longer exists in the gallery — `comfy run-template
+# default` failed with `no template named 'default' in the gallery` on EVERY
+# call, making the documented on-ramp dead. That was not a stale-cache problem:
+# it reproduces on a fresh install with the cache refreshed, and independently on
+# both macOS/MPS and Linux/CUDA hosts. The gallery moved on and this constant
+# rotted with it; the shipped package carries no `default` and no `get_started`.
+#
+# `image_z_image_turbo` is verified present and runnable end to end (a real
+# 512x512 PNG on an RTX 4070 Ti). NOTE it is a SUBGRAPH template: the positive
+# prompt is a promoted proxy widget on instance node 57, hence the `57.text`
+# address rather than a bare `text` — see _T2I_PROMPT_SLOT.
+#
+# Whatever this names must actually exist in the gallery. A hardcoded gallery
+# name is inherently rot-prone, which is exactly how this bug happened, so
+# `_t2i_missing_template_hint` is the durable half of the fix: it turns the next
+# rotation into one actionable error instead of a dead-end hint.
+_T2I_TEMPLATE = "image_z_image_turbo"
 
 # Slot keys for that template's prompt + checkpoint inputs. These VERSION WITH
 # `_T2I_TEMPLATE` — they are properties of that one graph, verified with
@@ -3039,8 +3120,83 @@ _T2I_TEMPLATE = "default"
 # (`workflow_slot_invalid`) rather than guessing which one is the positive
 # prompt. `ckpt_name` is unique in this graph, so the name form is used there —
 # it survives a template revision that renumbers nodes.
-_T2I_PROMPT_SLOT = "6.text"
-_T2I_CHECKPOINT_SLOT = "ckpt_name"
+#
+# The addresses above described the retired `default` graph. `image_z_image_turbo`
+# is a subgraph template and exposes its positive prompt as a promoted proxy
+# widget on instance node 57, so the address is `57.text`.
+_T2I_PROMPT_SLOT = "57.text"
+# EMPTY on purpose. `image_z_image_turbo` loads its weights through
+# UNETLoader/CLIPLoader/VAELoader, not CheckpointLoaderSimple, so there is no
+# `ckpt_name` slot to point `checkpoint=` at — and this is not peculiar to this
+# template: the split-loader layout is now the gallery norm, with NONE of the
+# current free `*_text_to_image` templates carrying a CheckpointLoaderSimple.
+# Left empty so `generate_image(checkpoint=...)` REFUSES by name (see the guard
+# in that tool) instead of addressing a slot the graph does not have, which
+# comfy-cli would reject as `workflow_slot_invalid` mid-run. Set
+# COMFY_T2I_CHECKPOINT_SLOT together with COMFY_T2I_TEMPLATE to re-enable it for
+# a checkpoint-style graph.
+_T2I_CHECKPOINT_SLOT = ""
+
+
+def _t2i_missing_template_hint(
+    exc: ComfyCliError, template: str
+) -> ComfyCliError | None:
+    """Turn comfy-cli's dead-end "no template named" into an actionable error.
+
+    Returns None when ``exc`` is some other failure, so the caller re-raises the
+    original untouched.
+
+    This is the durable half of the `default`-template regression. comfy-cli's own
+    text ends with ``try `comfy templates ls --name <substring>` to search``,
+    which is a dead end for an agent: it does not say WHICH name to search for,
+    and the failure is in a constant the caller never chose. Naming the free
+    text-to-image rows that actually exist turns a hard stop into a next step —
+    and, because the lookup only runs on the failure path, it costs nothing on
+    every healthy call.
+    """
+    if "no template named" not in str(exc).lower():
+        return None
+    try:
+        data = _run_comfy("templates", "ls", "--type", "image", timeout=60.0)
+        rows = data.get("rows", []) if isinstance(data, dict) else []
+        names = sorted(
+            str(r.get("name"))
+            for r in rows
+            if isinstance(r, dict)
+            and r.get("name")
+            # Case-insensitive, matching `search_templates`' own
+            # `t.lower() == "api"`: an exact-case test would let a paid row slip
+            # into a list of FREE suggestions, which is the one thing this hint
+            # must not do.
+            and not any(
+                isinstance(t, str) and t.lower() == "api" for t in (r.get("tags") or [])
+            )
+        )
+        suggestions = [n for n in names if "text_to_image" in n or "t2i" in n][
+            :8
+        ] or names[:8]
+    except (ComfyCliError, OSError, ValueError, TypeError, KeyError):
+        # A gallery lookup that itself fails must not mask the real error the
+        # caller came here with — fall back to naming only the broken constant.
+        # Narrow rather than bare `Exception` so a genuine bug in this hint path
+        # still surfaces instead of being swallowed into a vaguer message.
+        suggestions = []
+    tail = (
+        f" Free text-to-image templates currently in the gallery include: "
+        f"{', '.join(suggestions)}."
+        if suggestions
+        else ""
+    )
+    return ComfyCliError(
+        f"generate_image is configured to run template {template!r}, which is not in "
+        f"the gallery.{tail} Set COMFY_T2I_TEMPLATE (with COMFY_T2I_PROMPT_SLOT, and "
+        "COMFY_T2I_CHECKPOINT_SLOT if the graph has one) to a template that exists, "
+        "or use search_templates -> fetch_template -> run_workflow directly.",
+        # Preserve comfy-cli's structured code, the way `_t2i_slot_hint` does:
+        # rewriting the prose must not silently drop the field a caller branches
+        # on (`template_not_found`).
+        code=getattr(exc, "code", None),
+    )
 
 
 def _t2i_config() -> tuple[str, str, str]:
@@ -3120,6 +3276,24 @@ async def generate_image(
     # `params` (see module docstring / imports), and a same-named local here
     # would shadow it for the rest of this function.
     template_params: dict[str, Any] = {prompt_slot: prompt}
+    if checkpoint and not checkpoint_slot:
+        # The configured template loads weights through split loaders and has no
+        # checkpoint slot. Refusing by name beats forwarding `checkpoint` to an
+        # empty address, which comfy-cli rejects mid-run as `workflow_slot_invalid`
+        # after the submit — an error about slot syntax for what is really an
+        # unsupported argument on this graph.
+        raise ComfyCliError(
+            f"generate_image(checkpoint=...) is not supported by template "
+            f"{template!r}: no checkpoint slot is configured for it, so there is "
+            "nothing to set. (The built-in on-ramp template loads weights through "
+            "UNETLoader/CLIPLoader/VAELoader rather than CheckpointLoaderSimple, "
+            "which is now the gallery norm.) Omit `checkpoint` "
+            "to use the template's own weights, or point the on-ramp at a "
+            "CheckpointLoaderSimple graph by setting COMFY_T2I_TEMPLATE, "
+            "COMFY_T2I_PROMPT_SLOT and COMFY_T2I_CHECKPOINT_SLOT together "
+            "(list a candidate's slots with `comfy templates fetch <name> -o "
+            "wf.json && comfy workflow slots wf.json`)."
+        )
     if checkpoint:
         if checkpoint_slot == prompt_slot:
             # Same key for both slots would have the checkpoint overwrite the
@@ -3153,6 +3327,9 @@ async def generate_image(
         # same verb, so it spends the budget the same way.
         return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
     except ComfyCliError as exc:
+        missing = _t2i_missing_template_hint(exc, template)
+        if missing is not None:
+            raise missing from exc
         hinted = _t2i_slot_hint(
             exc, template, prompt_slot, checkpoint_slot if checkpoint else None
         )
@@ -3464,6 +3641,10 @@ class _ApprovalWording(NamedTuple):
     #: Optional trailing sentence naming another route for a client that cannot
     #: be prompted. Begins with a space — it is concatenated, not joined.
     escape_hatch: str = ""
+    #: The name an OPERATOR types in ``COMFY_MCP_ASSUME_CONSENT`` to
+    #: pre-authorize this gate. EMPTY means the gate can never be pre-authorized
+    #: — which is how the spend gates are held out of the mechanism entirely.
+    consent_token: str = ""
 
 
 _SPEND_APPROVAL_WORDING = _ApprovalWording(
@@ -3497,6 +3678,63 @@ _OPTIN_SPEND_APPROVAL_WORDING = _ApprovalWording(
 )
 
 
+# Operator-set pre-authorization for the per-call consent gates.
+#
+# WHY THIS EXISTS. Every gate raises an MCP elicitation and fails closed when it
+# is not affirmatively approved — correct, and unchanged. But the clients agents
+# actually run under (Claude Code, Codex CLI, both verified) answer the
+# elicitation WITHOUT rendering a prompt, so in practice no human is ever asked
+# and five tools are unusable: install_node, update_comfyui(target="all"),
+# switch_comfyui_version, restart_comfyui's kill-untracked, and launch with
+# --listen. The terminal escape hatch each error names is a real answer, but it
+# is not one an agent can take.
+#
+# WHY AN ENVIRONMENT VARIABLE, and not a tool argument. A tool argument is set by
+# the AGENT, so honouring one would let the agent consent on the user's behalf —
+# exactly what these gates exist to prevent, and what the fallback comments
+# elsewhere in this file warn against. This variable lives in the SERVER's
+# environment, written by whoever configured the MCP server (mcp.json, a shell
+# profile, a container spec). The model cannot set it. So it is a human granting
+# consent out-of-band at configuration time, which is the property the
+# elicitation was reaching for in the first place.
+#
+# WHY SPEND IS EXCLUDED. The spend gates carry no `consent_token`, so no value of
+# this variable — including "all" — can pre-authorize them. Money already has a
+# durable, human-set route in comfy-cli itself (`comfy generate consent always`,
+# read via `_engine_auto_confirms`), and a second mechanism would split that
+# policy across two places. Keeping one owner for the spend decision matters more
+# than the symmetry.
+#
+# The value is a COMMA-SEPARATED LIST of gate tokens, or "all". A list rather than
+# a boolean so the operator states what they are authorizing: enabling node
+# installs should not silently also authorize binding ComfyUI to every interface.
+_ASSUME_CONSENT_ENV = "COMFY_MCP_ASSUME_CONSENT"
+
+
+def _preauthorized_gates() -> frozenset[str]:
+    """Gate tokens the operator pre-authorized, lowercased.
+
+    Read per call rather than latched at import, so a test (or a client that
+    re-execs with different env) sees the current value — the same convention
+    `_t2i_config` follows.
+    """
+    raw = os.environ.get(_ASSUME_CONSENT_ENV, "")
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def _is_preauthorized(wording: _ApprovalWording) -> bool:
+    """Whether this gate was pre-authorized out-of-band by the operator.
+
+    A gate with no token is never pre-authorizable, which is what holds the spend
+    gates out of this mechanism no matter what the variable says.
+    """
+    token = wording.consent_token
+    if not token:
+        return False
+    granted = _preauthorized_gates()
+    return "all" in granted or token.lower() in granted
+
+
 async def _elicit_approval(
     ctx: Context, message: str, schema: type, wording: _ApprovalWording
 ) -> bool:
@@ -3507,7 +3745,27 @@ async def _elicit_approval(
     ``target="all"``), and the launch pair's network-exposure gate. Only the
     message, the answer schema, and ``wording`` differ; the fail-closed handling
     below must not. True = the user affirmatively approved.
+
+    Three outcomes, not two — the distinction the QA pass found missing:
+
+    * True — a person saw the prompt and approved.
+    * False — a person saw the prompt and DECLINED (``action == "decline"``).
+      Only here may a caller say "the user declined".
+    * raises — the client never got a decision to us (``"cancel"``, a missing
+      action, an auto-answer). Failing closed is the same; claiming a human
+      refused is not, so that wording is not available to the caller at all.
     """
+    if _is_preauthorized(wording):
+        # Checked BEFORE contacting the client: the operator has already decided,
+        # so prompting would be theatre — and on a client that cannot render one,
+        # it would fail closed against a human who already said yes. Logged so the
+        # approval is auditable rather than invisible.
+        logging.getLogger(__name__).info(
+            "consent pre-authorized for gate %r via %s",
+            wording.consent_token,
+            _ASSUME_CONSENT_ENV,
+        )
+        return True
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message=message, schema=schema),
@@ -3530,8 +3788,27 @@ async def _elicit_approval(
     # Every read is a `getattr`: a non-conforming client can return an object
     # with no `.action`/`.data`, and an AttributeError here would escape as an
     # uncaught crash instead of the refusal this contract promises.
-    if getattr(result, "action", None) != "accept":
-        return False
+    action = getattr(result, "action", None)
+    if action != "accept":
+        # "DECLINE" is a person saying no. Anything else — "cancel", a missing
+        # action, a client that resolves the request without ever rendering it —
+        # is NOT a decision, and reporting it as one is a lie about a human.
+        #
+        # This is the bug behind "the user declined ..." appearing in sessions
+        # where no prompt was ever displayed, across four different gates: every
+        # non-accept answer collapsed into the same False, and each caller then
+        # raised its "the user declined" text. Failing closed was right; naming a
+        # refusal nobody made was not — it sends the reader to argue with a user
+        # who was never asked, and hides that the client is the thing that needs
+        # fixing.
+        if action == "decline":
+            return False
+        raise ComfyCliError(
+            f"{wording.subject} not confirmed: the client did not present the "
+            f"confirmation prompt (it answered {action!r} without a user "
+            f"decision), so nobody was asked. {wording.nothing_done}"
+            f"{wording.escape_hatch}"
+        )
     return getattr(getattr(result, "data", None), "approve", False) is True
 
 
@@ -4064,7 +4341,102 @@ async def emit_partner_workflow(
     # the 120s backstop fires. On the default executor a run of cancelled calls
     # would pin those workers and starve every other tool that off-loads through
     # `to_thread`. See `_GENERATE_EXECUTOR`.
-    return await _in_generate_pool(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
+    result = await _in_generate_pool(_run_comfy, *args, timeout=_EMIT_WORKFLOW_TIMEOUT)
+    # Stamp cost provenance INTO the file. Everything that says this graph bills
+    # — the model, the billing node, the confirm_spend requirement — otherwise
+    # lives only in this response, and the file outlives the session that
+    # produced it. Its whole purpose is to be handed to `run_workflow`, where the
+    # billing actually happens, quite possibly by someone who never saw this
+    # reply; on disk the only hint was a class name.
+    stamped = await asyncio.to_thread(_stamp_partner_provenance, out_path, model)
+    if isinstance(result, dict) and stamped:
+        result["provenance"] = stamped
+    return result
+
+
+# Marker key for the provenance block stamped into an emitted partner workflow.
+# It rides inside each node's `_meta`, which is frontend passthrough metadata:
+# ComfyUI's executor reads `_meta.title` and ignores everything else, so this
+# cannot change what the graph DOES. A top-level key was not an option — an
+# API-format graph is a dict keyed by NODE ID, so a non-numeric sibling key is
+# read as a malformed node and rejected by /prompt.
+_PROVENANCE_KEY = "comfy_mcp"
+
+
+def _stamp_partner_provenance(out_path: str, model: str) -> dict[str, Any] | None:
+    """Record, in the emitted file, that running it SPENDS money.
+
+    Returns the stamped block (also handed back in the tool response), or None if
+    the file could not be read or carried no partner node.
+
+    Best-effort by design: the emit already SUCCEEDED by the time this runs, and
+    the graph is usable without the annotation, so a stamping failure must not
+    turn a good result into an error. What it must not do is silently claim to
+    have stamped when it did not — hence the return value.
+    """
+    try:
+        with open(out_path, encoding="utf-8") as fh:
+            graph = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(graph, dict):
+        return None
+    # The partner node is the one comfy-cli titled with the alias; fall back to
+    # any node whose class name looks like an API node so a title format change
+    # does not silently drop the stamp.
+    billing_nodes = [
+        (nid, node)
+        for nid, node in graph.items()
+        if isinstance(node, dict)
+        and (
+            model in str((node.get("_meta") or {}).get("title", ""))
+            or "Node" in str(node.get("class_type", ""))
+            and "Save" not in str(node.get("class_type", ""))
+        )
+    ]
+    if not billing_nodes:
+        return None
+    block = {
+        "spends_credits": True,
+        "partner_model": model,
+        "billing_nodes": sorted(str(nid) for nid, _ in billing_nodes),
+        "billing_class_types": sorted(
+            {str(node.get("class_type")) for _, node in billing_nodes}
+        ),
+        "emitted_by": "comfy-mcp",
+        "warning": (
+            "Running this workflow BILLS Comfy credits — the partner node calls a "
+            "hosted API. It is not a local graph. run_workflow refuses it unless "
+            "confirm_spend=True is passed explicitly."
+        ),
+        "requires": "run_workflow(confirm_spend=True)",
+    }
+    for _nid, node in billing_nodes:
+        meta = node.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            node["_meta"] = meta
+        meta[_PROVENANCE_KEY] = block
+    # ATOMIC, because the alternative destroys the caller's file. Opening
+    # `out_path` with "w" truncates the emitted workflow before `json.dump`
+    # finishes; a failure part-way (full disk, a serialization error) would
+    # leave a half-written or empty graph where a perfectly good one was, and
+    # the emit that produced it has already returned. Write a sibling temp file,
+    # fsync it, then `os.replace` — which is atomic on the same filesystem, so
+    # a reader sees either the original or the stamped version, never a stump.
+    tmp_path = f"{out_path}.comfy-mcp.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(graph, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, out_path)
+    except OSError:
+        # Best-effort cleanup; the original file is untouched either way.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        return None
+    return block
 
 
 # Hard ceiling for one template run (video templates are the slow end), so a
@@ -4837,9 +5209,9 @@ async def job(
     - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns the
       final payload, or `{"timed_out": True, "status": <last>}` on expiry — a
       TIMEOUT, not a failure.
-    - "watch" -> stream live progress via MCP notifications (default 600.0s,
-      same ceiling); same `timed_out` (timeout, not failure) shape, but `status` is a live
-      `{progress, total, nodes_done}` snapshot, not a raw status dict.
+    - "watch" -> relay progress notifications while waiting (default 600.0s,
+      same ceiling); `status` is a `{progress, total, nodes_done}` snapshot.
+      comfy-cli 1.15.0 sends no per-step events: expect `progress: null`.
     - "cancel" -> stop a queued/running job.
     - "queue" -> list known jobs (Comfy Cloud-tracked rows filtered out).
 
@@ -5465,6 +5837,7 @@ _NETWORK_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run "
         "`comfy launch --background -- <flags>` in a terminal instead."
     ),
+    consent_token="network_exposure",
 )
 
 
@@ -6027,6 +6400,7 @@ _KILL_UNTRACKED_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run `comfy stop --port <PORT>` in a "
         "terminal instead."
     ),
+    consent_token="kill_untracked",
 )
 
 
@@ -6441,6 +6815,7 @@ _UPDATE_ALL_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run `comfy update all` in a "
         "terminal instead."
     ),
+    consent_token="update_all",
 )
 
 # Said in the prompt AND in the cannot-be-prompted refusal, because both have to
@@ -6637,6 +7012,7 @@ _SWITCH_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run "
         "`comfy update comfy --version <VERSION>` in a terminal instead."
     ),
+    consent_token="version_switch",
 )
 
 
@@ -6993,6 +7369,7 @@ _INSTALL_APPROVAL_WORDING = _ApprovalWording(
         " If this client cannot show prompts, run "
         "`comfy node install <name>` in a terminal instead."
     ),
+    consent_token="install_node",
 )
 
 
@@ -7588,19 +7965,29 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
 
 
 @mcp.tool()
-def discover(schemas_only: bool = True) -> Any:
+def discover(schemas_only: bool = True, command: str = "") -> Any:
     """Return comfy-cli's self-describing command surface (its own contract).
 
     Wraps ``comfy discover`` so an agent can learn the CLI's contract at
     runtime instead of hard-coding it.
 
-    ``schemas_only`` (default True) forwards ``--schemas-only``: returns just
-    the schema bundle (~9k tokens) — argument/capability schemas, NOT the
-    ``commands`` tree or ``error_codes``. Pass ``schemas_only=False`` for
-    those too, in the full surface (~45k tokens, ~5x bigger — measured on
-    comfy-cli 1.13.0). Default is slim because MCP clients cap tool output
-    (e.g. Claude Code's ``MAX_MCP_OUTPUT_TOKENS``, default 25,000) by
-    TRUNCATING mid-JSON — the full tree can silently come back broken.
+    Args:
+        schemas_only: forwards ``--schemas-only`` to the CLI (default True).
+        command: return ONE schema body by name instead of the index.
+
+    Sizes matter here because MCP clients cap tool output (e.g. Claude Code's
+    ``MAX_MCP_OUTPUT_TOKENS``, default 25,000) by TRUNCATING mid-JSON, so an
+    oversized reply comes back broken rather than short:
+
+    - ``discover()`` — the default. Capabilities, version, command schemas, and
+      a ``schema_index`` of names. A couple of KB; always under the cap.
+    - ``discover(command="run")`` — one schema body (~1.6 KB).
+    - ``discover(schemas_only=False)`` — the entire surface, ``commands`` tree
+      and ``error_codes`` included. Big; only for a client with a raised cap.
+
+    The default USED to return all 35 schema bodies — ~63 KB from the CLI and
+    ~109 KB once pretty-printed, which exceeded a standard cap and made the tool
+    uncallable at its own default. Measured on comfy-cli 1.15.0.
     """
     args = ["discover"]
     if schemas_only:
@@ -7608,7 +7995,47 @@ def discover(schemas_only: bool = True) -> Any:
         # shipped in the same comfy-cli commit that introduced `discover`, so
         # any build carrying the command carries the flag.
         args.append("--schemas-only")
-    return _run_comfy(*args, timeout=60.0)
+    data = _run_comfy(*args, timeout=60.0)
+
+    # Everything below narrows what comes BACK; the child call is unchanged.
+    #
+    # Measured on comfy-cli 1.15.0: the default payload is ~63 KB of compact JSON
+    # from the CLI, and ~109 KB once a client pretty-prints it — over a standard
+    # 25,000-token cap, so the tool was rejected outright and could not be called
+    # AT ALL at its default setting. `schemas` is ~95% of that (35 entries,
+    # ~1.6 KB each) while `capabilities`/`version`/`command_schemas` together are
+    # ~2.7 KB.
+    #
+    # So the default now returns an INDEX of the schema names instead of every
+    # schema body. That is a deliberate response-shape change: a tool that
+    # exceeds the client cap returns nothing usable, and a truncated mid-JSON
+    # reply is worse than a small complete one. Any single schema is one more
+    # call away via `command=`, and `schemas_only=False` still returns the whole
+    # surface for a client that can take it.
+    if not isinstance(data, dict):
+        return data
+    schemas = data.get("schemas")
+    if not isinstance(schemas, dict):
+        return data
+    if command:
+        entry = schemas.get(command)
+        if entry is None:
+            raise ComfyCliError(
+                f"discover: no schema named {command!r}. Available: "
+                f"{', '.join(sorted(schemas))}."
+            )
+        return {"schema": entry, "version": data.get("version")}
+    if schemas_only:
+        slim = {k: v for k, v in data.items() if k != "schemas"}
+        slim["schema_index"] = sorted(schemas)
+        slim["hint"] = (
+            f"{len(schemas)} schema bodies omitted (~"
+            f"{len(json.dumps(schemas, separators=(',', ':'))) // 1024} KB, over a "
+            'typical MCP client\'s output cap). Call discover(command="<name>") '
+            "for one, or discover(schemas_only=False) for the whole surface."
+        )
+        return slim
+    return data
 
 
 @mcp.tool()
@@ -7654,7 +8081,9 @@ def project(action: str = "status") -> Any:
 # hosted ``API`` template from its free open-source sibling, which the
 # gallery titles IDENTICALLY (e.g. two "MiniMax H3: Text to Video" rows) —
 # without them a listing steers agents to the paid route while implying no
-# free one exists.
+# free one exists. Each projected row also carries a DERIVED ``api`` boolean
+# (see ``_template_is_api``) with no source key here: the one bit of ``tags``
+# a caller can read without scanning the list itself.
 _TEMPLATE_LIST_FIELDS = (
     "name",
     "title",
@@ -7669,23 +8098,144 @@ _TEMPLATE_LIST_FIELDS = (
 _TEMPLATE_LIST_MAX_LIMIT = 200
 
 
-def _template_matches(row: dict, query_lower: str) -> bool:
-    """True if ``query_lower`` (already lowercased) matches a template ``row``.
+def _row_str_items(row: dict, key: str) -> list[str]:
+    """The string items of a list-valued ``row`` field, tolerant of shape drift.
 
-    Case-insensitive substring match over the free-text fields ``name`` /
-    ``title`` / ``description`` plus the string items inside the ``tags`` and
-    ``models`` list values — deliberately NOT every string value, so a query
-    like ``"image"`` does not hit ``output_type`` on hundreds of rows.
+    ``tags`` / ``models`` are free-form gallery metadata comfy-cli passes
+    through verbatim, so a drifted row can carry anything under either key. A
+    value that is not a list/tuple contributes NO items, because the two ways
+    Python would otherwise read one are both wrong: a number raises
+    ``TypeError`` mid-listing, and a bare ``"API"`` string iterates into the
+    characters ``A``/``P``/``I`` — silently answering "not an API template" for
+    a row that says it is. Every reader below runs over EVERY row of the
+    default ``search_templates()`` page, so one drifted row must not decide
+    the call.
     """
+    value = row.get(key)
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _template_is_api(row: dict) -> bool:
+    """True if a template ``row`` carries the ``API`` tag.
+
+    An ``API`` row runs its model on a hosted partner API — it spends credits
+    and needs a key — where every other row runs on local hardware for free.
+    Case-insensitive, and tolerant of a drifted ``tags`` value (see
+    ``_row_str_items``) because it is gallery metadata comfy-cli passes through
+    verbatim — which is also why this is the gallery's CLAIM about a template,
+    not a verdict derived from its graph; deriving one here is what the
+    thin-wrapper rule forbids.
+
+    Absence of the tag is what returns False, which is not the same evidence as
+    a row that positively says it runs locally: a row with no readable ``tags``
+    at all reports False too. That is deliberate — it is the answer
+    ``exclude_api`` has always given such a row (it keeps it), and a flag that
+    disagreed with the filter that produced the page would be worse than a
+    conservative one. ``get_template(name)`` carries the full ``tags`` when a
+    row looks off.
+
+    ONE predicate with TWO readers, deliberately: ``exclude_api``'s filter and
+    the derived ``api`` flag on each projected row. Two copies of this test
+    would let the rows disagree with the filter that produced them.
+    """
+    return any(t.lower() == "api" for t in _row_str_items(row, "tags"))
+
+
+# Words, for query tokenizing and row indexing. Splitting on anything that is not
+# alphanumeric is what lets `MiniMax H3: Text to Video` be found by
+# `MiniMax Text to Video` — the colon and the `H3` no longer have to be typed.
+_TEMPLATE_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _template_words(row: dict) -> list[str]:
+    """Every searchable word in a template ``row``, lowercased.
+
+    ``name``/``title``/``description`` plus the string items inside ``tags`` and
+    ``models`` — deliberately NOT every string value, so a query like ``image``
+    does not hit ``output_type`` on hundreds of rows.
+    """
+    words: list[str] = []
     for key in ("name", "title", "description"):
         value = row.get(key)
-        if isinstance(value, str) and query_lower in value.lower():
-            return True
+        if isinstance(value, str):
+            words += _TEMPLATE_WORD_RE.findall(value.lower())
     for key in ("tags", "models"):
-        for item in row.get(key) or []:
-            if isinstance(item, str) and query_lower in item.lower():
-                return True
+        for item in _row_str_items(row, key):
+            words += _TEMPLATE_WORD_RE.findall(item.lower())
+    return words
+
+
+def _template_phrase_matches(row: dict, query_lower: str) -> bool:
+    """True if the query's words appear CONSECUTIVELY in ``row``.
+
+    The precise pass. Word-anchored rather than a raw substring test, so
+    ``image to image`` still means img2img and does not also match the
+    ``text to image`` rows, while the mid-word fragment ``ext to imag`` — which
+    the old substring test happily matched inside ``text to image`` — cannot
+    match anything.
+
+    The final token may be a PREFIX so that partial typing keeps working while
+    the phrase is still being typed (``image to ima`` finds img2img); every
+    earlier token must be a whole word, which is what preserves the ordering.
+    """
+    tokens = _TEMPLATE_WORD_RE.findall(query_lower)
+    if not tokens:
+        return True
+    words = _template_words(row)
+    last = len(tokens) - 1
+    for start in range(len(words) - len(tokens) + 1):
+        if all(
+            words[start + i].startswith(tok) if i == last else words[start + i] == tok
+            for i, tok in enumerate(tokens)
+        ):
+            return True
     return False
+
+
+def _template_matches(row: dict, query_lower: str) -> bool:
+    """True if every word of ``query_lower`` prefixes some word in ``row``.
+
+    WAS a raw substring test over the same fields, which failed in both
+    directions on the gallery's primary discovery path:
+
+    * FALSE NEGATIVES — the first phrasing anyone types. ``basic text to image``,
+      ``text image`` and ``MiniMax Text to Video`` all returned 0, the last one
+      despite ``MiniMax H3: Text to Video`` existing, because the stored title
+      has ``H3:`` in the middle and a substring test needs the phrase contiguous.
+      A clean ``total: 0`` is indistinguishable from "no such capability", so the
+      failure reads as absence rather than as a bad query.
+    * FALSE POSITIVES — mid-word fragments. ``ext to imag`` matched the same 91
+      rows as ``text to image``, and ``o Image`` matched 118 by landing inside
+      ``two images``.
+
+    Tokenized AND-matching fixes the first; anchoring each token at a WORD START
+    fixes the second while keeping the partial typing people rely on (``flux``
+    still finds ``flux2``, and ``t2v`` still finds ``t2v``). An all-tokens-must-
+    match rule means adding a word can only ever narrow, which is what makes
+    refining a search behave predictably.
+    """
+    tokens = _TEMPLATE_WORD_RE.findall(query_lower)
+    if not tokens:
+        return True
+    words = _template_words(row)
+    return all(any(word.startswith(token) for word in words) for token in tokens)
+
+
+def _unmatched_template_tokens(rows: list[dict], query_lower: str) -> list[str]:
+    """Query words that prefix NO word in any row — why a search came back empty.
+
+    A bare ``total: 0`` cannot distinguish "this capability does not exist" from
+    "one word of your query was wrong", and on a discovery tool that difference
+    decides whether an agent reports a feature missing. Naming the dead words
+    turns the retry into an obvious one.
+    """
+    tokens = _TEMPLATE_WORD_RE.findall(query_lower)
+    if not tokens:
+        return []
+    vocabulary = {word for row in rows for word in _template_words(row)}
+    return [t for t in tokens if not any(word.startswith(t) for word in vocabulary)]
 
 
 @mcp.tool()
@@ -7703,13 +8253,31 @@ def search_templates(
 
     Wraps ``comfy templates ls`` (~558 rows, narrows/pages it). Returns
     ``{"total", "shown", "offset", "rows"}`` — rows projected to
-    ``name/title/description/output_type/tags/category_title``. ``API`` in
-    ``tags`` means paid hosted; an identically-titled row without it is the
-    free local sibling — ``tags``/``category_title``, not the title, tell
-    them apart.
+    ``name/title/description/output_type/tags/category_title`` plus a derived
+    ``api`` boolean. ``API`` in ``tags`` means paid hosted — it spends the
+    signed-in account's credits, so ``run_template`` fails it CLOSED unless
+    ``confirm_spend=True`` — while ``api: false`` runs on local hardware for
+    free; an identically-titled row without the tag is the free sibling
+    (``api_minimax_h3_t2v`` vs ``video_minimax_h3_t2v``) — ``tags`` /
+    ``category_title`` / ``api``, not the title, tell them apart. ``api`` is
+    the same case-insensitive, drift-tolerant test ``exclude_api`` filters on
+    (see ``_template_is_api``), so an ``exclude_api=True`` page is all
+    ``api: false``; it is the gallery's own tag, not a graph inspection, so it
+    carries the same caveat that filter always has.
 
     Args:
         query: free-text match over name/title/description/tags/models.
+            Two passes. A PHRASE pass first — the words must appear
+            consecutively — so ``image to image`` stays img2img rather than
+            matching every ``text to image`` row. Only if that finds nothing
+            does an all-words pass run, and the reply then carries
+            ``match: "all-words"`` so a widened result is never mistaken for an
+            exact one. In the all-words pass: EVERY word must prefix a word in
+            the row, so
+            ``MiniMax Text to Video`` finds ``MiniMax H3: Text to Video``, and
+            each extra word only narrows. Word-anchored, so ``flux`` finds
+            ``flux2`` but ``ext`` does not match ``text``. When nothing matches,
+            the reply carries ``unmatched_query_words`` naming the dead words.
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
         exclude_api: drop ``API``-tagged rows.
@@ -7763,27 +8331,55 @@ def search_templates(
             "are not objects. comfy-cli's output shape may have drifted."
         )
     if exclude_api:
-        rows = [
-            r
-            for r in rows
-            if not any(
-                isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
-            )
-        ]
+        rows = [r for r in rows if not _template_is_api(r)]
+    unmatched: list[str] = []
+    relaxed = False
     if query:
         q = query.lower()
-        rows = [r for r in rows if _template_matches(r, q)]
+        candidates = rows
+        # TWO PASSES, precise first. The phrase pass keeps a multi-word query
+        # meaning what it says (`image to image` is img2img, not every
+        # `text to image` row); the token pass is what rescues the phrasings the
+        # old substring test dropped to a bare `total: 0` — a title with
+        # something in the middle (`MiniMax H3: Text to Video` for
+        # `MiniMax Text to Video`) or words the author never wrote contiguously.
+        # Falling back only when the precise pass finds NOTHING means recall is
+        # gained without ever diluting a query that already worked.
+        rows = [r for r in candidates if _template_phrase_matches(r, q)]
+        if not rows:
+            rows = [r for r in candidates if _template_matches(r, q)]
+            relaxed = bool(rows)
+        if not rows:
+            # Only computed on the empty path, where it is the whole value: a
+            # populated result needs no explanation.
+            unmatched = _unmatched_template_tokens(candidates, q)
 
     total = len(rows)
     offset = max(0, offset)
     page = rows[offset : offset + limit]
-    projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
-    return {
+    projected = [
+        {**{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS}, "api": _template_is_api(r)}
+        for r in page
+    ]
+    result = {
         "total": total,
         "shown": len(projected),
         "offset": offset,
         "rows": projected,
     }
+    if relaxed:
+        # Say so rather than silently widening: these rows contain every query
+        # word but not as the phrase that was typed, which is worth knowing
+        # before picking one.
+        result["match"] = "all-words"
+    if unmatched:
+        result["unmatched_query_words"] = unmatched
+        result["hint"] = (
+            f"No template matched every word. These matched nothing in the gallery: "
+            f"{', '.join(unmatched)}. Drop or reword them and search again — all "
+            "query words must match, so each extra word only narrows the result."
+        )
+    return result
 
 
 # Cap on how many validator findings ride back in a template's `local_check` —
@@ -9856,6 +10452,78 @@ def validate_workflow(workflow_path: str) -> Any:
     return _relayed_validation_report(report)
 
 
+def _slot_pairing_is_broken(slot: Any) -> bool:
+    """True when a slot's declared TYPE contradicts the value sitting in it.
+
+    Detects `comfy workflow slots` mis-pairing names onto values. comfy-cli zips
+    a node's input names (from ``object_info``) positionally against its
+    ``widgets_values``, so a node whose ``object_info`` under-reports its inputs
+    shifts every later pairing. Observed on the dynamic-combo partner nodes as a
+    class — ``MinimaxHailuo03TextToVideoNode`` exposes 3 inputs against 8
+    ``widgets_values``, which lands ``"MiniMax H3"`` in the ``INT`` slot
+    ``23.seed`` and ``"768P"`` in the ``BOOLEAN`` slot ``23.watermark``.
+
+    That is comfy-cli's bug, not this server's — reproduced with `comfy workflow
+    slots` directly, no MCP involved — and it cannot be repaired here: the true
+    pairing is not recoverable from a payload that has already lost it. What CAN
+    be done is refuse to pass it off as fact, because the failure is otherwise
+    entirely silent: ``validate_workflow`` still reports ``valid: true``, and
+    ``set_workflow_slot`` would write the user's value into the WRONG field.
+
+    Deliberately CONSERVATIVE — only flat contradictions, so a legitimate slot is
+    never flagged. A numeric string in an ``INT`` (``"42"``) and any string in a
+    ``COMBO``/``STRING`` are normal and pass.
+    """
+    if not isinstance(slot, dict):
+        return False
+    declared = str(slot.get("type") or "").upper()
+    value = slot.get("current_value")
+    if not isinstance(value, str):
+        return False
+    if declared in ("INT", "FLOAT"):
+        try:
+            float(value)
+        except ValueError:
+            return True
+    elif declared == "BOOLEAN" and value.strip().lower() not in ("true", "false"):
+        return True
+    return False
+
+
+def _flag_mispaired_slots(data: Any) -> Any:
+    """Annotate a `workflow slots` payload with any mis-paired slots it carries.
+
+    Additive: every original slot is relayed untouched, so nothing an agent
+    already reads disappears. The flag is what turns a silent wrong answer into a
+    visible suspect one.
+    """
+    if not isinstance(data, dict):
+        return data
+    slots = data.get("slots")
+    if not isinstance(slots, list):
+        return data
+    suspect = [
+        str(s.get("address"))
+        for s in slots
+        if isinstance(s, dict) and _slot_pairing_is_broken(s)
+    ]
+    if not suspect:
+        return data
+    for slot in slots:
+        if isinstance(slot, dict) and _slot_pairing_is_broken(slot):
+            slot["pairing_suspect"] = True
+    data["suspect_slots"] = suspect
+    data["warning"] = (
+        f"{len(suspect)} slot(s) hold a value that contradicts their declared type: "
+        f"{', '.join(suspect)}. comfy-cli pairs slot names onto values positionally, "
+        "and a node whose object_info under-reports its inputs shifts every later "
+        "pairing — so these names and values do NOT belong together. Do not set them: "
+        "the write would land in a different field. Edit the workflow JSON directly, "
+        "or use a template without dynamic-combo partner nodes."
+    )
+    return data
+
+
 @mcp.tool()
 def list_workflow_slots(workflow_path: str) -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
@@ -9877,7 +10545,8 @@ def list_workflow_slots(workflow_path: str) -> Any:
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
     argv._guard_workflow_path(workflow_path, frontend=True)
-    return _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    data = _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    return _flag_mispaired_slots(data)
 
 
 @mcp.tool()
@@ -10004,6 +10673,48 @@ def set_workflow_slot(
         )
         argv._reject_nul("override", o)
         rendered.append(o)
+    # REFUSE to write into a slot whose name and value were mis-paired upstream.
+    # This is the half of the mis-pairing bug that actually destroys data: the
+    # write itself "succeeds", `applied` names the address the caller asked for,
+    # and the value silently lands in a DIFFERENT field of the node — with
+    # `validate_workflow` still reporting `valid: true` afterwards. Reading the
+    # slots back (the obvious check) shows the address the caller named, so
+    # nothing looks wrong. Failing closed here is the only point where it can be
+    # caught, and one extra `workflow slots` call is cheap next to a corrupted
+    # workflow. Best-effort: a probe that cannot run must not block a write that
+    # would otherwise be fine, so any failure to inspect falls through.
+    #
+    # COST, accepted deliberately: this doubles the child processes for every
+    # slot write, including the overwhelmingly common clean case. One extra
+    # `workflow slots` is cheap next to silently writing a user's value into the
+    # wrong field of their graph — a corruption that reports success, leaves
+    # `validate_workflow` reporting valid: true, and survives the obvious
+    # read-back check. If the probe ever shows up in a profile, cache it per
+    # (path, mtime) rather than dropping it.
+    # The probe is suppressed; the REFUSAL is raised outside it. Raising inside
+    # the `suppress` would have it swallow its own exception and write anyway —
+    # turning the guard into a no-op that still costs a subprocess.
+    targeted: list[str] = []
+    with contextlib.suppress(Exception):
+        probe = _flag_mispaired_slots(
+            _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+        )
+        if isinstance(probe, dict):
+            suspect = {str(a) for a in probe.get("suspect_slots") or []}
+            targeted = sorted(
+                a for a in suspect if any(r.startswith(f"{a}=") for r in rendered)
+            )
+    if targeted:
+        raise ComfyCliError(
+            f"refusing to set {', '.join(targeted)}: comfy-cli reports these "
+            "slots with a value that contradicts their declared type, which "
+            "means their names were paired onto the wrong values (positional "
+            "zip against a node whose object_info under-reports its inputs). "
+            "The write would land in a different field and validate_workflow "
+            "would still say valid: true. Edit the workflow JSON directly, or "
+            "use a template without dynamic-combo partner nodes. "
+            "list_workflow_slots names every affected slot."
+        )
     args = ["workflow", "set-slot", workflow_path, *rendered]
     if stdout:
         args.append("--stdout")

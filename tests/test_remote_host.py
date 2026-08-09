@@ -285,13 +285,13 @@ def test_run_template_forwards_host_port_into_subcommand(patched_run, monkeypatc
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
     calls = patched_run(envelope(data={"prompt_id": "p1"}))
 
-    server._run_comfy("run-template", "default", "--async")
+    server._run_comfy("run-template", "image_z_image_turbo", "--async")
 
     cmd = calls[0]["cmd"]
     assert cmd[1:4] == ["--json", "--where", "local"]  # global prefix unchanged
     assert cmd[4:] == [
         "run-template",
-        "default",
+        "image_z_image_turbo",
         "--async",
         "--host",
         "gpu.example",
@@ -316,8 +316,8 @@ def test_generate_image_submit_forwards_host_port(patched_run, monkeypatch):
     assert result == {"prompt_id": "p1"}
     assert calls[0]["cmd"][4:] == [
         "run-template",
-        "default",
-        '--param=6.text="a red fox in snow"',
+        "image_z_image_turbo",
+        '--param=57.text="a red fox in snow"',
         "--timeout=60",
         "--async",
         "--host",
@@ -440,8 +440,8 @@ def test_run_template_local_default_is_byte_identical(patched_run):
 
     assert calls[0]["cmd"][4:] == [
         "run-template",
-        "default",
-        '--param=6.text="a cat"',
+        "image_z_image_turbo",
+        '--param=57.text="a cat"',
         "--timeout=60",
         "--async",
     ]
@@ -667,8 +667,8 @@ def test_generate_image_stream_forwards_host_port(patched_stream, monkeypatch):
     assert cmd[1:4] == ["--json-stream", "--where", "local"]  # global prefix unchanged
     assert cmd[4:] == [
         "run-template",
-        "default",
-        '--param=6.text="a cat"',
+        "image_z_image_turbo",
+        '--param=57.text="a cat"',
         "--timeout=120",
         "--host",
         "gpu.example",

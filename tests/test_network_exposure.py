@@ -32,6 +32,7 @@ comfy-cli is mocked throughout: no real ComfyUI is ever launched.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 from conftest import envelope
@@ -557,3 +558,106 @@ def test_prompt_and_refusal_do_not_overstate_what_the_detector_knows(
     message = str(excinfo.value)
     assert "could not confirm" in message
     assert "may bind" in message
+
+
+# --- QA 0.8.0: a refusal nobody made ----------------------------------------
+# Four gates reported "the user declined ..." in sessions where no prompt was
+# ever displayed. Failing closed was correct; naming a human refusal was not —
+# it sends the reader to argue with a user who was never asked, and hides that
+# the CLIENT is what needs fixing.
+
+
+def test_cancelled_elicitation_does_not_claim_the_user_declined():
+    """A cancelled/auto-answered prompt is not a decision by anyone."""
+    ctx = _FakeCtx(action="cancel")
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    message = str(exc.value)
+    assert "did not present the confirmation prompt" in message
+    assert "nobody was asked" in message
+    # The specific lie this guards against.
+    assert "declined" not in message
+    # Still fails closed.
+    assert "not confirmed" in message
+
+
+def test_declined_elicitation_still_says_the_user_declined():
+    """An actual decline keeps the accurate wording — the fix is not a blanket rename."""
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    assert "declined" in str(exc.value)
+
+
+# --- Operator pre-authorization (COMFY_MCP_ASSUME_CONSENT) --------------------
+# The clients agents actually run under answer the elicitation WITHOUT rendering
+# a prompt, so five gated tools were unusable. This lets the human who CONFIGURED
+# the server pre-authorize specific gates out-of-band. The agent cannot set an
+# environment variable, which is what keeps this from becoming self-consent.
+
+
+def test_preauthorized_gate_skips_the_prompt(monkeypatch):
+    """A named gate proceeds without contacting the client at all."""
+    monkeypatch.setenv("COMFY_MCP_ASSUME_CONSENT", "network_exposure")
+    ctx = _FakeCtx(action="cancel")  # would fail closed if it were asked
+
+    # Whether the launch itself then succeeds is not what this asserts (no CLI is
+    # mocked here); the property is that the GATE let it through without ever
+    # contacting the client.
+    with contextlib.suppress(server.ComfyCliError):
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    assert ctx.elicitations == []
+
+
+def test_unnamed_gate_still_asks(monkeypatch):
+    """Authorizing one gate does not authorize another."""
+    monkeypatch.setenv("COMFY_MCP_ASSUME_CONSENT", "install_node")
+    ctx = _FakeCtx(action="cancel")
+
+    with pytest.raises(server.ComfyCliError):
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    assert ctx.elicitations != []
+
+
+def test_spend_can_never_be_preauthorized_even_by_all(monkeypatch):
+    """`all` must not reach the money gates.
+
+    The spend wordings carry no `consent_token`, so no value of the variable can
+    match them. Money keeps ONE owner — comfy-cli's own durable
+    `comfy generate consent always` — rather than two mechanisms that can drift.
+    """
+    monkeypatch.setenv("COMFY_MCP_ASSUME_CONSENT", "all")
+
+    assert server._is_preauthorized(server._SPEND_APPROVAL_WORDING) is False
+    assert server._is_preauthorized(server._OPTIN_SPEND_APPROVAL_WORDING) is False
+    # While a non-spend gate IS covered by "all".
+    assert server._is_preauthorized(server._NETWORK_APPROVAL_WORDING) is True
+
+
+def test_unset_variable_changes_nothing(monkeypatch):
+    """Default posture is unchanged: every gate still prompts."""
+    monkeypatch.delenv("COMFY_MCP_ASSUME_CONSENT", raising=False)
+
+    for wording in (
+        server._NETWORK_APPROVAL_WORDING,
+        server._UPDATE_ALL_APPROVAL_WORDING,
+        server._SWITCH_APPROVAL_WORDING,
+        server._INSTALL_APPROVAL_WORDING,
+        server._SPEND_APPROVAL_WORDING,
+    ):
+        assert server._is_preauthorized(wording) is False
+
+
+def test_token_parsing_tolerates_spacing_and_case(monkeypatch):
+    """An operator hand-editing mcp.json should not be caught by whitespace."""
+    monkeypatch.setenv("COMFY_MCP_ASSUME_CONSENT", " Install_Node , version_switch ")
+
+    assert server._is_preauthorized(server._INSTALL_APPROVAL_WORDING) is True
+    assert server._is_preauthorized(server._SWITCH_APPROVAL_WORDING) is True
+    assert server._is_preauthorized(server._NETWORK_APPROVAL_WORDING) is False
