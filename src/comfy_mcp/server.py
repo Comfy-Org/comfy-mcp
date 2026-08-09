@@ -8534,6 +8534,53 @@ def _clean_finding_text(value: Any) -> str:
     return failure_log._scrub_text(str(value))[: errors._MAX_ERROR_FIELD_CHARS]
 
 
+# Findings whose fix is DOWNLOADING A FILE, not upgrading software. comfy-cli
+# emits `no_options_available` when a node's file-picker input has no installed
+# options — a missing checkpoint/LoRA/VAE.
+_MISSING_WEIGHT_CODES = frozenset({"no_options_available"})
+
+
+def _local_check_remedy(findings: list[Any]) -> str:
+    """Advice matched to WHY the template will not run.
+
+    This used to be one hardcoded sentence for every invalid template: "a
+    template served from the gallery can be newer than your install. Update
+    ComfyUI and its custom nodes (`update_comfyui`)". For a missing WEIGHT that
+    is wrong and expensive — no amount of updating ComfyUI produces
+    `sd_xl_base_1.0.safetensors`, and it sends a first-time user into a heavy
+    upgrade instead of a download. It also contradicted comfy-cli, which had
+    already returned the right hint on the identical finding and which
+    `validate_workflow` relays correctly.
+
+    Two independent QA passes reported it from opposite directions (a first-run
+    user following the documented on-ramp, and an error-quality audit), which is
+    what makes it worth branching rather than softening the wording.
+
+    The finding codes are already in hand, so use them.
+    """
+    codes = {str((f or {}).get("code") or "") for f in findings if isinstance(f, dict)}
+    missing_weights = bool(codes & _MISSING_WEIGHT_CODES)
+    other = bool(codes - _MISSING_WEIGHT_CODES)
+    if missing_weights and not other:
+        return (
+            "this template needs model files your install does not have. Fetch "
+            "them with `download_model` (`search_models` shows what is already "
+            "installed) — updating ComfyUI will not produce them."
+        )
+    if missing_weights and other:
+        return (
+            "this template needs BOTH model files and node classes/options your "
+            "install lacks. Fetch the weights with `download_model`, and update "
+            "ComfyUI and its custom nodes (`update_comfyui`) for the rest."
+        )
+    return (
+        "this template needs a node class or an input option your ComfyUI "
+        "install does not have — a template served from the gallery can be "
+        "newer than your install. Update ComfyUI and its custom nodes "
+        "(`update_comfyui`), or pick another template."
+    )
+
+
 def _finding_line(finding: Any) -> str:
     """Render one validator error/warning as a single readable clause.
 
@@ -8641,18 +8688,15 @@ def _local_template_check(workflow_path: str) -> dict:
             "your ComfyUI install. A clean check is necessary, not sufficient — "
             "see `validate_workflow` for what it cannot see."
         )
+    elif validation_errors:
+        summary = (
+            f"{len(validation_errors)} problem(s): {_local_check_remedy(validation_errors)} "
+            f"First: {_finding_line(validation_errors[0])}"
+        )
     else:
         summary = (
-            f"{len(validation_errors)} problem(s): this template needs a node "
-            "class or an input option your ComfyUI install does not have — a "
-            "template served from the gallery can be newer than your install. "
-            "Update ComfyUI and its custom nodes (`update_comfyui`), or pick "
-            f"another template. First: {_finding_line(validation_errors[0])}"
-            if validation_errors
-            else (
-                "this template did not validate against your ComfyUI install, "
-                "though comfy-cli listed no specific problem."
-            )
+            "this template did not validate against your ComfyUI install, "
+            "though comfy-cli listed no specific problem."
         )
 
     check = {

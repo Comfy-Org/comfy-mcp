@@ -903,3 +903,46 @@ def test_the_fallback_still_rescues_a_phrasing_miss(monkeypatch):
 
     assert _names(result) == ["video_minimax_h3_t2v"]
     assert result["match"] == "all-words"
+
+
+# --- local_check advice must match the actual failure ------------------------
+# Two independent QA passes reported the same thing from opposite directions: a
+# first-run user following the documented on-ramp, and an error-quality audit.
+# A missing WEIGHT was being answered with "update ComfyUI", which is both wrong
+# and expensive — and it contradicted comfy-cli's own hint on the same finding.
+
+
+def _remedy(codes):
+    return server._local_check_remedy([{"code": c} for c in codes])
+
+
+def test_missing_weights_are_answered_with_download_not_update():
+    remedy = _remedy(["no_options_available", "no_options_available"])
+
+    assert "download_model" in remedy
+    # The expensive wrong turn must not be suggested at all.
+    assert "update_comfyui" not in remedy
+    # And it says why, so the user does not go looking for an upgrade anyway.
+    assert "will not produce them" in remedy
+
+
+def test_missing_node_classes_still_recommend_updating():
+    remedy = _remedy(["unknown_class_type"])
+
+    assert "update_comfyui" in remedy
+    assert "download_model" not in remedy
+
+
+def test_a_mixed_failure_names_both_fixes():
+    remedy = _remedy(["no_options_available", "unknown_class_type"])
+
+    assert "download_model" in remedy
+    assert "update_comfyui" in remedy
+
+
+def test_an_unrecognized_code_keeps_the_conservative_advice():
+    """Unknown codes must not silently become 'download a model'."""
+    remedy = _remedy(["something_new_upstream"])
+
+    assert "update_comfyui" in remedy
+    assert "download_model" not in remedy
