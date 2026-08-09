@@ -5995,3 +5995,59 @@ def test_detached_head_message_reaches_the_caller(patched_run):
     assert "returned no JSON" not in msg
     # Git's own words are still there rather than replaced.
     assert "not currently on a branch" in msg
+
+
+# --- comfy-cli's actionable hint was being discarded -------------------------
+# `details.errors[].hint` carries the HOW-TO-FIX half of a validation failure.
+# Only `partner_nodes` was surfaced, so the raised error told a caller what
+# broke and never how to repair it — although the fix had already been computed
+# upstream and was sitting in the envelope.
+
+
+def test_per_finding_hints_reach_the_caller():
+    rendered = server.errors._render_error_details(
+        {
+            "errors": [
+                {
+                    "code": "no_options_available",
+                    "message": "node 4: 'sd_xl_base_1.0.safetensors' is unavailable",
+                    "hint": "install it (e.g. `comfy model download`) or point "
+                    "this input at an installed file",
+                }
+            ]
+        }
+    )
+
+    assert rendered is not None
+    assert "how to fix:" in rendered
+    assert "comfy model download" in rendered
+
+
+def test_surfaced_hints_are_bounded_and_say_how_many_were_dropped():
+    """A graph can fail on many nodes; the message must not become the report."""
+    details = {"errors": [{"hint": f"fix number {i}"} for i in range(7)]}
+
+    rendered = server.errors._render_error_details(details)
+
+    assert rendered.count("fix number") == server.errors._MAX_SURFACED_HINTS
+    assert "(+4 more)" in rendered
+
+
+def test_hints_are_scrubbed_like_every_other_rendered_field():
+    """A hint quotes the offending widget value, which can carry a credential."""
+    rendered = server.errors._render_error_details(
+        {
+            "errors": [
+                {
+                    "hint": "could not fetch https://user:secret@example.com/m.safetensors"
+                }
+            ]
+        }
+    )
+
+    assert "secret" not in rendered
+
+
+def test_findings_without_hints_change_nothing():
+    assert server.errors._render_error_details({"errors": [{"code": "x"}]}) is None
+    assert server.errors._render_error_details({"errors": "not-a-list"}) is None

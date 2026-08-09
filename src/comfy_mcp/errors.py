@@ -202,6 +202,16 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
 # failure; keep the set small so a large envelope can't bloat the message.
 _SURFACED_DETAIL_KEYS = ("partner_nodes",)
 
+# How many per-finding hints ride back in the message. comfy-cli puts the
+# ACTIONABLE half of a validation failure in `details.errors[].hint` — e.g. "the
+# server has no files installed for 'ckpt_name' … install it (e.g. `comfy model
+# download`) or point this input at an installed file". Surfacing none of that
+# left the raised error carrying only the summary line, so a caller was told
+# WHAT failed and never HOW to fix it, even though the fix had already been
+# computed upstream. Bounded because a graph can fail on many nodes at once and
+# this string lands in the client's face; the first few are what a user acts on.
+_MAX_SURFACED_HINTS = 3
+
 # Per-field cap for the rendered error message (mirrors the stderr cap) so a
 # multi-KB `message`/`hint` or a huge `partner_nodes` array can't produce an
 # unbounded error string in the MCP client / logs.
@@ -228,4 +238,28 @@ def _render_error_details(details: Any) -> str | None:
             value = ", ".join(str(v) for v in value)
         rendered = failure_log._scrub_text(str(value))[:_MAX_ERROR_FIELD_CHARS]
         parts.append(f"{key}: {rendered}")
+
+    # `details.errors` is a LIST OF FINDINGS, not a scalar, so the loop above
+    # cannot reach the `hint` inside each one — which is precisely the field a
+    # caller needs. Scrubbed and capped like every other rendered field: a hint
+    # quotes the offending widget value, which can be a URL with credentials in
+    # it.
+    findings = details.get("errors")
+    if isinstance(findings, (list, tuple)):
+        hints: list[str] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            hint = finding.get("hint")
+            if not hint:
+                continue
+            hints.append(failure_log._scrub_text(str(hint))[:_MAX_ERROR_FIELD_CHARS])
+            if len(hints) == _MAX_SURFACED_HINTS:
+                break
+        if hints:
+            more = len(
+                [f for f in findings if isinstance(f, dict) and f.get("hint")]
+            ) - len(hints)
+            suffix = f" (+{more} more)" if more > 0 else ""
+            parts.append("how to fix: " + " | ".join(hints) + suffix)
     return "; ".join(parts) if parts else None
