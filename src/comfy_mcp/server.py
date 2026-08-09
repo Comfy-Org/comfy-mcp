@@ -8081,7 +8081,9 @@ def project(action: str = "status") -> Any:
 # hosted ``API`` template from its free open-source sibling, which the
 # gallery titles IDENTICALLY (e.g. two "MiniMax H3: Text to Video" rows) —
 # without them a listing steers agents to the paid route while implying no
-# free one exists.
+# free one exists. Each projected row also carries a DERIVED ``api`` boolean
+# (see ``_template_is_api``) with no source key here: the one bit of ``tags``
+# a caller can read without scanning the list itself.
 _TEMPLATE_LIST_FIELDS = (
     "name",
     "title",
@@ -8094,6 +8096,51 @@ _TEMPLATE_LIST_FIELDS = (
 # Upper bound on a single page so an oversized `limit` can't build a response
 # that trips the MCP client's tool-output cap; callers page the rest via `offset`.
 _TEMPLATE_LIST_MAX_LIMIT = 200
+
+
+def _row_str_items(row: dict, key: str) -> list[str]:
+    """The string items of a list-valued ``row`` field, tolerant of shape drift.
+
+    ``tags`` / ``models`` are free-form gallery metadata comfy-cli passes
+    through verbatim, so a drifted row can carry anything under either key. A
+    value that is not a list/tuple contributes NO items, because the two ways
+    Python would otherwise read one are both wrong: a number raises
+    ``TypeError`` mid-listing, and a bare ``"API"`` string iterates into the
+    characters ``A``/``P``/``I`` — silently answering "not an API template" for
+    a row that says it is. Every reader below runs over EVERY row of the
+    default ``search_templates()`` page, so one drifted row must not decide
+    the call.
+    """
+    value = row.get(key)
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _template_is_api(row: dict) -> bool:
+    """True if a template ``row`` carries the ``API`` tag.
+
+    An ``API`` row runs its model on a hosted partner API — it spends credits
+    and needs a key — where every other row runs on local hardware for free.
+    Case-insensitive, and tolerant of a drifted ``tags`` value (see
+    ``_row_str_items``) because it is gallery metadata comfy-cli passes through
+    verbatim — which is also why this is the gallery's CLAIM about a template,
+    not a verdict derived from its graph; deriving one here is what the
+    thin-wrapper rule forbids.
+
+    Absence of the tag is what returns False, which is not the same evidence as
+    a row that positively says it runs locally: a row with no readable ``tags``
+    at all reports False too. That is deliberate — it is the answer
+    ``exclude_api`` has always given such a row (it keeps it), and a flag that
+    disagreed with the filter that produced the page would be worse than a
+    conservative one. ``get_template(name)`` carries the full ``tags`` when a
+    row looks off.
+
+    ONE predicate with TWO readers, deliberately: ``exclude_api``'s filter and
+    the derived ``api`` flag on each projected row. Two copies of this test
+    would let the rows disagree with the filter that produced them.
+    """
+    return any(t.lower() == "api" for t in _row_str_items(row, "tags"))
 
 
 # Words, for query tokenizing and row indexing. Splitting on anything that is not
@@ -8115,9 +8162,8 @@ def _template_words(row: dict) -> list[str]:
         if isinstance(value, str):
             words += _TEMPLATE_WORD_RE.findall(value.lower())
     for key in ("tags", "models"):
-        for item in row.get(key) or []:
-            if isinstance(item, str):
-                words += _TEMPLATE_WORD_RE.findall(item.lower())
+        for item in _row_str_items(row, key):
+            words += _TEMPLATE_WORD_RE.findall(item.lower())
     return words
 
 
@@ -8207,10 +8253,17 @@ def search_templates(
 
     Wraps ``comfy templates ls`` (~558 rows, narrows/pages it). Returns
     ``{"total", "shown", "offset", "rows"}`` — rows projected to
-    ``name/title/description/output_type/tags/category_title``. ``API`` in
-    ``tags`` means paid hosted; an identically-titled row without it is the
-    free local sibling — ``tags``/``category_title``, not the title, tell
-    them apart.
+    ``name/title/description/output_type/tags/category_title`` plus a derived
+    ``api`` boolean. ``API`` in ``tags`` means paid hosted — it spends the
+    signed-in account's credits, so ``run_template`` fails it CLOSED unless
+    ``confirm_spend=True`` — while ``api: false`` runs on local hardware for
+    free; an identically-titled row without the tag is the free sibling
+    (``api_minimax_h3_t2v`` vs ``video_minimax_h3_t2v``) — ``tags`` /
+    ``category_title`` / ``api``, not the title, tell them apart. ``api`` is
+    the same case-insensitive, drift-tolerant test ``exclude_api`` filters on
+    (see ``_template_is_api``), so an ``exclude_api=True`` page is all
+    ``api: false``; it is the gallery's own tag, not a graph inspection, so it
+    carries the same caveat that filter always has.
 
     Args:
         query: free-text match over name/title/description/tags/models.
@@ -8278,13 +8331,7 @@ def search_templates(
             "are not objects. comfy-cli's output shape may have drifted."
         )
     if exclude_api:
-        rows = [
-            r
-            for r in rows
-            if not any(
-                isinstance(t, str) and t.lower() == "api" for t in r.get("tags") or []
-            )
-        ]
+        rows = [r for r in rows if not _template_is_api(r)]
     unmatched: list[str] = []
     relaxed = False
     if query:
@@ -8310,7 +8357,10 @@ def search_templates(
     total = len(rows)
     offset = max(0, offset)
     page = rows[offset : offset + limit]
-    projected = [{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS} for r in page]
+    projected = [
+        {**{k: r.get(k) for k in _TEMPLATE_LIST_FIELDS}, "api": _template_is_api(r)}
+        for r in page
+    ]
     result = {
         "total": total,
         "shown": len(projected),

@@ -127,14 +127,16 @@ def test_search_templates_argv_and_empty_query_pages(patched_run):
 
 
 def test_search_templates_compact_projection(monkeypatch):
-    """Listing rows stay slim, but carry the two paid-vs-local discriminators.
+    """Listing rows stay slim, but carry the paid-vs-local discriminators.
 
     ``tags`` and ``category_title`` are IN the projection on purpose: the
     gallery titles a paid ``API`` template and its free open-source sibling
     identically ("MiniMax H3: Text to Video", twice), so a listing without
     them left an agent unable to tell the routes apart and steered users into
-    the paid one. The heavy fields (``models``/``providers``) still live in
-    ``get_template(name)`` only.
+    the paid one. ``api`` rides alongside as a DERIVED boolean — the one bit
+    of ``tags`` a caller can read without scanning the list itself. The heavy
+    fields (``models``/``providers``) still live in ``get_template(name)``
+    only.
     """
     _patch_ls(monkeypatch)
     row = _rows(server.search_templates())[0]
@@ -145,6 +147,7 @@ def test_search_templates_compact_projection(monkeypatch):
         "output_type",
         "tags",
         "category_title",
+        "api",
     }
     assert "models" not in row and "providers" not in row
 
@@ -188,6 +191,8 @@ def test_search_templates_identical_titles_stay_distinguishable(monkeypatch):
     assert by_name["api_minimax_h3_t2v"]["tags"] == ["API"]
     assert by_name["video_minimax_h3_t2v"]["category_title"] == "Video"
     assert by_name["api_minimax_h3_t2v"]["category_title"] == "Video API"
+    assert by_name["video_minimax_h3_t2v"]["api"] is False
+    assert by_name["api_minimax_h3_t2v"]["api"] is True
     # And the free sibling is isolable without eyeballing tags at all.
     free = _rows(server.search_templates("minimax h3", exclude_api=True))
     assert [r["name"] for r in free] == ["video_minimax_h3_t2v"]
@@ -209,6 +214,103 @@ def test_instructions_carry_the_dual_route_guidance():
     # The example that motivated the bullet, so the next H3-style QA round can
     # find this guidance by searching the constant.
     assert "MiniMax H3" in flat
+
+
+def test_search_templates_rows_flag_api_templates(monkeypatch):
+    """`api` is true exactly for the API-tagged rows, matched case-insensitively.
+
+    Without it the projection stripped `tags` and two templates with identical
+    titles (`api_minimax_h3_t2v` / `video_minimax_h3_t2v` in the real gallery)
+    were indistinguishable in results — so an agent could recommend the paid one
+    while reporting no free version exists.
+    """
+    rows = [
+        {"name": "local_one", "title": "T", "output_type": "image", "tags": []},
+        {"name": "paid_upper", "title": "T", "output_type": "image", "tags": ["API"]},
+        # comfy-cli passes gallery tags through verbatim, so the case is the
+        # gallery's to choose — the same predicate `exclude_api` uses folds it.
+        {"name": "paid_lower", "title": "T", "output_type": "image", "tags": ["api"]},
+        {"name": "paid_mixed", "title": "T", "output_type": "image", "tags": ["Api"]},
+        # A row with no `tags` key at all is local, not a KeyError.
+        {"name": "no_tags", "title": "T", "output_type": "image"},
+        # `tags` present but null, and a non-string item, are both tolerated.
+        {"name": "null_tags", "title": "T", "output_type": "image", "tags": None},
+        {"name": "odd_tags", "title": "T", "output_type": "image", "tags": [None, 7]},
+        # `tags` not a LIST at all — the shapes that decide the whole call, since
+        # the flag is derived for every row of a default page. A bare string
+        # must NOT iterate into its characters (`"API"` -> `A`/`P`/`I`, each a
+        # str, none equal to "api" — an accidental False on a row that says
+        # otherwise), and a number must not raise TypeError mid-listing.
+        {"name": "str_tags", "title": "T", "output_type": "image", "tags": "API"},
+        {"name": "num_tags", "title": "T", "output_type": "image", "tags": 7},
+        {"name": "bool_tags", "title": "T", "output_type": "image", "tags": True},
+        {"name": "dict_tags", "title": "T", "output_type": "image", "tags": {"api": 1}},
+        # A tuple IS a sequence of tags — tolerated, not drift.
+        {"name": "tuple_tags", "title": "T", "output_type": "image", "tags": ("API",)},
+    ]
+    _patch_ls(monkeypatch, rows)
+
+    flags = {r["name"]: r["api"] for r in _rows(server.search_templates())}
+    assert flags == {
+        "local_one": False,
+        "paid_upper": True,
+        "paid_lower": True,
+        "paid_mixed": True,
+        "no_tags": False,
+        "null_tags": False,
+        "odd_tags": False,
+        # Undecodable `tags` report False — the same answer `exclude_api` gives
+        # such a row (it keeps it), so the flag can never contradict the filter.
+        # The point is that the call SURVIVES them, not that False is evidence
+        # the template is free; `get_template(name)` has the real `tags`.
+        "str_tags": False,
+        "num_tags": False,
+        "bool_tags": False,
+        "dict_tags": False,
+        "tuple_tags": True,
+    }
+    assert all(isinstance(v, bool) for v in flags.values())
+
+
+def test_search_templates_exclude_api_page_is_all_api_false(monkeypatch):
+    """The flag and the filter read the same tag, so they can never disagree.
+
+    `exclude_api=True` drops the API rows; whatever survives must therefore
+    report `api: false`. A second copy of the tag test is what would let these
+    two drift apart.
+    """
+    _patch_ls(monkeypatch)
+    kept = _rows(server.search_templates(exclude_api=True))
+    assert kept and all(r["api"] is False for r in kept)
+
+
+def test_search_templates_survives_a_drifted_tags_value_on_every_path(monkeypatch):
+    """A row with a non-list `tags` cannot take down a listing, a filter or a query.
+
+    Three readers walk `tags`: the projected `api` flag (every default call),
+    `exclude_api`'s filter, and `_template_matches`' free-text search — which
+    also walks `models`. All three go through one drift-tolerant accessor, so a
+    single junk row degrades to "no tags on this row" instead of raising
+    `TypeError` and failing the whole call for the 557 good rows beside it.
+    """
+    rows = [
+        {"name": "good", "title": "Good", "output_type": "image", "tags": ["API"]},
+        {
+            "name": "junk",
+            "title": "Junk",
+            "output_type": "image",
+            "tags": 7,
+            "models": 9,
+        },
+    ]
+    _patch_ls(monkeypatch, rows)
+
+    assert _names(server.search_templates()) == ["good", "junk"]
+    assert _names(server.search_templates(exclude_api=True)) == ["junk"]
+    # The query still matches on the fields that ARE readable (name/title), and
+    # a tags/models-only query simply misses the junk row rather than raising.
+    assert _names(server.search_templates(query="junk")) == ["junk"]
+    assert _names(server.search_templates(query="API")) == ["good"]
 
 
 def test_search_templates_query_narrows_reported_cases(monkeypatch):
@@ -291,6 +393,11 @@ def test_search_templates_exclude_api(monkeypatch):
     assert "flux_i2i" not in names and "seedream_5" not in names
     assert set(names) == {"image_to_image", "basic_txt2img", "clip_maker"}
     assert kept["total"] == 3
+
+    # The fixture tags are upper-case; a lower-case one drops just the same.
+    lowered = [dict(r, tags=[t.lower() for t in r["tags"]]) for r in ROWS]
+    _patch_ls(monkeypatch, lowered)
+    assert set(_names(server.search_templates(exclude_api=True))) == set(names)
 
 
 def test_search_templates_bad_shape_raises(monkeypatch):
