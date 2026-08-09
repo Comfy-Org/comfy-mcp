@@ -19,6 +19,7 @@ Built on the [Model Context Protocol](https://modelcontextprotocol.io) and
 <p>
   <a href="https://github.com/Comfy-Org/comfy-mcp/actions/workflows/ci.yml"><img src="https://github.com/Comfy-Org/comfy-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Comfy-Org/comfy-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/Comfy-Org/comfy-mcp" alt="Release"></a>
+  <a href="https://pypi.org/project/comfy-mcp/"><img src="https://img.shields.io/pypi/v/comfy-mcp" alt="PyPI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later%20OR%20Commercial-blue.svg" alt="License: AGPL-3.0-or-later OR Commercial"></a>
 </p>
 
@@ -42,7 +43,7 @@ anywhere else to pick one.
 
 |  | **Cloud connection** | **Local connection** |
 |---|---|---|
-| What it is | Hosted MCP at `https://cloud.comfy.org/mcp` | **This repo** — an open-source server you run |
+| What it is | Hosted MCP at `https://cloud.comfy.org/mcp` | **This repo** — an open-source server you run (`pip install comfy-mcp`) |
 | Transport | Remote HTTP; nothing to install | stdio; your client launches it as a subprocess |
 | Runs on | Comfy Cloud GPUs | Your machine, or a ComfyUI you host |
 | Needs ComfyUI | No | Yes, your own |
@@ -128,10 +129,11 @@ Four steps take you from a fresh install to your first generated image.
    pip install comfy-mcp          # this MCP server → the `comfy-mcp` command
    ```
 
-   `pip install comfy-mcp` puts a `comfy-mcp` console script on your `PATH`; that command is
-   what you point your AI client at in step 3. (Contributing, or working from a checkout?
-   `pip install .` there, or `pip install -e .` for a working copy.) (A dedicated venv is fine — MCP clients may not see that
-   venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
+   [`comfy-mcp` is on PyPI](https://pypi.org/project/comfy-mcp/), so no checkout is needed —
+   installing from a clone (`pip install -e .`) is only for hacking on the server itself. The
+   install puts a `comfy-mcp` console script on your `PATH`; that command is what you point your
+   AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that venv's
+   `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
 
    > Installed this server back when it was called `comfy-local-mcp`? Do
    > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — installing
@@ -171,9 +173,10 @@ the originals stay in the ComfyUI workspace.
 <summary>Renamed from <code>comfy-local-mcp</code> — the four things that moved and how to finish the migration</summary>
 
 This server used to be called **`comfy-local-mcp`**. It was never published to PyPI under that
-name, so this only affects you if you installed it from a source checkout — but for those installs
-the rename is **not** something installing `comfy-mcp` finishes on its own, because `comfy-mcp` is a
-*different distribution*, not a new version of the old one. Four things moved:
+name ([PyPI has only `comfy-mcp`](https://pypi.org/project/comfy-mcp/)), so this only affects you
+if you installed it from a source checkout — but for those installs the rename is **not**
+something `pip install comfy-mcp` finishes on its own, because `comfy-mcp` is a *different
+distribution*, not a new version of the old one. Four things moved:
 
 | Was | Is now |
 | --- | --- |
@@ -188,7 +191,7 @@ the rename is **not** something installing `comfy-mcp` finishes on its own, beca
    `ModuleNotFoundError`:
 
    ```bash
-   pip uninstall comfy-local-mcp   # then: pip install comfy-mcp   (or `pip install .` from a checkout)
+   pip uninstall comfy-local-mcp   # then: pip install comfy-mcp
    ```
 
 2. **Change `"command"` to `comfy-mcp`** in every MCP client config that starts this server
