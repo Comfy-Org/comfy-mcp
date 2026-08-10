@@ -8947,7 +8947,11 @@ def nodes(
     Wraps the `comfy nodes` family (`object_info`, incl. custom nodes).
     `action`:
     - "search" (default) -> `nodes search <query>`: find a class name by
-      keyword (e.g. "KSampler", "load image").
+      keyword. Case-insensitive, word-order-independent token match over
+      name/display/category/description ("ksampler advanced", "image
+      load"); zero hits fall back to close NAMES ("KSampeler" -> KSampler)
+      flagged `close_match: true` — guesses, not matches. Needs comfy-cli
+      1.14.0+, this server's floor; below it the query was one substring.
     - "get" -> `nodes show <name>`: one class's full input/output schema.
     - "list" -> `nodes ls [--produces/--accepts/--category/--pack/--label]`:
       filtered browse; bare call lists all.
@@ -9538,9 +9542,15 @@ def search_models(query: str = "", folder: str = "") -> Any:
     """Search / list model files available to the LOCAL ComfyUI install.
 
     Three modes: ``query`` -> ``comfy models search --text <query>``
-    (filename substring, all folders on v1.14.0+, ``checkpoints`` only below
-    the floor); else ``folder`` -> ``comfy models list-folder <folder>``;
-    else -> ``comfy models list-folders`` (folder names).
+    (filename match, all folders on v1.14.0+, ``checkpoints`` only below the
+    floor); else ``folder`` -> ``comfy models list-folder <folder>``; else ->
+    ``comfy models list-folders`` (folder names).
+
+    ``query`` tokens match word-order-independently and ignore ``-`` ``_``
+    ``.`` separators, so "sdxl base" finds ``sd_xl_base_1.0.safetensors``.
+    That needs a comfy-cli NEWER than v1.15.0 (Comfy-Org/comfy-cli#684,
+    merged after v1.15.0 was cut); on v1.15.0 and older the whole query is
+    one substring, so search a single word there.
 
     RESPONSE SHAPE DIFFERS BY MODE: ``query`` returns ``{rows: [...]}``,
     ``folder`` returns ``{files: [...]}``. Filenames only — no base-model/
@@ -9560,7 +9570,7 @@ def search_models(query: str = "", folder: str = "") -> Any:
     if query:
         # NUL only — deliberately NO `argv._reject_option_like` here, unlike the other
         # option values this module guards for hygiene. `--text` is a free-form
-        # substring match over model FILENAMES, and a leading dash is legitimate
+        # match over model FILENAMES, and a leading dash is legitimate
         # data in that position: the `-fp16` / `-fp8` / `-turbo` suffixes are
         # ordinary in model filenames, so `query="-fp16"` is a real search that
         # matches real rows. Click takes the token after a value-taking option
