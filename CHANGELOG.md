@@ -38,6 +38,25 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   comfy-cli 1.15.0 and 1.16.0 both shipped fixes to verbs called here without
   warranting a move.
 
+### Known issues from 0.9.0 — two now fixed upstream
+
+comfy-cli 1.16.0 resolves two of the three upstream defects 0.9.0 shipped with.
+Upgrade the engine (`pip install --upgrade comfy-cli`) to pick them up: this
+server needs no change, and its floor is deliberately unmoved, so an install
+below 1.16.0 keeps working with the old behaviour rather than being refused.
+
+- **Progress streaming works.** `comfy jobs watch` delivered a single envelope
+  at the end claiming no nodes had run, because it connected under a fresh
+  client id and a local ComfyUI addresses execution events only to the session
+  that submitted the prompt. It now attaches as the submitter and streams live
+  progress.
+- **`nodes(action="path")` respects `from_type` and `max_depth`**, and claims
+  `"exact": true` only when the search actually finished. It previously
+  returned identical rows for unrelated source types while reporting the answer
+  as exact.
+- **Still open:** the slot mis-pairing originating in `comfy workflow slots`.
+  This server continues to detect and refuse it, but cannot repair the pairing.
+
 ## 0.9.0
 
 Seven P1 defects found by two independent QA passes (Claude Code and Codex CLI).
