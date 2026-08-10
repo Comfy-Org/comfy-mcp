@@ -882,7 +882,18 @@ def test_nodes_reject_embedded_nul(monkeypatch):
             call()
 
 
-# --- tool docstring budget (<=300 est. tokens) ------------------------------
+# --- tool docstring budget (<=375 est. tokens) ------------------------------
+#
+# Raised 300 -> 375 when the "search" bullet gained `nodes search`'s matching
+# semantics (case-insensitive, word-order-independent token match; close-name
+# fallback). That is not decoration: the docstring IS the tool description an
+# agent reads, and without it an agent composes single-word queries and reads
+# a `close_match` guess as a real hit. Measured ~365 after the edit; the
+# ceiling sits just above so ordinary rewording never trips it while real
+# growth does. Ratchet DOWN if this bullet list is trimmed; never bump without
+# saying why in the same PR. The whole-server ceiling in
+# `test_payload_budget.py` is the other half of this guard and was NOT raised.
+_NODES_DOC_BUDGET_TOKENS = 375
 
 
 def test_nodes_tool_docstring_within_its_own_token_budget():
@@ -892,7 +903,9 @@ def test_nodes_tool_docstring_within_its_own_token_budget():
             doc = ast.get_docstring(node)
             assert doc is not None
             est_tokens = len(doc) // 4
-            assert est_tokens <= 300, f"nodes() docstring ~{est_tokens} est. tokens"
+            assert est_tokens <= _NODES_DOC_BUDGET_TOKENS, (
+                f"nodes() docstring ~{est_tokens} est. tokens"
+            )
             return
     pytest.fail("nodes() tool not found in server.py")
 
