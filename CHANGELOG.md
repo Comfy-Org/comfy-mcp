@@ -7,6 +7,56 @@ behaviour changes, even though that would be a major bump after 1.0 — while th
 project is pre-1.0, minor is the strongest signal available, so read it as
 "check the notes before upgrading".
 
+## 0.10.0
+
+`search_templates` rows can now tell a paid template from a free one.
+
+### Added
+
+- **An `api` boolean on every `search_templates` row.** The gallery's `API` tag
+  — the one meaning "this template runs the model on a hosted partner API and
+  spends your credits" — was dropped on the way out. Two templates can carry
+  the same title and differ only by that tag (`api_minimax_h3_t2v` vs
+  `video_minimax_h3_t2v`), so an agent reading the results could not tell them
+  apart, and would recommend the paid one while saying no free version existed.
+  Each row now carries a plain `api: true`/`false`, derived with the exact tag
+  test `exclude_api` already used and factored into one shared helper so the
+  flag and the filter cannot drift apart. The raw `tags` list stays out of the
+  rows, so the listing is as compact as before. This is additive — a caller
+  ignoring the field sees no change — but it is a response-shape change, hence
+  the minor bump.
+
+### Documentation
+
+- The tokenized matching semantics that `nodes` and `search_models` inherit
+  from comfy-cli are now documented, so a caller knows how a multi-word query
+  is matched instead of inferring it from results.
+- The comfy-cli floor's rationale records that its cheap-to-raise precedent
+  expired once this server began publishing to PyPI: the guard refuses up front
+  in `_run_comfy` rather than degrading per verb, so a raise is a breaking
+  change for anyone below the new floor. The floor itself stays at 1.14.0 —
+  comfy-cli 1.15.0 and 1.16.0 both shipped fixes to verbs called here without
+  warranting a move.
+
+### Known issues from 0.9.0 — two now fixed upstream
+
+comfy-cli 1.16.0 resolves two of the three upstream defects 0.9.0 shipped with.
+Upgrade the engine (`pip install --upgrade comfy-cli`) to pick them up: this
+server needs no change, and its floor is deliberately unmoved, so an install
+below 1.16.0 keeps working with the old behaviour rather than being refused.
+
+- **Progress streaming works.** `comfy jobs watch` delivered a single envelope
+  at the end claiming no nodes had run, because it connected under a fresh
+  client id and a local ComfyUI addresses execution events only to the session
+  that submitted the prompt. It now attaches as the submitter and streams live
+  progress.
+- **`nodes(action="path")` respects `from_type` and `max_depth`**, and claims
+  `"exact": true` only when the search actually finished. It previously
+  returned identical rows for unrelated source types while reporting the answer
+  as exact.
+- **Still open:** the slot mis-pairing originating in `comfy workflow slots`.
+  This server continues to detect and refuse it, but cannot repair the pairing.
+
 ## 0.9.0
 
 Seven P1 defects found by two independent QA passes (Claude Code and Codex CLI).
