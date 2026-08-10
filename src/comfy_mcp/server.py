@@ -286,10 +286,17 @@ _STREAM_LINE_LIMIT = 1024 * 1024
 # walk, the `templates` gallery cache TTL, and `comfy run`'s `--allow-spend`
 # interlock.
 #
-# Why that raise was cheap, as precedent for the next one: this server is
-# pre-launch (private repo, not published to PyPI), so ~nobody is pinned to the
-# previous release — a floor is only cheap to raise BEFORE you have users. And on
-# 1.13.0 enough of the tool surface is inert that the server reads as BROKEN
+# Why that raise was cheap — and why the next one is NOT. At the time this server
+# was pre-launch (private repo, nothing on PyPI), so ~nobody could be pinned to the
+# previous release, and a floor is only cheap to raise BEFORE you have users. That
+# window has CLOSED: comfy-mcp publishes to PyPI as of 0.9.0, so an installed base
+# exists and a raise is a BREAKING change for anyone below the new floor — this
+# guard refuses up front in `_run_comfy`, it does not degrade per verb. Raise it
+# only for a verb or option this tool surface actually CALLS and cannot degrade
+# around (the 1.14.0 rationale above), never because a newer comfy-cli merely
+# exists: 1.15.0 and 1.16.0 both shipped fixes to verbs called here — restored
+# cloud-job error text, live `jobs watch` progress — and neither moved this floor.
+# And on 1.13.0 enough of the tool surface is inert that the server reads as BROKEN
 # rather than as out-of-date, which is a worse first contact than a clear
 # "upgrade comfy-cli" refusal.
 #
