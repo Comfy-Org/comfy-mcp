@@ -198,18 +198,14 @@ through these steps IN ORDER — a later step never overrides an earlier one:
   and rounding a 6 GB slice of an A100 up into the `>= 24 GB` band will OOM
   the run. Trust the reported figure whenever the gap is wider than ~10%.
   On Apple Silicon (`gpu.vendor` Apple) `gpu.vram_bytes` is null and
-  `gpu.unified_memory` is true. Do NOT substitute `ram_bytes`: that shape
-  IDENTIFIES the machine rather than sizing it — STEP 4's Apple row is
-  unconditional, so the figure changes no verdict. That short-circuit is
-  APPLE-ONLY; a null `vram_bytes` on any other GPU is UNKNOWN (step 3),
-  never a cue to read RAM instead.
+  `gpu.unified_memory` is true — use `ram_bytes` instead. That substitution
+  is APPLE-ONLY.
 - STEP 3, if the figure you need is missing, ASK. `hardware` absent (older
-  comfy-cli), `gpu` null or absent, or `vram_bytes` null or zero on ANY
+  comfy-cli), `gpu` null or absent, `vram_bytes` null or zero on ANY
   non-Apple GPU (including a non-Apple unified-memory part such as a
-  Jetson/Grace board or a Strix Halo APU): every one of these is UNKNOWN,
-  NOT "no GPU". An Apple Silicon machine never reaches
-  this step for a memory figure — STEP 4 answers it without one. Ask the
-  user what GPU and how much VRAM/RAM they have and route on their answer —
+  Jetson/Grace board or a Strix Halo APU), or `ram_bytes` missing or zero on
+  the Apple path: every one of these is UNKNOWN, NOT "no GPU". Ask the user
+  what GPU and how much VRAM/RAM they have and route on their answer —
   never strand a usable GPU behind an UNKNOWN, and do not shell out to
   probe the hardware yourself: this server can neither bound nor audit a
   command it did not run.
@@ -217,18 +213,15 @@ through these steps IN ORDER — a later step never overrides an earlier one:
   a ROCm/XPU build), by VRAM: >= 24 GB, local generation is a good default;
   8 GB to under 24 GB, images are fine (prefer current, smaller models) but
   expect video to be slow or infeasible; under 8 GB, do NOT run local
-  diffusion. Apple Silicon: do NOT run local diffusion, at ANY memory size —
-  recommend cloud. That row is unconditional and needs no figure: current
-  image and video models are too large to run at a workable speed on the
-  Apple GPU. It is an APPLE-GPU rule, not a Mac rule — an Intel Mac with a
-  discrete card follows the VRAM bands above. A non-Apple INTEGRATED
+  diffusion. Apple Silicon, by unified memory: >= 32 GB, image generation is
+  OK; under 32 GB, treat it as the no-GPU verdict. A non-Apple INTEGRATED
   GPU that reports a real `vram_bytes` routes on that figure like any other
   card (one that doesn't is UNKNOWN — step 3). A figure the USER gave you
-  (step 3) routes on the VRAM bands — no memory row is left for an Apple
-  Silicon Mac, whose verdict is settled without a figure, and the non-Apple
+  (step 3) routes on the row that fits their machine: the unified-memory row
+  for an Apple Silicon Mac, the VRAM bands otherwise — the non-Apple
   unified-memory boards step 3 sends you to ask about have no row of their
-  own, so their reported figure routes on the VRAM bands too (not the
-  Apple short-circuit of step 2, which stays Apple-only). A CONFIRMED absence of a
+  own, so route the figure they report on the VRAM bands (not the
+  Apple-only `ram_bytes` substitution of step 2). A CONFIRMED absence of a
   GPU is the USER telling you there is none — no `hardware` payload states
   it, since a null or absent `gpu` is UNKNOWN by step 3 — and that answer
   also means do NOT run local diffusion. These bands are defaults, not a ban
@@ -239,8 +232,10 @@ through these steps IN ORDER — a later step never overrides an earlier one:
 - STEP 5, when the answer is "not on this machine", REDIRECT rather than
   dead-end: partner nodes (plain web calls, fine on any machine) or the
   Comfy Cloud MCP if their client has it connected.
-- Generating on a Mac ANYWAY: the Apple row rules out that GPU, not the
-  capability — generation is fine via partner infrastructure:
+- Video on Apple Silicon's OWN GPU: do NOT attempt it — time estimates are
+  unreliable and thermals suffer; recommend cloud instead. That is an
+  APPLE-GPU rule, not a Mac rule (an Intel Mac with a discrete card follows
+  the discrete-GPU row) — video itself is fine via partner infrastructure:
   `API`-tagged video templates and `emit_partner_workflow`. Reach them with
   `search_templates(tag="API", type="video")` — filter on BOTH axes, because
   neither alone isolates partner-run video (`tag` doesn't constrain output
