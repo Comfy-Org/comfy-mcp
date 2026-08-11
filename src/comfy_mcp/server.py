@@ -76,7 +76,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -10960,14 +10960,16 @@ def _apply_startup_instructions() -> None:
     mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
 
 
-def main(args: Sequence[str] | None = None) -> None:
+def main(args: list[str] | None = None) -> None:
     """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
 
     ``args`` defaults to the process's arguments and exists so a test can drive
     the entry point without rewriting ``sys.argv``; the console script calls
-    this with none. Only the two human-facing flags are intercepted (see
-    :func:`cli._handle_argv`) — every other argument still falls through to the
-    server exactly as it did when argv was ignored outright.
+    this with none. It is a ``list``, not a ``Sequence``, because a bare ``str``
+    satisfies ``Sequence[str]`` and would be read character by character, which
+    :func:`cli._handle_argv` rejects outright. Only the two human-facing flags
+    are intercepted (see that function) — every other argument still falls
+    through to the server exactly as it did when argv was ignored outright.
 
     A macOS protected-folder denial hit during startup (a config, log, or module
     the server itself reads from under ~/Documents, say) arrives as a bare
@@ -10990,9 +10992,7 @@ def main(args: Sequence[str] | None = None) -> None:
         # version out of installed metadata walks `sys.path`, so it is one more
         # startup read a protected-folder denial can land on, and it deserves
         # the same translated guidance as the rest.
-        if cli._handle_argv(
-            list(sys.argv[1:] if args is None else args), _MIN_COMFY_CLI_STR
-        ):
+        if cli._handle_argv(sys.argv[1:] if args is None else args, _MIN_COMFY_CLI_STR):
             return
         # Before serving: enrich the handshake instructions with the one-shot
         # machine snapshot. Runs inside this try on purpose — the

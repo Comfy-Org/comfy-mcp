@@ -10,6 +10,7 @@ free to pass arguments this program does not know about.
 
 from __future__ import annotations
 
+import io
 import re
 import subprocess
 import sys
@@ -73,6 +74,56 @@ def test_everything_else_falls_through_to_the_server(argv, capsys):
     assert capsys.readouterr() == ("", "")
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [["--", "--help"], ["--", "-h"], ["--", "-V"], ["--transport", "--", "--version"]],
+)
+def test_end_of_options_marker_is_honoured(argv, capsys):
+    """Past a bare `--` a token is an operand, so it must not print to stdout.
+
+    Answering a *client* on stdout is worse than not answering: that stream is
+    the JSON-RPC channel, so prose plus exit 0 reads as protocol garbage rather
+    than a diagnosable failure. `--` is the escape hatch for a caller that has
+    to pass such a token along.
+    """
+    assert cli._handle_argv(argv, _FLOOR) is False
+    assert capsys.readouterr() == ("", "")
+
+
+def test_a_bare_string_is_rejected_rather_than_read_as_characters():
+    """`main("--help")` must not iterate letters and silently serve."""
+    with pytest.raises(TypeError, match="list of arguments"):
+        cli._handle_argv("--help", _FLOOR)  # type: ignore[arg-type]
+
+
+def test_usage_is_pure_ascii():
+    """Non-ASCII would make `comfy-mcp --help > out.txt` a UnicodeEncodeError.
+
+    Redirected or piped, stdout carries the locale's encoding, and a code page
+    that cannot represent an em dash raises after writing half the message.
+    """
+    usage = cli._usage(_FLOOR)
+    usage.encode("ascii")  # raises UnicodeEncodeError if a stray glyph creeps in
+
+
+@pytest.mark.parametrize("flag", ["--help", "--version"])
+def test_a_reader_that_left_early_does_not_traceback(flag, monkeypatch):
+    """`comfy-mcp --help | head -1`, or `q` in a pager, closes the pipe on us."""
+
+    class _ClosedPipe:
+        def write(self, text):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def fileno(self):
+            raise io.UnsupportedOperation("fileno")
+
+    monkeypatch.setattr(sys, "stdout", _ClosedPipe())
+    assert cli._handle_argv([flag], _FLOOR) is True
+
+
 def test_version_prefers_installed_metadata(monkeypatch):
     monkeypatch.setattr(metadata, "version", lambda name: f"9.9.9-{name}")
     assert cli._version() == "9.9.9-comfy-mcp"
@@ -85,6 +136,39 @@ def test_version_falls_back_to_the_source_literal(monkeypatch):
         raise metadata.PackageNotFoundError(name)
 
     monkeypatch.setattr(metadata, "version", _missing)
+    assert cli._version() == comfy_mcp.__version__
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param(OSError(13, "Permission denied"), id="unreadable-metadata"),
+        pytest.param(
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"), id="corrupt-metadata"
+        ),
+    ],
+)
+def test_version_falls_back_when_the_dist_info_is_broken(broken, monkeypatch):
+    """A `.dist-info` that exists but is unreadable fails as something else.
+
+    That is the broken install the README sends users here to diagnose, so it
+    must answer rather than traceback.
+    """
+
+    def _broken(name):
+        raise broken
+
+    monkeypatch.setattr(metadata, "version", _broken)
+    assert cli._version() == comfy_mcp.__version__
+
+
+def test_version_falls_back_when_metadata_has_no_version_field(monkeypatch):
+    """METADATA with no `Version:` hands back `None`, not an exception.
+
+    Printing `comfy-mcp None` would both mislead and violate the declared
+    `-> str`.
+    """
+    monkeypatch.setattr(metadata, "version", lambda name: None)
     assert cli._version() == comfy_mcp.__version__
 
 
@@ -119,6 +203,11 @@ def test_entry_point_exits_zero_with_output(flag):
     `python -m comfy_mcp.server` reaches the same `main()` the `comfy-mcp`
     console script does, so this covers the real `sys.argv` read and the exit
     status a user sees — without needing the script on PATH.
+
+    `stdin` is `DEVNULL` so a regression fails fast: if flag interception ever
+    stops firing, the child becomes a stdio MCP server, and on pytest's
+    inherited stdin it would block for the whole timeout — and pass or hang
+    depending on whether that handle happened to be at EOF.
     """
     proc = subprocess.run(
         [sys.executable, "-m", "comfy_mcp.server", flag],
@@ -126,6 +215,7 @@ def test_entry_point_exits_zero_with_output(flag):
         text=True,
         timeout=120,
         cwd=_ROOT,
+        stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.startswith("comfy-mcp ")
