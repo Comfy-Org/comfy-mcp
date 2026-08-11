@@ -82,6 +82,9 @@ Four steps take you from a fresh install to your first generated image.
    `pip install .` puts a `comfy-mcp` console script on your `PATH`; that command is what you
    point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
+   `comfy-mcp --version` confirms it landed — but don't run `comfy-mcp` itself to test it: it
+   is a **stdio** server that talks MCP over stdin/stdout, so in a terminal it just waits and
+   exits without printing anything. `comfy-mcp --help` says the same thing in one screen.
 
    > Installed this server back when it was called `comfy-local-mcp`? Do
    > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — `pip install .`
