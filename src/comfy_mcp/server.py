@@ -100,7 +100,45 @@ from . import (
 from .errors import ComfyCliError
 from .params import SlotOverride, SlotVariants
 
-mcp = MCPServer("comfy-mcp", instructions=instructions.INSTRUCTIONS)
+
+def _server_version() -> str:
+    """The version this server reports in the ``initialize`` handshake.
+
+    Prefer the INSTALLED distribution's metadata: that is the release a user's
+    bug report has to be correlated with, and it is what ``pip install
+    comfy-mcp`` records. A source tree that was never installed (running
+    straight off ``PYTHONPATH=src``) has no distribution metadata at all, so
+    fall back to the package literal — ``tests/test_packaging.py`` pins that
+    literal to ``pyproject.toml``'s version, so the two only disagree when a
+    stale editable install lags the checkout, and there the *installed* string
+    is still the honest answer.
+
+    Fails OPEN in every direction, like the startup snapshot probe: this runs at
+    IMPORT time, so anything raising here would take the whole server down over
+    a display string.
+
+    The lookup itself lives in :func:`cli._version`, the leaf that already owns
+    it for ``comfy-mcp --version``. It is ONE question — "which release is
+    this?" — and two copies would drift into two answers for the same install:
+    the handshake string a client displays and the string a user reads off the
+    terminal have to agree, or a bug report correlates against the wrong
+    release. This function stays as the name because the CALLER's reason is
+    specific to the handshake, and because it is where that reason is written
+    down.
+    """
+    return cli._version()
+
+
+# `version` is passed explicitly because the SDK does not infer one: it defaults
+# to `""` and `Server.server_info` hands that straight to the client, so an
+# unversioned server answers `initialize` with `"serverInfo": {"name":
+# "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
+# correlate a bug report against.
+mcp = MCPServer(
+    "comfy-mcp",
+    version=_server_version(),
+    instructions=instructions.INSTRUCTIONS,
+)
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a

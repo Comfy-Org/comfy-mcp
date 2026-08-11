@@ -21,13 +21,18 @@ name in this module.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from importlib import metadata
 
 from . import __version__
 
-# The installed distribution's name (``[project] name`` in pyproject.toml).
+# The distribution name from ``pyproject.toml`` — what ``pip install`` records.
+# Spelled out rather than taken from ``__package__``: that is the IMPORT name
+# (``comfy_mcp``), a different string that resolves here only because
+# ``importlib.metadata`` normalizes ``_`` to ``-`` before it looks a
+# distribution up.
 _DISTRIBUTION = "comfy-mcp"
 
 _HELP_FLAGS = frozenset({"-h", "--help"})
@@ -40,27 +45,47 @@ _END_OF_OPTIONS = "--"
 def _version() -> str:
     """The running version, preferring installed package metadata.
 
+    The single answer to "which release is this?", for BOTH callers that ask:
+    ``comfy-mcp --version`` here, and :func:`server._server_version` for the
+    ``initialize`` handshake's ``serverInfo.version``. One implementation on
+    purpose — two would drift into two answers for the same install, and the
+    string a client displays has to be the string the user reads off their
+    terminal, or a bug report correlates against the wrong release.
+
     Metadata is the authoritative answer for the thing the user actually
-    installed — it is what ``pip show comfy-mcp`` reports and what a
-    ``serverInfo.version`` should agree with. It is unavailable in exactly one
-    situation: running from a source tree that was never installed (no
-    ``.dist-info``), where :data:`comfy_mcp.__version__` is the source of truth
-    the release checks pin (``tests/test_packaging.py``). So try metadata, fall
-    back to the literal — never the other way round, which would report the
-    checkout's number for an install that shipped a different one.
+    installed — it is what ``pip show comfy-mcp`` reports. It is unavailable in
+    exactly one ordinary situation: running from a source tree that was never
+    installed (no ``.dist-info``), where :data:`comfy_mcp.__version__` is the
+    source of truth the release checks pin (``tests/test_packaging.py``). So try
+    metadata, fall back to the literal — never the other way round, which would
+    report the checkout's number for an install that shipped a different one.
 
     The fallback is deliberately wider than "no ``.dist-info``": a
     ``.dist-info`` that EXISTS but is corrupt, unreadable, or carries no
-    ``Version`` field fails as something other than
-    ``PackageNotFoundError`` (an ``OSError`` reading METADATA) or does not fail
-    at all and hands back ``None``. That broken install is precisely the case
-    the README sends users here to diagnose, so every one of those answers the
-    source literal rather than a traceback or ``comfy-mcp None``.
+    ``Version`` field fails as something other than ``PackageNotFoundError`` (an
+    ``OSError`` reading METADATA) or does not fail at all and hands back
+    ``None``. Both must still answer — a broken install is precisely what the
+    README sends users to ``--version`` to diagnose, and on the handshake side
+    this runs at IMPORT time, so raising would take the whole server down over a
+    display string. Only the unreadable case is WARNED about: a source checkout
+    has no metadata by design and is the normal dev path, while a
+    half-written ``.dist-info`` is a real fault worth a line in the log.
     """
     try:
         installed = metadata.version(_DISTRIBUTION)
-    except Exception:  # noqa: BLE001 - a broken install must still answer
+    except metadata.PackageNotFoundError:
+        # Not installed as a distribution at all — a source checkout on
+        # `PYTHONPATH`. The normal dev case, not an error.
         return __version__
+    except Exception:  # a broken install must still answer
+        logging.getLogger(__name__).warning(
+            "could not read installed %s metadata; reporting the source version",
+            _DISTRIBUTION,
+            exc_info=True,
+        )
+        return __version__
+    # `or`, not a bare return: metadata with no `Version:` field yields None,
+    # which would reach a client as the very empty version this exists to fix.
     return installed or __version__
 
 

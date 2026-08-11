@@ -172,6 +172,25 @@ def test_version_falls_back_when_metadata_has_no_version_field(monkeypatch):
     assert cli._version() == comfy_mcp.__version__
 
 
+def test_the_terminal_and_the_handshake_report_the_same_version(monkeypatch):
+    """One lookup, so `--version` and `serverInfo.version` cannot drift apart.
+
+    They answer the same question about the same install, and a bug report
+    correlates the string a user read off their terminal against the string
+    their client displayed. `server._server_version` delegates here rather than
+    repeating the metadata read; this fails if someone forks it back into two.
+    Checked on the fallback branch too, since that is where two copies diverged
+    before they were collapsed.
+    """
+    assert server._server_version() == cli._version()
+
+    def _absent(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", _absent)
+    assert server._server_version() == cli._version() == comfy_mcp.__version__
+
+
 def test_main_answers_help_without_starting_the_server(monkeypatch, capsys):
     """`main()` returns before any startup probing or `mcp.run()`."""
 
