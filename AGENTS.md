@@ -127,7 +127,8 @@ wrong copy of, so that risk doesn't apply.
 ## Toolchain
 
 Python ≥ 3.10; pip + setuptools (no `uv.lock` here — comfy-cli bundles `uv` and may write a
-stray one into the working directory; gitignored).
+stray one into the working directory; gitignored). **comfy-cli is deliberately NOT a declared
+dependency** — don't "fix" that by adding one; `pyproject.toml`'s comment says why.
 
 ```bash
 pip install -e '.[dev]'   # install with dev extras (pytest, ruff)

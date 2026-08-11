@@ -73,22 +73,32 @@ Four steps take you from a fresh install to your first generated image.
 1. **Install the pieces.**
 
    ```bash
-   pip install "comfy-cli>=1.14.0"  # the engine (>= 1.14.0 required)
-   comfy install                  # create a ComfyUI workspace (skip if you have one)
-   pip install .                  # this MCP server → the `comfy-mcp` command
+   pip install comfy-mcp "comfy-cli>=1.14.0"  # this server + the engine it wraps
+   comfy install                              # create a ComfyUI workspace (skip if you have one)
    ```
 
-   Run that last one from a checkout of this repo (`pip install -e .` for a working copy).
-   `pip install .` puts a `comfy-mcp` console script on your `PATH`; that command is what you
-   point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
+   **Both names, one command — on purpose.** Installing `comfy-mcp` does **not** install
+   comfy-cli: it is not a declared dependency of this package, because the server runs whichever
+   `comfy` binary your `PATH` (or [`COMFY_BIN`](#prerequisites)) resolves to, which is often not
+   the environment you installed the server into. Declaring it would put a second copy in this
+   venv that may not be the one your tools actually drive; the version that matters is checked at
+   **runtime** instead, against the binary really being called. Skip it and the server still
+   starts and completes the MCP handshake — every tool call then fails with "`comfy` not found on
+   PATH", which is a missing engine, not a broken install.
+
+   `pip install comfy-mcp` puts a `comfy-mcp` console script on your `PATH`; that command is what
+   you point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
    `comfy-mcp --version` confirms it landed — but don't run `comfy-mcp` itself to test it: it
    is a **stdio** server that talks MCP over stdin/stdout, so in a terminal it just waits and
    exits without printing anything. `comfy-mcp --help` says the same thing in one screen.
 
+   To install from a checkout of this repo instead, run `pip install .` there (`pip install -e .`
+   for a working copy) — the comfy-cli half is the same either way.
+
    > Installed this server back when it was called `comfy-local-mcp`? Do
-   > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — `pip install .`
-   > alone will **not** clean up after the old name.
+   > [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp) first — installing
+   > `comfy-mcp` alone will **not** clean up after the old name.
 
 2. **Launch ComfyUI** and leave it running:
 
@@ -138,7 +148,7 @@ the rename is **not** something `pip install .` finishes on its own, because `co
    `ModuleNotFoundError`:
 
    ```bash
-   pip uninstall comfy-local-mcp   # then: pip install .   (or `pip install -e .`)
+   pip uninstall comfy-local-mcp   # then: pip install comfy-mcp   (or `pip install -e .`)
    ```
 
 2. **Change `"command"` to `comfy-mcp`** in every MCP client config that starts this server
@@ -393,7 +403,12 @@ full cloud tool list, and the slash-command/prompt tables live.
   `download-status` / `downloads` / `download-cancel`), `models search`'s cross-folder walk, the
   templates gallery cache TTL, and `comfy run`'s `--allow-spend` interlock. On 1.13.0 enough of
   the surface is inert that the server reads as broken rather than as out-of-date, which is why
-  the floor moved rather than each tool degrading.
+  the floor moved rather than each tool degrading. **Installing this server does not install
+  comfy-cli** — it is deliberately *not* a declared dependency of the `comfy-mcp` package, because
+  the binary that matters is whichever one `PATH` / `COMFY_BIN` resolves to rather than one pinned
+  into this server's environment, so the floor above is enforced at runtime against that binary
+  (the rationale lives in `pyproject.toml`). Install the two together:
+  `pip install comfy-mcp "comfy-cli>=1.14.0"`.
 - **Every capability degrade is still in place**, because the floor and a degrade guard different
   failures: the floor catches a *wrong comfy-cli version*, a degrade catches a *correct version in
   a broken environment*. The version guard fails **open** on a `--version` it can't parse (a
