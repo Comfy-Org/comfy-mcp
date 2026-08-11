@@ -63,7 +63,6 @@ import asyncio
 import contextlib
 import errno
 import functools
-import importlib.metadata
 import ipaddress
 import json
 import logging
@@ -87,16 +86,19 @@ from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
 
-from . import __version__ as _SOURCE_VERSION
-from . import argv, clitext, errors, failure_log, instructions, params, target, tcc
+from . import (
+    argv,
+    cli,
+    clitext,
+    errors,
+    failure_log,
+    instructions,
+    params,
+    target,
+    tcc,
+)
 from .errors import ComfyCliError
 from .params import SlotOverride, SlotVariants
-
-# The distribution name from `pyproject.toml` — what `pip install` records.
-# Spelled out rather than taken from `__package__`: that is the IMPORT name
-# (`comfy_mcp`), a different string that resolves here only because
-# `importlib.metadata` normalizes `_` to `-` before it looks a distribution up.
-_DISTRIBUTION = "comfy-mcp"
 
 
 def _server_version() -> str:
@@ -114,26 +116,17 @@ def _server_version() -> str:
     Fails OPEN in every direction, like the startup snapshot probe: this runs at
     IMPORT time, so anything raising here would take the whole server down over
     a display string.
+
+    The lookup itself lives in :func:`cli._version`, the leaf that already owns
+    it for ``comfy-mcp --version``. It is ONE question — "which release is
+    this?" — and two copies would drift into two answers for the same install:
+    the handshake string a client displays and the string a user reads off the
+    terminal have to agree, or a bug report correlates against the wrong
+    release. This function stays as the name because the CALLER's reason is
+    specific to the handshake, and because it is where that reason is written
+    down.
     """
-    try:
-        detected = importlib.metadata.version(_DISTRIBUTION)
-    except importlib.metadata.PackageNotFoundError:
-        # Not installed as a distribution at all — a source checkout on
-        # ``PYTHONPATH``. The normal dev case, not an error.
-        detected = None
-    except Exception:
-        # Anything else means the installed metadata exists but is unreadable
-        # (a truncated or half-written ``.dist-info``). The literal below is
-        # still a correct answer for the code that is actually running.
-        logging.getLogger(__name__).warning(
-            "could not read installed %s metadata; reporting the source version",
-            _DISTRIBUTION,
-            exc_info=True,
-        )
-        detected = None
-    # `or`, not a bare return: metadata with no `Version:` field yields None,
-    # which would reach the client as the very empty version this exists to fix.
-    return detected or _SOURCE_VERSION
+    return cli._version()
 
 
 # `version` is passed explicitly because the SDK does not infer one: it defaults
@@ -11005,8 +10998,16 @@ def _apply_startup_instructions() -> None:
     mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
 
 
-def main() -> None:
-    """Entry point: serve the MCP over stdio.
+def main(args: list[str] | None = None) -> None:
+    """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
+
+    ``args`` defaults to the process's arguments and exists so a test can drive
+    the entry point without rewriting ``sys.argv``; the console script calls
+    this with none. It is a ``list``, not a ``Sequence``, because a bare ``str``
+    satisfies ``Sequence[str]`` and would be read character by character, which
+    :func:`cli._handle_argv` rejects outright. Only the two human-facing flags
+    are intercepted (see that function) — every other argument still falls
+    through to the server exactly as it did when argv was ignored outright.
 
     A macOS protected-folder denial hit during startup (a config, log, or module
     the server itself reads from under ~/Documents, say) arrives as a bare
@@ -11022,6 +11023,15 @@ def main() -> None:
     :func:`_require_comfy_bin` do for the child process we spawn.
     """
     try:
+        # First thing in the body — before the startup probing below, which
+        # shells out and can be slow — because a human asking what this program
+        # is should get an answer that does not depend on the state of their
+        # install. Inside the `try` rather than above it because reading the
+        # version out of installed metadata walks `sys.path`, so it is one more
+        # startup read a protected-folder denial can land on, and it deserves
+        # the same translated guidance as the rest.
+        if cli._handle_argv(sys.argv[1:] if args is None else args, _MIN_COMFY_CLI_STR):
+            return
         # Before serving: enrich the handshake instructions with the one-shot
         # machine snapshot. Runs inside this try on purpose — the
         # probe swallows its own failures (including a PermissionError, an
