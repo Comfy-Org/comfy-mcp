@@ -63,6 +63,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import importlib.metadata
 import ipaddress
 import json
 import logging
@@ -86,11 +87,65 @@ from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
 
+from . import __version__ as _SOURCE_VERSION
 from . import argv, clitext, errors, failure_log, instructions, params, target, tcc
 from .errors import ComfyCliError
 from .params import SlotOverride, SlotVariants
 
-mcp = MCPServer("comfy-mcp", instructions=instructions.INSTRUCTIONS)
+# The distribution name from `pyproject.toml` — what `pip install` records.
+# Spelled out rather than taken from `__package__`: that is the IMPORT name
+# (`comfy_mcp`), a different string that resolves here only because
+# `importlib.metadata` normalizes `_` to `-` before it looks a distribution up.
+_DISTRIBUTION = "comfy-mcp"
+
+
+def _server_version() -> str:
+    """The version this server reports in the ``initialize`` handshake.
+
+    Prefer the INSTALLED distribution's metadata: that is the release a user's
+    bug report has to be correlated with, and it is what ``pip install
+    comfy-mcp`` records. A source tree that was never installed (running
+    straight off ``PYTHONPATH=src``) has no distribution metadata at all, so
+    fall back to the package literal — ``tests/test_packaging.py`` pins that
+    literal to ``pyproject.toml``'s version, so the two only disagree when a
+    stale editable install lags the checkout, and there the *installed* string
+    is still the honest answer.
+
+    Fails OPEN in every direction, like the startup snapshot probe: this runs at
+    IMPORT time, so anything raising here would take the whole server down over
+    a display string.
+    """
+    try:
+        detected = importlib.metadata.version(_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        # Not installed as a distribution at all — a source checkout on
+        # ``PYTHONPATH``. The normal dev case, not an error.
+        detected = None
+    except Exception:
+        # Anything else means the installed metadata exists but is unreadable
+        # (a truncated or half-written ``.dist-info``). The literal below is
+        # still a correct answer for the code that is actually running.
+        logging.getLogger(__name__).warning(
+            "could not read installed %s metadata; reporting the source version",
+            _DISTRIBUTION,
+            exc_info=True,
+        )
+        detected = None
+    # `or`, not a bare return: metadata with no `Version:` field yields None,
+    # which would reach the client as the very empty version this exists to fix.
+    return detected or _SOURCE_VERSION
+
+
+# `version` is passed explicitly because the SDK does not infer one: it defaults
+# to `""` and `Server.server_info` hands that straight to the client, so an
+# unversioned server answers `initialize` with `"serverInfo": {"name":
+# "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
+# correlate a bug report against.
+mcp = MCPServer(
+    "comfy-mcp",
+    version=_server_version(),
+    instructions=instructions.INSTRUCTIONS,
+)
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
