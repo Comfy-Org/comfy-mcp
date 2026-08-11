@@ -126,7 +126,8 @@ wrong copy of, so that risk doesn't apply.
 ## Toolchain
 
 Python ≥ 3.10; pip + setuptools (no `uv.lock` here — comfy-cli bundles `uv` and may write a
-stray one into the working directory; gitignored).
+stray one into the working directory; gitignored). **comfy-cli is deliberately NOT a declared
+dependency** — don't "fix" that by adding one; `pyproject.toml`'s comment says why.
 
 ```bash
 pip install -e '.[dev]'   # install with dev extras (pytest, ruff)
@@ -138,16 +139,6 @@ ruff format --check .     # format check (run `ruff format .` to fix)
 CI (`.github/workflows/ci.yml`) runs all three on Python 3.10 and 3.14 every PR; get them
 green locally. Never add a `paths`/`paths-ignore` filter to its `pull_request` trigger —
 `test (py3.10)`/`test (py3.14)` must report every PR; it no-ops on Markdown-only changes.
-
-**comfy-cli is deliberately NOT a declared dependency** — do not "fix" that by adding it.
-The engine that matters is whichever binary `PATH`/`COMFY_BIN` resolves to (usually a
-different environment from the one this server is installed into), so a pinned wheel here
-would install a second copy nothing calls; the `>= 1.14.0` floor is enforced at RUNTIME
-against the real binary instead (`_check_comfy_version`). The cost is that
-`pip install comfy-mcp` alone yields a server whose tools all error until comfy-cli is
-installed, so the docs carry that weight: the README quickstart installs both in one command
-and says why, and `tests/test_packaging.py` pins the pair (undeclared + documented) so
-neither half can drift without the other.
 
 ## Tests
 
