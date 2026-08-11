@@ -49,10 +49,25 @@ dependencies = [
 # comfy-cli is intentionally NOT a declared dependency: this server shells out
 # to whatever `comfy` binary PATH/COMFY_BIN resolves to (which may differ from a
 # pip-installed one), and the envelope/discover contract it wraps is carried by a
-# specific comfy-cli build rather than a hard-pinnable PyPI release. Compatibility
-# is enforced at RUNTIME instead — `server_info` asserts the comfy-cli envelope
-# schema major and, when COMFY_CLI_MIN_VERSION is set, a minimum version. See
-# src/comfy_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
+# specific comfy-cli build rather than a hard-pinnable PyPI release. Declaring it
+# would install a second copy into THIS environment that the tools may never
+# call, while doing nothing about the one they do — and not a small one: pip
+# resolves comfy-cli into ~40 further distributions (GitPython, cookiecutter,
+# uv, analytics clients), all of which a declaration would force on every
+# install of this server, including the ones already driving a `comfy` on PATH.
+# Compatibility is enforced at
+# RUNTIME instead, against the binary actually invoked: `_check_comfy_version`
+# holds a hard `>= _MIN_COMFY_CLI` floor before the first call, `_unwrap_envelope`
+# asserts the envelope schema major, and `server_info` reports both plus the
+# optional COMFY_CLI_MIN_VERSION. See src/comfy_mcp/server.py.
+#
+# The cost is real and is paid in the DOCS, not here: `pip install comfy-mcp`
+# alone yields a server that completes the MCP handshake and then errors on every
+# tool call until comfy-cli is installed. So the README quickstart installs both
+# in one command (`pip install comfy-mcp "comfy-cli>=1.14.0"`) and says why, and
+# tests/test_packaging.py pins that pairing — undeclared HERE requires documented
+# THERE. Reverse this decision by all means, but reverse both halves together;
+# see AGENTS.md ("Toolchain").
 
 [project.optional-dependencies]
 # The ruff floor is 0.16, not 0.15, because `[tool.ruff.lint] select` below now

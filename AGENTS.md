@@ -139,6 +139,16 @@ CI (`.github/workflows/ci.yml`) runs all three on Python 3.10 and 3.14 every PR;
 green locally. Never add a `paths`/`paths-ignore` filter to its `pull_request` trigger —
 `test (py3.10)`/`test (py3.14)` must report every PR; it no-ops on Markdown-only changes.
 
+**comfy-cli is deliberately NOT a declared dependency** — do not "fix" that by adding it.
+The engine that matters is whichever binary `PATH`/`COMFY_BIN` resolves to (usually a
+different environment from the one this server is installed into), so a pinned wheel here
+would install a second copy nothing calls; the `>= 1.14.0` floor is enforced at RUNTIME
+against the real binary instead (`_check_comfy_version`). The cost is that
+`pip install comfy-mcp` alone yields a server whose tools all error until comfy-cli is
+installed, so the docs carry that weight: the README quickstart installs both in one command
+and says why, and `tests/test_packaging.py` pins the pair (undeclared + documented) so
+neither half can drift without the other.
+
 ## Tests
 
 Tests live in `tests/` and mock comfy-cli — no real ComfyUI, no `comfy` binary. `_run_comfy`
