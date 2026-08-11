@@ -54,6 +54,24 @@ dependencies = [
 # schema major and, when COMFY_CLI_MIN_VERSION is set, a minimum version. See
 # src/comfy_mcp/server.py (ENVELOPE_SCHEMA_MAJOR / MIN_COMFY_CLI_VERSION).
 
+# The PyPI sidebar renders these, and it renders NOTHING without them: through
+# 0.10.0 the published metadata carried no `project_urls` and an empty
+# `Home-page`, so someone who found the package on PyPI had no route back to the
+# repository, the docs, or the issue tracker. `Homepage` also backfills the
+# legacy `Home-page` field that `pip show` prints.
+#
+# Keep every entry a page that is maintained OUTSIDE this file — the repo root,
+# the docs site, the issue tracker — rather than a deep link into a document
+# whose headings we would then have to keep in sync with a URL nobody here
+# tests. `Documentation` is the docs site's MCP page (its "Local Comfy MCP
+# Connection" section covers this package), which is the same page README.md
+# points readers at.
+[project.urls]
+Homepage = "https://github.com/Comfy-Org/comfy-mcp"
+Repository = "https://github.com/Comfy-Org/comfy-mcp"
+Documentation = "https://docs.comfy.org/agent-tools/mcp"
+Issues = "https://github.com/Comfy-Org/comfy-mcp/issues"
+
 [project.optional-dependencies]
 # The ruff floor is 0.16, not 0.15, because `[tool.ruff.lint] select` below now
 # enables RUF100 (unused-`noqa`) — and 0.16 narrowed BLE001 to stop flagging a
