@@ -1,3 +1,22 @@
+<!--
+mcp-name: io.github.Comfy-Org/comfy-mcp
+
+The line above is not decoration and not a comment for readers: it is the
+ownership token the official MCP Registry checks. Publishing the listing in
+`server.json` makes registry.modelcontextprotocol.io fetch this package's
+metadata from PyPI and look for `mcp-name: <the server.json name>` in the
+description — which for this project is this file, verbatim, as
+`[project] readme` in pyproject.toml. Finding it is how the registry proves
+that whoever owns the GitHub namespace also owns the PyPI package.
+
+So the string must stay byte-identical to `server.json`'s `name` (including
+its capitalisation), must stay in README.md rather than move to a file PyPI
+never sees, and must keep a space or a newline after it — a token glued to
+the following character is read as a prefix of some longer name and rejected.
+tests/test_packaging.py pins all three. Removing it does not break anything
+here; it breaks the next release's registry publish.
+-->
+
 <div align="center">
 
 <img src="assets/logo.svg" alt="Comfy" width="160"/>

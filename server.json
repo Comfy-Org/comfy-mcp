@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Comfy-Org/comfy-mcp",
+  "description": "Drive the ComfyUI installed on your own machine: generate, monitor jobs, and build workflows.",
+  "version": "0.10.0",
+  "websiteUrl": "https://docs.comfy.org/agent-tools/mcp",
+  "repository": {
+    "url": "https://github.com/Comfy-Org/comfy-mcp",
+    "source": "github",
+    "id": "1286514652"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "comfy-mcp",
+      "version": "0.10.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
