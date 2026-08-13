@@ -29,8 +29,17 @@ The third invariant is `[project.urls]`, the links PyPI renders in its
 sidebar. Nothing in this repo displays them, so their absence is invisible
 here and only shows up on a published page — which is how 0.10.0 shipped with
 `"project_urls": null` and a blank `Home-page`.
+
+The fourth is `server.json`, the listing published to the official MCP
+Registry. It is the same shape of problem one step further out: nothing in this
+repo reads that file, and its consumer is a PUBLIC directory reached only from
+`publish.yml`'s `publish-mcp-registry` job, on a `release: created` event, after
+PyPI has already been written to irreversibly. A mistake there is discovered at
+the worst possible moment, so the checks that can be made statically are made
+here instead.
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -44,6 +53,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PYPROJECT = _ROOT / "pyproject.toml"
 _INIT = _ROOT / "src" / "comfy_mcp" / "__init__.py"
 _README = _ROOT / "README.md"
+_SERVER_JSON = _ROOT / "server.json"
 
 
 def _pyproject_version() -> str:
@@ -393,4 +403,183 @@ def test_project_urls_point_at_this_repository():
     assert urls.get("Issues", "").startswith(_REPO_URL + "/"), (
         f"pyproject.toml `[project.urls]` has Issues={urls.get('Issues')!r}, "
         f"expected an issue tracker under {_REPO_URL}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# server.json — the official MCP Registry listing.
+#
+# `publish.yml`'s `publish-mcp-registry` job rewrites the two version fields
+# from the release tag and hands the file to `mcp-publisher`. Everything ELSE in
+# it ships exactly as committed, to a public directory, under the org's
+# identity — and the failure modes are all silent here and loud there. So the
+# invariants below are the ones the registry itself enforces at publish time,
+# pinned at PR time where the fix is an edit.
+# ---------------------------------------------------------------------------
+
+# The namespace the org's registry grant covers is `io.github.Comfy-Org/*` and
+# it is CASE-SENSITIVE — a publish as `io.github.comfy-org/...` is rejected 403.
+_SERVER_NAME = "io.github.Comfy-Org/comfy-mcp"
+
+# https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json:
+# `description` is `maxLength: 100`, and the publisher rejects a longer one
+# rather than truncating it.
+_MAX_REGISTRY_DESCRIPTION = 100
+
+# The registry accepts exactly this base URL for `registryType: pypi`
+# (`model.RegistryURLPyPI`); anything else, including a trailing slash or the
+# JSON API path, fails validation as a registry/type mismatch.
+_PYPI_BASE_URL = "https://pypi.org"
+
+
+def _server_json() -> dict:
+    return json.loads(_SERVER_JSON.read_text(encoding="utf-8"))
+
+
+def test_server_json_is_valid_json_naming_this_org_namespace():
+    """The name is the identity the registry authorizes, and its case matters.
+
+    The sibling cloud server's first publish attempt died on exactly this:
+    `403 … You have permission to publish: io.github.Comfy-Org/*. Attempting to
+    publish: io.github.comfy-org/comfy-cloud-mcp-server`. A lowercased org here
+    would fail the same way — after the release is cut and PyPI is written.
+    """
+    assert _server_json().get("name") == _SERVER_NAME
+
+
+def test_server_json_declares_the_pypi_package_and_no_remotes():
+    """This is a LOCAL stdio server: a package to install, not a URL to call.
+
+    The cloud MCP's listing is the opposite shape — a `remotes` entry pointing
+    at its hosted endpoint — and it is the nearest file to copy from. A
+    `remotes` block here would advertise this project as something a client can
+    connect to over the network, which it is not.
+    """
+    server_json = _server_json()
+    assert "remotes" not in server_json, (
+        "server.json declares `remotes`. This server is stdio: the client "
+        "launches it as a subprocess from the installed PyPI package. A "
+        "`remotes` entry belongs to the cloud MCP, not to this one."
+    )
+    packages = server_json.get("packages")
+    assert isinstance(packages, list) and len(packages) == 1, packages
+    package = packages[0]
+    assert package.get("registryType") == "pypi", package
+    assert package.get("identifier") == "comfy-mcp", package
+    assert package.get("registryBaseUrl") == _PYPI_BASE_URL, package
+    assert package.get("transport") == {"type": "stdio"}, package
+
+
+def test_server_json_versions_seed_from_the_packaged_version():
+    """Both version fields, kept honest even though the job overwrites them.
+
+    `publish-mcp-registry` rewrites `.version` AND `.packages[].version` from
+    the tag, so a stale committed value never reaches the registry. It is still
+    wrong to leave one behind: the file is what a reader (and `mcp-publisher
+    validate`) sees, and a `packages[].version` that names a release which does
+    not exist on PyPI is indistinguishable from a real defect.
+    """
+    server_json = _server_json()
+    version = _pyproject_version()
+    assert server_json.get("version") == version, (
+        f"server.json version {server_json.get('version')!r} != packaged "
+        f"version {version!r}. Both version bumps happen in one commit."
+    )
+    assert [package.get("version") for package in server_json["packages"]] == [
+        version
+    ], server_json["packages"]
+
+
+def test_server_json_description_fits_the_registry_limit():
+    """`maxLength: 100` in the schema, enforced by the publisher, not trimmed."""
+    description = _server_json().get("description", "")
+    assert 0 < len(description) <= _MAX_REGISTRY_DESCRIPTION, (
+        f"server.json description is {len(description)} characters; the "
+        f"registry schema caps it at {_MAX_REGISTRY_DESCRIPTION}."
+    )
+
+
+def test_server_json_links_point_at_this_repository():
+    """A copy from the cloud server's listing would advertise the wrong project.
+
+    `repository.url` is checked against the same constant `[project.urls]` uses,
+    so the two cannot drift; `websiteUrl` is only required not to be the cloud
+    server's page, because which docs page is right is an editorial call this
+    test has no business making.
+    """
+    server_json = _server_json()
+    assert server_json.get("repository", {}).get("url") == _REPO_URL, server_json
+    assert server_json.get("repository", {}).get("source") == "github", server_json
+    website = server_json.get("websiteUrl", "")
+    assert website.startswith("https://"), website
+    assert "/agent-tools/cloud" not in website, (
+        f"server.json websiteUrl is {website!r}, the Comfy Cloud MCP's page. "
+        "This listing is for the local server."
+    )
+
+
+# The registry's own boundary rule for the ownership token, from
+# `internal/validators/registries/mcpname.go`: the matched name must be followed
+# by end-of-content, a character that cannot continue a server name, or an HTML
+# comment close. Anything else means the token was read as a PREFIX of some
+# longer name and the publish is rejected — which is a real trap here, because
+# the documented place to hide the token is an HTML comment.
+_SERVER_NAME_CHARS = re.compile(r"[A-Za-z0-9._/-]")
+
+
+def _token_has_boundary(rest: str) -> bool:
+    if not rest:
+        return True
+    if not _SERVER_NAME_CHARS.fullmatch(rest[0]):
+        return True
+    return rest.startswith("-->") or rest.startswith("--!>")
+
+
+@pytest.mark.parametrize(
+    ("rest", "expected"),
+    [
+        pytest.param("", True, id="end-of-content"),
+        pytest.param("\n", True, id="newline"),
+        pytest.param(" -->", True, id="spaced-comment-close"),
+        pytest.param("-->", True, id="glued-comment-close"),
+        pytest.param("--!>", True, id="glued-bogus-comment-close"),
+        pytest.param("<br>", True, id="html-tag"),
+        pytest.param("-pro", False, id="longer-name"),
+        pytest.param("/extra", False, id="longer-path"),
+        pytest.param(".dev", False, id="longer-dotted"),
+    ],
+)
+def test_the_boundary_helper_matches_the_registry_rule(rest, expected):
+    """Pin the helper against the cases the registry's own matcher distinguishes.
+
+    Without this, a helper that returned `True` unconditionally would make the
+    README check below pass on a token the registry rejects — the usual failure
+    mode of a test that asserts a string is "present and well-formed".
+    """
+    assert _token_has_boundary(rest) is expected
+
+
+def test_readme_carries_the_registry_ownership_token():
+    """The registry proves PyPI ownership by finding this string in the README.
+
+    It fetches `https://pypi.org/pypi/comfy-mcp/<version>/json` and scans
+    `info.description` — which IS this file, because `[project] readme` points
+    here — for `mcp-name: <the server.json name>`. No token, no publish. Nothing
+    else in the repo reads it, so deleting it as stray markup is easy and its
+    cost lands on the next release rather than on the PR that removed it.
+    """
+    readme = _README.read_text(encoding="utf-8")
+    name = _server_json()["name"]
+    token = f"mcp-name: {name}"
+    occurrences = [match.end() for match in re.finditer(re.escape(token), readme)]
+    assert occurrences, (
+        f"README.md does not contain the registry ownership token `{token}`. "
+        "The MCP Registry reads it out of the PUBLISHED PyPI description to "
+        "prove this repo owns the `comfy-mcp` distribution; without it "
+        "publish.yml's registry job fails after the release is already cut."
+    )
+    assert any(_token_has_boundary(readme[end:]) for end in occurrences), (
+        f"README.md contains `{token}` but every occurrence is glued to a "
+        "following name character, so the registry reads it as a prefix of a "
+        "longer name and rejects it. Put it on its own line."
     )

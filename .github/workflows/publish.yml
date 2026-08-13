@@ -163,3 +163,109 @@ jobs:
           INSTALLED=$(python -c "import comfy_mcp; print(comfy_mcp.__version__)")
           echo "imported comfy_mcp ${INSTALLED}"
           test "${INSTALLED}" = "${VERSION}"
+
+  # The listing in the official MCP Registry (registry.modelcontextprotocol.io),
+  # which is the directory MCP clients search for installable servers. It is a
+  # separate publish from PyPI's and a separate identity: PyPI knows this project
+  # as the distribution `comfy-mcp`, the registry knows it as
+  # `io.github.Comfy-Org/comfy-mcp`, and the entry is what ties the two together.
+  #
+  # It runs after `verify-install` rather than after `build-and-publish` because
+  # the registry does not take the listing on trust: it fetches
+  # `https://pypi.org/pypi/comfy-mcp/<version>/json` and refuses to publish until
+  # that exact version exists AND its description carries the ownership token (see
+  # README.md's `mcp-name:` comment). `verify-install` is precisely the job that
+  # waits out PyPI's index lag, so hanging this off it turns a race into a
+  # dependency. `verify-install` needs `build-and-publish` needs `check-version`,
+  # so the tag has already been proven to match both packaged version files by the
+  # time this job reads it — that check is inherited, not repeated here.
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    needs: verify-install
+    runs-on: ubuntu-latest
+    permissions:
+      # Scoped to THIS job, not the workflow: `id-token: write` mints an OIDC
+      # token for this repository, and the only step that should be able to
+      # obtain one is the publisher login below. A job-level block zeroes what it
+      # does not name, so `contents: read` is restated for the checkout (the same
+      # reason `build-and-publish` restates it).
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Sync server.json to the release tag
+        env:
+          # The same input `check-version` reads, so both jobs derive the version
+          # from one source. `GITHUB_REF` would also work on this trigger, but a
+          # release can be created against a tag whose ref this job did not check
+          # out, and there is no reason for the two jobs to disagree about where
+          # the number comes from.
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          # The committed version in server.json is only a seed; the tag is the
+          # source of truth, so the listing always matches the release with no
+          # hand-editing. Guard it before it reaches a PUBLIC directory: an entry
+          # published under a garbage version cannot be quietly withdrawn, and
+          # `check-version` has only proven the tag equals the packaged version —
+          # not that either is canonical. Every release here is a plain vX.Y.Z, so
+          # reject leading zeros and any prerelease/build suffix (v01.2.3,
+          # v1.2.3-rc.1) rather than smuggle a non-canonical version into the
+          # registry.
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Refusing to publish: '${TAG}' is not a canonical vX.Y.Z release tag"
+            exit 1
+          fi
+          # BOTH versions: the server version and the PyPI package version the
+          # registry resolves. Leaving `.packages[].version` at the committed seed
+          # would point a freshly published listing at whatever release happened
+          # to be current when the file was last touched.
+          jq --arg v "$VERSION" '.version = $v | .packages[].version = $v' \
+            server.json > server.tmp
+          mv server.tmp server.json
+          # `jq -e` so a rewrite that silently matched nothing (a renamed field, an
+          # emptied `packages` array) fails here rather than publishing the seed.
+          jq -e --arg v "$VERSION" \
+            '.version == $v and (.packages | length > 0) and all(.packages[]; .version == $v)' \
+            server.json > /dev/null
+          echo "server.json pinned to ${VERSION}"
+          cat server.json
+
+      # Pin mcp-publisher to an explicit release and verify the download against
+      # that release's published SHA256 before extracting or executing it. This
+      # job holds `id-token: write`, so an unpinned `releases/latest` binary would
+      # run — and receive an OIDC token for this repository — with no supply-chain
+      # guarantee whatsoever. Pin + verify closes that. Bump the version here
+      # deliberately; `checksums.txt` comes from the same pinned release, so the
+      # two can never drift apart.
+      - name: Install mcp-publisher
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64 | arm64) arch=arm64 ;;
+            *) echo "::error::Unsupported architecture: $(uname -m)"; exit 1 ;;
+          esac
+          asset="mcp-publisher_${os}_${arch}.tar.gz"
+          base="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl -fsSL -o "$asset" "${base}/${asset}"
+          curl -fsSL -o checksums.txt "${base}/registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
+          # Anchored to end-of-line so the sibling `<asset>.sbom.json` entry cannot
+          # be the line that gets checked. A grep that matches nothing exits 1 and
+          # `pipefail` fails the step, so a renamed asset cannot skip verification.
+          grep " ${asset}\$" checksums.txt | sha256sum -c -
+          tar xzf "$asset" mcp-publisher
+
+      # Exchanges the job's OIDC token for a registry credential. The namespace
+      # grant is CASE-SENSITIVE and scoped to `io.github.Comfy-Org/*`, which is why
+      # server.json spells the org exactly as GitHub does.
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish
