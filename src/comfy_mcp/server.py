@@ -9039,9 +9039,73 @@ def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     }
 
 
-def _nodes_search_sync(query: str) -> Any:
+def _node_row_is_api(row: Any) -> bool:
+    """True only if a ``nodes`` row POSITIVELY declares itself a partner-API node.
+
+    comfy-cli puts ``is_api_node`` on every ``nodes search`` / ``nodes ls`` row,
+    but only from the release that added it — a row from an older engine carries
+    no such key, and an absent key is UNKNOWN, not paid. So it reads False and
+    ``exclude_api`` KEEPS the row: degrading OPEN is the deliberate direction,
+    because dropping a row we cannot classify hides a free node from the caller
+    who asked for free ones, while keeping it only risks showing a paid one that
+    ``run_template`` / ``run_workflow`` still fail CLOSED on without
+    ``confirm_spend=True``. That is also why this is an ``is True`` identity test
+    rather than a truthiness one: a drifted ``"true"`` / ``1`` value reads as
+    unknown-and-kept rather than as the engine's claim.
+
+    The claim itself is entirely comfy-cli's — this never inspects a node's
+    schema to decide, which is what the thin-wrapper rule forbids (the same
+    standing ``_template_is_api`` has over the gallery's ``API`` tag).
+    """
+    return isinstance(row, dict) and row.get("is_api_node") is True
+
+
+def _without_api_nodes(data: Any) -> Any:
+    """``data`` minus its ``is_api_node: true`` rows, with ``count`` recomputed.
+
+    ``total`` is left EXACTLY as comfy-cli reported it — the whole point of the
+    two numbers is that they can differ, since the engine caps a search page
+    (20 rows by default) and reports how many nodes actually matched. Recomputing
+    it here would report a truncated page's survivors as the match count, so a
+    page whose 20 rows happened to be paid would come back ``total: 0`` — the
+    "no such capability" reading, on a catalog that may hold the free sibling one
+    row past the cap. ``count`` (the rows you were handed) is the number this
+    filter is entitled to change; ``excluded_api`` says how many it took, so a
+    caller can tell this filter's drop from the engine's truncation.
+
+    Shape drift is LOUD rather than silent, matching ``search_templates``: a
+    payload with no readable ``rows`` cannot be filtered, and quietly returning
+    the unfiltered rows would answer a request to exclude paid nodes with paid
+    nodes. Only an ``exclude_api=True`` caller can reach this — the default path
+    never inspects the payload at all.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        shape = (
+            "keys {" + ", ".join(sorted(map(str, data))) + "}"
+            if isinstance(data, dict)
+            else data.__class__.__name__
+        )
+        raise ComfyCliError(
+            "unexpected `comfy nodes search` payload: expected a dict with a "
+            f"`rows` list, got {shape}. comfy-cli's output shape may have "
+            "drifted; retry without exclude_api for the raw passthrough."
+        )
+    rows = data["rows"]
+    kept = [row for row in rows if not _node_row_is_api(row)]
+    return {
+        **data,
+        "rows": kept,
+        "count": len(kept),
+        "excluded_api": len(rows) - len(kept),
+    }
+
+
+def _nodes_search_sync(query: str, exclude_api: bool = False) -> Any:
     """``nodes(action="search")``'s body — the exact ``search_nodes`` this replaced."""
-    return _run_comfy("nodes", "search", query, timeout=60.0)
+    data = _run_comfy("nodes", "search", query, timeout=60.0)
+    # Untouched unless asked: `exclude_api=False` is byte-identical passthrough,
+    # payload guard included.
+    return _without_api_nodes(data) if exclude_api else data
 
 
 def _nodes_get_sync(name: str) -> Any:
@@ -9133,6 +9197,12 @@ _NODES_ACTIONS_TAKING_NAME = ("get", "upstream", "downstream")
 # five rather than five identical one-element tuples.
 _NODES_ACTIONS_TAKING_LIST_FILTERS = ("list",)
 _NODES_ACTIONS_TAKING_LIMIT = ("upstream", "downstream")
+# `exclude_api` is search-only ON PURPOSE: `nodes ls` is already filter-rich
+# (produces/accepts/category/pack/label narrow it), while "search" is the
+# free-text path an agent reaches for when the user asked for a capability
+# rather than a class name — the one place a paid/free mix is decided by a
+# query, not by a filter the caller already chose.
+_NODES_ACTIONS_TAKING_EXCLUDE_API = ("search",)
 # `from_type`/`to_type` are both REQUIRED by, and only consumed by, "path".
 _NODES_ACTIONS_TAKING_PATH_TYPES = ("path",)
 # `max_depth`/`max_paths` are optional (sentinel `None` resolves to comfy-cli's
@@ -9155,6 +9225,7 @@ def nodes(
     to_type: str = "",
     max_depth: int | None = None,
     max_paths: int | None = None,
+    exclude_api: bool = False,
 ) -> Any:
     """Search, inspect, filter, or graph-walk node classes in the LOCAL live catalog.
 
@@ -9176,10 +9247,20 @@ def nodes(
     - "types" -> `nodes types`: connection types by connectivity.
     - "categories" -> `nodes categories`: the category tree.
 
+    "search"/"list" rows carry `is_api_node` where the engine emits it:
+    true = a PAID partner-API node (spends credits, gated by
+    `confirm_spend`), false = free local weights — twins can differ ONLY
+    here, so read the field, not the title. Pass `exclude_api=True` when
+    the user asked for free / local / open-weights: it drops the true
+    rows and recomputes `count` (+`excluded_api`); `total` stays the
+    engine's UNFILTERED count, and rows MISSING the field are kept —
+    unknown is not paid.
+
     `query` only for "search"; `name` for "get"/"upstream"/"downstream";
     the five list filters only for "list"; `limit` only for
     "upstream"/"downstream"; `from_type`/`to_type`/`max_depth`/`max_paths`
-    only for "path" — elsewhere each is rejected.
+    only for "path"; `exclude_api` only for "search" — elsewhere each is
+    rejected.
 
     Freshness: LIVE — read from `object_info` every call; an outdated
     install lists outdated nodes.
@@ -9194,6 +9275,7 @@ def nodes(
     wants_name = action in _NODES_ACTIONS_TAKING_NAME
     wants_list_filters = action in _NODES_ACTIONS_TAKING_LIST_FILTERS
     wants_limit = action in _NODES_ACTIONS_TAKING_LIMIT
+    wants_exclude_api = action in _NODES_ACTIONS_TAKING_EXCLUDE_API
     wants_path_types = action in _NODES_ACTIONS_TAKING_PATH_TYPES
     wants_depth_paths = action in _NODES_ACTIONS_TAKING_DEPTH_PATHS
 
@@ -9268,6 +9350,14 @@ def nodes(
                     "is used by action in "
                     f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_DEPTH_PATHS)}."
                 )
+    # `False` is "not supplied" here, the same way `""` is for the string params
+    # — only an explicit opt-in is refused, so no existing call gains an error.
+    if not wants_exclude_api and exclude_api:
+        raise ComfyCliError(
+            f"nodes(action={action!r}) does not take exclude_api — exclude_api "
+            "is used by action in "
+            f"{', '.join(repr(a) for a in _NODES_ACTIONS_TAKING_EXCLUDE_API)}."
+        )
 
     # ALL params validated up front, before ANY dispatch — `download`'s shape
     # (commit 2), not `job`'s: a rejection never costs a spawn even on the
@@ -9306,7 +9396,7 @@ def nodes(
     # verbatim — even the `"-1"` a negative bound would render as.
 
     if action == "search":
-        return _nodes_search_sync(query)
+        return _nodes_search_sync(query, exclude_api)
     if action == "get":
         return _nodes_get_sync(name)
     if action == "list":

@@ -225,6 +225,123 @@ def test_nodes_categories_argv(patched_run):
     assert calls[0]["cmd"][4:] == ["nodes", "categories"]
 
 
+# --- `exclude_api` (paid partner-API nodes) --------------------------------
+
+# The shape `comfy nodes search` actually emits: `total` counts every match,
+# `count` counts the rows that survived the engine's own page cap, and each row
+# carries `is_api_node` — except on an engine predating that field, which the
+# `"LegacyNode"` row below stands in for.
+_SEARCH_PAYLOAD = {
+    "query": "minimax",
+    "total": 57,
+    "count": 3,
+    "close_match": False,
+    "rows": [
+        {"name": "MinimaxHailuoNode", "is_api_node": True},
+        {"name": "MinimaxLocalNode", "is_api_node": False},
+        {"name": "LegacyNode"},
+    ],
+}
+
+
+def test_nodes_search_default_is_untouched_passthrough(patched_run):
+    """`exclude_api` defaults off, and off means the payload is not touched at all."""
+    patched_run(envelope(data=_SEARCH_PAYLOAD))
+    assert server.nodes(action="search", query="minimax") == _SEARCH_PAYLOAD
+
+
+def test_nodes_search_exclude_api_drops_only_the_true_rows(patched_run):
+    patched_run(envelope(data=_SEARCH_PAYLOAD))
+    data = server.nodes(action="search", query="minimax", exclude_api=True)
+    # The `is_api_node: true` row goes; the explicit `false` row AND the row
+    # that never carried the field both stay — unknown is not paid.
+    assert [row["name"] for row in data["rows"]] == ["MinimaxLocalNode", "LegacyNode"]
+
+
+def test_nodes_search_exclude_api_recomputes_count_but_not_total(patched_run):
+    """`count` describes the rows you were handed; `total` stays comfy-cli's own.
+
+    Recomputing `total` post-filter would report a truncated page's survivors as
+    the match count — a page that happened to be all-paid would come back
+    `total: 0`, which reads as "no such node" on a catalog whose free sibling is
+    one row past the engine's cap.
+    """
+    patched_run(envelope(data=_SEARCH_PAYLOAD))
+    data = server.nodes(action="search", query="minimax", exclude_api=True)
+    assert data["count"] == 2
+    assert data["excluded_api"] == 1
+    assert data["total"] == 57
+    # everything else rides through untouched
+    assert data["query"] == "minimax"
+    assert data["close_match"] is False
+    # and the filter is a copy, not an edit of the payload it was handed
+    assert _SEARCH_PAYLOAD["count"] == 3
+    assert len(_SEARCH_PAYLOAD["rows"]) == 3
+
+
+def test_nodes_search_exclude_api_keeps_a_whole_legacy_payload(patched_run):
+    """An engine that emits no `is_api_node` at all filters NOTHING (degrade open)."""
+    legacy = {
+        "query": "sampler",
+        "total": 2,
+        "count": 2,
+        "rows": [{"name": "KSampler"}, {"name": "KSamplerAdvanced"}],
+    }
+    patched_run(envelope(data=legacy))
+    data = server.nodes(action="search", query="sampler", exclude_api=True)
+    assert data["rows"] == legacy["rows"]
+    assert data["count"] == 2
+    assert data["excluded_api"] == 0
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes", None], ids=repr)
+def test_nodes_search_exclude_api_keeps_a_drifted_flag_value(patched_run, value):
+    """Only a literal `True` is the engine's claim — anything else is unknown."""
+    patched_run(
+        envelope(
+            data={
+                "total": 1,
+                "count": 1,
+                "rows": [{"name": "Odd", "is_api_node": value}],
+            }
+        )
+    )
+    data = server.nodes(action="search", query="odd", exclude_api=True)
+    assert [row["name"] for row in data["rows"]] == ["Odd"]
+
+
+def test_nodes_search_exclude_api_keeps_a_non_object_row(patched_run):
+    """A row that is not an object cannot claim anything — it is kept, not crashed on."""
+    patched_run(
+        envelope(
+            data={"total": 2, "count": 2, "rows": ["KSampler", {"is_api_node": True}]}
+        )
+    )
+    data = server.nodes(action="search", query="ksampler", exclude_api=True)
+    assert data["rows"] == ["KSampler"]
+    assert data["count"] == 1
+
+
+def test_nodes_search_exclude_api_does_not_change_the_argv(patched_run):
+    """The filter is client-side over comfy-cli's own field — no new CLI flag."""
+    calls = patched_run(envelope(data=_SEARCH_PAYLOAD))
+    server.nodes(action="search", query="minimax", exclude_api=True)
+    assert calls[0]["cmd"][4:] == ["nodes", "search", "minimax"]
+
+
+def test_nodes_search_exclude_api_raises_on_a_drifted_payload(patched_run):
+    """No readable `rows` -> say so, rather than answer 'exclude paid' with paid rows."""
+    patched_run(envelope(data=[{"name": "KSampler"}]))
+    with pytest.raises(server.ComfyCliError, match="unexpected `comfy nodes search`"):
+        server.nodes(action="search", query="sampler", exclude_api=True)
+
+
+def test_nodes_search_drifted_payload_still_passes_through_by_default(patched_run):
+    """The shape guard is opt-in: the default path never inspects the payload."""
+    patched_run(envelope(data=[{"name": "KSampler"}]))
+    assert server.nodes(action="search", query="sampler") == [{"name": "KSampler"}]
+
+
 # --- extraneous-parameter / missing-required policy (REJECT LOUDLY) --------
 
 
@@ -307,6 +424,31 @@ def test_nodes_search_rejects_path_types(no_spawn, param):
 def test_nodes_search_rejects_depth_paths(no_spawn, param):
     with pytest.raises(server.ComfyCliError, match=rf"does not take {param}"):
         server.nodes(action="search", query="sampler", **{param: 3})
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"action": "list"},
+        {"action": "get", "name": "KSampler"},
+        {"action": "upstream", "name": "KSampler"},
+        {"action": "path", "from_type": "MODEL", "to_type": "IMAGE"},
+        {"action": "types"},
+        {"action": "categories"},
+    ],
+    ids=lambda kw: kw["action"],
+)
+def test_nodes_rejects_exclude_api_outside_search(no_spawn, kwargs):
+    """`exclude_api` is search-only; elsewhere it is refused, not silently ignored."""
+    with pytest.raises(server.ComfyCliError, match="does not take exclude_api"):
+        server.nodes(exclude_api=True, **kwargs)
+
+
+def test_nodes_exclude_api_false_is_not_a_supplied_param(patched_run):
+    """`False` reads as 'not supplied' — every other action still runs normally."""
+    calls = patched_run(envelope(data=[{"name": "KSampler"}]))
+    server.nodes(action="list", exclude_api=False)
+    assert calls[0]["cmd"][4:] == ["nodes", "ls"]
 
 
 def test_nodes_list_rejects_name(no_spawn):
@@ -882,18 +1024,22 @@ def test_nodes_reject_embedded_nul(monkeypatch):
             call()
 
 
-# --- tool docstring budget (<=375 est. tokens) ------------------------------
+# --- tool docstring budget (<=500 est. tokens) ------------------------------
 #
 # Raised 300 -> 375 when the "search" bullet gained `nodes search`'s matching
 # semantics (case-insensitive, word-order-independent token match; close-name
 # fallback). That is not decoration: the docstring IS the tool description an
 # agent reads, and without it an agent composes single-word queries and reads
-# a `close_match` guess as a real hit. Measured ~365 after the edit; the
-# ceiling sits just above so ordinary rewording never trips it while real
-# growth does. Ratchet DOWN if this bullet list is trimmed; never bump without
-# saying why in the same PR. The whole-server ceiling in
-# `test_payload_budget.py` is the other half of this guard and was NOT raised.
-_NODES_DOC_BUDGET_TOKENS = 375
+# a `close_match` guess as a real hit. Raised 375 -> 500 for the paid/free
+# paragraph: `is_api_node` is the ONE bit that separates a row billing the
+# user's credits from its identically-titled free twin, and `exclude_api` is
+# useless to an agent that is not told when to pass it — an undocumented flag
+# is an unused one. Measured ~475 after that edit; the ceiling sits just above
+# so ordinary rewording never trips it while real growth does. Ratchet DOWN if
+# this bullet list is trimmed; never bump without saying why in the same PR.
+# The whole-server ceiling in `test_payload_budget.py` is the other half of
+# this guard and was NOT raised.
+_NODES_DOC_BUDGET_TOKENS = 500
 
 
 def test_nodes_tool_docstring_within_its_own_token_budget():
