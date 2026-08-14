@@ -163,9 +163,9 @@ workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 (`job`, `fetch_outputs`); and
 download handles use `download_id` (`download`, and the id `download_model`
 polls with). No tool takes a bare `path` or `workflow` argument. RETURNED
-payloads use the same names, so a handle read out of one result goes straight
-back into the next call — a download payload keys it `download_id` even where
-comfy-cli's own field is `id`, which is kept alongside it.
+payloads use those same names, so a handle read out of one result passes
+straight back in — a download payload that HAS a handle keys it `download_id`,
+comfy-cli's own `id` kept alongside.
 
 Routing — check the machine before running local diffusion. `server_info`
 passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a

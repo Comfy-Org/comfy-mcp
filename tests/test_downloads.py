@@ -2427,6 +2427,58 @@ def test_the_unsupported_degrade_carries_no_handle(patched_run):
     assert "download_id" not in result
 
 
+def test_the_legacy_foreground_fallback_carries_no_handle(
+    patched_async_run, legacy_comfy_cli
+):
+    """The OTHER download payload with deliberately no `download_id`.
+
+    A comfy-cli that predates `--background` runs the transfer in the
+    foreground, so nothing is ever detached and no id is minted — the payload
+    is marked `background_unsupported` instead. It never reaches
+    `_with_download_id`, which is exactly why the tool docstring and the
+    handshake hedge their otherwise-universal claim: an agent that subscripts
+    `result["download_id"]` on the strength of an unqualified promise would
+    raise `KeyError` right here.
+    """
+    patched_async_run(
+        '{"type": "envelope", "ok": true, "data": {"saved": "/models/x"}}\n'
+    )
+
+    result = _download_model("https://hf.co/x.safetensors")
+
+    assert result["background_unsupported"] is True
+    assert "download_id" not in result
+
+
+def test_the_handle_echoed_back_is_the_one_the_caller_used(monkeypatch):
+    """When the engine's `id` and the caller's handle DIFFER, the caller's wins.
+
+    Every other fixture here spells both the same, so this is the only case
+    that can tell `_with_download_id`'s unconditional write apart from one that
+    preferred the payload's own `id`. The choice is deliberate, not incidental:
+    `download_id` is documented as the handle you pass BACK, and the caller's
+    spelling is the one comfy-cli demonstrably just resolved, while reading the
+    engine's `id` instead would make the timed-out envelope disagree with
+    itself again — its outer level has no `id` to read, so the two nesting
+    levels would go back to carrying different values for one handle, the exact
+    defect this whole section closes.
+    """
+    caller_handle = "A1B2C3D4E5F6"  # same download, engine spells it lowercase
+    _sequenced(monkeypatch, [_status("completed"), _status("downloading")] * 5)
+
+    terminal = server.download(action="status", download_id=caller_handle)
+    assert terminal["download_id"] == caller_handle
+    assert terminal["id"] == _HANDLE  # comfy-cli's own, untouched beside it
+
+    _install_clock(monkeypatch, start=0.0).tick_per_read(10.0)
+    timed_out = server.download(action="wait", download_id=caller_handle)
+    assert timed_out["timed_out"] is True
+    # BOTH levels carry the caller's spelling — they cannot disagree.
+    assert timed_out["download_id"] == caller_handle
+    assert timed_out["status"]["download_id"] == caller_handle
+    assert timed_out["status"]["id"] == _HANDLE
+
+
 @pytest.mark.parametrize("payload", [None, "starting", 3, ["a1b2c3d4e5f6"]])
 def test_a_non_dict_payload_passes_through_untouched(payload):
     """A comfy-cli answering with a non-object `data` has nowhere to hang the

@@ -9881,6 +9881,17 @@ def _with_download_id(payload: Any, download_id: str) -> Any:
     misleading: it carried this wrapper's ``download_id`` at the top and
     comfy-cli's nested ``id`` for the SAME value one level down. So the nested
     status payload is normalized too, and the two levels cannot disagree.
+
+    The written value is the CALLER'S handle unconditionally, never reconciled
+    against a payload's own ``id``, and that is deliberate for both halves.
+    ``download_id`` is documented as the handle you pass BACK, and the caller's
+    spelling is the one comfy-cli demonstrably just resolved — while preferring
+    the engine's ``id`` would reopen the very disagreement above: the timed-out
+    envelope has no ``id`` of its own to read, so its two levels would again
+    carry different values for one handle. It cannot clobber a DIFFERENT
+    handle either: the one caller that passes a value the payload also carries
+    (``download_model``'s ``wait=False`` submit) reads it out of that payload
+    via :func:`_submitted_download_id`, which returns it unrewritten.
     """
     if not isinstance(payload, dict):
         return payload
@@ -10251,8 +10262,8 @@ async def download_model(
         ``wait=True``: the final status, or ``{"timed_out": True, "download_id":
         ..., "status": ...}`` on expiry — not an error, keep polling that id.
         ``wait=False``: the submit payload (``download_id``, ``dest``,
-        ``total_bytes``, ``status``). Every payload keys the handle
-        ``download_id``, so read it and pass it straight back — no renaming.
+        ``total_bytes``, ``status``). Both key it ``download_id`` — read it back
+        unrenamed; the pre-1.14 foreground fallback payload carries none.
 
     Gotchas:
         - comfy-cli writes straight to the FINAL path while transferring, so a
