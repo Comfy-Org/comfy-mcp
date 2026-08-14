@@ -2472,6 +2472,12 @@ def server_info() -> Any:
         - ``comfy_target`` (host/port), only when a remote ComfyUI is
           configured (``COMFYUI_URL``/``COMFYUI_HOST``) — the submit/poll
           tools follow it; this call never probes it.
+
+        ``config.background``, when a background server is recorded, reports
+        the pid comfy-cli verified is LISTENING on that port, with the pid it
+        recorded (the launch wrapper, which does not hold the port) kept as
+        ``recorded_pid``; ``pid_source``/``pid_note`` say which you got. Stop a
+        server with ``stop_comfyui``, never by killing a reported pid.
     """
     envelope, stdout, args, returncode, stderr = _run_comfy_raw("env", timeout=60.0)
     # `_run_comfy_raw` hands back `_last_json_object`'s answer unfiltered, so
@@ -2485,6 +2491,10 @@ def server_info() -> Any:
     compat["envelope_schema"] = _envelope_schema(envelope)
     freshness = _freshness_report()
     report = dict(data) if isinstance(data, dict) else {"env": data}
+    # Before anything is reported: the background record's pid is comfy-cli's
+    # LAUNCH WRAPPER, not the process holding the port. Only costs a subprocess
+    # when there is a record to reconcile.
+    report = _with_reconciled_background(report)
     report["compatibility"] = compat
     report["freshness"] = freshness
     # server_info is the "call first" diagnostic, so surface a malformed remote
@@ -6056,7 +6066,13 @@ def _launch_comfyui_sync(extra_args: list[str]) -> Any:
     if extra_args:
         args += ["--", *extra_args]
     with _lifecycle_slot("start"):
-        return _run_comfy(*args, timeout=180.0, plain_ok=True)
+        result = _run_comfy(*args, timeout=180.0, plain_ok=True)
+        # Still inside the slot: the pid this reports must describe the server
+        # this call just started, so a concurrent stop/restart must not land in
+        # between. The launch envelope's `pid` is the wrapper comfy-cli spawned,
+        # not the listener — see `_reconcile_reported_pid`. `restart_comfyui`
+        # composes this function, so it is corrected there too.
+        return _reconcile_reported_pid(result)
 
 
 # NOTE (temporary upstream caveat): `comfy launch --background` currently
@@ -6101,7 +6117,11 @@ async def launch_comfyui(
     needs no confirmation.
 
     Prints text with no JSON envelope; success returns a synthesized
-    ``{"ok": True, ...}``.
+    ``{"ok": True, ...}``. When the installed comfy-cli DOES report a pid, it
+    is the one verified to be listening on the port, not the launch wrapper
+    comfy-cli records (kept as ``recorded_pid``); ``pid_source``/``pid_note``
+    say which you got. Stop the server with ``stop_comfyui``, never by killing
+    a reported pid.
     """
     guarded = argv._guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
@@ -6421,6 +6441,145 @@ def _verified_untracked_listener(port: int) -> _UntrackedListener | None:
     raw = data.get("cmdline")
     cmdline = " ".join(part for part in raw if isinstance(part, str)) if raw else ""
     return _UntrackedListener(pid=pid, port=port, cmdline=cmdline)
+
+
+# --- reporting a pid that actually holds the port ---------------------------
+#
+# `comfy launch --background` records the pid of the WRAPPER it spawned — the
+# detached `comfy … launch` re-invocation — not the `python main.py` that
+# wrapper starts and that binds the port. Both the launch envelope's `pid` and
+# `comfy env`'s `config.background.pid` carry that recorded value, so anything
+# acting on the number this server hands out (killing it, matching it against
+# the port's listener, attributing a crash to it) acts on the parent: killing it
+# leaves ComfyUI running and still holding the port.
+#
+# The engine already answers the question correctly, so this asks it rather than
+# deriving anything: `_verified_untracked_listener` is the same single
+# `comfy stop --port <p> --dry-run` passthrough the kill gate above reads, and
+# its `verified` payload names the process comfy-cli itself identified on the
+# port. Nothing here consults the process table, and the recorded value is kept
+# alongside rather than discarded — it is still the pid `comfy stop` acts on.
+
+
+def _port_number(value: Any) -> int | None:
+    """``value`` as a TCP port, or ``None``.
+
+    comfy-cli's schemas type a port as ``integer`` OR ``string`` (the launch
+    envelope echoes what was parsed off the command line, and the background
+    record round-trips through the config file), so both spellings arrive here.
+
+    Not :func:`argv._guard_log_port`, whose contract is the opposite one: that
+    guards a port a TOOL CALLER supplied on its way into argv, so it refuses a
+    string and raises on anything invalid. This reads a port back OUT of
+    comfy-cli's own payload, where an unusable value means only that there is
+    nothing to reconcile — never an error to raise at the caller.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            return None
+    if not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 65535 else None
+
+
+def _reconcile_reported_pid(record: Any) -> Any:
+    """``record`` with its ``pid`` reconciled against the port's real listener.
+
+    Takes any mapping carrying comfy-cli's ``pid`` + ``port`` pair — the
+    ``launch`` envelope and ``comfy env``'s background record are the same shape
+    — and returns a copy in which:
+
+    * ``pid`` is the process comfy-cli verified is listening on that port,
+    * ``recorded_pid`` keeps the value comfy-cli recorded (the wrapper), and
+    * ``pid_source`` / ``pid_note`` say which is which.
+
+    Left EXACTLY as it came when there is no pid/port pair to reconcile, so the
+    plain-text ``launch`` synthesis (which carries neither) and a comfy-cli that
+    reports no background record are untouched.
+
+    Degrades rather than fails: :func:`_verified_untracked_listener` answers
+    ``None`` for every failure — nothing on the port, a listener comfy-cli will
+    not vouch for, or a comfy-cli predating ``comfy stop --port`` (it ships in
+    1.15.0) — and that case keeps the recorded pid and says it is unconfirmed.
+    Reporting an unverified pid while labelling it unverified is the honest
+    answer; silently reporting it as the listener is the bug.
+    """
+    if not isinstance(record, dict):
+        return record
+    recorded = record.get("pid")
+    if not isinstance(recorded, int) or isinstance(recorded, bool):
+        return record
+    port = _port_number(record.get("port"))
+    if port is None:
+        return record
+    listener = _verified_untracked_listener(port)
+    if listener is None:
+        return {
+            **record,
+            "pid_source": "cli-record",
+            "pid_note": (
+                "`pid` is the pid comfy-cli recorded and could NOT be confirmed "
+                f"against whatever is listening on port {port} (`comfy stop "
+                "--port <p> --dry-run` vouched for nothing: the port may be idle, "
+                "or this comfy-cli predates `comfy stop --port`, which ships in "
+                "1.15.0). For a server started by `comfy launch --background` the "
+                "recorded pid is the wrapper process, NOT the one holding the "
+                "port, so do not kill it or match it against a port listing — use "
+                "`stop_comfyui` to stop the server."
+            ),
+        }
+    if listener.pid == recorded:
+        return {
+            **record,
+            "recorded_pid": recorded,
+            "pid_source": "port-listener",
+            "pid_note": (
+                "`pid` is confirmed by comfy-cli (`comfy stop --port <p> "
+                f"--dry-run`) to be the process listening on port {port}."
+            ),
+        }
+    return {
+        **record,
+        "pid": listener.pid,
+        "recorded_pid": recorded,
+        "pid_source": "port-listener",
+        "pid_note": (
+            "`pid` is the process comfy-cli verified is listening on port "
+            f"{port} (`comfy stop --port <p> --dry-run`). `recorded_pid` is the "
+            "pid comfy-cli recorded for this port — normally the "
+            "`comfy launch --background` wrapper that spawned the listener, and "
+            "in any case NOT the process holding the port, so killing it leaves "
+            "ComfyUI running. Stop the server with `stop_comfyui`, which tears "
+            "down the whole tree."
+        ),
+    }
+
+
+def _with_reconciled_background(report: dict) -> dict:
+    """``comfy env``'s report with its background record's pid reconciled.
+
+    comfy-cli emits that record under ``config.background``; its ``env`` schema
+    also declares a top-level ``background`` of the same shape, which nothing
+    populates today. The top-level form is therefore only reconciled when the
+    ``config`` one is absent — reconciling both would spend a second subprocess
+    on the same port for one record spelled two ways.
+    """
+    config = report.get("config")
+    if isinstance(config, dict) and isinstance(config.get("background"), dict):
+        return {
+            **report,
+            "config": {
+                **config,
+                "background": _reconcile_reported_pid(config["background"]),
+            },
+        }
+    if isinstance(report.get("background"), dict):
+        return {**report, "background": _reconcile_reported_pid(report["background"])}
+    return report
 
 
 class KillUntrackedApproval(BaseModel):
