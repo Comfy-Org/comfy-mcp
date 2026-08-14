@@ -68,12 +68,7 @@ primitive is this repo's job. Project anchoring (`_project_root`, `COMFY_PROJECT
 `project` tool) is the same kind of adaptation: comfy-cli resolves its governing `project/1`
 by walking up from its own process cwd, assuming a persistent shell session an MCP client's
 arbitrary per-call cwd can't provide, so this server passes `cwd=` on its own spawns instead
-— the `status`/`init` verdicts stay entirely comfy-cli's own. Handle NAMING is a third:
-`instructions.INSTRUCTIONS` promises one name per handle across the whole surface, and
-comfy-cli takes a download's handle as `download_id` but reports it as `id`, so
-`_with_download_id` echoes the documented name onto every download payload (comfy-cli's own
-`id` kept beside it). It derives nothing — the value is the id the call was made with —
-which is what keeps it inside the rule.
+— the `status`/`init` verdicts stay entirely comfy-cli's own.
 
 The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
