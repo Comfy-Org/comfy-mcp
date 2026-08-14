@@ -2141,7 +2141,11 @@ def test_the_shared_poll_puts_its_extra_keys_before_the_status(monkeypatch):
     assert result == {
         "timed_out": True,
         "download_id": "a1b2c3d4e5f6",
-        "status": {"status": "running"},
+        # `_poll_download` keys the handle on the NESTED payload too, so the
+        # two levels of this envelope cannot spell the same value differently
+        # — see `_with_download_id`. It is added without disturbing the key
+        # order this test exists to pin.
+        "status": {"status": "running", "download_id": "a1b2c3d4e5f6"},
     }
 
 
@@ -2205,7 +2209,8 @@ def test_the_shared_poll_still_takes_an_expired_bound(monkeypatch, timeout_secon
     assert server._poll_download("a1b2c3d4e5f6", timeout_seconds) == {
         "timed_out": True,
         "download_id": "a1b2c3d4e5f6",
-        "status": {"status": "running"},
+        # The nested payload carries the handle under the documented name too.
+        "status": {"status": "running", "download_id": "a1b2c3d4e5f6"},
     }
 
 

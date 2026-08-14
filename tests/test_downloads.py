@@ -789,7 +789,13 @@ def _submit(download_id: str = "a1b2c3d4e5f6", **extra) -> dict:
 
 
 def _status(status: str, **extra) -> dict:
-    """A `model download-status` payload."""
+    """A `model download-status` payload, AS COMFY-CLI EMITS IT.
+
+    Note the handle is `id` here and `download_id` nowhere: that is comfy-cli's
+    own spelling, and it is what `_keyed` below wraps for the assertions, so
+    these fixtures keep saying what the engine says rather than what the
+    wrapper adds to it.
+    """
     return {
         "id": "a1b2c3d4e5f6",
         "status": status,
@@ -799,6 +805,17 @@ def _status(status: str, **extra) -> dict:
         "error": None,
         **extra,
     }
+
+
+def _keyed(payload: dict, download_id: str = "a1b2c3d4e5f6") -> dict:
+    """`payload` as a CALLER sees it — the handle echoed under `download_id`.
+
+    Every download tool takes its handle as `download_id`, so the wrapper adds
+    that spelling on the way out (comfy-cli's `id` stays put alongside it).
+    Without it an agent reading a handle out of a result had to know to rename
+    the key before passing it back.
+    """
+    return {**payload, "download_id": download_id}
 
 
 class _FakeClock:
@@ -902,7 +919,7 @@ def test_download_model_submits_then_polls_to_completion(monkeypatch):
 
     result = _download_model("https://hf.co/x.safetensors")
 
-    assert result == _status("completed")
+    assert result == _keyed(_status("completed"))
     assert calls[0][:4] == ("model", "download", "--url", "https://hf.co/x.safetensors")
     assert calls[0][-1] == "--background"
     # Polls the id the submit handed back, and keeps polling past `downloading`.
@@ -928,7 +945,10 @@ def test_download_model_returns_a_timed_out_envelope_rather_than_raising(monkeyp
     assert result == {
         "timed_out": True,
         "download_id": "a1b2c3d4e5f6",
-        "status": _status("downloading"),
+        # The NESTED status is keyed the same way as the envelope around it —
+        # this payload used to carry `download_id` at the top and comfy-cli's
+        # raw `id` for the same value one level down.
+        "status": _keyed(_status("downloading")),
     }
     # A bound that expires before the first poll still reports a real status.
     assert len(calls) == 2
@@ -1362,7 +1382,9 @@ def test_download_status_maps_command_and_returns_data(patched_run):
     payload = _status("downloading", percent=25.0)
     calls = patched_run(envelope(data=payload))
 
-    assert server.download(action="status", download_id="a1b2c3d4e5f6") == payload
+    assert server.download(action="status", download_id="a1b2c3d4e5f6") == _keyed(
+        payload
+    )
     assert calls[0]["cmd"][4:] == ["model", "download-status", "a1b2c3d4e5f6"]
     assert calls[0]["timeout"] == 60.0
 
@@ -1372,7 +1394,7 @@ def test_download_status_is_the_default_action(patched_run):
     payload = _status("downloading")
     calls = patched_run(envelope(data=payload))
 
-    assert server.download(download_id="a1b2c3d4e5f6") == payload
+    assert server.download(download_id="a1b2c3d4e5f6") == _keyed(payload)
     assert calls[0]["cmd"][4:] == ["model", "download-status", "a1b2c3d4e5f6"]
 
 
@@ -1608,8 +1630,8 @@ def test_wait_for_download_returns_the_terminal_payload(monkeypatch):
     """download(action="wait") polls until terminal and returns that payload."""
     calls = _sequenced(monkeypatch, [_status("downloading"), _status("completed")])
 
-    assert server.download(action="wait", download_id="a1b2c3d4e5f6") == _status(
-        "completed"
+    assert server.download(action="wait", download_id="a1b2c3d4e5f6") == _keyed(
+        _status("completed")
     )
     assert calls[0] == ("model", "download-status", "a1b2c3d4e5f6")
     assert len(calls) == 2
@@ -1641,7 +1663,9 @@ def test_wait_for_download_times_out_cleanly(monkeypatch):
     assert server.download(action="wait", download_id="a1b2c3d4e5f6") == {
         "timed_out": True,
         "download_id": "a1b2c3d4e5f6",
-        "status": _status("downloading"),
+        # Nested and top-level agree — see the `download_model` twin of this
+        # assertion for the shape they used to disagree on.
+        "status": _keyed(_status("downloading")),
     }
 
 
@@ -2301,3 +2325,163 @@ def test_download_has_no_url_parameter():
     params = set(inspect.signature(server.download).parameters)
     assert "url" not in params
     assert params == {"action", "download_id", "timeout_seconds"}
+
+
+# --- the handle a caller reads BACK OUT --------------------------------------
+#
+# comfy-cli keys a download's handle `id` — in `model download-status` and in
+# its `model downloads` listing alike — while every tool here takes it as
+# `download_id`, the convention `instructions.INSTRUCTIONS` states outright.
+# The two used to disagree on the way OUT, so an agent that read a handle off
+# one result and fed it into the next call had to know to rename the key: a
+# discovery failure that fails quietly rather than loudly, because the value
+# was right and only the label was wrong. The sharpest instance was the
+# timed-out payload, which carried BOTH spellings for the SAME value at
+# different nesting levels. These tests pin the round trip.
+
+_HANDLE = "a1b2c3d4e5f6"
+
+
+def test_every_download_payload_hands_its_handle_back_unrenamed(monkeypatch):
+    """Read `download_id` out of ANY download payload; pass it straight back.
+
+    Covers every surface a handle can come from — the submit envelope, a
+    waited `download_model`, and the grouped tool's three actions — and then
+    actually feeds each handle into `download(action="status"/"cancel")`, so
+    the assertion is the round trip itself rather than a key's presence.
+    """
+    _sequenced(
+        monkeypatch,
+        [
+            _submit(),  # download_model(wait=False)
+            _submit(),  # download_model(wait=True): the submit
+            _status("completed"),  #                 ... then its poll
+            _status("completed"),  # download(action="wait")
+            _status("downloading"),  # download(action="status")
+            _status("cancelled"),  # download(action="cancel")
+        ],
+    )
+
+    payloads = [
+        _download_model("https://hf.co/x.safetensors", wait=False),
+        _download_model("https://hf.co/x.safetensors"),
+        server.download(action="wait", download_id=_HANDLE),
+        server.download(action="status", download_id=_HANDLE),
+        server.download(action="cancel", download_id=_HANDLE),
+    ]
+
+    # Subscript, not `.get("download_id") or .get("id")`: the documented key is
+    # simply there, on every one of them.
+    handles = [payload["download_id"] for payload in payloads]
+    assert handles == [_HANDLE] * len(payloads)
+
+    replayed = _sequenced(monkeypatch, [_status("completed")] * (2 * len(handles)))
+    for handle in handles:
+        server.download(action="status", download_id=handle)
+        server.download(action="cancel", download_id=handle)
+    assert [call[2] for call in replayed] == [_HANDLE] * (2 * len(handles))
+
+
+def test_comfy_clis_own_id_survives_alongside_the_documented_name(monkeypatch):
+    """The engine's `id` is KEPT, not renamed — this adds a spelling only."""
+    _sequenced(monkeypatch, [_status("completed")])
+
+    result = server.download(action="wait", download_id=_HANDLE)
+
+    assert result["download_id"] == _HANDLE
+    assert result["id"] == _HANDLE
+
+
+def test_the_timed_out_payload_agrees_with_itself_at_every_level(monkeypatch):
+    """One value, one spelling — the old shape's clearest symptom, closed.
+
+    The envelope's `download_id` is this wrapper's; the `id` nested under
+    `status` is comfy-cli's raw payload passed straight through. Both levels
+    now key the handle `download_id`, so neither can send a caller looking for
+    a key the other one uses.
+    """
+    _sequenced(monkeypatch, [_status("downloading")] * 10)
+    _install_clock(monkeypatch, start=0.0).tick_per_read(10.0)
+
+    result = server.download(action="wait", download_id=_HANDLE)
+
+    assert result["timed_out"] is True
+    assert result["download_id"] == _HANDLE
+    assert result["status"]["download_id"] == _HANDLE
+    assert result["status"]["id"] == _HANDLE
+
+
+def test_the_unsupported_degrade_carries_no_handle(patched_run):
+    """The one download payload that deliberately has NO `download_id`.
+
+    A comfy-cli without the verb group also rejects `--background`, so no id
+    can ever have been minted on it — the degrade's message says exactly that,
+    and hanging a handle-shaped key on it would contradict it.
+    """
+    returncode, stdout, stderr = _NO_DOWNLOAD_STATUS
+    patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    result = server.download(action="status", download_id=_HANDLE)
+
+    assert result["unsupported"] is True
+    assert "download_id" not in result
+
+
+def test_the_legacy_foreground_fallback_carries_no_handle(
+    patched_async_run, legacy_comfy_cli
+):
+    """The OTHER download payload with deliberately no `download_id`.
+
+    A comfy-cli that predates `--background` runs the transfer in the
+    foreground, so nothing is ever detached and no id is minted — the payload
+    is marked `background_unsupported` instead. It never reaches
+    `_with_download_id`, which is exactly why the tool docstring and the
+    handshake hedge their otherwise-universal claim: an agent that subscripts
+    `result["download_id"]` on the strength of an unqualified promise would
+    raise `KeyError` right here.
+    """
+    patched_async_run(
+        '{"type": "envelope", "ok": true, "data": {"saved": "/models/x"}}\n'
+    )
+
+    result = _download_model("https://hf.co/x.safetensors")
+
+    assert result["background_unsupported"] is True
+    assert "download_id" not in result
+
+
+def test_the_handle_echoed_back_is_the_one_the_caller_used(monkeypatch):
+    """When the engine's `id` and the caller's handle DIFFER, the caller's wins.
+
+    Every other fixture here spells both the same, so this is the only case
+    that can tell `_with_download_id`'s unconditional write apart from one that
+    preferred the payload's own `id`. The choice is deliberate, not incidental:
+    `download_id` is documented as the handle you pass BACK, and the caller's
+    spelling is the one comfy-cli demonstrably just resolved, while reading the
+    engine's `id` instead would make the timed-out envelope disagree with
+    itself again — its outer level has no `id` to read, so the two nesting
+    levels would go back to carrying different values for one handle, the exact
+    defect this whole section closes.
+    """
+    caller_handle = "A1B2C3D4E5F6"  # same download, engine spells it lowercase
+    _sequenced(monkeypatch, [_status("completed"), _status("downloading")] * 5)
+
+    terminal = server.download(action="status", download_id=caller_handle)
+    assert terminal["download_id"] == caller_handle
+    assert terminal["id"] == _HANDLE  # comfy-cli's own, untouched beside it
+
+    _install_clock(monkeypatch, start=0.0).tick_per_read(10.0)
+    timed_out = server.download(action="wait", download_id=caller_handle)
+    assert timed_out["timed_out"] is True
+    # BOTH levels carry the caller's spelling — they cannot disagree.
+    assert timed_out["download_id"] == caller_handle
+    assert timed_out["status"]["download_id"] == caller_handle
+    assert timed_out["status"]["id"] == _HANDLE
+
+
+@pytest.mark.parametrize("payload", [None, "starting", 3, ["a1b2c3d4e5f6"]])
+def test_a_non_dict_payload_passes_through_untouched(payload):
+    """A comfy-cli answering with a non-object `data` has nowhere to hang the
+    key, and rewrapping it would change the result shape — the same position
+    the legacy fallback takes on its own non-object payload."""
+    assert server._with_download_id(payload, _HANDLE) is payload

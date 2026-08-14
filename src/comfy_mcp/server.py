@@ -9858,6 +9858,60 @@ def _download_failed(payload: Any) -> bool:
     return _download_status_of(payload) in _DOWNLOAD_FAILURE_STATUSES
 
 
+def _with_download_id(payload: Any, download_id: str) -> Any:
+    """Echo *download_id* on a download payload comfy-cli keys ``id``.
+
+    The RETURN-VALUE half of the argument-naming convention
+    (:data:`instructions.INSTRUCTIONS`): every download argument on this side is
+    ``download_id``, while comfy-cli spells the same handle ``id`` in its
+    ``model download-status`` / ``model downloads`` payloads. An agent that
+    reads a handle out of one result and feeds it into the next call therefore
+    had to know to rename the key — a discovery failure that fails quietly
+    ("plausible but stuck"), since the value was right and only the label was
+    wrong.
+
+    So the handle is keyed under the DOCUMENTED name at the wrapper boundary.
+    This adds a spelling, it does not rename one: comfy-cli's own ``id`` is left
+    in place beside it for anything already reading that. And it derives nothing
+    — the value is the very id this call was made with — so the thin-wrapper
+    rule is untouched; the naming convention is MCP surface, which is this
+    repo's to own.
+
+    The timed-out envelope is the case that made the old shape actively
+    misleading: it carried this wrapper's ``download_id`` at the top and
+    comfy-cli's nested ``id`` for the SAME value one level down. So the nested
+    status payload is normalized too, and the two levels cannot disagree.
+
+    The written value is the CALLER'S handle unconditionally, never reconciled
+    against a payload's own ``id``, and that is deliberate for both halves.
+    ``download_id`` is documented as the handle you pass BACK, and the caller's
+    spelling is the one comfy-cli demonstrably just resolved — while preferring
+    the engine's ``id`` would reopen the very disagreement above: the timed-out
+    envelope has no ``id`` of its own to read, so its two levels would again
+    carry different values for one handle. It cannot clobber a DIFFERENT
+    handle either: the one caller that passes a value the payload also carries
+    (``download_model``'s ``wait=False`` submit) reads it out of that payload
+    via :func:`_submitted_download_id`, which returns it unrewritten.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    # Copy, never mutate: `_poll_until_terminal` hands back comfy-cli's own
+    # parsed payload, and the caller's copy is not this function's to edit.
+    # Key ORDER is preserved rather than led with `download_id` — the timed-out
+    # envelope's `timed_out, download_id, status` order is pinned by a test of
+    # the shared poll loop, so a payload that already carries the key keeps its
+    # position and only a payload missing it gains one at the end.
+    normalized = dict(payload)
+    nested = normalized.get("status")
+    # Only the timed-out envelope nests a payload under `status` — on a real
+    # `download-status` result that key is the status STRING, so the isinstance
+    # check alone would be enough and the `timed_out` half is belt-and-braces.
+    if normalized.get("timed_out") and isinstance(nested, dict):
+        normalized["status"] = _with_download_id(nested, download_id)
+    normalized["download_id"] = download_id
+    return normalized
+
+
 def _submitted_download_id(submitted: Any) -> str:
     """The ``download_id`` out of a ``model download --background`` envelope.
 
@@ -10160,14 +10214,22 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     payload is returned like any other terminal one; only ``download_model``
     turns that into a raise, matching ``job(action="wait")``, which likewise
     hands back a failed job's status rather than raising on it.
+
+    Both shapes go out through :func:`_with_download_id`, so the handle reads
+    ``download_id`` on the terminal payload AND on the status nested inside the
+    timed-out envelope — the level that used to disagree with the ``download_id``
+    beside it.
     """
-    return _poll_until_terminal(
-        "model",
-        "download-status",
+    return _with_download_id(
+        _poll_until_terminal(
+            "model",
+            "download-status",
+            download_id,
+            timeout_seconds=timeout_seconds,
+            is_terminal=_is_download_terminal,
+            timed_out_extra={"download_id": download_id},
+        ),
         download_id,
-        timeout_seconds=timeout_seconds,
-        is_terminal=_is_download_terminal,
-        timed_out_extra={"download_id": download_id},
     )
 
 
@@ -10200,7 +10262,8 @@ async def download_model(
         ``wait=True``: the final status, or ``{"timed_out": True, "download_id":
         ..., "status": ...}`` on expiry — not an error, keep polling that id.
         ``wait=False``: the submit payload (``download_id``, ``dest``,
-        ``total_bytes``, ``status``).
+        ``total_bytes``, ``status``). Both key it ``download_id`` — read it back
+        unrenamed; the pre-1.14 foreground fallback payload carries none.
 
     Gotchas:
         - comfy-cli writes straight to the FINAL path while transferring, so a
@@ -10332,7 +10395,13 @@ async def download_model(
     # it by — the same broken contract the waiting path already refuses.
     download_id = _submitted_download_id(submitted)
     if not wait:
-        return submitted
+        # Already keyed `download_id` by comfy-cli's own submit envelope, so
+        # this is a no-op today. Routed through it anyway so every payload this
+        # family hands back passes the same boundary: an engine that later
+        # spelled the submit's handle `id` — the way its `download-status` and
+        # `downloads` payloads already do — would otherwise reintroduce the
+        # rename here alone, on the one call whose entire product is a handle.
+        return _with_download_id(submitted, download_id)
     # One `to_thread` for the whole poll loop rather than one per poll: the loop
     # is `time.sleep` + blocking spawns throughout, and it is already bounded by
     # `timeout_seconds`, so handing the entire thing to a worker thread keeps the
@@ -10387,17 +10456,23 @@ async def download_model(
 
 def _download_status_sync(download_id: str) -> Any:
     """``download(action="status")``'s body — the exact ``download_status`` this replaced."""
-    return _run_comfy("model", "download-status", download_id, timeout=60.0)
+    return _with_download_id(
+        _run_comfy("model", "download-status", download_id, timeout=60.0), download_id
+    )
 
 
 def _download_wait_sync(download_id: str, timeout_seconds: float) -> Any:
     """``download(action="wait")``'s body — the exact ``wait_for_download`` this replaced."""
+    # No `_with_download_id` here: `_poll_download` already applies it, to both
+    # the terminal payload and the timed-out envelope's nested status.
     return _poll_download(download_id, timeout_seconds)
 
 
 def _download_cancel_sync(download_id: str) -> Any:
     """``download(action="cancel")``'s body — the exact ``cancel_download`` this replaced."""
-    return _run_comfy("model", "download-cancel", download_id, timeout=60.0)
+    return _with_download_id(
+        _run_comfy("model", "download-cancel", download_id, timeout=60.0), download_id
+    )
 
 
 # The three actions `download` dispatches, in the order their old standalone
@@ -10443,9 +10518,15 @@ def download(
     - "cancel" -> stop a running transfer and its partial file.
 
     `download_id` required for every action; `timeout_seconds` only for
-    "wait" -- rejected elsewhere. Too-old comfy-cli: `{"error",
-    "unsupported": True}` instead of raising.
+    "wait" -- rejected elsewhere. Payloads key the handle `download_id`;
+    pass it back as-is. Too-old comfy-cli: `{"error", "unsupported": True}`
+    instead of raising.
     """
+    # The docstring stays silent on two things a maintainer needs and an agent
+    # does not (its own token budget is pinned by a test): comfy-cli's `id` is
+    # KEPT alongside the `download_id` this adds — see `_with_download_id` —
+    # and the `unsupported` degrade deliberately carries neither, because a CLI
+    # that old can never have minted an id at all.
     if action not in _DOWNLOAD_ACTIONS:
         raise ComfyCliError(
             f"invalid download action: {action!r} — expected one of "
