@@ -28,7 +28,14 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # measurement so ordinary edits never trip it while real growth does. Ratchet
 # DOWN as the docstring diet lands; never bump without stating why in the same
 # PR.
-_BUDGET_TOKENS = 15_000
+#
+# 15,000 -> 15,250 when `nodes` documented `is_api_node` / `exclude_api`: that
+# paragraph is ~130 tokens and the tree was ALREADY at 14,984, so the slack the
+# ratchet was set with had been spent by intervening docstring growth rather
+# than by this change. Measured ~15,112 after it. Deliberately tight — the
+# point of this ceiling is that the next growth is a decision too, not that
+# there is room for one.
+_BUDGET_TOKENS = 15_250
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
