@@ -54,8 +54,19 @@ from comfy_mcp import failure_log, server, target
 
 @pytest.fixture(autouse=True)
 def _skip_version_guard(monkeypatch):
-    """Neutralize the once-per-process comfy-cli version guard for unit tests."""
+    """Neutralize the once-per-process comfy-cli version guard for unit tests.
+
+    Both halves of the guard's module state are reset, not just the latch.
+    ``_comfy_cli_version`` caches the version the guard last PARSED, and the
+    dedicated guard tests below re-enable the guard and let it write that global
+    for real — via ``global``, which `monkeypatch` cannot see. Without this
+    second `setattr` recording (and so restoring) it, a faked 1.14.0 in
+    `test_wrapper.py` would leak into every later test in the session, and the
+    readers that gate on a HIGHER floor — `job(action="watch")`, which needs
+    1.16.0 — would refuse in tests that never mentioned a version at all.
+    """
     monkeypatch.setattr(server, "_version_checked", True)
+    monkeypatch.setattr(server, "_comfy_cli_version", None)
 
 
 @pytest.fixture(autouse=True)
