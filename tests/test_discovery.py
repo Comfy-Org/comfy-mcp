@@ -181,7 +181,7 @@ def test_nodes_downstream_with_limit(patched_run):
 
 
 def test_nodes_path_defaults(patched_run):
-    calls = patched_run(envelope(data=[]))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
     # concrete int defaults are always passed, so the argv is deterministic
     assert calls[0]["cmd"][4:] == [
@@ -193,12 +193,11 @@ def test_nodes_path_defaults(patched_run):
         "6",
         "--max-paths",
         "10",
-        "--loose",
     ]
 
 
 def test_nodes_path_overrides(patched_run):
-    calls = patched_run(envelope(data=[]))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     server.nodes(
         action="path", from_type="LATENT", to_type="IMAGE", max_depth=3, max_paths=2
     )
@@ -211,17 +210,25 @@ def test_nodes_path_overrides(patched_run):
         "3",
         "--max-paths",
         "2",
-        "--loose",
     ]
 
 
-# The canonical MODEL -> IMAGE answer, as comfy-cli's `--loose` traversal
-# returns it. Used as the relayed payload below so the assertions read as the
-# route an agent is actually meant to get back.
-_CANONICAL_MODEL_TO_IMAGE = {
+# The canonical MODEL -> IMAGE answer as a POST-fix comfy-cli (>= 1.16.0)
+# returns it: `KSampler -> VAEDecode`, every step naming the socket type it
+# traversed. `mode` is the marker `_nodes_path_is_type_constrained` reads —
+# comfy-cli added it in the same commit that made its `--exact` walker
+# type-constrained, so its presence is what says the default answer is sound.
+_TYPED_MODEL_TO_IMAGE = {
     "from": "MODEL",
     "to": "IMAGE",
-    "exact": False,
+    "mode": "exact",
+    "exact": True,
+    "truncated": False,
+    "truncated_by": None,
+    "depth_limited": False,
+    "collapsed": False,
+    "not_searched": False,
+    "not_searched_reason": None,
     "max_depth": 6,
     "max_paths": 10,
     "count": 1,
@@ -233,52 +240,134 @@ _CANONICAL_MODEL_TO_IMAGE = {
                 {"node": "KSampler", "from_type": "MODEL", "to_type": "LATENT"},
                 {"node": "VAEDecode", "from_type": "LATENT", "to_type": "IMAGE"},
             ],
+            "support": [{"type": "VAE", "node": "CheckpointLoaderSimple"}],
+        }
+    ],
+}
+
+# The SAME query on a PRE-fix comfy-cli (1.13.x-1.15.x, all inside this
+# server's supported floor), reproduced from comfy-cli's own
+# `nodes_path_object_info` fixture run against its pre-#695 walker. Every
+# symptom the ticket reports is here and none of them is visible in the
+# payload's SHAPE: a node that takes no MODEL link, a blank `from_type`, and
+# no `KSampler -> VAEDecode`. No `mode` key — that is the only tell.
+_PRE_FIX_MODEL_TO_IMAGE = {
+    "from": "MODEL",
+    "to": "IMAGE",
+    "exact": True,
+    "max_depth": 6,
+    "max_paths": 10,
+    "count": 1,
+    "paths": [
+        {
+            "from": "MODEL",
+            "to": "IMAGE",
+            "steps": [
+                {"node": "ByteDanceImageNode", "from_type": "", "to_type": "IMAGE"}
+            ],
         }
     ],
 }
 
 
-def test_nodes_path_never_takes_the_engines_exact_default(patched_run):
-    """`--loose` is pinned on EVERY path call; `--exact` is never sent.
+def test_nodes_path_asks_the_engines_default_mode_first(patched_run):
+    """A type-constrained engine is asked ONCE, in its own `--exact` default.
 
-    The whole defect was passing no mode flag at all, which is not neutral —
-    it takes comfy-cli's `--exact` default, whose `exact_paths` admits any node
-    whose REQUIRED link inputs are satisfied. That is vacuously true of a node
-    with no link inputs, so `--exact` answers MODEL -> IMAGE with widget-only
-    loaders and generators that never consume MODEL, blanks their step's input
-    type, and burns `max_paths` on them before the real route is reached.
-    Asserted across the argument space (default bounds, overridden bounds,
-    equal types, a pair with no route) rather than once, because a future
-    branch that composes the argv differently for one of them would silently
-    reinstate the wrong mode for that case only.
+    The fallback is for the engines that need it, not a tax on the ones that
+    do not: `--exact` on comfy-cli >= 1.16.0 is `--loose` PLUS a satisfiability
+    filter, and it is the only mode that reports `support` and can claim
+    `exact: true`. Re-asking in `--loose` there would drop both.
     """
-    calls = patched_run(envelope(data=_CANONICAL_MODEL_TO_IMAGE))
-    for kwargs in (
-        {"from_type": "MODEL", "to_type": "IMAGE"},
-        {"from_type": "MODEL", "to_type": "IMAGE", "max_depth": 4, "max_paths": 3},
-        {"from_type": "MODEL", "to_type": "MODEL"},
-        {"from_type": "IMAGE", "to_type": "MODEL"},
-    ):
-        server.nodes(action="path", **kwargs)
-    assert calls, "no comfy invocation recorded"
-    for call in calls:
-        assert "--loose" in call["cmd"], call["cmd"]
-        assert "--exact" not in call["cmd"], call["cmd"]
-
-
-def test_nodes_path_relays_the_canonical_model_to_image_route(patched_run):
-    """The MODEL -> IMAGE payload comes back byte-identical — no re-derivation.
-
-    Pins the wrapper half of the ticket's acceptance: comfy-cli's verdict is
-    returned as-is, so the route an agent reads is `KSampler -> VAEDecode`,
-    every step names the socket type it traversed rather than an empty string,
-    and the path is longer than one hop. Which nodes the engine picks is the
-    ENGINE's answer, proven live against a real catalog by the gated e2e pin in
-    `tests/e2e/test_smoke.py`; a mocked test cannot and must not assert it.
-    """
-    patched_run(envelope(data=_CANONICAL_MODEL_TO_IMAGE))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
-    assert data == _CANONICAL_MODEL_TO_IMAGE
+    assert len(calls) == 1, [c["cmd"] for c in calls]
+    assert "--loose" not in calls[0]["cmd"]
+    assert "--exact" not in calls[0]["cmd"]
+    assert data == _TYPED_MODEL_TO_IMAGE
+
+
+def test_nodes_path_refuses_a_pre_fix_engines_default_answer(patched_run):
+    """A pre-1.16.0 payload is re-asked in `--loose` and never relayed.
+
+    The regression this ticket is about. comfy-cli's pre-#695 `exact_paths`
+    admitted any node whose REQUIRED link inputs were satisfied — vacuously
+    true of a node with no link inputs — so it answered MODEL -> IMAGE with
+    widget-only generators that never consume MODEL, blanked their step's
+    `from_type`, and burned `max_paths` on them before the real route was
+    reached. Structurally valid, semantically wrong, and unspottable by the
+    caller, which is why the wrapper has to catch it rather than pass it on.
+    """
+    calls = patched_run(envelope(data=_PRE_FIX_MODEL_TO_IMAGE))
+    server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert len(calls) == 2, [c["cmd"] for c in calls]
+    assert "--loose" not in calls[0]["cmd"]
+    assert calls[1]["cmd"][4:] == [
+        "nodes",
+        "path",
+        "MODEL",
+        "IMAGE",
+        "--max-depth",
+        "6",
+        "--max-paths",
+        "10",
+        "--loose",
+    ]
+
+
+def _sequenced_run(monkeypatch, replies: list) -> list:
+    """Answer successive `_run_comfy` calls from `replies`; record their argv.
+
+    The conftest fakes hand back ONE canned reply per fixture, and the mode
+    fallback needs a different answer per call — the multi-call case AGENTS.md
+    leaves to a local stub. An exhausted iterator fails loudly.
+    """
+    calls: list[tuple] = []
+    pending = iter(replies)
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        try:
+            return next(pending)
+        except StopIteration:
+            raise AssertionError(f"unexpected extra comfy-cli call: {args}") from None
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    return calls
+
+
+def test_nodes_path_fallback_relays_the_canonical_model_to_image_route(monkeypatch):
+    """The route an agent reads back after the fallback fires.
+
+    Pins the ticket's acceptance on the wrapper half: `KSampler -> VAEDecode`
+    is present, every step names the socket type it traversed rather than an
+    empty string, and the path is longer than one hop. WHICH nodes the engine
+    picks is the ENGINE's answer — proven live against a real catalog by the
+    gated e2e pin in `tests/e2e/test_smoke.py`, and against comfy-cli's own
+    `nodes_path_object_info` fixture in comfy-cli's suite; a mocked test cannot
+    and must not assert it.
+    """
+    loose = {
+        "from": "MODEL",
+        "to": "IMAGE",
+        "exact": False,
+        "max_depth": 6,
+        "max_paths": 10,
+        "count": 1,
+        "paths": [
+            {
+                "from": "MODEL",
+                "to": "IMAGE",
+                "steps": [
+                    {"node": "KSampler", "from_type": "MODEL", "to_type": "LATENT"},
+                    {"node": "VAEDecode", "from_type": "LATENT", "to_type": "IMAGE"},
+                ],
+            }
+        ],
+    }
+    calls = _sequenced_run(monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, loose])
+    data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert [a[-1] for a in calls] == ["10", "--loose"]
+    assert data == loose
     steps = data["paths"][0]["steps"]
     assert [s["node"] for s in steps] == ["KSampler", "VAEDecode"]
     assert all(s["from_type"] for s in steps), steps
@@ -288,16 +377,33 @@ def test_nodes_path_relays_the_canonical_model_to_image_route(patched_run):
 def test_nodes_path_relays_an_empty_result_rather_than_inventing_one(patched_run):
     """No route -> the engine's own empty answer, not a consolation payload.
 
-    `--exact` answers the routeless IMAGE -> MODEL with a bare
+    On a pre-fix engine the routeless IMAGE -> MODEL came back as a bare
     `CheckpointLoaderSimple` — a node that consumes nothing, dressed as a
-    one-step path. Under `--loose` the engine returns `count: 0` and no paths,
-    and the wrapper must hand that straight back: an explicit "no such route"
-    is the answer, and synthesizing anything friendlier here would be the
+    one-step path. The `--loose` re-ask returns `count: 0` and no paths, and
+    the wrapper hands that straight back: an explicit "no such route" is the
+    answer, and synthesizing anything friendlier here would be the
     derive-it-locally breach the architecture rule forbids.
     """
     empty = {"from": "IMAGE", "to": "MODEL", "count": 0, "paths": []}
     patched_run(envelope(data=empty))
     assert server.nodes(action="path", from_type="IMAGE", to_type="MODEL") == empty
+
+
+def test_nodes_path_unreadable_payload_falls_back_rather_than_trusting_it(
+    patched_run,
+):
+    """A shape this server cannot read is treated as the OLD contract.
+
+    The marker is read out of a dict; a list, a scalar or a null is neither a
+    post-fix payload nor something to relay on faith, so it takes the same
+    `--loose` re-ask. Fail toward the mode that is sound on every supported
+    engine — the cost of guessing wrong that way is one extra call.
+    """
+    for data in ([], None, "nope", 3):
+        calls = patched_run(envelope(data=data))
+        server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+        assert len(calls) == 2, (data, [c["cmd"] for c in calls])
+        assert "--loose" in calls[1]["cmd"]
 
 
 def test_nodes_types_argv(patched_run):
@@ -1071,7 +1177,7 @@ def test_nodes_path_still_passes_negative_bounds_through(patched_run):
     those verbatim), so even a negative bound is comfy-cli's to reject, not the
     wrapper's to refuse for looking dash-leading.
     """
-    calls = patched_run(envelope(data=[]))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     server.nodes(
         action="path", from_type="MODEL", to_type="IMAGE", max_depth=-1, max_paths=-2
     )
@@ -1084,7 +1190,6 @@ def test_nodes_path_still_passes_negative_bounds_through(patched_run):
         "-1",
         "--max-paths",
         "-2",
-        "--loose",
     ]
 
 
@@ -1128,16 +1233,16 @@ def test_nodes_reject_embedded_nul(monkeypatch):
 # The whole-server ceiling in `test_payload_budget.py` is the other half of
 # this guard and was NOT raised.
 #
-# Raised 500 -> 510 when the "path" bullet gained `--loose` and the sentence
-# saying every step is a real socket link. Small, and stated plainly because
-# the previous bump's own note applies again: the tree was ALREADY at ~493 of
-# 500, so the 25 tokens of slack that ceiling was set with had been spent by
-# intervening growth, not by this edit — which costs ~14. It is not decoration
-# either: `path` shipped answers that were structurally valid and semantically
-# wrong, and an agent that is not told the steps are type-checked links has no
-# way to tell this tool's output from that one. Measured ~507. The whole-server
-# ceiling was again NOT raised (~15,126 of 15,250).
-_NODES_DOC_BUDGET_TOKENS = 510
+# Raised 500 -> 508 for the "path" bullet's two added clauses — every step is a
+# real socket link, and no route means no paths. Stated plainly because the
+# previous bump's own note applies again: the tree was ALREADY at ~493 of 500,
+# so the slack that ceiling was set with had been spent by intervening growth,
+# not by this edit, which costs ~12. Not decoration either: `path` shipped
+# answers that were structurally valid and semantically wrong, and an agent not
+# told the steps are type-checked links has no way to tell this tool's output
+# from that one. Measured ~505. The whole-server ceiling in
+# `test_payload_budget.py` was again NOT raised.
+_NODES_DOC_BUDGET_TOKENS = 508
 
 
 def test_nodes_tool_docstring_within_its_own_token_budget():

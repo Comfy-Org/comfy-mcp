@@ -18,11 +18,14 @@ tools (no mocks):
    error rather than skipping.
 3. ``nodes(action="path", from_type="MODEL", to_type="IMAGE")`` against the live
    catalog. Also a REGRESSION GUARD, and for the same reason as case 2: the tool
-   used to send no traversal-mode flag, taking comfy-cli's ``--exact`` default,
-   which answered with nodes that never accept a MODEL socket while keeping a
-   perfectly valid-looking payload. No mocked test can catch that — a canned
+   used to relay whatever comfy-cli's default traversal mode returned, and on a
+   pre-1.16.0 engine that was nodes which never accept a MODEL socket, wrapped in
+   a perfectly valid-looking payload. No mocked test can catch that — a canned
    envelope asserts whatever it was handed — so the only real defense is asking a
-   real ``object_info``. Needs no checkpoint, only the core node set.
+   real ``object_info``. Whether the answer arrives in the engine's own default
+   mode or in the ``--loose`` re-ask is invisible here BY DESIGN: this asserts the
+   semantics a caller is owed, which both modes must satisfy on a healthy install.
+   Needs no checkpoint, only the core node set.
 
 **Gated.** They require BOTH a live local ComfyUI answering on ``COMFYUI_URL`` (or
 ``http://127.0.0.1:8188``) AND the ``comfy`` binary on ``PATH`` (or ``COMFY_BIN``).
@@ -210,7 +213,8 @@ def test_nodes_path_model_to_image_is_semantically_sound():
     accepted MODEL, every step's `from_type` blank, every path one hop long, the
     canonical route missing. A canned envelope proves the argv and the relay; only
     a live catalog proves the answer, so this pins the semantics against whatever
-    `object_info` the machine actually has.
+    `object_info` the machine actually has — on whichever comfy-cli is installed,
+    which is exactly the axis the fix is about.
 
     Deliberately install-agnostic. It asserts the PROPERTIES the ticket's
     acceptance is written in — every step names the socket type it traversed, and

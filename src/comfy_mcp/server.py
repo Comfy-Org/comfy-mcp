@@ -9146,52 +9146,95 @@ def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
     return _run_comfy(*args, timeout=60.0)
 
 
+# The marker key that tells this server WHICH `nodes path` contract the
+# installed comfy-cli speaks. comfy-cli added `mode` to the `nodes path`
+# payload in the same commit that made its `--exact` walker type-constrained
+# (comfy-cli #695, released in 1.16.0), so its presence is the engine's own
+# statement that its default mode is sound. Nothing else in the payload
+# distinguishes the two: every field the OLD one emitted, the new one still
+# emits, with the same names and the same meanings.
+_PATH_TYPED_EXACT_MARKER = "mode"
+
+
+def _nodes_path_is_type_constrained(data: Any) -> bool:
+    """Does this engine's ``nodes path`` default mode route on socket TYPE?
+
+    Reads the answer out of comfy-cli's own payload rather than off a version
+    number this repo would then have to keep in sync. ``True`` only for a
+    payload carrying :data:`_PATH_TYPED_EXACT_MARKER`; anything else — a
+    pre-fix payload, or a shape this server cannot read at all — is treated as
+    the old contract, which costs one extra ``--loose`` call and never a wrong
+    answer.
+    """
+    return isinstance(data, dict) and _PATH_TYPED_EXACT_MARKER in data
+
+
 def _nodes_path_sync(
     from_type: str, to_type: str, max_depth: int, max_paths: int
 ) -> Any:
-    """``nodes(action="path")``'s body — ``nodes_path`` plus an explicit ``--loose``.
+    """``nodes(action="path")``'s body — ``nodes_path`` plus a mode fallback.
 
-    The ONE thing decided here is WHICH of comfy-cli's two traversal modes to
-    ask for; both are the engine's own walk over the live ``object_info``
-    graph, so this stays a passthrough — no graph is parsed and no verdict is
-    derived on this side. Not passing the flag at all (what this did before)
-    is not neutral: it takes comfy-cli's ``--exact`` default, which on this
-    verb is the mode that answers WRONG.
+    Two passthroughs, and the ONLY thing decided here is which of comfy-cli's
+    two traversal modes the installed engine can be trusted to answer in. Both
+    are the engine's own walk over the live ``object_info`` graph and the
+    payload is relayed verbatim either way, so this stays inside the
+    thin-wrapper rule: no graph is parsed here and no verdict is derived here.
 
-    ``--loose`` (``find_paths``) walks the engine's consumers index, which is
-    keyed on **socket type** — built from link inputs only, and an enum/COMBO
-    widget is not a link — so every step is a node that genuinely accepts the
-    type the step before it produced, the chain provably starts at
-    ``from_type``, and each step's reported input type is the type actually
-    traversed.
+    **Why a fallback at all.** comfy-cli's ``--exact`` default was not always
+    type-constrained. Before comfy-cli #695 (released in 1.16.0) its
+    ``exact_paths`` walked EVERY node and admitted any whose *required link
+    inputs* were already satisfied — vacuously true of a node with no link
+    inputs at all. So it answered with widget-only loaders and generators that
+    never consume ``from_type``, reported their step's ``from_type`` as the
+    empty string (it had no consumed type to name), and burned ``max_paths`` on
+    them before a real route was reached. This server's floor is comfy-cli
+    1.13.0, so that engine is inside the supported range, and the payload it
+    produces is the right shape and the wrong answer — indistinguishable from a
+    correct one to a caller that cannot re-derive it. Measured against
+    comfy-cli's own ``nodes_path_object_info`` fixture on the pre-fix engine:
+    ``MODEL`` -> ``IMAGE`` returns ``ByteDanceImageNode`` (which takes no MODEL
+    link) and omits ``KSampler -> VAEDecode`` entirely, and the routeless
+    ``IMAGE`` -> ``MODEL`` comes back as a bare ``CheckpointLoaderSimple``
+    instead of as no answer.
 
-    ``--exact`` (``exact_paths``) instead admits any node whose REQUIRED link
-    inputs are already satisfied. That is vacuously true of a node with NO
-    link inputs, so it returns widget-only loaders and generators that never
-    consume ``from_type``, reports their step's input type as the empty
-    string, and lets them exhaust ``max_paths`` before a real route is
-    reached. Measured against comfy-cli's own six-node fixture: ``MODEL`` ->
-    ``IMAGE`` under ``--exact`` is ``CheckpointLoaderSimple ->
-    EmptyLatentImage -> VAEDecode`` (MODEL never used) where ``--loose``
-    gives ``KSampler -> VAEDecode``; and ``IMAGE`` -> ``MODEL``, which has no
-    route at all, comes back under ``--exact`` as a bare
-    ``CheckpointLoaderSimple`` instead of as no answer. Structurally valid,
-    semantically wrong, and indistinguishable from a right answer to a caller
-    that cannot re-derive it — the reason the flag is pinned rather than left
-    to the engine's default.
+    ``--loose`` on that same engine is sound: it walks the consumers index,
+    which is keyed on socket type and built from link inputs only (an
+    enum/COMBO widget is not a link), so every step genuinely accepts the type
+    the step before it produced, every step names that type, and an unroutable
+    pair comes back as no paths. On the fixture it gives
+    ``KSampler -> VAEDecode`` and nothing for ``IMAGE`` -> ``MODEL``.
 
-    No capability probe is needed, unlike ``run_workflow``'s ``--allow-spend``:
-    ``nodes path``, ``--exact/--loose`` and the ``envelope/1`` contract
-    ``_run_comfy`` itself requires all landed in the SAME comfy-cli commit, so
-    there is no engine this server can talk to at all that has the verb but
-    not the flag.
+    **Why not just pin ``--loose``.** On a post-fix engine ``--exact`` is
+    type-constrained too — it is loose PLUS a satisfiability filter — and it
+    answers strictly better: it reports each path's other required inputs under
+    ``support`` (the ``VAE`` for ``VAEDecode``, and which node can supply it),
+    and it is the only mode that can claim ``exact: true``, which on an empty
+    result is a PROOF that no route exists rather than merely no route found.
+    Pinning ``--loose`` unconditionally would take both away from every
+    up-to-date install to fix an engine most of them are not running, and would
+    reinstate a milder version of the same complaint — routes whose steps
+    cannot actually be wired.
 
-    Not exposed as a caller-facing toggle. ``--exact``'s intent — every step's
-    required inputs satisfiable from the path so far — is worth having, but
-    until the engine also requires a path to CONSUME ``from_type``, offering
-    it would hand an agent a mode whose wrong answers it has no way to spot.
+    So: ask in the default mode, and re-ask in ``--loose`` only when the answer
+    comes back in the pre-fix contract
+    (:func:`_nodes_path_is_type_constrained`). An up-to-date engine pays
+    exactly one call and behaves as it does today; a pre-fix engine pays a
+    second call and gets a sound answer instead of a plausible-looking wrong
+    one. The verdict is re-read per call rather than latched, matching this
+    module's "never memoize the negative" policy — an engine upgraded under a
+    running server is picked up on the next call, not on the next restart.
+
+    The flag itself needs no capability probe, unlike ``run_workflow``'s
+    ``--allow-spend``: ``nodes path``, ``--exact/--loose`` and the ``envelope/1``
+    contract ``_run_comfy`` itself requires all landed in the SAME comfy-cli
+    commit, so no engine this server can talk to has the verb without the flag.
+
+    Neither mode is exposed as a caller-facing toggle. ``--exact`` is what a
+    caller gets wherever it is trustworthy, and offering the pre-fix engine's
+    version of it would hand an agent a mode whose wrong answers it has no way
+    to spot.
     """
-    return _run_comfy(
+    args = (
         "nodes",
         "path",
         from_type,
@@ -9200,9 +9243,11 @@ def _nodes_path_sync(
         str(max_depth),
         "--max-paths",
         str(max_paths),
-        "--loose",
-        timeout=60.0,
     )
+    data = _run_comfy(*args, timeout=60.0)
+    if _nodes_path_is_type_constrained(data):
+        return data
+    return _run_comfy(*args, "--loose", timeout=60.0)
 
 
 def _nodes_types_sync() -> Any:
@@ -9285,8 +9330,8 @@ def nodes(
     - "upstream"/"downstream" -> `nodes upstream|downstream <name>
       [--limit N]`: what feeds INTO / is fed FROM `name`.
     - "path" -> `nodes path <from_type> <to_type> --max-depth N
-      --max-paths N --loose`: chains between two types, every step a
-      real socket link; depth/paths 6/10. No route -> no paths.
+      --max-paths N`: chains between two types, every step a real
+      socket link; depth/paths 6/10. No route -> no paths.
     - "types" -> `nodes types`: connection types by connectivity.
     - "categories" -> `nodes categories`: the category tree.
 
