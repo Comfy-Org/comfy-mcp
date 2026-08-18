@@ -1766,6 +1766,10 @@ class _StreamProgress:
         # The run's handle, latched off the stream (see `report`). None until
         # comfy-cli reports it — i.e. until something was actually submitted.
         self.prompt_id: str | None = None
+        # True once the run reported an `execution_error`. The handle stays
+        # useful (the job exists and is inspectable) but it is no longer a
+        # RUNNING job, so a timeout must not describe it as one — see `report`.
+        self.errored = False
         self._last = -1.0  # last value reported (kept non-decreasing)
 
     def snapshot(self) -> dict:
@@ -1795,12 +1799,26 @@ class _StreamProgress:
         local run event and emits ``queued`` only once the job's state file is on
         disk, so from that line on the id is pollable — which is what lets a wait
         that expires hand back a live job instead of orphaning it.
+
+        The latched value is put through the same :func:`argv._guard_prompt_id`
+        the ``job`` verbs run on a caller-supplied id, and a value that fails it
+        is DROPPED rather than latched. Two reasons, and the first is contract
+        rather than hardening: handing back an id those verbs would refuse makes
+        the payload's "poll this" a promise the server has already broken. The
+        second is that ``_readline_unbounded`` deliberately has no line ceiling,
+        so a malformed event could otherwise inflate both the returned payload
+        and the raised message without bound.
         """
         if self.prompt_id is None:
             reported = event.get("prompt_id")
             if isinstance(reported, str) and reported:
-                self.prompt_id = reported
+                try:
+                    self.prompt_id = argv._guard_prompt_id(reported)
+                except ComfyCliError:
+                    pass  # unusable as a handle; keep looking
         etype = event.get("type")
+        if etype == "execution_error":
+            self.errored = True
         if etype == "queued":
             nodes = event.get("nodes")
             if isinstance(nodes, list) and nodes:
@@ -2075,6 +2093,75 @@ def _live_job_note(prompt_id: str) -> str:
     )
 
 
+def _live_handle(tracker: "_StreamProgress", *, stream_ended: bool) -> str | None:
+    """The run's handle, but only while "still running" is actually true.
+
+    :func:`_live_job_note` and the payload built on it both assert a job that is
+    RUNNING and uncancelled. Three things have to hold for that, and having an id
+    is only the first:
+
+    * a ``prompt_id`` was latched at all — no submit, no job (ComfyUI down, a
+      stalled template fetch), and inventing one the caller could never find is
+      worse than the error it replaces;
+    * the stream had NOT already reached EOF — comfy-cli dying without an
+      envelope leaves the reap running on the same deadline, so an expiry there
+      is a dead child, not an outlived run, and the returncode/stderr the raising
+      branch collects are the answer rather than noise;
+    * no ``execution_error`` was reported — the job exists and is inspectable,
+      but it FAILED, so "still running" would be a lie.
+
+    Returns None in each of those cases, routing the caller to the raising branch
+    (which still names the handle in prose — see the ``fate`` block).
+    """
+    if stream_ended or tracker.errored:
+        return None
+    return tracker.prompt_id
+
+
+def _live_job_payload(handle: str, tracker: "_StreamProgress") -> dict:
+    """The "your job outlived this wait" result, built in one place.
+
+    Shared by the two deadlines that can strand a submitted run — this server's
+    own ``asyncio.wait_for`` and comfy-cli's per-event ``--timeout`` (its
+    ``ws_timeout`` envelope) — so the two cannot drift into different shapes for
+    what is, to the caller, the same event.
+    """
+    return {
+        "timed_out": True,
+        "prompt_id": handle,
+        "status": tracker.snapshot(),
+        "note": _live_job_note(handle),
+    }
+
+
+# comfy-cli's error code for its OWN per-event deadline expiring
+# (`comfy_cli/command/run/__init__.py`, `WebSocketTimeoutException` ->
+# `renderer.error(code="ws_timeout", ...)`). That envelope is the exact sibling
+# of our parent `asyncio.wait_for` expiry — the WATCHER gave up while ComfyUI
+# kept executing a prompt it had already accepted — and comfy-cli says so in its
+# own handler: it cancels nothing and deliberately leaves the submit-time job
+# record NON-TERMINAL, because "the job may genuinely still be running
+# server-side". That is what makes answering it with "still running" a report
+# rather than a guess. Unwrapping it raises, so the handle was lost here. Since
+# `_run_template_argv` LOWERS `--timeout` to the caller's budget, the engine's
+# deadline is the one that fires first on any gap between events longer than the
+# budget (a cold multi-GB checkpoint load — precisely the slow-hardware case the
+# handle exists for), which makes this the COMMON expiry, not the exotic one.
+#
+# The handle handed back is the LATCHED one, never the envelope's. comfy-cli
+# does put a `prompt_id` in this error's `details`, but only from #605
+# (2026-07-27) — well after the 1.14.0 floor this server supports — so reading
+# it there would work on some supported installs and silently not on others.
+# The id latched off the stream is present on every version that emits events
+# at all, and is the same id.
+#
+# Deliberately just this one code. `ws_disconnected` is the neighbouring case and
+# is NOT included: "lost connection to ComfyUI" cannot distinguish a dropped
+# socket from a server that died taking the queue with it, so answering it with
+# "still running, poll it" would be a guess. It keeps raising.
+_ENGINE_WATCHER_TIMEOUT_CODE = "ws_timeout"
+
+
 async def _run_comfy_streaming(
     *args: str,
     ctx: Context | None = None,
@@ -2101,10 +2188,17 @@ async def _run_comfy_streaming(
     that SUBMITS a job: an expiry that happens after comfy-cli reported a
     ``prompt_id`` returns ``{"timed_out": True, "prompt_id": ..., "status": ...,
     "note": ...}`` instead, because the job is still running and the caller needs
-    the handle to poll, collect or cancel it (see :func:`_live_job_note`). It is
-    deliberately gated on the id being known: a deadline reached BEFORE the
-    submit (ComfyUI not running, a stalled template fetch) has no job to hand
-    back and stays the error it always was. Whichever branch runs, the ``finally``
+    the handle to poll, collect or cancel it (see :func:`_live_job_note`).
+
+    TWO deadlines can strand such a run, and it covers both, because a caller
+    cannot tell them apart and neither can the job: this function's own
+    ``asyncio.wait_for``, and comfy-cli's per-event ``--timeout``, which arrives
+    as a ``ws_timeout`` error envelope and is in fact the one that usually fires
+    first (:data:`_ENGINE_WATCHER_TIMEOUT_CODE` says why). Both are gated on
+    :func:`_live_handle` — a deadline reached BEFORE the submit (ComfyUI not
+    running, a stalled template fetch) has no job to hand back and stays the
+    error it always was, as does one reached after the stream already ended or
+    the run reported an execution error. Whichever branch runs, the ``finally``
     below still kills the child.
     """
     _require_comfy_bin()
@@ -2195,15 +2289,23 @@ async def _run_comfy_streaming(
         else None
     )
 
+    # Set once `_pump` hits stdout EOF, i.e. comfy-cli died without an envelope.
+    # The reap that follows is bounded by the SAME deadline, so a deadline can
+    # expire with the child already dead — which is not "the run outlived our
+    # wait" and must not be answered with the still-running handle payload.
+    stream_ended = False
+
     async def _read() -> tuple[bool, Any]:
         # Read up to the terminal envelope, then — on the EOF path only — reap
         # the child and its stderr. Both are bounded by the caller's `timeout`
         # (a child that closes stdout without exiting can't wedge the unbounded
         # proc.wait/stderr read). On the envelope path the reap is deliberately
         # left to the caller so it runs OFF the client budget.
+        nonlocal stream_ended
         got_envelope = await _pump()
         if got_envelope:
             return True, None
+        stream_ended = True
         # EOF: the child has closed stdout, so a plain wait is safe and its
         # stderr is collectible for the error message.
         returncode = await proc.wait()
@@ -2247,19 +2349,15 @@ async def _run_comfy_streaming(
             # Latched off the stream, so it is set exactly when a job exists to
             # hand back — see `_StreamProgress.report`.
             handle = tracker.prompt_id
-            if timeout_returns_handle and handle:
+            live = _live_handle(tracker, stream_ended=stream_ended)
+            if timeout_returns_handle and live is not None:
                 # A submitted run that outlived the wait is not a failure: the
                 # deadline is ours, the job is the server's, and returning the
                 # handle is what keeps it pollable instead of orphaned. Checked
                 # before `raise_on_timeout` so the handle wins if a caller ever
                 # asks for both (`job(action="watch")`, the only tail today,
                 # sets neither and is unaffected).
-                return {
-                    "timed_out": True,
-                    "prompt_id": handle,
-                    "status": tracker.snapshot(),
-                    "note": _live_job_note(handle),
-                }
+                return _live_job_payload(live, tracker)
             if not raise_on_timeout:
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
@@ -2296,11 +2394,20 @@ async def _run_comfy_streaming(
             # orphans a live run. Raising callers get it in prose because a
             # ComfyCliError reaches the client as text; the tools that need it
             # as DATA pass `timeout_returns_handle` above.
-            fate = (
-                _live_job_note(handle)
-                if handle
-                else 'The run may still be going — check `job(action="status")`.'
-            )
+            if live is not None:
+                fate = _live_job_note(live)
+            elif handle:
+                # A handle we have but cannot call live: the stream had already
+                # ended, or the run reported an execution error. Still name it —
+                # it is what makes the failure inspectable — but do not repeat
+                # the payload's "still running, was NOT cancelled" claim.
+                fate = (
+                    f"The run was submitted as prompt_id {handle!r}; its stream "
+                    'ended before this deadline, so check `job(action="status")` '
+                    "for what became of it."
+                )
+            else:
+                fate = 'The run may still be going — check `job(action="status")`.'
             message = (
                 f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
                 f"Progress so far: {tracker.snapshot()}. {fate} For long "
@@ -2353,14 +2460,35 @@ async def _run_comfy_streaming(
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 stderr = ""
-        return _unwrap_envelope(
-            envelope,
-            args,
-            proc.returncode,
-            stderr,
-            stdout=stdout_text,
-            streaming=True,
-        )
+        try:
+            return _unwrap_envelope(
+                envelope,
+                args,
+                proc.returncode,
+                stderr,
+                stdout=stdout_text,
+                streaming=True,
+            )
+        except ComfyCliError as exc:
+            # The engine's own per-event deadline, not ours: same event as the
+            # `asyncio.TimeoutError` above (the watcher gave up on a run ComfyUI
+            # is still executing) reaching us as an envelope instead of an
+            # expiry. Answer it with the same payload, built from the same
+            # latched handle rather than the one this envelope carries only on
+            # post-floor comfy-cli builds, so a caller whose
+            # contract is "never return without the handle" holds on BOTH
+            # deadlines. See `_ENGINE_WATCHER_TIMEOUT_CODE` for why it is exactly
+            # one code, and `_live_handle` for the three conditions the claim
+            # rests on. Any other error — the graph failed, the prompt was
+            # rejected, ComfyUI was never up — still raises unchanged.
+            live = _live_handle(tracker, stream_ended=stream_ended)
+            if (
+                timeout_returns_handle
+                and live is not None
+                and exc.code == _ENGINE_WATCHER_TIMEOUT_CODE
+            ):
+                return _live_job_payload(live, tracker)
+            raise
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, cancellation, or normal completion — a failed progress
@@ -2374,8 +2502,17 @@ async def _run_comfy_streaming(
         # Cancelling an asyncio stream read takes effect immediately, so unlike
         # the thread-pool reader this replaced there is nothing left parked on
         # the pipe once the task is cancelled — no join is needed.
-        if stderr_future is not None and not stderr_future.done():
-            stderr_future.cancel()
+        if stderr_future is not None:
+            if not stderr_future.done():
+                stderr_future.cancel()
+            elif not stderr_future.cancelled():
+                # Finished on its own — retrieve its outcome so a drain that died
+                # (a stream read raising, e.g. a reset pipe) does not leave asyncio
+                # logging "Task exception was never retrieved" at GC. Every early
+                # return above skips the `await`, so this is the one place that can
+                # cover them all; the exception is discarded because it describes
+                # the diagnostics channel, never the run's own result.
+                stderr_future.exception()
 
 
 def _detect_comfy_cli_version() -> str | None:
@@ -3337,13 +3474,24 @@ def _t2i_missing_template_hint(
 # call; this server can neither see nor raise it, and when that cap fires first
 # the call returns NOTHING — not even the `prompt_id` — while the generation
 # keeps running on the user's GPU. So the wait has to expire on THIS side first,
-# where the handle can still be handed back. 90s plus the parent's
-# `_RUN_TEMPLATE_TIMEOUT_GRACE` lands on the same 120s ceiling `run_workflow`'s
-# default is chosen against, and well inside the 300s cap seen in the field.
-# Short is cheap now precisely because expiry is no longer a dead end: it returns
-# the `prompt_id` to poll (see `generate_image`). Callers who genuinely want to
-# block longer pass a bigger `timeout_seconds` — up to their client's cap.
-_T2I_DEFAULT_TIMEOUT = 90.0
+# where the handle can still be handed back.
+#
+# 60s, not the 90s that would land the whole call on exactly the 120s low end of
+# the 120-300s caps seen in the field. Matching that number is a TIE, not a win,
+# and this call loses a tie twice over: the server's clock starts inside
+# `_run_comfy_streaming`, AFTER a `_check_comfy_version` that is documented at up
+# to 30s on its first call, while the client's cap covers the whole call
+# including that probe. 60s plus `_RUN_TEMPLATE_TIMEOUT_GRACE` is 90s, leaving
+# real headroom under the lowest cap rather than racing it — and under
+# `run_workflow`'s 110s, which is that tool's WHOLE wait (it adds no grace on
+# top), so 90s+30s was never the same ceiling as its default despite running the
+# same kind of job.
+#
+# Short is cheap precisely because expiry is no longer a dead end: it returns the
+# `prompt_id` to poll (see `generate_image`), on the engine's deadline as well as
+# ours. Callers who genuinely want to block longer pass a bigger
+# `timeout_seconds` — up to their client's cap.
+_T2I_DEFAULT_TIMEOUT = 60.0
 
 
 def _t2i_config() -> tuple[str, str, str]:
@@ -3387,7 +3535,7 @@ async def generate_image(
         wait: True (default) blocks up to ``timeout_seconds``, streaming
             progress; False submits and returns a ``prompt_id`` at once —
             prefer False on slow hardware.
-        timeout_seconds: bounds this wait when ``wait=True``. Default 90s:
+        timeout_seconds: bounds this wait when ``wait=True``. Default 60s:
             your client's own transport cap (seen in the wild at 120-300s) is
             invisible here and the shorter wins, so it is the real ceiling.
 
@@ -3395,7 +3543,8 @@ async def generate_image(
     finishes in time. An expired wait is NOT a failure: it returns
     ``{"timed_out": True, "prompt_id", "status", "note"}`` for a job still
     RUNNING — poll ``job(action="status")``, collect ``fetch_outputs``, cancel
-    ``job(action="cancel")``. No path drops the handle.
+    ``job(action="cancel")``. That holds for the engine's own per-event deadline
+    as much as this wait's, so no expiry drops the handle.
 
     Gotchas:
     - Always FREE, a local OSS graph — use ``partner_generate`` for paid

@@ -4245,6 +4245,163 @@ def test_streaming_bounded_tail_payload_is_unchanged(monkeypatch):
     }
 
 
+# --- The OTHER deadline: comfy-cli's own per-event `--timeout` ---------------
+#
+# `_run_template_argv` LOWERS the engine's `--timeout` to the caller's budget, so
+# the engine's deadline is the one that fires first on any gap between events
+# longer than that budget — a cold multi-GB checkpoint load, exactly the
+# slow-hardware case the handle exists for. It arrives as a `ws_timeout` error
+# envelope (comfy-cli's `WebSocketTimeoutException` handler) carrying no
+# `prompt_id`, so unwrapping it raised and the handle was lost — the parent
+# `asyncio.wait_for` branch above never ran. Same event to the caller, same
+# answer.
+
+
+def _engine_error_stream(code: str, message: str) -> str:
+    """`queued` (so a handle is latched) + comfy-cli's own error envelope."""
+    return (
+        _QUEUED_WITH_HANDLE
+        + "\n"
+        + json.dumps(
+            {
+                "schema": "envelope/1",
+                "type": "envelope",
+                "ok": False,
+                "error": {"code": code, "message": message},
+            }
+        )
+        + "\n"
+    )
+
+
+def test_engine_ws_timeout_returns_the_handle(patched_stream):
+    """comfy-cli's own per-event expiry hands back the handle, like ours does."""
+    patched_stream(
+        _engine_error_stream(
+            "ws_timeout", "WebSocket timed out after 60s waiting for server response."
+        )
+    )
+
+    result = asyncio.run(
+        server._run_comfy_streaming(
+            "run-template",
+            "some_template",
+            timeout=30.0,  # never reached: the ENGINE gave up first
+            timeout_returns_handle=True,
+        )
+    )
+
+    assert result["timed_out"] is True
+    assert result["prompt_id"] == _HANDLE
+    assert 'job(action="cancel")' in result["note"]
+
+
+def test_engine_ws_timeout_still_raises_without_the_opt_in(patched_stream):
+    """`run_workflow` / `run_template` keep the error they document.
+
+    The engine-side branch is scoped to `timeout_returns_handle` exactly like the
+    parent-deadline one, so a caller that did not opt in sees no change at all.
+    """
+    patched_stream(_engine_error_stream("ws_timeout", "WebSocket timed out."))
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming("run-template", "some_template", timeout=30.0)
+        )
+
+    assert exc.value.code == "ws_timeout"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "execution_error",  # the graph itself failed — no live job to poll
+        "ws_disconnected",  # cannot tell a dropped socket from a dead server
+        "server_not_running",  # nothing was ever submitted
+        "prompt_rejected",  # ComfyUI refused the graph
+        "cancelled",  # someone stopped it on purpose
+    ],
+)
+def test_engine_errors_other_than_ws_timeout_still_raise(patched_stream, code):
+    """Only the engine's TIMEOUT is answered with "still running" — nothing else.
+
+    Every other failure means the job is not running, so a `timed_out` payload
+    would assert something false and, worse, tell the caller to keep polling it.
+    """
+    patched_stream(_engine_error_stream(code, "nope"))
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run-template",
+                "some_template",
+                timeout=30.0,
+                timeout_returns_handle=True,
+            )
+        )
+
+    assert exc.value.code == code
+
+
+def test_expired_wait_after_an_execution_error_does_not_claim_a_live_job(monkeypatch):
+    """A run that reported an error is inspectable, not RUNNING — say so.
+
+    The handle stays in the raised message (it is what makes the failure
+    inspectable), but the payload's "was NOT cancelled, keep polling" claim would
+    be false, so this falls through to the error instead.
+    """
+    errored = json.dumps(
+        {"schema": "event/1", "type": "execution_error", "prompt_id": _HANDLE}
+    )
+    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n", errored + "\n"])
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run-template",
+                "some_template",
+                timeout=0.25,
+                timeout_returns_handle=True,
+            )
+        )
+
+    msg = str(exc.value)
+    assert _HANDLE in msg  # still recoverable
+    assert "was NOT" not in msg  # ... but not advertised as a live run
+
+
+def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(monkeypatch):
+    """An id the `job` verbs would refuse is not handed back as a handle.
+
+    `_readline_unbounded` has no line ceiling by design, so a malformed event can
+    carry an arbitrarily long "id". Returning it would both inflate the payload
+    and promise a poll that `argv._guard_prompt_id` refuses on the next call.
+    """
+    junk = json.dumps(
+        {
+            "schema": "event/1",
+            "type": "queued",
+            "prompt_id": "x" * (argv._MAX_PROMPT_ID_LEN + 1),
+            "nodes": [{"id": "1"}],
+        }
+    )
+    _blocking_streaming_child(monkeypatch, [junk + "\n"])
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run-template",
+                "some_template",
+                timeout=0.25,
+                timeout_returns_handle=True,
+            )
+        )
+
+    msg = str(exc.value)
+    assert "already submitted as prompt_id" not in msg
+    assert "x" * 300 not in msg  # nor echoed back whole
+
+
 class _StderrBlockingProc:
     """stdout hits EOF fast; ``stderr.read()`` blocks past the timeout.
 
@@ -4306,6 +4463,41 @@ def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
     assert (
         "stderr tail: <empty>" in msg
     )  # tail gathering was cancelled -> empty, best-effort
+
+
+def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(monkeypatch):
+    """A deadline that lands on the post-EOF reap is a dead child, not a live run.
+
+    `_read` bounds the EOF-path `proc.wait()` + stderr drain with the SAME
+    deadline, so the expiry can fire with comfy-cli already gone — the window is
+    however long the drain blocks, not a race. Answering that with "your job is
+    still running, keep polling" would also throw away the returncode and stderr
+    that are the only diagnosis of why the engine died, so it falls through to
+    the raising branch (which still names the handle).
+    """
+    queued = json.dumps(
+        {"schema": "event/1", "type": "queued", "prompt_id": _HANDLE, "nodes": [{}]}
+    )
+
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        return _StderrBlockingProc(cmd, [queued + "\n"])
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run-template",
+                "some_template",
+                timeout=0.25,
+                timeout_returns_handle=True,
+            )
+        )
+
+    msg = str(exc.value)
+    assert _HANDLE in msg  # recoverable
+    assert "was NOT" not in msg  # ... but not advertised as still running
 
 
 # --- restart_comfyui (stop -> launch composition) --------------------------

@@ -46,12 +46,12 @@ def test_generate_image_streams_and_maps_command(patched_stream):
     # No checkpoint given -> no ckpt_name param. The prompt rides inside a single
     # `--param=KEY=VALUE` token (JSON-encoded value), and the engine gets its
     # per-event deadline — capped at comfy-cli's own 120s default, never raised,
-    # and LOWERED here to the 90s default budget (`_T2I_DEFAULT_TIMEOUT`).
+    # and LOWERED here to the 60s default budget (`_T2I_DEFAULT_TIMEOUT`).
     assert cmd[4:] == [
         "run-template",
         "image_z_image_turbo",
         '--param=57.text="a red fox in snow"',
-        "--timeout=90",
+        "--timeout=60",
     ]
     # Nothing spend-related: the default template is a free local OSS graph.
     assert "--allow-spend" not in cmd
@@ -78,7 +78,7 @@ def test_generate_image_forwards_checkpoint_when_streaming(patched_stream, monke
         "image_z_image_turbo",
         '--param=57.text="a cat"',
         '--param=ckpt_name="sd_xl.safetensors"',
-        "--timeout=90",
+        "--timeout=60",
     ]
 
 
@@ -92,7 +92,7 @@ def test_generate_image_leading_dash_prompt_is_not_parsed_as_flag(patched_stream
         "run-template",
         "image_z_image_turbo",
         '--param=57.text="--not-a-flag, just text"',
-        "--timeout=90",
+        "--timeout=60",
     ]
     # The whole prompt is one argv token, so comfy-cli's parser never sees a
     # bare `--not-a-flag`.
@@ -180,7 +180,7 @@ def test_generate_image_env_overrides_template_and_slots(patched_stream, monkeyp
         "image_flux2",
         '--param=44.text="a cat"',
         '--param=unet_name="flux2.safetensors"',
-        "--timeout=90",
+        "--timeout=60",
     ]
 
 
@@ -306,7 +306,7 @@ def test_generate_image_colliding_slots_are_fine_without_a_checkpoint(
         "run-template",
         "image_z_image_turbo",
         '--param=6.text="a cat"',
-        "--timeout=90",
+        "--timeout=60",
     ]
 
 
@@ -538,8 +538,14 @@ def test_generate_image_default_wait_fits_a_conservative_client_cap(monkeypatch)
     assert seen["timeout"] == pytest.approx(
         server._T2I_DEFAULT_TIMEOUT + server._RUN_TEMPLATE_TIMEOUT_GRACE
     )
-    # 300s is the cap observed in the field; 120s is what `run_workflow`'s own
-    # default is chosen against. Stay under the tighter one.
-    assert seen["timeout"] <= 120.0
+    # 300s is the cap observed in the field; 120s is the low end of that range.
+    # STRICTLY under, not `<=`: landing on the cap exactly is a tie, and this
+    # call loses a tie — the server's clock starts inside `_run_comfy_streaming`,
+    # after a `_check_comfy_version` documented at up to 30s on its first call,
+    # while the client's cap covers the whole call including that probe. Pinned
+    # against 110s (`run_workflow`'s whole wait, which adds no grace on top) so
+    # there is real headroom rather than a photo finish.
+    assert seen["timeout"] < 120.0
+    assert seen["timeout"] <= 110.0
     # And the expiry hands back the handle rather than raising.
     assert seen["kwargs"]["timeout_returns_handle"] is True
