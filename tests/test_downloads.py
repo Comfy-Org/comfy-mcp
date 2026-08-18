@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import subprocess
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -907,6 +908,17 @@ def _sequenced(monkeypatch, replies: list, *, seconds_per_call: float = 0.0) -> 
             raise AssertionError(f"unexpected extra comfy-cli call: {args}") from None
 
     monkeypatch.setattr(server, "_run_comfy", fake_run)
+    # `download(action="cancel")` reads the envelope's `changed` flag as well as
+    # its data, so it spawns through `_run_comfy_with_changed`. Answer it from
+    # the SAME script — a sequenced reply is a `data` payload, and this stub
+    # reports `changed` as unknown, which is what an engine that omits the flag
+    # gives. Tests that care about the flag use `patched_run`, which fakes the
+    # subprocess and so carries a real envelope.
+    monkeypatch.setattr(
+        server,
+        "_run_comfy_with_changed",
+        lambda *args, **kwargs: (fake_run(*args, **kwargs), None),
+    )
     return calls
 
 
@@ -1400,13 +1412,17 @@ def test_download_status_is_the_default_action(patched_run):
 
 def test_cancel_download_maps_command_and_returns_data(patched_run):
     """download(action="cancel") wraps `comfy model download-cancel <id>`."""
-    calls = patched_run(envelope(data=_status("cancelled")))
+    calls = patched_run(envelope(data=_status("cancelled"), changed=True))
 
     assert server.download(action="cancel", download_id="a1b2c3d4e5f6")["status"] == (
         "cancelled"
     )
     assert calls[0]["cmd"][4:] == ["model", "download-cancel", "a1b2c3d4e5f6"]
-    assert calls[0]["timeout"] == 60.0
+    # The cancel's OWN budget, not the family's generic 60s: cancelling is
+    # metadata plus a signal, and the bound is what makes "the cancel blocked
+    # for the rest of the transfer" impossible rather than merely unobserved.
+    assert calls[0]["timeout"] == server._DOWNLOAD_CANCEL_TIMEOUT
+    assert server._DOWNLOAD_CANCEL_TIMEOUT <= 30.0
 
 
 def test_cancel_download_unknown_id_raises_error_envelope(patched_run):
@@ -1421,6 +1437,234 @@ def test_cancel_download_unknown_id_raises_error_envelope(patched_run):
 
     with pytest.raises(server.ComfyCliError, match="download_not_found"):
         server.download(action="cancel", download_id="nope")
+
+
+# --- the cancel verdict ------------------------------------------------------
+#
+# comfy-cli answers `model download-cancel` with the download's status ROW,
+# which is the same shape a transfer nobody touched would produce. A cancel that
+# arrived too late therefore came back `status: "completed"`, `percent: 100.0`,
+# `error: null` — a success payload for a cancel that stopped nothing, with no
+# field an agent could branch on to find that out. These pin the two engine
+# answers this now reports separately (the resulting `status`, and the
+# envelope's own `changed` flag), in the shape `job(action="cancel")` already
+# uses: independent facts, reported independently.
+
+
+def _cancelled_at(status: str, *, changed=None, **extra) -> dict:
+    """A `download-cancel` reply: comfy-cli's status row + its `changed` flag."""
+    return envelope(data=_status(status, **extra), changed=changed)
+
+
+def test_cancel_of_a_starting_transfer_reports_the_abort(patched_run):
+    """The reported repro: cancel issued while the transfer reads "starting".
+
+    comfy-cli's own abort is real — `download-cancel` writes a cancel sentinel,
+    `killpg`s the detached worker, then reclaims the partial file — so the row
+    that comes back reads `cancelled`, and it says it changed state. Both halves
+    reach the caller.
+    """
+    patched_run(_cancelled_at("cancelled", changed=True, completed_bytes=0))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is True
+    assert result["changed"] is True
+    assert result["note"].startswith("cancelled:")
+    # comfy-cli's own row is still there, unedited, beside the verdict.
+    assert result["status"] == "cancelled"
+    assert result["dest"] == "/models/x.safetensors"
+
+
+def test_a_cancel_that_stopped_nothing_is_never_a_success_payload(patched_run):
+    """The reported defect, verbatim: `completed` / 100% / `error: null`.
+
+    A transfer that finished before the cancel landed gives comfy-cli nothing
+    to stop, and its reply is indistinguishable from a healthy download's. That
+    payload must not read as a cancel: `cancelled` is the field to branch on,
+    and it is False here even though `status`/`error` say nothing is wrong.
+    """
+    patched_run(_cancelled_at("completed", changed=True, completed_bytes=4_000_000_000))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is False
+    assert result["status"] == "completed"
+    assert result["error"] is None
+    assert "NOT cancelled" in result["note"]
+    # Names what is left to decide rather than dead-ending on the refusal.
+    assert "delete the file yourself" in result["note"]
+
+
+def test_cancel_on_an_already_terminal_id_says_so_rather_than_succeeding(
+    patched_run,
+):
+    """An id that had already completed: a no-op, and it says which kind."""
+    patched_run(_cancelled_at("completed", changed=False))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is False
+    assert result["changed"] is False
+    assert "already finished" in result["note"]
+
+
+def test_cancel_on_an_already_failed_id_is_not_reported_as_a_cancel(patched_run):
+    """`failed` is terminal too — and it is not a transfer this call stopped."""
+    patched_run(_cancelled_at("failed", changed=True, error="connection reset"))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is False
+    assert "ALREADY failed" in result["note"]
+    # `changed` on a terminal row is comfy-cli reclaiming the partial file.
+    assert "reclaimed its partial file" in result["note"]
+
+
+def test_cancel_of_an_already_cancelled_id_reports_the_no_op(patched_run):
+    """The case `status` alone cannot tell from a fresh cancel.
+
+    A second cancel against the same id returns `cancelled` exactly as the
+    first did, so the status row is identical — only comfy-cli's `changed`
+    flag separates "this call stopped it" from "it was already stopped".
+    """
+    patched_run(_cancelled_at("cancelled", changed=False))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is True
+    assert result["changed"] is False
+    assert "ALREADY cancelled" in result["note"]
+
+
+def test_a_cancel_the_engine_did_not_honor_is_reported_as_still_running(
+    patched_run,
+):
+    """`ok` from comfy-cli with a live status is NOT a cancel.
+
+    The one shape that must never be waved through: the command succeeded, and
+    the transfer it was asked to stop is still moving bytes.
+    """
+    patched_run(_cancelled_at("downloading", changed=False))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is False
+    assert "may still be running" in result["note"]
+    assert 'download(action="status")' in result["note"]
+
+
+def test_a_missing_changed_flag_is_unknown_not_false(patched_run):
+    """An engine that omits the flag has not said the call changed nothing."""
+    patched_run(_cancelled_at("cancelled"))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["changed"] is None
+    assert result["cancelled"] is True
+    # Not the "ALREADY cancelled" no-op wording, which `changed is False` owns.
+    assert "ALREADY" not in result["note"]
+
+
+def test_a_non_boolean_changed_flag_is_unknown_too(patched_run):
+    """`changed` is a boolean in the schema; anything else is not an answer."""
+    patched_run(_cancelled_at("cancelled", changed="yes"))
+
+    assert (
+        server.download(action="cancel", download_id="a1b2c3d4e5f6")["changed"] is None
+    )
+
+
+def test_the_verdict_survives_a_payload_that_is_not_a_status_row(patched_run):
+    """A broken engine contract still gets a field to branch on."""
+    patched_run(envelope(data=None, changed=True))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is False
+    assert result["data"] is None
+    assert "no status" in result["note"]
+
+
+def test_cancel_is_bounded_and_says_the_download_may_still_be_running(
+    patched_run,
+):
+    """The bound expiring is the one answer that must not claim anything.
+
+    The child's whole process group is killed at the deadline, so what happened
+    to the transfer is unknown from here — the error says that, and names the
+    way back to a real answer instead of reporting a cancel.
+    """
+    patched_run(
+        "",
+        raises=subprocess.TimeoutExpired(
+            cmd=[server.COMFY_BIN, "model", "download-cancel"],
+            timeout=server._DOWNLOAD_CANCEL_TIMEOUT,
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    message = str(excinfo.value)
+    assert "nothing here claims the transfer stopped" in message
+    assert "may still be running" in message
+    assert "download(action='status'" in message
+    assert excinfo.value.timed_out is True
+
+
+def test_a_real_cancel_failure_is_not_swallowed_by_the_timeout_branch(patched_run):
+    """Only a TIMEOUT gets the re-worded raise; every other failure is raw."""
+    patched_run(
+        {
+            "type": "envelope",
+            "ok": False,
+            "error": {"code": "model_download_foreground_cancel", "message": "nope"},
+        }
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert excinfo.value.code == "model_download_foreground_cancel"
+    assert "nothing here claims" not in str(excinfo.value)
+
+
+def test_the_unsupported_degrade_carries_the_cancel_verdict(patched_run):
+    """A comfy-cli with no `download-cancel` cancelled nothing, and says so.
+
+    The degrade's message already points at the inline `download_model` that
+    still works there; this pins the machine-readable half, so an agent
+    branching on `cancelled` never has to read its ABSENCE as a cancel.
+    """
+    returncode, stdout, stderr = _NO_DOWNLOAD_CANCEL
+    patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["unsupported"] is True
+    assert result["cancelled"] is False
+
+
+def test_the_status_degrade_carries_no_cancel_verdict(patched_run):
+    """`download-status` is not a cancel and has no verdict to report."""
+    returncode, stdout, stderr = _NO_DOWNLOAD_STATUS
+    patched_run(stdout, returncode=returncode, stderr=stderr)
+
+    result = server.download(action="status", download_id="a1b2c3d4e5f6")
+
+    assert result["unsupported"] is True
+    assert "cancelled" not in result
+
+
+def test_only_cancel_grows_the_verdict_fields(patched_run):
+    """`status` is a READ — adding a cancel verdict there would be a lie."""
+    patched_run(envelope(data=_status("downloading"), changed=False))
+
+    result = server.download(action="status", download_id="a1b2c3d4e5f6")
+
+    assert "cancelled" not in result
+    assert "note" not in result
 
 
 # Click's usage error for a verb the installed comfy-cli does not have: exit 2,
@@ -2283,7 +2527,19 @@ def test_download_rejects_a_supplied_timeout_seconds_where_unused(no_spawn, acti
     assert "'wait'" in str(excinfo.value)
 
 
-# --- tool docstring budget (<=220 est. tokens) + R6 disambiguation ------------
+# --- tool docstring budget (<=245 est. tokens) + R6 disambiguation ------------
+
+# 220 -> 245 when the "cancel" bullet named the field a caller has to branch on.
+# The bullet used to end at "stop a running transfer and its partial file",
+# which is exactly the reading that made a no-op cancel look like a success: the
+# payload comfy-cli returns for a cancel that stopped nothing is a status row
+# reading `completed` / `error: null`, so an agent told only that the action
+# stops transfers has no reason to look past it. Naming `cancelled` (and
+# `changed` / `note`) is ~25 tokens, and it is the cheapest place to spend them
+# — this is the one text the model reads BEFORE it calls. Kept deliberately
+# tight, like the whole-payload ceiling in `test_payload_budget.py`: the next
+# growth is a decision too.
+_DOWNLOAD_DOC_BUDGET_TOKENS = 245
 
 
 def test_download_tool_docstring_within_its_own_token_budget():
@@ -2293,7 +2549,9 @@ def test_download_tool_docstring_within_its_own_token_budget():
             doc = ast.get_docstring(node)
             assert doc is not None
             est_tokens = len(doc) // 4
-            assert est_tokens <= 220, f"download() docstring ~{est_tokens} est. tokens"
+            assert est_tokens <= _DOWNLOAD_DOC_BUDGET_TOKENS, (
+                f"download() docstring ~{est_tokens} est. tokens"
+            )
             return
     pytest.fail("download() tool not found in server.py")
 
