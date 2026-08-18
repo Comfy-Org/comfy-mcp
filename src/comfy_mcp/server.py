@@ -10008,6 +10008,19 @@ def _download_cancel_note(
     NOT-cancelled ones name the way forward rather than dead-ending, because on
     every one of them the caller still has a decision to make (a file that
     landed anyway, a transfer that may still be running).
+
+    ``changed`` is REPORTED here, never interpreted. The engine's flag says only
+    THAT state moved on this call, not WHAT moved, so a note that named the
+    file's disposition from it — "comfy-cli kept the completed file at `dest`",
+    "comfy-cli reclaimed its partial file" — would be this wrapper guessing, and
+    guessing the same flag two contradictory ways on two adjacent branches.
+    Worse, it is the guess whose cost is asymmetric: comfy-cli downloads to the
+    final ``dest`` and a state-changing cancel may unlink it, so telling the
+    caller the file is there to delete can be exactly backwards. The three
+    values are kept distinct on the cancelled branch for the same reason
+    ``_run_comfy_with_changed`` refuses to coerce a missing flag to ``False``:
+    ``None`` is "the engine did not say", which cannot carry the ``True``
+    branch's claim that THIS call is what stopped the transfer.
     """
     if cancelled:
         if changed is False:
@@ -10015,25 +10028,44 @@ def _download_cancel_note(
                 "no-op: this download was ALREADY cancelled before this call, so "
                 "nothing was stopped now."
             )
+        if changed is None:
+            return (
+                "cancelled: comfy-cli reports this download cancelled, but "
+                "emitted no `changed` flag — so whether THIS call stopped it or "
+                "it was already cancelled is unknown."
+            )
         return "cancelled: comfy-cli stopped the transfer's worker."
+    moved = (
+        " comfy-cli reports this call changed state, but not what it changed."
+        if changed
+        else ""
+    )
     if status == "completed":
-        raced = " — it landed as the cancel arrived" if changed else ""
         return (
-            f"NOT cancelled: the transfer had already finished{raced}, so "
-            "comfy-cli kept the completed file at `dest`. Nothing was aborted; "
-            "delete the file yourself if the download was a mistake."
+            "NOT cancelled: the transfer had already finished, so there was no "
+            f"running transfer to stop.{moved} Nothing was aborted; check `dest` "
+            "and delete the file yourself if the download was a mistake."
         )
     if status in _DOWNLOAD_TERMINAL_STATUSES:
-        swept = "; comfy-cli reclaimed its partial file" if changed else ""
         return (
             f"NOT cancelled: this download was ALREADY {status} before this "
-            f"call{swept}. There was no running transfer to stop."
+            f"call, so there was no running transfer to stop.{moved}"
         )
-    where = f"status {status!r}" if status else "no status"
+    # SCRUBBED and capped like every other engine-derived string this server
+    # renders (`_unwrap_envelope`, `errors._render_error_details`): `status` is
+    # comfy-cli's, and a version-skewed engine or a tampered state file could
+    # put a credential-bearing URL or a blob where a one-word status belongs.
+    # The terminal branch above needs no such treatment — it only ever
+    # interpolates a member of `_DOWNLOAD_TERMINAL_STATUSES`.
+    where = (
+        f"status {failure_log._scrub_text(status)[: errors._MAX_ERROR_FIELD_CHARS]!r}"
+        if status
+        else "no status"
+    )
     return (
         f"NOT cancelled: comfy-cli returned {where}, so this transfer may still "
-        'be running. Re-check it with `download(action="status")` and re-issue '
-        "the cancel."
+        f'be running.{moved} Re-check it with `download(action="status")` and '
+        "re-issue the cancel if it is."
     )
 
 
@@ -10079,6 +10111,14 @@ def _with_cancel_verdict(payload: Any, changed: bool | None) -> Any:
         # the verdict anyway and keep the engine's own reply under `data`; the
         # note's last branch already says the status is missing.
         return {**verdict, "data": payload}
+    # The verdict wins a name clash deliberately, unlike `_with_download_id`,
+    # which keeps comfy-cli's `id` beside the spelling it adds. The asymmetry is
+    # the source: `id` and `download_id` are two spellings of a value the ENGINE
+    # owns, so dropping one would drop an engine answer, while `cancelled` /
+    # `changed` / `note` name no field of comfy-cli's `download-status` row —
+    # `changed` in particular is an ENVELOPE field, so the one here is already
+    # the engine's own, read one level up. A row that grew a `changed` of its
+    # own would therefore be shadowed by the same flag, not by an inference.
     return {**payload, **verdict}
 
 
@@ -10418,12 +10458,28 @@ def _download_verb_unsupported(
             f"{'check on' if verb == 'download-status' else 'cancel'}."
         ),
         "unsupported": True,
-        # The cancel half carries the verdict field too, set to the only honest
-        # value: this comfy-cli has no abort verb, so nothing was cancelled. An
-        # agent branching on `cancelled` must never have to read its ABSENCE as
-        # a cancel — which is the whole point of the field. `download-status`
+        # The cancel half carries the WHOLE verdict, set to the only honest
+        # values: this comfy-cli has no abort verb, so no cancel was attempted
+        # and nothing changed. All three keys, not just `cancelled` — the tool
+        # docstring promises callers that "`changed` and `note` say what
+        # happened instead", so shipping the degrade with `cancelled` alone
+        # would hand an agent that believed it a `KeyError`, which is the same
+        # read-the-absence failure the field exists to prevent. `download-status`
         # gets no such key: it is not a cancel and has no verdict to report.
-        **({"cancelled": False} if verb == "download-cancel" else {}),
+        **(
+            {
+                "cancelled": False,
+                "changed": False,
+                "note": (
+                    "NOT cancelled: this comfy-cli has no `model "
+                    "download-cancel`, so no cancel was attempted and nothing "
+                    "changed. There is no background transfer to stop here — "
+                    "`download_model` runs the download inline on this install."
+                ),
+            }
+            if verb == "download-cancel"
+            else {}
+        ),
     }
 
 

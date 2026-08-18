@@ -1517,8 +1517,54 @@ def test_cancel_on_an_already_failed_id_is_not_reported_as_a_cancel(patched_run)
 
     assert result["cancelled"] is False
     assert "ALREADY failed" in result["note"]
-    # `changed` on a terminal row is comfy-cli reclaiming the partial file.
-    assert "reclaimed its partial file" in result["note"]
+    # `changed` is REPORTED, not interpreted: comfy-cli says that state moved,
+    # never what moved, so the note must not name a file disposition it would
+    # have had to guess (and would have guessed the opposite way one branch up).
+    assert "changed state, but not what it changed" in result["note"]
+    assert "partial file" not in result["note"]
+
+
+def test_the_changed_flag_is_never_read_as_a_file_disposition(patched_run):
+    """The same `changed: true` must not mean two opposite things.
+
+    A cancel that lost the race comes back `completed`; one against an id that
+    had already failed comes back `failed`. Both can carry `changed: true`, and
+    comfy-cli's flag says only THAT something moved. Naming the file's fate off
+    it told the caller the finished file was kept in one branch and the partial
+    reclaimed in the other — off one bit that distinguishes neither, while the
+    engine downloads to the final `dest` and a state-changing cancel may unlink
+    it. Neither branch claims a disposition now.
+    """
+    patched_run(_cancelled_at("completed", changed=True))
+
+    note = server.download(action="cancel", download_id="a1b2c3d4e5f6")["note"]
+
+    assert "changed state, but not what it changed" in note
+    assert "kept the completed file" not in note
+    # Still names the decision left to the caller, just without asserting the
+    # file is there: checking `dest` is the caller's step, not a claim of ours.
+    assert "check `dest`" in note
+
+
+def test_a_changed_cancel_with_a_live_status_does_not_contradict_the_engine(
+    patched_run,
+):
+    """The fallback branch reports `changed` instead of ignoring it.
+
+    A worker SIGKILLed before it could flip its state file leaves comfy-cli
+    saying it changed state while the status row still reads `downloading`.
+    Answering that with a bare "may still be running; re-issue the cancel"
+    contradicted the engine's own flag on the same call — so the flag is
+    relayed, and the re-issue is made conditional on the transfer still running.
+    """
+    patched_run(_cancelled_at("downloading", changed=True))
+
+    result = server.download(action="cancel", download_id="a1b2c3d4e5f6")
+
+    assert result["cancelled"] is False
+    assert result["changed"] is True
+    assert "changed state, but not what it changed" in result["note"]
+    assert "re-issue the cancel if it is" in result["note"]
 
 
 def test_cancel_of_an_already_cancelled_id_reports_the_no_op(patched_run):
@@ -1564,6 +1610,14 @@ def test_a_missing_changed_flag_is_unknown_not_false(patched_run):
     assert result["cancelled"] is True
     # Not the "ALREADY cancelled" no-op wording, which `changed is False` owns.
     assert "ALREADY" not in result["note"]
+    # ...and not the `changed is True` wording either. `None` is the case the
+    # flag was ADDED to name — an engine that omits it leaves a repeat cancel of
+    # an already-cancelled id indistinguishable from a fresh abort — so falling
+    # through to "comfy-cli stopped the transfer's worker" would reintroduce the
+    # exact ambiguity. It gets its own hedged branch.
+    assert "emitted no `changed` flag" in result["note"]
+    assert "unknown" in result["note"]
+    assert "stopped the transfer's worker" not in result["note"]
 
 
 def test_a_non_boolean_changed_flag_is_unknown_too(patched_run):
@@ -1584,6 +1638,24 @@ def test_the_verdict_survives_a_payload_that_is_not_a_status_row(patched_run):
     assert result["cancelled"] is False
     assert result["data"] is None
     assert "no status" in result["note"]
+
+
+def test_an_engine_supplied_status_is_scrubbed_and_capped_in_the_note(patched_run):
+    """`status` is comfy-cli's string, and it lands in client-facing prose.
+
+    Every other engine-derived field this server renders goes through
+    `failure_log._scrub_text` and `errors._MAX_ERROR_FIELD_CHARS`; the note's
+    fallback branch is the one place a raw `status` reached the caller. A
+    version-skewed engine or a tampered state file is all it takes to put a
+    credential-bearing URL or a blob where a one-word status belongs.
+    """
+    leaky = "https://<user>:<pass>@example.invalid/x " + "z" * 4_000
+    patched_run(_cancelled_at(leaky))
+
+    note = server.download(action="cancel", download_id="a1b2c3d4e5f6")["note"]
+
+    assert "<pass>" not in note
+    assert len(note) < 1_000
 
 
 def test_cancel_is_bounded_and_says_the_download_may_still_be_running(
@@ -1644,6 +1716,13 @@ def test_the_unsupported_degrade_carries_the_cancel_verdict(patched_run):
 
     assert result["unsupported"] is True
     assert result["cancelled"] is False
+    # The WHOLE verdict, not just `cancelled`: the tool docstring tells callers
+    # that `changed` and `note` say what happened instead, so an agent that
+    # believed it and subscripted `result["note"]` here would have hit a
+    # `KeyError` — the read-the-absence failure the verdict exists to close.
+    assert result["changed"] is False
+    assert "NOT cancelled" in result["note"]
+    assert "no `model download-cancel`" in result["note"]
 
 
 def test_the_status_degrade_carries_no_cancel_verdict(patched_run):
