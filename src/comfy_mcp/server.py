@@ -11328,6 +11328,48 @@ def _apply_startup_instructions() -> None:
     mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
 
 
+def _warm_template_gallery() -> None:
+    """Best-effort: pull comfy-cli's template gallery index into cache at startup.
+
+    comfy-cli caches the gallery index (``~/.cache/comfy-cli/gallery/index.json``,
+    24h TTL) and refreshes a merely STALE cache in a detached background
+    process — but an ABSENT or corrupt cache is fetched SYNCHRONOUSLY inside
+    the command, on a network timeout of its own. So on a fresh machine the
+    first :func:`search_templates` pays a cold comfy-cli start PLUS that fetch
+    inside its own request window, and a QA pass under parallel load watched
+    cold first calls like this one stack up into client-side transport
+    timeouts. This moves that cost off the request path, the same way
+    :func:`_apply_startup_instructions`' probe already pre-pays the
+    ``comfy --version`` gate and the interpreter/page cache — leaving the
+    gallery the one cold component still billed to a caller.
+
+    ``templates ls``, NOT ``templates refresh``: ``ls`` is a no-op fetch-wise
+    when the cache is present and fresh (it fetches only when the cache is
+    absent or corrupt, and stale-refreshes detached), while ``refresh`` forces
+    a network fetch on EVERY startup — which is the opposite trade for a
+    machine that is already warm.
+
+    Best-effort in every direction. The result is discarded; every failure this
+    tolerates (the same set :func:`_machine_snapshot_block` tolerates) returns
+    silently, because a warm that fails costs nothing but the cold first call
+    the caller would have paid anyway. The missing-binary check is here rather
+    than left to ``_require_comfy_bin`` inside :func:`_run_comfy` so a machine
+    with no comfy-cli installed gets no ``binary_missing`` failure-log entry
+    from a warm nobody asked for — that log exists to explain a call the user
+    actually made.
+
+    The 30s is the SUBPROCESS cap, not a startup stall: ``main()`` starts this
+    on a daemon thread and nothing ever joins it, so this function cannot
+    delay the initialize response however long it takes.
+    """
+    if shutil.which(COMFY_BIN) is None:
+        return
+    try:
+        _run_comfy("templates", "ls", timeout=30.0)
+    except (ComfyCliError, OSError, UnicodeDecodeError):
+        return
+
+
 def main(args: list[str] | None = None) -> None:
     """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
 
@@ -11368,6 +11410,19 @@ def main(args: list[str] | None = None) -> None:
         # OSError subclass) and falls open, so nothing here can keep the
         # server from starting.
         _apply_startup_instructions()
+        # Then warm comfy-cli's template gallery cache off the request path.
+        # Started and never joined: unlike the snapshot probe above there is no
+        # result to collect, so there is nothing to wait for and this can never
+        # delay the initialize response. It therefore runs CONCURRENTLY with
+        # that probe whenever the probe outlived its bounded join; both funnel
+        # through `_check_comfy_version`, whose worst case is a duplicate
+        # `comfy --version` spawn — harmless, and the warm is correct either
+        # way.
+        threading.Thread(
+            target=_warm_template_gallery,
+            name="comfy-mcp-gallery-warm",
+            daemon=True,
+        ).start()
         # Name the transport rather than inheriting the SDK's default: the whole
         # stdio design rests on it — `failure_log`'s rule that stdout is the
         # JSON-RPC channel and must never be written to is only true under
