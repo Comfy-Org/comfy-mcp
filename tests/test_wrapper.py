@@ -4131,6 +4131,120 @@ def test_streaming_timeout_stdout_tail_is_bounded(monkeypatch):
     assert "".join(noisy).strip() not in msg  # the full blob never made it in
 
 
+# --- The handle a streaming timeout must not swallow ------------------------
+#
+# Killing our comfy-cli child at the deadline stops the WATCHER, never the job
+# ComfyUI already accepted. So whichever way a streaming timeout ends, the
+# `prompt_id` the stream reported has to come back with it — in prose for the
+# raising callers (a ComfyCliError reaches the client as text), as DATA for the
+# one that asked for `timeout_returns_handle`.
+
+_HANDLE = "11111111-2222-3333-4444-555555555555"
+_QUEUED_WITH_HANDLE = json.dumps(
+    {
+        "schema": "event/1",
+        "type": "queued",
+        "prompt_id": _HANDLE,
+        "nodes": [{"id": "1"}],
+    }
+)
+
+
+def _blocking_streaming_child(monkeypatch, first_lines):
+    """Spawn fake emitting ``first_lines``, then blocking past any deadline."""
+    procs: list[_BlockingProc] = []
+
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        proc = _BlockingProc(cmd, first_lines)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    return procs
+
+
+def test_streaming_timeout_message_names_the_prompt_id(monkeypatch):
+    """The raised timeout names the submitted job, so it can still be recovered."""
+    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n"])
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming("run", "--workflow", "wf.json", timeout=0.25)
+        )
+
+    msg = str(exc.value)
+    assert _HANDLE in msg
+    assert "already submitted" in msg  # ... and that it was not cancelled
+    assert 'job(action="cancel")' in msg
+    assert "wait=False" in msg  # the existing pointer at the non-blocking shape
+
+
+def test_streaming_timeout_returns_the_handle_only_when_asked(monkeypatch):
+    """`timeout_returns_handle` is what turns the expiry into a payload.
+
+    Without it the deadline stays a `ComfyCliError` — `run_workflow` /
+    `run_template` document that contract and their callers branch on it.
+    """
+    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n"])
+
+    result = asyncio.run(
+        server._run_comfy_streaming(
+            "run-template",
+            "some_template",
+            timeout=0.25,
+            timeout_returns_handle=True,
+        )
+    )
+
+    assert result["timed_out"] is True
+    assert result["prompt_id"] == _HANDLE
+    assert _HANDLE in result["note"]
+
+
+def test_streaming_timeout_handle_payload_needs_a_submitted_job(monkeypatch):
+    """No `prompt_id` reported means no job to hand back — it stays an error.
+
+    A deadline reached before the submit (ComfyUI down, a stalled fetch) has
+    nothing to poll, so answering with a successful `timed_out` payload would
+    invent a job the caller could never find.
+    """
+    preflight = json.dumps({"schema": "event/1", "type": "converted", "node_count": 1})
+    _blocking_streaming_child(monkeypatch, [preflight + "\n"])
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(
+            server._run_comfy_streaming(
+                "run-template",
+                "some_template",
+                timeout=0.25,
+                timeout_returns_handle=True,
+            )
+        )
+
+    assert "already submitted as prompt_id" not in str(exc.value)
+
+
+def test_streaming_bounded_tail_payload_is_unchanged(monkeypatch):
+    """`raise_on_timeout=False` (the `job(action="watch")` tail) keeps its shape.
+
+    The caller of a watch already HAS the prompt_id — it passed it in — so the
+    new key must not appear there and change a payload other tools parse.
+    """
+    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n"])
+
+    result = asyncio.run(
+        server._run_comfy_streaming(
+            "jobs", "watch", _HANDLE, timeout=0.25, raise_on_timeout=False
+        )
+    )
+
+    assert result == {
+        "timed_out": True,
+        "status": {"progress": 0.0, "total": 1.0, "nodes_done": 0},
+    }
+
+
 class _StderrBlockingProc:
     """stdout hits EOF fast; ``stderr.read()`` blocks past the timeout.
 

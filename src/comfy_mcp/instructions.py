@@ -20,7 +20,9 @@ flows:
 - Long generations: `run_workflow(wait=False)` -> poll `job(action="wait")` /
   `job(action="status")` (or stream live via `job(action="watch")`) ->
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
-  does not block.
+  does not block; same for `generate_image` / `run_template` on slow hardware,
+  where YOUR transport cap bounds a `wait=True` call too. A run that outlives
+  a wait keeps going — poll its `prompt_id`, never re-run it.
 - Large model downloads: `download_model` submits to a background worker and
   returns a `download_id`; poll `download(action="wait")` /
   `download(action="status")`, or `download(action="cancel")` to stop one.

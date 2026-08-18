@@ -1763,6 +1763,9 @@ class _StreamProgress:
     def __init__(self) -> None:
         self.total: float | None = None  # node count (from the queued manifest)
         self.done = 0  # nodes fully executed or served from cache
+        # The run's handle, latched off the stream (see `report`). None until
+        # comfy-cli reports it — i.e. until something was actually submitted.
+        self.prompt_id: str | None = None
         self._last = -1.0  # last value reported (kept non-decreasing)
 
     def snapshot(self) -> dict:
@@ -1785,7 +1788,18 @@ class _StreamProgress:
         :meth:`snapshot`; the MCP notification is the only ctx-gated part, and it
         is best-effort — a send that fails is dropped rather than propagated, so
         it can never abort the run it is only describing.
+
+        The first ``prompt_id`` any event carries is latched before the type
+        dispatch, so events that are NOT progress ticks (``output``,
+        ``execution_error``) still yield the handle. comfy-cli stamps it on every
+        local run event and emits ``queued`` only once the job's state file is on
+        disk, so from that line on the id is pollable — which is what lets a wait
+        that expires hand back a live job instead of orphaning it.
         """
+        if self.prompt_id is None:
+            reported = event.get("prompt_id")
+            if isinstance(reported, str) and reported:
+                self.prompt_id = reported
         etype = event.get("type")
         if etype == "queued":
             nodes = event.get("nodes")
@@ -2043,11 +2057,30 @@ async def _run_comfy_async(
         await _reap_async(proc)
 
 
+def _live_job_note(prompt_id: str) -> str:
+    """What to do with the handle of a run that outlived this call's wait.
+
+    Killing the comfy-cli child at our deadline stops the WATCHER, never the
+    job: ComfyUI executes a prompt it has already accepted regardless of who is
+    listening, which is exactly how a timed-out ``wait=True`` call used to leave
+    a generation running with no handle to poll, collect or cancel it. One
+    string, shared by the payload the timeout can RETURN and the message it can
+    RAISE, so the two cannot drift.
+    """
+    return (
+        f"The run was already submitted as prompt_id {prompt_id!r} and was NOT "
+        'cancelled — poll it with `job(action="status")` (or '
+        '`job(action="wait")` / `job(action="watch")`), collect its files with '
+        '`fetch_outputs`, and stop it with `job(action="cancel")`.'
+    )
+
+
 async def _run_comfy_streaming(
     *args: str,
     ctx: Context | None = None,
     timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     raise_on_timeout: bool = True,
+    timeout_returns_handle: bool = False,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
@@ -2063,6 +2096,16 @@ async def _run_comfy_streaming(
     ``raise_on_timeout=False`` for a bounded *tail* that should instead return a
     ``{"timed_out": True, "status": <progress snapshot>}`` payload (mirroring
     ``job(action="wait")``) rather than surface the deadline as an error.
+
+    ``timeout_returns_handle=True`` is the narrower version of that for a verb
+    that SUBMITS a job: an expiry that happens after comfy-cli reported a
+    ``prompt_id`` returns ``{"timed_out": True, "prompt_id": ..., "status": ...,
+    "note": ...}`` instead, because the job is still running and the caller needs
+    the handle to poll, collect or cancel it (see :func:`_live_job_note`). It is
+    deliberately gated on the id being known: a deadline reached BEFORE the
+    submit (ComfyUI not running, a stalled template fetch) has no job to hand
+    back and stays the error it always was. Whichever branch runs, the ``finally``
+    below still kills the child.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -2201,6 +2244,22 @@ async def _run_comfy_streaming(
             if not got_envelope:
                 return eof_result
         except (asyncio.TimeoutError, TimeoutError) as exc:
+            # Latched off the stream, so it is set exactly when a job exists to
+            # hand back — see `_StreamProgress.report`.
+            handle = tracker.prompt_id
+            if timeout_returns_handle and handle:
+                # A submitted run that outlived the wait is not a failure: the
+                # deadline is ours, the job is the server's, and returning the
+                # handle is what keeps it pollable instead of orphaned. Checked
+                # before `raise_on_timeout` so the handle wins if a caller ever
+                # asks for both (`job(action="watch")`, the only tail today,
+                # sets neither and is unaffected).
+                return {
+                    "timed_out": True,
+                    "prompt_id": handle,
+                    "status": tracker.snapshot(),
+                    "note": _live_job_note(handle),
+                }
             if not raise_on_timeout:
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
@@ -2232,12 +2291,21 @@ async def _run_comfy_streaming(
             # Slice to the last lines before joining so a chatty child's full
             # stdout history isn't copied just to keep the 500-char tail.
             timeout_stdout = "".join(lines[-500:])
+            # Name the handle when the stream gave us one: the deadline killed
+            # the watcher, not the job, so an error that omits it is what
+            # orphans a live run. Raising callers get it in prose because a
+            # ComfyCliError reaches the client as text; the tools that need it
+            # as DATA pass `timeout_returns_handle` above.
+            fate = (
+                _live_job_note(handle)
+                if handle
+                else 'The run may still be going — check `job(action="status")`.'
+            )
             message = (
                 f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
-                f"Progress so far: {tracker.snapshot()}. The run may still be "
-                'going — check `job(action="status")`, or for long generations '
-                'submit with `wait=False` and poll `job(action="wait")` / '
-                '`job(action="watch")`. '
+                f"Progress so far: {tracker.snapshot()}. {fate} For long "
+                "generations submit with `wait=False` and poll "
+                '`job(action="wait")` / `job(action="watch")`. '
                 # Scrubbed, not raw: comfy-cli echoes the URL it is fetching to
                 # stderr, and this sentence goes straight to the MCP client. See
                 # `_timeout_failure`, whose two fragments this mirrors.
@@ -3264,6 +3332,20 @@ def _t2i_missing_template_hint(
     )
 
 
+# Default wall clock for `generate_image(wait=True)`, deliberately far under
+# `run_template`'s 600s. An MCP client enforces its OWN transport cap on a tool
+# call; this server can neither see nor raise it, and when that cap fires first
+# the call returns NOTHING — not even the `prompt_id` — while the generation
+# keeps running on the user's GPU. So the wait has to expire on THIS side first,
+# where the handle can still be handed back. 90s plus the parent's
+# `_RUN_TEMPLATE_TIMEOUT_GRACE` lands on the same 120s ceiling `run_workflow`'s
+# default is chosen against, and well inside the 300s cap seen in the field.
+# Short is cheap now precisely because expiry is no longer a dead end: it returns
+# the `prompt_id` to poll (see `generate_image`). Callers who genuinely want to
+# block longer pass a bigger `timeout_seconds` — up to their client's cap.
+_T2I_DEFAULT_TIMEOUT = 90.0
+
+
 def _t2i_config() -> tuple[str, str, str]:
     """Resolve ``generate_image``'s (template, prompt slot, checkpoint slot).
 
@@ -3289,7 +3371,7 @@ async def generate_image(
     prompt: str,
     checkpoint: str | None = None,
     wait: bool = True,
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float = _T2I_DEFAULT_TIMEOUT,
     ctx: Context | None = None,
 ) -> Any:
     """Generate an image from a text prompt — the fast on-ramp.
@@ -3302,12 +3384,18 @@ async def generate_image(
     Args:
         checkpoint: swaps the checkpoint model; must already be installed on
             the machine that RUNS the job. Omit for the template's default.
-        wait: True (default) blocks/streams progress; False submits and
-            returns a ``prompt_id`` to poll via ``job(action="status")``.
-        timeout_seconds: used only when ``wait=True``; ignored (fixed short
-            submit timeout) when ``wait=False``.
+        wait: True (default) blocks up to ``timeout_seconds``, streaming
+            progress; False submits and returns a ``prompt_id`` at once —
+            prefer False on slow hardware.
+        timeout_seconds: bounds this wait when ``wait=True``. Default 90s:
+            your client's own transport cap (seen in the wild at 120-300s) is
+            invisible here and the shorter wins, so it is the real ceiling.
 
-    Returns: same envelope shape as ``run_workflow`` (``prompt_id`` + outputs).
+    Returns: ``run_workflow``'s shape (``prompt_id`` + outputs) when the run
+    finishes in time. An expired wait is NOT a failure: it returns
+    ``{"timed_out": True, "prompt_id", "status", "note"}`` for a job still
+    RUNNING — poll ``job(action="status")``, collect ``fetch_outputs``, cancel
+    ``job(action="cancel")``. No path drops the handle.
 
     Gotchas:
     - Always FREE, a local OSS graph — use ``partner_generate`` for paid
@@ -3389,8 +3477,17 @@ async def generate_image(
     try:
         # Submit-vs-stream and the parent's grace over the engine deadline are
         # `_run_template_exec`'s, shared with `run_template` — this tool runs the
-        # same verb, so it spends the budget the same way.
-        return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
+        # same verb, so it spends the budget the same way. It differs in ONE
+        # thing: an expired wait here returns the `prompt_id` rather than raising
+        # (`timeout_returns_handle`). This is the flagship one-call on-ramp, so
+        # its wait is the one most likely to be outlived by a real generation on
+        # real local hardware — and a first-time caller who gets an error with no
+        # handle has a job running on their GPU they cannot poll, collect or
+        # cancel. `run_template` keeps raising: its docstring documents that, and
+        # its callers reach for `wait=False` deliberately.
+        return await _run_template_exec(
+            args, budget, wait=wait, ctx=ctx, timeout_returns_handle=True
+        )
     except ComfyCliError as exc:
         missing = _t2i_missing_template_hint(exc, template)
         if missing is not None:
@@ -4756,7 +4853,12 @@ def _run_template_argv(
 
 
 async def _run_template_exec(
-    args: list[str], budget: float, *, wait: bool, ctx: Context | None
+    args: list[str],
+    budget: float,
+    *,
+    wait: bool,
+    ctx: Context | None,
+    timeout_returns_handle: bool = False,
 ) -> Any:
     """Run a built ``run-template`` argv on the branch ``wait`` selects.
 
@@ -4783,11 +4885,21 @@ async def _run_template_exec(
     ``server_not_running`` result, replacing an actionable error with a generic
     parent kill (and orphaning an already-enqueued run). The engine must be the
     side that gives up.
+
+    ``timeout_returns_handle`` is forwarded to :func:`_run_comfy_streaming` for a
+    caller whose contract is "never return without the ``prompt_id``" — see
+    :func:`generate_image`. Off by default so ``run_template``'s wait keeps
+    raising on expiry, as its docstring documents.
     """
     timeout = budget + _RUN_TEMPLATE_TIMEOUT_GRACE
     if not wait:
         return await _in_generate_pool(_run_comfy, *args, "--async", timeout=timeout)
-    return await _run_comfy_streaming(*args, ctx=ctx, timeout=timeout)
+    return await _run_comfy_streaming(
+        *args,
+        ctx=ctx,
+        timeout=timeout,
+        timeout_returns_handle=timeout_returns_handle,
+    )
 
 
 # Unlike `partner_generate`, this does NOT probe for the spend interlock
