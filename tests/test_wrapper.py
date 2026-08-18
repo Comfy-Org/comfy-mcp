@@ -4370,18 +4370,34 @@ def test_expired_wait_after_an_execution_error_does_not_claim_a_live_job(monkeyp
     assert "was NOT" not in msg  # ... but not advertised as a live run
 
 
-def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(monkeypatch):
+@pytest.mark.parametrize(
+    "id_len",
+    [
+        argv._MAX_PROMPT_ID_LEN + 1,  # just over the ceiling
+        1_000_000,  # and grossly over it
+    ],
+)
+def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(monkeypatch, id_len):
     """An id the `job` verbs would refuse is not handed back as a handle.
 
     `_readline_unbounded` has no line ceiling by design, so a malformed event can
-    carry an arbitrarily long "id". Returning it would both inflate the payload
-    and promise a poll that `argv._guard_prompt_id` refuses on the next call.
+    carry an arbitrarily long "id". Latching it would promise a poll that
+    `argv._guard_prompt_id` refuses on the very next call.
+
+    What is asserted is that it never becomes the HANDLE, and that the raised
+    message stays bounded whatever the line's size. Deliberately NOT asserted:
+    that the id is absent from the message. It does still appear there, inside
+    the diagnostic stdout tail — that tail exists to show what comfy-cli actually
+    emitted, and is already clipped to `_STDERR_MAX_CHARS`, so demanding its
+    absence would be demanding the diagnostics be broken. The bound is the
+    protection; the guard is the contract.
     """
+    junk_id = "x" * id_len
     junk = json.dumps(
         {
             "schema": "event/1",
             "type": "queued",
-            "prompt_id": "x" * (argv._MAX_PROMPT_ID_LEN + 1),
+            "prompt_id": junk_id,
             "nodes": [{"id": "1"}],
         }
     )
@@ -4398,8 +4414,12 @@ def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(monkeypatch):
         )
 
     msg = str(exc.value)
+    # Never offered back as something to poll ...
     assert "already submitted as prompt_id" not in msg
-    assert "x" * 300 not in msg  # nor echoed back whole
+    assert '"timed_out"' not in msg
+    # ... and the oversized line cannot inflate the error, however big it got.
+    assert len(msg) < server._STDERR_MAX_CHARS
+    assert len(msg) < id_len or id_len < 1_000
 
 
 class _StderrBlockingProc:

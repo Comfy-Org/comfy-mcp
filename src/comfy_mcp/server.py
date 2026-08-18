@@ -3524,8 +3524,8 @@ async def generate_image(
 ) -> Any:
     """Generate an image from a text prompt — the fast on-ramp.
 
-    Runs ComfyUI's default SD1.5 template via ``comfy run-template`` (override
-    with ``COMFY_T2I_TEMPLATE`` + matching slot envs) — same run path/target
+    Runs the built-in text-to-image template via ``comfy run-template``
+    (override with ``COMFY_T2I_TEMPLATE`` + matching slot envs) — same path/target
     as ``run_workflow``: this machine unless ``COMFYUI_URL``/``COMFYUI_HOST``
     says otherwise; never Cloud.
 
