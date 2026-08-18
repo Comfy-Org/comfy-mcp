@@ -9156,6 +9156,25 @@ def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
 _PATH_TYPED_EXACT_MARKER = "mode"
 
 
+# The `nodes path` pair's SHARED wall-clock budget, and the floor the `--loose`
+# re-ask is never squeezed below. Every other `nodes` verb is one 60s call, and
+# so is this one wherever the fallback does not fire; what the fallback must not
+# do is spend 60s TWICE. ~120s is the whole request budget a typical MCP client
+# allows — the ceiling `download_model`'s 110s default is sized to sit under —
+# and `nodes` is a SYNC tool on the shared thread pool, where a client's
+# cancellation never reaches the worker, so a second child would be spawned, and
+# run to term, after the caller had already given up. The re-ask therefore gets
+# what is LEFT of the 60s rather than a fresh 60s of its own.
+#
+# Floored rather than allowed to reach zero because the re-ask is the call whose
+# answer is actually returned: a first call that ate the budget producing a
+# payload this server is about to discard must not reduce the sound query to an
+# instant synthetic timeout. So the worst case is 60 + 15, not 60 + 60, and it
+# is still comfortably inside the client's budget.
+_NODES_PATH_TIMEOUT = 60.0
+_NODES_PATH_RETRY_MIN_TIMEOUT = 15.0
+
+
 def _nodes_path_is_type_constrained(data: Any) -> bool:
     """Does this engine's ``nodes path`` default mode route on socket TYPE?
 
@@ -9188,7 +9207,7 @@ def _nodes_path_sync(
     never consume ``from_type``, reported their step's ``from_type`` as the
     empty string (it had no consumed type to name), and burned ``max_paths`` on
     them before a real route was reached. This server's floor is comfy-cli
-    1.13.0, so that engine is inside the supported range, and the payload it
+    1.14.0, so that engine is inside the supported range, and the payload it
     produces is the right shape and the wrong answer — indistinguishable from a
     correct one to a caller that cannot re-derive it. Measured against
     comfy-cli's own ``nodes_path_object_info`` fixture on the pre-fix engine:
@@ -9228,11 +9247,31 @@ def _nodes_path_sync(
     ``--allow-spend``: ``nodes path``, ``--exact/--loose`` and the ``envelope/1``
     contract ``_run_comfy`` itself requires all landed in the SAME comfy-cli
     commit, so no engine this server can talk to has the verb without the flag.
+    A source build or a fork could still carry the verb without the option, and
+    that one shape degrades the way every other option-shaped gap in this module
+    does (``--registry``, ``--background``, ``--host``/``--port``): Click's
+    ``No such option: --loose`` is caught and the FIRST payload is returned
+    instead. That is not a retreat from the fix — on an engine with no
+    ``--loose`` there is no sounder answer to be had, so the choice is between
+    this file's behavior before this change and no answer at all, and the
+    degrade is narrow enough (:func:`clitext._is_missing_option_error`, minus a
+    phrase :func:`clitext._phrase_is_only_the_caller_s` shows the caller merely
+    echoed through ``from_type``/``to_type``) that it cannot swallow the errors
+    that MUST propagate. A timeout on the re-ask, or ComfyUI going away between
+    the two spawns, is re-raised: there the engine HAS a sound mode and simply
+    did not answer, and relaying the discarded payload would hand back the
+    plausible-looking wrong route this function exists to withhold, with nothing
+    in it to say so.
 
     Neither mode is exposed as a caller-facing toggle. ``--exact`` is what a
     caller gets wherever it is trustworthy, and offering the pre-fix engine's
     version of it would hand an agent a mode whose wrong answers it has no way
-    to spot.
+    to spot. Nor is a "the fallback fired" flag synthesized into the reply —
+    that would be this repo deriving a field comfy-cli did not emit, and the
+    marker already IS the signal in both directions: a payload with ``mode`` was
+    answered in the engine's own default, one without it was answered by the
+    ``--loose`` re-ask (and correspondingly carries no ``support`` and no
+    ``exact: true``).
     """
     args = (
         "nodes",
@@ -9244,10 +9283,41 @@ def _nodes_path_sync(
         "--max-paths",
         str(max_paths),
     )
-    data = _run_comfy(*args, timeout=60.0)
+    started = time.monotonic()
+    data = _run_comfy(*args, timeout=_NODES_PATH_TIMEOUT)
     if _nodes_path_is_type_constrained(data):
         return data
-    return _run_comfy(*args, "--loose", timeout=60.0)
+    retry_timeout = max(
+        _NODES_PATH_RETRY_MIN_TIMEOUT,
+        _NODES_PATH_TIMEOUT - (time.monotonic() - started),
+    )
+    try:
+        return _run_comfy(*args, "--loose", timeout=retry_timeout)
+    except ComfyCliError as exc:
+        # The one failure that is better answered than raised: an engine whose
+        # `nodes path` has no `--loose` at all. Narrow on purpose, exactly as at
+        # `node_dependencies`' `--registry` — `_is_missing_option_error` matches
+        # Click's parser error and nothing else, and
+        # `_phrase_is_only_the_caller_s` subtracts the phrase when a caller put
+        # it there themselves through `from_type`/`to_type` (the bounds are
+        # stringified ints, but they are passed for the same reason the other
+        # sites pass every caller value: the set is what the argv carries, not
+        # what looks plausible today). Every OTHER failure — the re-ask timing
+        # out, ComfyUI going away between the two spawns — propagates, because
+        # relaying `data` there would silently hand back the pre-fix engine's
+        # wrong-but-well-shaped route that this function exists to withhold.
+        if not clitext._is_missing_option_error(
+            exc, "--loose"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--loose")),
+            from_type,
+            to_type,
+            str(max_depth),
+            str(max_paths),
+        ):
+            raise
+        return data
 
 
 def _nodes_types_sync() -> Any:
