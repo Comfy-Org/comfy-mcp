@@ -366,6 +366,20 @@ _MIN_COMFY_CLI_STR = "1.14.0"
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
 
+# Serializes the probe itself, so racing FIRST calls share one `comfy --version`
+# instead of each spawning its own. The memo alone only dedupes calls that arrive
+# after a probe has FINISHED — the startup machine-snapshot probe (a daemon
+# thread) is usually first, and every tool call arriving while it is still inside
+# its 30s-capped subprocess would otherwise read `_version_checked is False` and
+# spawn a redundant cold comfy-cli interpreter, N concurrent first calls spawning
+# N of them on exactly the machine least able to afford it. Waiting on the lock
+# costs a caller no more wall time than running that duplicate probe would have,
+# and it leaves the machine less loaded. `threading.Lock` (not an asyncio one) is
+# correct for both call styles: the sync paths call `_check_comfy_version`
+# directly, the async paths via `asyncio.to_thread`, and it is never held across
+# an `await`.
+_VERSION_CHECK_LOCK = threading.Lock()
+
 # `COMFY_PROJECT`'s raw value, read from the environment at most once per
 # process (see `_project_root`). The sentinel distinguishes "not read yet" from
 # "read and unset" (`None`) without a second flag.
@@ -717,65 +731,72 @@ def _check_comfy_version() -> None:
     global _version_checked
     if _version_checked:
         return
-    try:
-        proc = _spawn_comfy_version()
-    except subprocess.TimeoutExpired:
-        # A hung `--version` is latched so we don't re-block every later call on
-        # the same 30s wait; fail OPEN for the rest of the process.
-        _version_checked = True
-        return
-    except PermissionError as exc:
-        # The spawn ITSELF was denied (not the child exiting non-zero) — e.g. a
-        # `comfy` launcher whose interpreter sits in a protected folder. Without
-        # this branch the generic handler below fails open and the raw EPERM
-        # escapes from the real spawn a moment later, unexplained. Must precede
-        # the OSError handler: PermissionError is a subclass of it.
-        denied = getattr(exc, "filename", None) or tcc._tcc_path_from(str(exc))
-        if tcc._is_macos() and (
-            tcc._looks_like_tcc_denial(str(exc))
-            or tcc._macos_protected_dir(denied) is not None
-        ):
+    with _VERSION_CHECK_LOCK:
+        # Re-check under the lock: a caller that queued behind an in-flight probe
+        # must observe ITS verdict rather than duplicate it. Everything below is
+        # unchanged — each failure-policy branch latches (or deliberately does
+        # not) exactly as before; the lock only bounds the probe to one at a time.
+        if _version_checked:
+            return
+        try:
+            proc = _spawn_comfy_version()
+        except subprocess.TimeoutExpired:
+            # A hung `--version` is latched so we don't re-block every later call on
+            # the same 30s wait; fail OPEN for the rest of the process.
+            _version_checked = True
+            return
+        except PermissionError as exc:
+            # The spawn ITSELF was denied (not the child exiting non-zero) — e.g. a
+            # `comfy` launcher whose interpreter sits in a protected folder. Without
+            # this branch the generic handler below fails open and the raw EPERM
+            # escapes from the real spawn a moment later, unexplained. Must precede
+            # the OSError handler: PermissionError is a subclass of it.
+            denied = getattr(exc, "filename", None) or tcc._tcc_path_from(str(exc))
+            if tcc._is_macos() and (
+                tcc._looks_like_tcc_denial(str(exc))
+                or tcc._macos_protected_dir(denied) is not None
+            ):
+                raise ComfyCliError(
+                    f"`{COMFY_BIN}` could not be started.\n\n{tcc._tcc_guidance(denied)}\n\n"
+                    f"Original error: {exc}"
+                ) from exc
+            return  # any other permission problem: fail OPEN, exactly as before
+        except (OSError, subprocess.SubprocessError):
+            # A transient spawn failure fails OPEN for THIS call but is NOT latched —
+            # a later call re-checks rather than permanently disabling the guard.
+            return
+        if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
+            # comfy-cli's own interpreter could not start because macOS denied it
+            # its venv — the reported failure for a ComfyUI install under
+            # ~/Documents. This guard runs before the first tool call of the
+            # process, so catching it here is what turns the raw `Fatal Python
+            # error` traceback into the fix. Deliberately NOT memoized: granting
+            # Full Disk Access and retrying in the same process must re-check.
             raise ComfyCliError(
-                f"`{COMFY_BIN}` could not be started.\n\n{tcc._tcc_guidance(denied)}\n\n"
-                f"Original error: {exc}"
-            ) from exc
-        return  # any other permission problem: fail OPEN, exactly as before
-    except (OSError, subprocess.SubprocessError):
-        # A transient spawn failure fails OPEN for THIS call but is NOT latched —
-        # a later call re-checks rather than permanently disabling the guard.
-        return
-    if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
-        # comfy-cli's own interpreter could not start because macOS denied it
-        # its venv — the reported failure for a ComfyUI install under
-        # ~/Documents. This guard runs before the first tool call of the
-        # process, so catching it here is what turns the raw `Fatal Python
-        # error` traceback into the fix. Deliberately NOT memoized: granting
-        # Full Disk Access and retrying in the same process must re-check.
-        raise ComfyCliError(
-            f"`{COMFY_BIN}` could not start.\n\n"
-            f"{tcc._tcc_guidance(_scrubbed_tcc_path(proc.stderr))}\n\n"
-            # Same rule as `_unwrap_envelope`'s TCC branch: a captured stream is
-            # scrubbed on its way to the client, and so is the path pulled OUT
-            # of one (`_scrubbed_tcc_path`, a no-op on a real filesystem path).
-            # This probe is only `comfy --version`, so it carries no caller URL
-            # of its own — but comfy-cli reads its config at startup, so a
-            # warning naming a configured server URL can land on this stderr,
-            # and the asymmetry is not worth preserving.
-            "Original error: "
-            f"{failure_log._scrubbed_stream_tail(proc.stderr, errors._MAX_ERROR_FIELD_CHARS)}"
-        )
-    version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
-    if version is not None and version < _MIN_COMFY_CLI:
-        # Deliberately do NOT memoize a too-old verdict: if the user upgrades and
-        # retries within the same process, re-check rather than latch the failure.
-        raise ComfyCliError(
-            f"comfy-cli {'.'.join(map(str, version))} is too old — this server "
-            f"requires comfy-cli >= {_MIN_COMFY_CLI_STR}. Upgrade it with "
-            # Double-quoted for the same cross-shell reason as
-            # `_require_comfy_bin`'s install advice — see the note there.
-            f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
-        )
-    _version_checked = True
+                f"`{COMFY_BIN}` could not start.\n\n"
+                f"{tcc._tcc_guidance(_scrubbed_tcc_path(proc.stderr))}\n\n"
+                # Same rule as `_unwrap_envelope`'s TCC branch: a captured stream is
+                # scrubbed on its way to the client, and so is the path pulled OUT
+                # of one (`_scrubbed_tcc_path`, a no-op on a real filesystem path).
+                # This probe is only `comfy --version`, so it carries no caller URL
+                # of its own — but comfy-cli reads its config at startup, so a
+                # warning naming a configured server URL can land on this stderr,
+                # and the asymmetry is not worth preserving.
+                "Original error: "
+                f"{failure_log._scrubbed_stream_tail(proc.stderr, errors._MAX_ERROR_FIELD_CHARS)}"
+            )
+        version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
+        if version is not None and version < _MIN_COMFY_CLI:
+            # Deliberately do NOT memoize a too-old verdict: if the user upgrades and
+            # retries within the same process, re-check rather than latch the failure.
+            raise ComfyCliError(
+                f"comfy-cli {'.'.join(map(str, version))} is too old — this server "
+                f"requires comfy-cli >= {_MIN_COMFY_CLI_STR}. Upgrade it with "
+                # Double-quoted for the same cross-shell reason as
+                # `_require_comfy_bin`'s install advice — see the note there.
+                f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
+            )
+        _version_checked = True
 
 
 def _scrubbed_tcc_path(text: str | None) -> str | None:

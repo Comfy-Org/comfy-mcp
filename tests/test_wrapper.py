@@ -692,6 +692,120 @@ def test_version_guard_latches_on_timeout(monkeypatch):
     assert server._version_checked is True
 
 
+def _passing_version_proc() -> subprocess.CompletedProcess:
+    """A `comfy --version` result at the floor, for the lock tests below."""
+    return subprocess.CompletedProcess(
+        [server.COMFY_BIN, "--version"],
+        0,
+        stdout="comfy-cli, version 1.14.0",
+        stderr="",
+    )
+
+
+def test_version_guard_probes_once_for_a_herd_of_racing_first_calls(monkeypatch):
+    """Concurrent FIRST calls share ONE probe instead of spawning one each.
+
+    The memo alone only dedupes calls arriving after a probe has FINISHED. The
+    real first-call window is a slow one — the startup machine-snapshot probe
+    holds `comfy --version` for a full cold comfy-cli start — and every tool
+    call landing inside it used to read `_version_checked is False` and spawn
+    its own, N racing callers spawning N cold interpreters on exactly the
+    machine least able to afford them.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+
+    spawns: list[float] = []
+    counter = threading.Lock()
+    ready = threading.Barrier(5)
+
+    def fake_spawn() -> subprocess.CompletedProcess:
+        with counter:
+            spawns.append(time.monotonic())
+        time.sleep(0.2)  # hold the probe open so the herd genuinely overlaps
+        return _passing_version_proc()
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+
+    raised: list[BaseException] = []
+
+    def caller() -> None:
+        ready.wait(timeout=10)  # release all five at the same instant
+        try:
+            server._check_comfy_version()
+        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+            raised.append(exc)
+
+    threads = [threading.Thread(target=caller) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads)  # no deadlock
+    assert raised == []
+    assert len(spawns) == 1  # the whole point: one probe, not five
+    assert server._version_checked is True
+    assert not server._VERSION_CHECK_LOCK.locked()
+
+
+def test_version_guard_lock_does_not_latch_a_transient_failure(monkeypatch):
+    """The lock serializes the probe; it must not change WHICH verdicts latch.
+
+    A transient spawn error still fails OPEN without latching, so the very next
+    call re-probes — the branch most at risk of being accidentally swallowed by
+    a "we already ran it" early return added under the lock.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+
+    spawns: list[str] = []
+
+    def fake_spawn() -> subprocess.CompletedProcess:
+        spawns.append("call")
+        if len(spawns) == 1:
+            raise OSError("boom")
+        return _passing_version_proc()
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+
+    server._check_comfy_version()  # no raise
+    assert server._version_checked is False  # transient error still not latched
+    assert len(spawns) == 1
+    assert not server._VERSION_CHECK_LOCK.locked()
+
+    server._check_comfy_version()  # re-probes rather than returning the memo
+    assert len(spawns) == 2
+    assert server._version_checked is True
+
+
+def test_version_guard_releases_the_lock_when_a_verdict_raises(monkeypatch):
+    """A raising verdict must leave the lock free, not wedge every later call.
+
+    Two of the guard's branches — a too-old version and a TCC-denied start —
+    raise from INSIDE the `with`, and neither latches, so the next call is
+    expected to take the lock again. If the raise leaked the lock, the first
+    upgrade-and-retry in the same process would hang forever instead of
+    re-checking; the `with` is what makes that impossible.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+
+    stdouts = iter(["comfy-cli, version 1.11.0", "comfy-cli, version 1.14.0"])
+
+    def fake_spawn() -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            [server.COMFY_BIN, "--version"], 0, stdout=next(stdouts), stderr=""
+        )
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+
+    with pytest.raises(server.ComfyCliError, match="too old"):
+        server._check_comfy_version()
+    assert not server._VERSION_CHECK_LOCK.locked()
+    assert server._version_checked is False
+
+    server._check_comfy_version()  # the upgraded install: re-checked, not wedged
+    assert server._version_checked is True
+
+
 def test_spawn_comfy_version_keeps_the_bounded_decode_safe_invocation(monkeypatch):
     """The one shared spawn site: right argv, bounded, and decode-safe."""
     seen: dict[str, object] = {}
