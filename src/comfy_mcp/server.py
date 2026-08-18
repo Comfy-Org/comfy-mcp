@@ -4673,7 +4673,8 @@ async def _resolve_template_spend_consent(
         ),
         declined=(
             f"spend not confirmed: the prompt to let the template "
-            f"{name!r} spend Comfy credits was declined. Nothing was spent and "
+            f"'{_display_model(name)}' spend Comfy credits was declined. Nothing "
+            "was spent and "
             "no run was started. (A template with no partner-API nodes runs "
             "for free — call again with confirm_spend=False to run it without "
             "spending.)"
