@@ -595,7 +595,7 @@ def test_declined_elicitation_still_reports_a_decline():
 
 # --- QA 0.10.0: a decline is not proof of a person ---------------------------
 # The 0.8.0 fix above rests on "action == 'decline'" meaning a human said no.
-# It does not. Hermes Agent's `tools/approval.py` returns "decline" for a
+# It does not. At least one shipping agent client answers "decline" for a
 # session with no approval surface registered, a dispatch exception, a CLI
 # prompt that raised, and a failed session lookup — none of which involve a
 # person. The server cannot tell those from a real refusal, so it must not
@@ -623,6 +623,98 @@ def test_decline_does_not_assert_that_a_person_refused():
 def test_decline_hedge_names_no_way_around_the_gate():
     """The hedge must not hand an agent a bypass for a refusal it was just given."""
     message = server._DECLINE_MAY_BE_AUTOMATIC
+    for bypass in ("confirm_", "COMFY_MCP_ASSUME_CONSENT", "consent always"):
+        assert bypass not in message
+
+
+def _declined_messages(monkeypatch) -> dict[str, str]:
+    """Every gate's DELIVERED refusal, driven through a client that declines.
+
+    All eight gates funnel through `_elicit_approval`, so forcing its False —
+    the `action == "decline"` outcome, and the only one that does not raise on
+    its own — reaches each gate's own declined text without standing up eight
+    different tool stacks. What is asserted is therefore the ASSEMBLED string a
+    caller receives, not a constant read in isolation.
+    """
+
+    async def _declines(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(server, "_elicit_approval", _declines)
+    monkeypatch.setattr(server, "_client_elicitation_support", lambda _ctx: True)
+    monkeypatch.setattr(server, "_engine_auto_confirms", lambda: False)
+    ctx = object()
+
+    def _refusal(coro):
+        with pytest.raises(server.ComfyCliError) as exc:
+            asyncio.run(coro)
+        return str(exc.value)
+
+    messages = {
+        "partner_generate": _refusal(
+            server._resolve_spend_consent("flux-pro", False, ctx)
+        ),
+        "run_template": _refusal(
+            server._resolve_template_spend_consent("txt2img", True, ctx)
+        ),
+        "run_workflow": _refusal(
+            server._resolve_workflow_spend_consent("graph.json", True, ctx)
+        ),
+        "launch_network_exposure": _refusal(
+            server._resolve_network_exposure_consent(["--listen"], False, ctx, "launch")
+        ),
+        "update_comfyui_all": _refusal(server._resolve_update_all_consent(False, ctx)),
+        "switch_comfyui_version": _refusal(
+            server._resolve_switch_consent("v0.3.0", False, ctx)
+        ),
+        "install_nodes": _refusal(
+            server._resolve_install_consent("some-pack", False, ctx)
+        ),
+    }
+    # The kill gate reports its refusal as a `reason` folded into the restart's
+    # guidance error rather than as a raise (see `_KillDecision`), so it is
+    # collected differently — but it is the same decline, and the same contract.
+    listener = server._UntrackedListener(pid=4242, port=8188, cmdline="python main.py")
+    decision = asyncio.run(server._resolve_kill_untracked_consent(listener, False, ctx))
+    assert not decision.approved
+    messages["restart_kill_untracked"] = decision.reason
+    return messages
+
+
+def test_no_gate_asserts_a_person_on_a_decline(monkeypatch):
+    """Every gate, not just the launch one, reports the refusal anonymously.
+
+    Matching on "the user" rather than the exact old sentence: the claim that
+    must not survive is naming WHO refused, in any phrasing.
+    """
+    messages = _declined_messages(monkeypatch)
+    # All eight, so a gate added later cannot quietly skip the contract.
+    assert len(messages) == 8
+
+    for gate, message in messages.items():
+        assert "declined" in message, gate  # still reports the refusal
+        assert "the user" not in message, gate  # but never names who made it
+        assert "You declined" not in message, gate
+
+
+def test_every_gate_carries_the_hedge_on_a_decline(monkeypatch):
+    """The hedge is what tells a reader who saw no prompt why they saw none."""
+    for gate, message in _declined_messages(monkeypatch).items():
+        assert server._DECLINE_MAY_BE_AUTOMATIC.strip() in message, gate
+
+
+def test_the_generate_refusal_as_delivered_names_no_bypass(monkeypatch):
+    """The constant's invariant, checked on the message a caller actually gets.
+
+    Only `partner_generate` is asserted whole: it is the gate where every path
+    spends, so any route named in its refusal is a route to unconsented spend.
+    The two opt-in verbs deliberately DO name `confirm_spend=False` — for
+    `run_template` that is the free-run path and cannot spend, and
+    `run_workflow` names it only to forbid it — so a blanket assertion there
+    would pin the wrong contract.
+    """
+    message = _declined_messages(monkeypatch)["partner_generate"]
+
     for bypass in ("confirm_", "COMFY_MCP_ASSUME_CONSENT", "consent always"):
         assert bypass not in message
 

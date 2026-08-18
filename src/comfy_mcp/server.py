@@ -3715,11 +3715,12 @@ class _ApprovalWording(NamedTuple):
 # Appended to every "declined" refusal, because a bare `action == "decline"` does
 # NOT prove a person saw anything. The MCP spec separates "decline" (the user
 # said no) from "cancel" (dismissed without a decision), but a client is free to
-# answer either way, and at least one shipping client (Hermes Agent, verified in
-# `tools/approval.py`) returns "decline" for conditions with no human in them at
-# all: no approval surface registered for the session, a dispatch exception, a
-# CLI prompt that raised, a session lookup that failed. #219 made every OTHER
-# auto-answer raise honestly; this is the one shape that still arrives wearing a
+# answer either way, and at least one shipping agent client returns "decline"
+# for conditions with no human in them at all: no approval surface registered
+# for the session, a dispatch exception, a CLI prompt that raised, a session
+# lookup that failed. Every OTHER auto-answer
+# already raises honestly rather than reporting a decision (see
+# `_elicit_approval`); this is the one shape that still arrives wearing a
 # person's clothes, and the server cannot tell it apart. So the copy stops
 # asserting the person and names both possibilities.
 #
@@ -3879,9 +3880,13 @@ async def _elicit_approval(
     # uncaught crash instead of the refusal this contract promises.
     action = getattr(result, "action", None)
     if action != "accept":
-        # "DECLINE" is a person saying no. Anything else — "cancel", a missing
+        # "DECLINE" is an ANSWER to the request — usually a person saying no,
+        # but not provably one: a client may auto-decline a prompt it could not
+        # show (see `_DECLINE_MAY_BE_AUTOMATIC`), so callers report the refusal
+        # without naming who made it. Anything else — "cancel", a missing
         # action, a client that resolves the request without ever rendering it —
-        # is NOT a decision, and reporting it as one is a lie about a human.
+        # is not even an answer, and reporting it as a decision is a lie about a
+        # human.
         #
         # This is the bug behind "the user declined ..." appearing in sessions
         # where no prompt was ever displayed, across four different gates: every
@@ -3965,7 +3970,8 @@ async def _resolve_spend_consent(
             return True
         raise ComfyCliError(
             f"spend not confirmed: the prompt to spend Comfy credits on "
-            f"`{model}` was declined. Nothing was spent and no generation was "
+            f"`{_display_model(model)}` was declined. Nothing was spent and no "
+            f"generation was "
             f"started.{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     return confirm_spend
@@ -4630,7 +4636,7 @@ async def _resolve_optin_spend_consent(
     ``declined`` are this level's ``_ApprovalWording``.
 
     Returns True to append ``--allow-spend``. Raises :class:`ComfyCliError` —
-    before any child is spawned — when the user actively declined.
+    before any child is spawned — when the prompt was declined.
     """
     if not confirm_spend:
         return False
@@ -4668,10 +4674,10 @@ async def _resolve_template_spend_consent(
         declined=(
             f"spend not confirmed: the prompt to let the template "
             f"{name!r} spend Comfy credits was declined. Nothing was spent and "
-            "no run was started."
+            "no run was started. (A template with no partner-API nodes runs "
+            "for free — call again with confirm_spend=False to run it without "
+            "spending.)"
             f"{_DECLINE_MAY_BE_AUTOMATIC}"
-            " (A template with no partner-API nodes runs for free — "
-            "call again with confirm_spend=False to run it without spending.)"
         ),
     )
 
@@ -4751,7 +4757,7 @@ async def _resolve_workflow_spend_consent(
             " Do NOT retry this graph with confirm_spend=False "
             "to get past this: unlike run_template, `comfy run`'s spend gate is "
             "not in a comfy-cli release yet, so on the installed engine that "
-            "would run the workflow and spend the credits the user just "
+            "would run the workflow and spend the credits that were just "
             "refused."
         ),
     )
@@ -6734,7 +6740,8 @@ async def _resolve_kill_untracked_consent(
             return _KillDecision(True, "")
         return _KillDecision(
             False,
-            f"You declined to stop pid {listener.pid}, so it is still running.",
+            f"The prompt to stop pid {listener.pid} was declined, so it is "
+            f"still running.{_DECLINE_MAY_BE_AUTOMATIC}",
         )
     # Client cannot be prompted: `confirm_kill_untracked` is the documented
     # fallback, and its `False` default is why a bare call from such a client
