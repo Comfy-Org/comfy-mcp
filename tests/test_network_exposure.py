@@ -583,14 +583,48 @@ def test_cancelled_elicitation_does_not_claim_the_user_declined():
     assert "not confirmed" in message
 
 
-def test_declined_elicitation_still_says_the_user_declined():
-    """An actual decline keeps the accurate wording — the fix is not a blanket rename."""
+def test_declined_elicitation_still_reports_a_decline():
+    """An actual decline keeps reporting a refusal — the fix is not a blanket rename."""
     ctx = _FakeCtx(action="decline")
 
     with pytest.raises(server.ComfyCliError) as exc:
         _launch(extra_args=["--listen"], ctx=ctx)
 
     assert "declined" in str(exc.value)
+
+
+# --- QA 0.10.0: a decline is not proof of a person ---------------------------
+# The 0.8.0 fix above rests on "action == 'decline'" meaning a human said no.
+# It does not. Hermes Agent's `tools/approval.py` returns "decline" for a
+# session with no approval surface registered, a dispatch exception, a CLI
+# prompt that raised, and a failed session lookup — none of which involve a
+# person. The server cannot tell those from a real refusal, so it must not
+# claim one.
+
+
+def test_decline_does_not_assert_that_a_person_refused():
+    """A decline reports the refusal without naming who made it."""
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        _launch(extra_args=["--listen"], ctx=ctx)
+
+    message = str(exc.value)
+    # Reports the refusal, and still fails closed.
+    assert "declined" in message
+    assert "not confirmed" in message
+    # But never asserts the human. This is the claim the server cannot support.
+    assert "the user declined" not in message
+    # And says so explicitly, so a reader who saw no prompt knows why.
+    assert "cannot display a prompt" in message
+    assert "nobody was asked" in message
+
+
+def test_decline_hedge_names_no_way_around_the_gate():
+    """The hedge must not hand an agent a bypass for a refusal it was just given."""
+    message = server._DECLINE_MAY_BE_AUTOMATIC
+    for bypass in ("confirm_", "COMFY_MCP_ASSUME_CONSENT", "consent always"):
+        assert bypass not in message
 
 
 # --- Operator pre-authorization (COMFY_MCP_ASSUME_CONSENT) --------------------

@@ -3712,6 +3712,28 @@ class _ApprovalWording(NamedTuple):
     consent_token: str = ""
 
 
+# Appended to every "declined" refusal, because a bare `action == "decline"` does
+# NOT prove a person saw anything. The MCP spec separates "decline" (the user
+# said no) from "cancel" (dismissed without a decision), but a client is free to
+# answer either way, and at least one shipping client (Hermes Agent, verified in
+# `tools/approval.py`) returns "decline" for conditions with no human in them at
+# all: no approval surface registered for the session, a dispatch exception, a
+# CLI prompt that raised, a session lookup that failed. #219 made every OTHER
+# auto-answer raise honestly; this is the one shape that still arrives wearing a
+# person's clothes, and the server cannot tell it apart. So the copy stops
+# asserting the person and names both possibilities.
+#
+# It deliberately does NOT name a way to bypass the gate. On a genuine decline
+# that would hand the agent a route around a refusal it was just given, which is
+# the failure the caller comments elsewhere in this file warn about; the
+# `escape_hatch` on the RAISE paths already covers the client that cannot prompt.
+_DECLINE_MAY_BE_AUTOMATIC = (
+    ' Some clients answer "decline" on their own when they cannot display a '
+    "prompt, so if no prompt appeared, the client refused by itself and nobody "
+    "was asked."
+)
+
+
 _SPEND_APPROVAL_WORDING = _ApprovalWording(
     subject="spend",
     what="the credit spend",
@@ -3814,8 +3836,10 @@ async def _elicit_approval(
     Three outcomes, not two — the distinction the QA pass found missing:
 
     * True — a person saw the prompt and approved.
-    * False — a person saw the prompt and DECLINED (``action == "decline"``).
-      Only here may a caller say "the user declined".
+    * False — the client answered ``"decline"``. USUALLY a person saying no,
+      but not provably one: a client may auto-decline a prompt it cannot show
+      (see :data:`_DECLINE_MAY_BE_AUTOMATIC`), and that is indistinguishable
+      here. A caller may report a refusal, but must not assert WHO made it.
     * raises — the client never got a decision to us (``"cancel"``, a missing
       action, an auto-answer). Failing closed is the same; claiming a human
       refused is not, so that wording is not available to the caller at all.
@@ -3940,8 +3964,9 @@ async def _resolve_spend_consent(
         if await _elicit_spend_consent(ctx, model):
             return True
         raise ComfyCliError(
-            f"spend not confirmed: the user declined to spend Comfy credits on "
-            f"`{model}`. Nothing was spent and no generation was started."
+            f"spend not confirmed: the prompt to spend Comfy credits on "
+            f"`{model}` was declined. Nothing was spent and no generation was "
+            f"started.{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     return confirm_spend
 
@@ -4641,9 +4666,11 @@ async def _resolve_template_spend_consent(
             "this one, or the remote a COMFYUI_URL/COMFYUI_HOST names."
         ),
         declined=(
-            f"spend not confirmed: the user declined to let the template "
-            f"{name!r} spend Comfy credits. Nothing was spent and no run was "
-            "started. (A template with no partner-API nodes runs for free — "
+            f"spend not confirmed: the prompt to let the template "
+            f"{name!r} spend Comfy credits was declined. Nothing was spent and "
+            "no run was started."
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
+            " (A template with no partner-API nodes runs for free — "
             "call again with confirm_spend=False to run it without spending.)"
         ),
     )
@@ -4717,9 +4744,11 @@ async def _resolve_workflow_spend_consent(
             "COMFYUI_URL/COMFYUI_HOST names."
         ),
         declined=(
-            f"spend not confirmed: the user declined to let the workflow "
-            f"'{path_display}' spend Comfy credits. Nothing was spent and no "
-            "run was started. Do NOT retry this graph with confirm_spend=False "
+            f"spend not confirmed: the prompt to let the workflow "
+            f"'{path_display}' spend Comfy credits was declined. Nothing was "
+            "spent and no run was started."
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
+            " Do NOT retry this graph with confirm_spend=False "
             "to get past this: unlike run_template, `comfy run`'s spend gate is "
             "not in a comfy-cli release yet, so on the installed engine that "
             "would run the workflow and spend the credits the user just "
@@ -5972,9 +6001,10 @@ async def _resolve_network_exposure_consent(
         ):
             return
         raise ComfyCliError(
-            f"network exposure not confirmed: the user declined to {action} the "
-            f"local ComfyUI with {summary}. "
+            f"network exposure not confirmed: the prompt to {action} the "
+            f"local ComfyUI with {summary} was declined. "
             f"{_NETWORK_APPROVAL_WORDING.nothing_done}"
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_network_exposure` is the documented
     # fallback, and its `False` default is why a bare call from such a client
@@ -7095,9 +7125,9 @@ async def _resolve_update_all_consent(
         if await _elicit_update_all_consent(ctx):
             return
         raise ComfyCliError(
-            "node pack update not confirmed: the user declined to update the "
-            "installed custom node packs. Nothing was updated and no pack code "
-            "was run."
+            "node pack update not confirmed: the prompt to update the installed "
+            "custom node packs was declined. Nothing was updated and no pack "
+            f"code was run.{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_update_all` is the documented fallback,
     # and its `False` default is why a bare `target="all"` from such a client runs
@@ -7281,8 +7311,9 @@ async def _resolve_switch_consent(
         if await _elicit_version_switch_consent(ctx, version):
             return
         raise ComfyCliError(
-            f"version switch not confirmed: the user declined to switch the "
-            f"local ComfyUI to {version!r}. Nothing was changed."
+            f"version switch not confirmed: the prompt to switch the "
+            f"local ComfyUI to {version!r} was declined. Nothing was changed."
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_switch` is the documented fallback, and
     # its `False` default is why a bare call from such a client destroys nothing.
@@ -7648,8 +7679,9 @@ async def _resolve_install_consent(
         if await _elicit_node_install_consent(ctx, names_display):
             return
         raise ComfyCliError(
-            "node install not confirmed: the user declined to install "
-            f"{names_display}. {_INSTALL_APPROVAL_WORDING.nothing_done}"
+            "node install not confirmed: the prompt to install "
+            f"{names_display} was declined. "
+            f"{_INSTALL_APPROVAL_WORDING.nothing_done}{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_install` is the documented fallback, and
     # its `False` default is why a bare call from such a client installs nothing.
