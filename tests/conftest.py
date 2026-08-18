@@ -18,8 +18,10 @@ copy per test file:
   ``communicate``) — ``envelope`` + ``patched_run`` / ``patched_plain_run``;
 * the streaming ``--json-stream`` path
   (``asyncio.create_subprocess_exec`` + incremental stream reads) —
-  ``patched_stream``. ``run_workflow``, ``job(action="watch")`` and
-  ``generate_image`` all drive the same NDJSON stream.
+  ``patched_stream``, plus ``blocking_stream`` for the timeout paths (a child
+  that emits some lines and then blocks past the caller's deadline).
+  ``run_workflow``, ``job(action="watch")`` and ``generate_image`` all drive the
+  same NDJSON stream.
 * the plain-JSON ASYNC path (``asyncio.create_subprocess_exec`` + bounded drains
   of both pipes) — ``patched_async_run``, for ``server._run_comfy_async``. Same
   spawn and same real ``StreamReader`` pipes as the streaming fake, but the output
@@ -587,6 +589,58 @@ def patched_stream(monkeypatch):
             proc = _FakeProc(
                 list(cmd), stdout_text, env=env, stdin=stdin, limit=limit, cwd=cwd
             )
+            procs.append(proc)
+            return proc
+
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        return procs
+
+    return setup
+
+
+class _BlockingStreamProc:
+    """A fake streaming child that emits ``first_lines`` and then never yields.
+
+    The one case ``patched_stream`` cannot model: its ``_FakeProc`` drains a
+    canned stream to EOF instantly and reports itself already exited, so it can
+    never hold a read past a deadline. ``returncode`` starts None so the timeout
+    handler's kill fires; no ``pid``, so ``server._kill_proc_tree_async`` takes
+    the ``proc.kill()`` fallback instead of signalling a made-up process group.
+    """
+
+    def __init__(self, cmd, first_lines, stderr_text=""):
+        self.cmd = cmd
+        # Real reader left OPEN: the lines are readable, then the next read
+        # blocks until the caller's deadline cancels it (see stream_reader).
+        self.stdout = stream_reader("".join(first_lines), eof=False)
+        self.stderr = stream_reader(stderr_text)
+        self.returncode = None
+        self.killed = False
+
+    async def wait(self):
+        self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.fixture
+def blocking_stream(monkeypatch):
+    """Patch the streaming spawn with a child that emits lines then blocks.
+
+    Returns ``setup(first_lines, stderr_text=…) -> procs`` — the list capturing
+    each spawned :class:`_BlockingStreamProc`, so a test can assert
+    ``procs[0].killed`` (the timeout handler reaped the child) or the argv it
+    was spawned with. The timeout-path counterpart of :func:`patched_stream`.
+    """
+
+    def setup(first_lines, *, stderr_text: str = "") -> list[_BlockingStreamProc]:
+        procs: list[_BlockingStreamProc] = []
+
+        async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+            proc = _BlockingStreamProc(list(cmd), first_lines, stderr_text)
             procs.append(proc)
             return proc
 
