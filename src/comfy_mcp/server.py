@@ -9149,7 +9149,48 @@ def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
 def _nodes_path_sync(
     from_type: str, to_type: str, max_depth: int, max_paths: int
 ) -> Any:
-    """``nodes(action="path")``'s body — the exact ``nodes_path`` this replaced."""
+    """``nodes(action="path")``'s body — ``nodes_path`` plus an explicit ``--loose``.
+
+    The ONE thing decided here is WHICH of comfy-cli's two traversal modes to
+    ask for; both are the engine's own walk over the live ``object_info``
+    graph, so this stays a passthrough — no graph is parsed and no verdict is
+    derived on this side. Not passing the flag at all (what this did before)
+    is not neutral: it takes comfy-cli's ``--exact`` default, which on this
+    verb is the mode that answers WRONG.
+
+    ``--loose`` (``find_paths``) walks the engine's consumers index, which is
+    keyed on **socket type** — built from link inputs only, and an enum/COMBO
+    widget is not a link — so every step is a node that genuinely accepts the
+    type the step before it produced, the chain provably starts at
+    ``from_type``, and each step's reported input type is the type actually
+    traversed.
+
+    ``--exact`` (``exact_paths``) instead admits any node whose REQUIRED link
+    inputs are already satisfied. That is vacuously true of a node with NO
+    link inputs, so it returns widget-only loaders and generators that never
+    consume ``from_type``, reports their step's input type as the empty
+    string, and lets them exhaust ``max_paths`` before a real route is
+    reached. Measured against comfy-cli's own six-node fixture: ``MODEL`` ->
+    ``IMAGE`` under ``--exact`` is ``CheckpointLoaderSimple ->
+    EmptyLatentImage -> VAEDecode`` (MODEL never used) where ``--loose``
+    gives ``KSampler -> VAEDecode``; and ``IMAGE`` -> ``MODEL``, which has no
+    route at all, comes back under ``--exact`` as a bare
+    ``CheckpointLoaderSimple`` instead of as no answer. Structurally valid,
+    semantically wrong, and indistinguishable from a right answer to a caller
+    that cannot re-derive it — the reason the flag is pinned rather than left
+    to the engine's default.
+
+    No capability probe is needed, unlike ``run_workflow``'s ``--allow-spend``:
+    ``nodes path``, ``--exact/--loose`` and the ``envelope/1`` contract
+    ``_run_comfy`` itself requires all landed in the SAME comfy-cli commit, so
+    there is no engine this server can talk to at all that has the verb but
+    not the flag.
+
+    Not exposed as a caller-facing toggle. ``--exact``'s intent — every step's
+    required inputs satisfiable from the path so far — is worth having, but
+    until the engine also requires a path to CONSUME ``from_type``, offering
+    it would hand an agent a mode whose wrong answers it has no way to spot.
+    """
     return _run_comfy(
         "nodes",
         "path",
@@ -9159,6 +9200,7 @@ def _nodes_path_sync(
         str(max_depth),
         "--max-paths",
         str(max_paths),
+        "--loose",
         timeout=60.0,
     )
 
@@ -9243,7 +9285,8 @@ def nodes(
     - "upstream"/"downstream" -> `nodes upstream|downstream <name>
       [--limit N]`: what feeds INTO / is fed FROM `name`.
     - "path" -> `nodes path <from_type> <to_type> --max-depth N
-      --max-paths N`: chains between two types; depth/paths default 6/10.
+      --max-paths N --loose`: chains between two types, every step a
+      real socket link; depth/paths 6/10. No route -> no paths.
     - "types" -> `nodes types`: connection types by connectivity.
     - "categories" -> `nodes categories`: the category tree.
 
