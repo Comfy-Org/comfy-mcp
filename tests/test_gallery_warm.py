@@ -39,7 +39,7 @@ def _real_warm(monkeypatch):
 
 
 def test_warm_runs_one_templates_ls_with_its_own_timeout(patched_run):
-    """The warm is exactly one ``templates ls``, capped at 30s, result discarded."""
+    """The warm is exactly one ``templates ls``, capped at 60s, result discarded."""
     calls = patched_run(envelope(data={"rows": [], "total": 0}))
 
     assert server._warm_template_gallery() is None
@@ -50,7 +50,23 @@ def test_warm_runs_one_templates_ls_with_its_own_timeout(patched_run):
     # cache that is present and fresh, while `refresh` forces a network fetch on
     # every single startup.
     assert call["cmd"][4:] == ["templates", "ls"]
-    assert call["timeout"] == 30.0
+    # The SAME budget `search_templates` gives the identical command, not a
+    # shorter one: the warm is the cold-cache invocation, so it is the one most
+    # likely to need the full fetch, and an expiry SIGKILLs the process group
+    # mid-write of comfy-cli's index.json.
+    assert call["timeout"] == 60.0
+
+
+def test_search_templates_and_the_warm_share_one_timeout(patched_run):
+    """Neither can drift into a shorter budget than the other for `templates ls`."""
+    warm_calls = patched_run(envelope(data={"rows": [], "total": 0}))
+    server._warm_template_gallery()
+    search_calls = patched_run(envelope(data={"rows": [], "total": 0}))
+    server.search_templates()
+
+    # Pinned to the value, not just to each other: an equality that both sides
+    # could satisfy with `None` would pass while asserting nothing.
+    assert warm_calls[0]["timeout"] == search_calls[0]["timeout"] == 60.0
 
 
 def test_warm_without_a_binary_never_spawns_or_logs(monkeypatch, tmp_path):
@@ -141,3 +157,105 @@ def test_main_starts_the_warm_on_a_daemon_thread_it_never_joins(monkeypatch):
         assert thread.daemon, "a non-daemon warm would hold the process open"
     finally:
         release.set()
+
+
+def test_warm_writes_no_failure_log_record_for_any_failure(monkeypatch, tmp_path):
+    """EVERY failure mode of the warm is silent in the log, not just no-binary.
+
+    The `shutil.which` short-circuit only ever suppressed ``binary_missing``;
+    ``timeout`` / ``spawn_failed`` / ``no_json`` / ``error_envelope`` each write
+    a record from inside ``_run_comfy``, and on an offline host that is one
+    entry per startup spending the log's fixed rotation budget on a call no
+    reader can correlate with anything they did. The warm runs inside
+    ``failure_log._unattributed_calls()`` so the whole set is quiet.
+    """
+    path = tmp_path / "state" / "failures.jsonl"
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(path))
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+
+    def timing_out(*args, **kwargs):
+        failure_log._log_failure("timeout", args, message="comfy-cli timed out")
+        raise server.ComfyCliError("comfy-cli timed out")
+
+    monkeypatch.setattr(server, "_run_comfy", timing_out)
+
+    assert server._warm_template_gallery() is None
+
+    assert not path.exists(), [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
+
+
+def test_suppression_is_scoped_to_the_warm_thread(monkeypatch, tmp_path):
+    """A real tool call's failure is still recorded, during and after a warm.
+
+    Thread-local, not a global mute: the warm must not quiet the failures
+    another thread is reporting at the same moment, and it must restore the
+    previous state when it returns.
+    """
+    path = tmp_path / "state" / "failures.jsonl"
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(path))
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    inside = threading.Event()
+    release = threading.Event()
+
+    def parked(*args, **kwargs):
+        failure_log._log_failure("timeout", args, message="warm timed out")
+        inside.set()
+        release.wait(10)
+        raise server.ComfyCliError("warm timed out")
+
+    monkeypatch.setattr(server, "_run_comfy", parked)
+    warm = threading.Thread(target=server._warm_template_gallery, daemon=True)
+    warm.start()
+    try:
+        assert inside.wait(5), "the warm never reached the suppressed call"
+        # A different thread, mid-warm: this one IS a call the user made.
+        failure_log._log_failure("timeout", ("jobs", "ls"), message="tool timed out")
+    finally:
+        release.set()
+        warm.join(10)
+
+    # ...and the suppression is unwound once the warm returns.
+    failure_log._log_failure("no_json", ("env",), message="after the warm")
+
+    kinds = [
+        json.loads(line)["message"]
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert kinds == ["tool timed out", "after the warm"]
+
+
+def test_main_survives_a_thread_start_failure(monkeypatch):
+    """Thread exhaustion drops the warm; it never aborts the server.
+
+    ``main()``'s only other handler translates ``PermissionError``, so an
+    unhandled ``RuntimeError("can't start new thread")`` from the warm — the
+    one part of startup documented as best-effort in every direction — would be
+    the thing that stops the server from starting at all.
+    """
+    order: list[str] = []
+    real_thread = threading.Thread
+
+    class _ExhaustedForTheWarm(real_thread):
+        """Real threads for everything else; only the warm's start() fails.
+
+        Scoped by name rather than blanket-patching ``threading.Thread``: the
+        snapshot probe above it builds one too, and a test that broke BOTH
+        would not show which start() ``main()`` actually tolerates.
+        """
+
+        def start(self):
+            if self.name == "comfy-mcp-gallery-warm":
+                raise RuntimeError("can't start new thread")
+            return super().start()
+
+    monkeypatch.setattr(server.threading, "Thread", _ExhaustedForTheWarm)
+    monkeypatch.setattr(
+        server.mcp, "run", lambda *, transport: order.append(f"run:{transport}")
+    )
+
+    server.main()
+
+    assert order == ["run:stdio"]
