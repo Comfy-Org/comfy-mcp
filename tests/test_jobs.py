@@ -30,6 +30,7 @@ import asyncio
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -556,7 +557,12 @@ def test_job_wait_default_timeout_is_25_seconds(monkeypatch):
 
 
 def test_job_watch_default_timeout_is_600_seconds(monkeypatch):
+    """600s is the CALL's budget, and the two diagnostic `jobs status` polls are
+    carved out of it rather than added on top — so the stream gets 600 less one
+    `_WATCH_POLL_MAX` per poll, and the wall time stays bounded by what the
+    caller asked for."""
     seen: dict = {}
+    calls = _patch_jobs_status(monkeypatch, {"status": "running"})
 
     async def fake_stream(
         *args, ctx=None, timeout=None, raise_on_timeout=True, **kwargs
@@ -568,7 +574,8 @@ def test_job_watch_default_timeout_is_600_seconds(monkeypatch):
 
     asyncio.run(server.job(action="watch", prompt_id="pid"))
 
-    assert seen["timeout"] == 600.0
+    assert seen["timeout"] == 600.0 - 2 * server._WATCH_POLL_MAX
+    assert calls[0]["timeout"] == server._WATCH_POLL_MAX
 
 
 @pytest.mark.parametrize("oversized", [float("inf"), 86_400.0])
@@ -847,7 +854,11 @@ def test_job_wait_sleeps_the_shared_poll_interval(monkeypatch):
 # --- action="watch" (streamed) --------------------------------------------------
 
 
-def test_job_watch_streams_progress_and_returns_data(patched_stream):
+def test_job_watch_streams_progress_and_returns_data(patched_stream, monkeypatch):
+    # Stub the two `jobs status` polls: they spawn through the same
+    # `create_subprocess_exec` the stream fake patches, so without this
+    # `procs[0]` would be the seed poll rather than the `jobs watch` child.
+    _patch_jobs_status(monkeypatch, {"status": "running"})
     procs = patched_stream(_OK_STREAM)
     ctx = _RecordingCtx()
 
@@ -930,6 +941,9 @@ def test_job_watch_times_out_returns_payload(monkeypatch):
         procs.append(proc)
         return proc
 
+    # Stub the diagnostic polls out of the spawn list: `procs[0]` must be the
+    # `jobs watch` child whose kill this test is asserting.
+    _patch_jobs_status(monkeypatch, {"status": "running"})
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
@@ -974,6 +988,7 @@ def test_job_watch_times_out_reports_progress_without_ctx(monkeypatch):
         procs.append(proc)
         return proc
 
+    _patch_jobs_status(monkeypatch, {"status": "running"})
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
 
@@ -1015,22 +1030,30 @@ def _patch_comfy_version(monkeypatch, version_text: str) -> None:
     monkeypatch.setattr(server.subprocess, "run", fake)
 
 
-def _patch_jobs_status(monkeypatch, payload, *, raises=None) -> list[tuple]:
+def _patch_jobs_status(monkeypatch, payload, *, raises=None) -> list[dict]:
     """Answer BOTH `jobs status` shell-outs the watch branch makes.
 
-    The seed poll before the stream and the fallback poll at the deadline run
-    the same `_run_comfy("jobs", "status", ...)`, so one stub covers both and
-    the returned call list is how a test tells them apart (by count and order).
-    """
-    calls: list[tuple] = []
+    The seed poll before the stream and the fallback poll at the deadline both
+    run `_run_comfy_async("jobs", "status", ...)` — the CANCELLABLE spawn path,
+    not `_run_comfy` on the thread pool — so one stub covers both, and the
+    returned call list is how a test tells them apart (by count and order).
+    Each entry records the `timeout` that poll was handed, which is how the
+    budget test asserts the polls are carved OUT of the caller's bound rather
+    than added on top of it.
 
-    def fake_run(*args, **kwargs):
-        calls.append(args)
+    Stubbing at `_run_comfy_async` rather than at `create_subprocess_exec` also
+    keeps the polls out of the fake-spawn lists the stream tests index into:
+    `procs[0]` stays the `jobs watch` child.
+    """
+    calls: list[dict] = []
+
+    async def fake_run(*args, **kwargs):
+        calls.append({"args": args, "timeout": kwargs.get("timeout")})
         if raises is not None:
             raise raises
         return payload
 
-    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    monkeypatch.setattr(server, "_run_comfy_async", fake_run)
     return calls
 
 
@@ -1070,6 +1093,7 @@ def test_job_watch_version_gate_fails_open_on_an_unreadable_version(
 ):
     """Same policy as the server-wide floor: a `--version` that cannot be parsed
     is UNKNOWN, not too-old, so the watch proceeds exactly as it did before."""
+    _patch_jobs_status(monkeypatch, {"status": "running"})
     procs = patched_stream(_OK_STREAM)
     _patch_comfy_version(monkeypatch, "comfy-cli, version unreleased-dev")
 
@@ -1082,6 +1106,7 @@ def test_job_watch_version_gate_fails_open_on_an_unreadable_version(
 
 def test_job_watch_allows_1_16_0_itself(monkeypatch, patched_stream):
     """Pin the boundary: the floor release is accepted, not merely "newer than"."""
+    _patch_jobs_status(monkeypatch, {"status": "running"})
     procs = patched_stream(_OK_STREAM)
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
@@ -1109,12 +1134,15 @@ def test_job_watch_zero_event_timeout_embeds_a_status_poll_and_a_hint(monkeypatc
     assert result["events_seen"] == 0
     assert result["status"]["events_seen"] == 0
     assert result["job"] == {"status": "running", "workflow_size": 4}
-    assert "comfy-cli < 1.16.0" in result["hint"]
+    # The gate VERIFIED 1.16.0 here, so the hint must not blame the version it
+    # just cleared — it names the causes that are still on the table.
+    assert "comfy-cli < 1.16.0" not in result["hint"]
+    assert "queued behind another" in result["hint"]
     # Seeded from the same poll, so `total` is no longer structurally null.
     assert result["status"]["total"] == 4.0
     assert procs[0].killed
     # Two polls: one seeding `total` before the stream, one at the deadline.
-    assert [c[:3] for c in calls] == [("jobs", "status", "pid")] * 2
+    assert [c["args"] for c in calls] == [("jobs", "status", "pid")] * 2
 
 
 def test_job_watch_zero_event_timeout_omits_job_when_the_poll_fails(monkeypatch):
@@ -1269,7 +1297,10 @@ def test_job_watch_rejects_an_unusable_prompt_id(bad_id):
 
 
 def test_job_watch_clamps_oversized_timeout(monkeypatch):
+    """The ceiling still binds, and the polls still come out of the clamped bound
+    — `_MAX_WATCH_TIMEOUT` caps the CALL, not just the stream."""
     seen: dict = {}
+    _patch_jobs_status(monkeypatch, {"status": "running"})
 
     async def fake_stream(
         *args, ctx=None, timeout=None, raise_on_timeout=True, **kwargs
@@ -1282,7 +1313,7 @@ def test_job_watch_clamps_oversized_timeout(monkeypatch):
         server.job(action="watch", prompt_id="pid", timeout_seconds=float("inf"))
     )
 
-    assert seen["timeout"] == server._MAX_WATCH_TIMEOUT
+    assert seen["timeout"] == server._MAX_WATCH_TIMEOUT - 2 * server._WATCH_POLL_MAX
 
 
 @pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
@@ -1499,3 +1530,267 @@ def test_job_tool_docstring_within_its_own_token_budget():
             assert not doc.strip().splitlines()[0].startswith("LOCAL")
             return
     pytest.fail("job() tool not found in server.py")
+
+
+# --- review follow-ups on the watch gate (PR #241) ------------------------------
+#
+# Everything below pins a fix made in review, and each one is a case where the
+# first cut of the gate said something the code itself could disprove.
+
+
+def test_a_rejected_per_verb_floor_un_memoizes_the_version(monkeypatch):
+    """The upgrade the error message asks for has to be able to TAKE EFFECT.
+
+    1.15.0 clears the server-wide `_MIN_COMFY_CLI`, so `_check_comfy_version`
+    latches `_version_checked` on its way past. Without dropping that latch the
+    watch gate's refusal outlives the fix it prescribes: the user runs `pip
+    install -U comfy-cli`, retries in the same long-lived server process, and is
+    told to upgrade again — forever.
+    """
+    versions = iter(["comfy-cli, version 1.15.0", "comfy-cli, version 1.16.0"])
+    probes: list[int] = []
+
+    def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
+        probes.append(1)
+        return subprocess.CompletedProcess(cmd, 0, stdout=next(versions), stderr="")
+
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", None)
+    monkeypatch.setattr(server.subprocess, "run", fake)
+    _patch_jobs_status(monkeypatch, {"status": "running"})
+    procs = _patch_blocking_stream(monkeypatch, [])
+
+    with pytest.raises(server.ComfyCliError, match="1.16.0"):
+        asyncio.run(server.job(action="watch", prompt_id="pid"))
+
+    # The refusal dropped BOTH halves of the memo, so the next call re-probes.
+    assert server._version_checked is False
+    assert server._comfy_cli_version is None
+
+    # Same process, upgraded install: the watch now runs.
+    asyncio.run(server.job(action="watch", prompt_id="pid", timeout_seconds=0.25))
+
+    assert len(probes) == 2
+    assert server._comfy_cli_version == (1, 16, 0)
+    assert list(procs[0].cmd[4:]) == ["jobs", "watch", "pid"]
+
+
+def test_a_reprobe_that_cannot_read_the_version_clears_the_stale_one(monkeypatch):
+    """`_comfy_cli_version` is reset at the TOP of the probe, so "unparseable =>
+    fail OPEN" keeps holding on a retry. A source build installed over the
+    release an earlier probe read must leave the version UNKNOWN, not leave the
+    old tuple in place for a per-verb floor to keep refusing on."""
+    versions = iter(["comfy-cli, version 1.15.0", "comfy-cli, version unreleased-dev"])
+
+    def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
+        return subprocess.CompletedProcess(cmd, 0, stdout=next(versions), stderr="")
+
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", None)
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()
+    assert server._comfy_cli_version == (1, 15, 0)
+
+    server._invalidate_version_cache()
+    server._check_comfy_version()
+
+    assert server._comfy_cli_version is None
+
+
+def test_concurrent_first_callers_probe_the_version_once(monkeypatch):
+    """`_version_lock` closes the check-then-set: without it every thread that
+    arrives before the latch is set spawns its own 30s `comfy --version`, and a
+    reader can catch `_comfy_cli_version` mid-probe."""
+    probes: list[int] = []
+
+    def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
+        probes.append(1)
+        time.sleep(0.05)  # widen the window the lock has to close
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="comfy-cli, version 1.16.0", stderr=""
+        )
+
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", None)
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    threads = [threading.Thread(target=server._check_comfy_version) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert probes == [1]
+    assert server._comfy_cli_version == (1, 16, 0)
+
+
+def test_the_watch_polls_are_carved_out_of_the_callers_timeout(monkeypatch):
+    """A 5s watch must not hold the MCP request for ~125s. Each `jobs status`
+    poll gets a tenth of the caller's bound (capped at `_WATCH_POLL_MAX`), and
+    the stream gets what is left — so the sum never exceeds `timeout_seconds`."""
+    calls = _patch_jobs_status(monkeypatch, {"status": "running"})
+    seen: dict = {}
+
+    async def fake_stream(
+        *args, ctx=None, timeout=None, raise_on_timeout=True, **kwargs
+    ):
+        seen["timeout"] = timeout
+        return {"timed_out": True, "events_seen": 0, "status": {}}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+
+    asyncio.run(server.job(action="watch", prompt_id="pid", timeout_seconds=5.0))
+
+    assert calls[0]["timeout"] == 0.5
+    assert seen["timeout"] == 4.0
+    assert 2 * calls[0]["timeout"] + seen["timeout"] <= 5.0
+
+
+def test_the_watch_polls_run_on_the_cancellable_spawn_path(monkeypatch):
+    """Both polls must go through `_run_comfy_async`, not
+    `asyncio.to_thread(_run_comfy, ...)`: a client that gives up mid-watch can
+    cancel a coroutine but never a worker thread's `comfy jobs status` child."""
+    _patch_jobs_status(monkeypatch, {"status": "running"})
+    _patch_blocking_stream(monkeypatch, [])
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a watch poll used the blocking `_run_comfy` path")
+
+    monkeypatch.setattr(server, "_run_comfy", forbidden)
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert result["job"] == {"status": "running"}
+
+
+def test_the_no_events_hint_names_the_version_when_it_is_unknown(monkeypatch):
+    """The fail-OPEN case is the one the version half of the hint exists for: an
+    install the gate could not identify may well be the too-old one, and this is
+    the only place left to say so."""
+    _patch_jobs_status(monkeypatch, {"status": "running"})
+    _patch_blocking_stream(monkeypatch, [])
+    _patch_comfy_version(monkeypatch, "comfy-cli, version unreleased-dev")
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert server._comfy_cli_version is None
+    assert "comfy-cli < 1.16.0" in result["hint"]
+
+
+@pytest.mark.parametrize(
+    "job_payload",
+    [
+        {"state": "running"},  # `status` renamed
+        {"status": 42},  # `status` not a string
+        {"error": "something went sideways"},  # an error blob, not a report
+        {"status": "some-status-nobody-here-knows"},
+        ["not", "a", "dict"],
+    ],
+)
+def test_the_no_events_hint_needs_a_POSITIVELY_active_status(monkeypatch, job_payload):
+    """`not _is_terminal(...)` is not the test the docstring promised: it is also
+    False for a payload carrying no readable status at all, so an unreadable
+    blob used to be answered with "the job is still running" — exactly the guess
+    the hint must never be. Only a recognized ACTIVE status earns the claim."""
+    _patch_jobs_status(monkeypatch, job_payload)
+    _patch_blocking_stream(monkeypatch, [])
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert result["job"] == job_payload  # still embedded: it is what we know
+    assert "hint" not in result  # but no claim about a job we cannot read
+
+
+@pytest.mark.parametrize(
+    "workflow_size",
+    [float("inf"), float("nan"), 10**400],
+)
+def test_a_non_finite_workflow_size_leaves_total_unseeded(monkeypatch, workflow_size):
+    """`json.loads` accepts bare `Infinity`/`NaN`, and a Python int has no upper
+    bound — so `float(size)` could either seed a non-finite `total` that leaves
+    the payload as non-standard JSON, or raise `OverflowError` straight out of a
+    best-effort seed and abort the whole watch."""
+    _patch_jobs_status(
+        monkeypatch, {"status": "running", "workflow_size": workflow_size}
+    )
+    _patch_blocking_stream(monkeypatch, [])
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert result["timed_out"] is True
+    assert result["status"]["total"] is None
+
+
+@pytest.mark.parametrize("etype", ["execution_start", "execution_error", "output"])
+def test_a_non_progress_execution_event_still_counts_as_seen(monkeypatch, etype):
+    """`events_seen` is a claim about the WATCHER, not about progress. An
+    `execution_error` on the first node proves `jobs watch` attached — reporting
+    zero there sent the caller off to check a comfy-cli version that was fine,
+    and burned a second `jobs status` spawn to do it."""
+    calls = _patch_jobs_status(monkeypatch, {"status": "running"})
+    _patch_blocking_stream(monkeypatch, [json.dumps({"type": etype}) + "\n"])
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert result["events_seen"] == 1
+    assert result["status"]["progress"] is None  # it was not a progress tick
+    assert "hint" not in result
+    assert len(calls) == 1  # the seed only: no fallback poll
+
+
+def test_unrecognized_stream_chatter_does_not_count_as_an_event(monkeypatch):
+    """The other half of the same claim: a custom node's own line proves nothing
+    about the websocket attach, so it must not suppress the diagnosis."""
+    _patch_jobs_status(monkeypatch, {"status": "running"})
+    _patch_blocking_stream(
+        monkeypatch, [json.dumps({"type": "some-custom-node-line"}) + "\n"]
+    )
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert result["events_seen"] == 0
+    assert result["job"] == {"status": "running"}
+
+
+def test_progress_never_exceeds_its_own_total(monkeypatch):
+    """`total` is a lower bound an under-counting `workflow_size` can disprove.
+    When the run gets further than the seed promised, the SEED was wrong — raise
+    it rather than hand a client a progress above its own total to render."""
+    _patch_jobs_status(monkeypatch, {"status": "running", "workflow_size": 2})
+    _patch_blocking_stream(
+        monkeypatch,
+        [
+            json.dumps({"type": "execution_cached", "nodes": ["1", "2", "3", "4"]})
+            + "\n"
+        ],
+    )
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
+    ctx = _RecordingCtx()
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25, ctx=ctx)
+    )
+
+    assert result["status"]["nodes_done"] == 4  # what was actually observed
+    assert result["status"]["progress"] == 4.0
+    assert result["status"]["total"] == 4.0  # grown, not left at the stale 2
+    assert all(c["progress"] <= c["total"] for c in ctx.calls if c["total"] is not None)

@@ -176,8 +176,10 @@ instead — nothing blocking runs on the event loop, enforced by ruff's `ASYNC` 
 async runners live there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`,
 a plain-JSON twin of `_run_comfy` for CANCELLATION — `asyncio.to_thread` is non-blocking,
 but cancellation never reaches the thread, so a client giving up left the child running. It
-carries the legacy foreground `model download`, `workflow_deps`' 300s resolve, and
-`upload_file`'s 300s transfer. Each stream keeps only a `_STDERR_MAX_CHARS` tail
+carries the legacy foreground `model download`, `workflow_deps`' 300s resolve,
+`upload_file`'s 300s transfer, and `job(action="watch")`'s two diagnostic `jobs status`
+polls — short calls, but they bracket a watch that may already have burned an hour, which
+is exactly when a client has given up. Each stream keeps only a `_STDERR_MAX_CHARS` tail
 (`_drain_capped_into`; callers widen stdout via `stdout_cap=`), never `communicate()`'s full
 capture. `auth_login` (`_start_login`) is a third spawn site with its own browser flow.
 

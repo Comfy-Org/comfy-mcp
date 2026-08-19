@@ -76,7 +76,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -379,6 +379,17 @@ _version_checked = False
 # server-wide one: raising `_MIN_COMFY_CLI` to 1.16.0 would refuse every tool on
 # an install where only `jobs watch` is broken.
 _comfy_cli_version: tuple[int, int, int] | None = None
+
+# Guards the check-then-set of the two globals above. `_check_comfy_version` is
+# reached from synchronous tool bodies AND from `asyncio.to_thread` (the
+# streaming runner, and `job(action="watch")`'s gate), so concurrent first
+# callers could otherwise each spawn their own 30s `comfy --version`, and a
+# reader could see `_comfy_cli_version` mid-probe — after the reset that opens
+# the probe but before the parse that closes it, i.e. `None` on an install
+# whose version is perfectly readable. The `_version_checked` fast path stays
+# UNLOCKED on purpose: it sits on the hot path of every `_run_comfy` call, and
+# a stale read of it costs at most one redundant probe, never a wrong verdict.
+_version_lock = threading.Lock()
 
 # `COMFY_PROJECT`'s raw value, read from the environment at most once per
 # process (see `_project_root`). The sentinel distinguishes "not read yet" from
@@ -727,10 +738,35 @@ def _check_comfy_version() -> None:
     logs" deep inside a tool call. Fails OPEN on anything it can't positively read
     as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
     future comfy-cli output-format change can never wedge a working install.
+
+    The memoized fast path is read WITHOUT ``_version_lock`` (it sits on the hot
+    path of every :func:`_run_comfy` call); the probe itself runs under it. See
+    the note where the lock is declared.
+    """
+    if _version_checked:
+        return
+    with _version_lock:
+        _check_comfy_version_locked()
+
+
+def _check_comfy_version_locked() -> None:
+    """:func:`_check_comfy_version`'s body, run with ``_version_lock`` held.
+
+    Split out only so the memoized fast path above can skip the lock. The
+    re-check of ``_version_checked`` is the second half of that double-check: a
+    caller that queued on the lock while another thread ran the probe must not
+    run a second one.
     """
     global _version_checked, _comfy_cli_version
     if _version_checked:
         return
+    # Reset FIRST so every exit below either records a freshly parsed version or
+    # leaves this None. Without it a RE-probe that cannot read ``--version`` (a
+    # source build or a fork installed over the release an earlier probe read)
+    # keeps the stale tuple, and the "unparseable => fail OPEN" contract
+    # documented where this global is declared quietly stops holding: a per-verb
+    # floor would go on refusing a version it can no longer read.
+    _comfy_cli_version = None
     try:
         proc = _spawn_comfy_version()
     except subprocess.TimeoutExpired:
@@ -798,6 +834,31 @@ def _check_comfy_version() -> None:
             f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
         )
     _version_checked = True
+
+
+def _invalidate_version_cache() -> None:
+    """Forget the probed comfy-cli version so the next check re-probes.
+
+    Called when a PER-VERB floor (today ``_MIN_WATCH_COMFY_CLI``) refuses a
+    version the SERVER-WIDE floor accepted. Without it that refusal is permanent
+    for the life of the process: anything in ``[_MIN_COMFY_CLI,
+    _MIN_WATCH_COMFY_CLI)`` sails past :func:`_check_comfy_version`, which
+    LATCHES ``_version_checked`` on the way through — so a user who follows this
+    server's own ``pip install -U comfy-cli`` advice and retries in the same
+    long-lived server process would keep hitting the memoized old tuple and keep
+    being told to upgrade.
+
+    That is the same "do NOT memoize a too-old verdict" policy the server-wide
+    floor already holds, extended to the floors that sit above it. The only
+    difference is that this one has to UNDO a latch rather than decline to set
+    one, which is why it clears the parsed version too: leaving it would let the
+    next probe's early-return path hand a per-verb floor the very tuple it just
+    rejected.
+    """
+    global _version_checked, _comfy_cli_version
+    with _version_lock:
+        _version_checked = False
+        _comfy_cli_version = None
 
 
 def _scrubbed_tcc_path(text: str | None) -> str | None:
@@ -1770,6 +1831,21 @@ def _parse_event(line: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+# Execution events that carry no progress but still prove `jobs watch`
+# successfully attached to ComfyUI's websocket as the submitting session — the
+# question `_StreamProgress.events` exists to answer. Kept separate from the
+# progress branches in `report`, which count themselves.
+_NON_PROGRESS_EVENTS = frozenset(
+    {
+        "execution_start",
+        "execution_success",
+        "execution_error",
+        "execution_interrupted",
+        "output",
+    }
+)
+
+
 class _StreamProgress:
     """Maps comfy-cli's ``--json-stream`` run events to MCP progress values.
 
@@ -1783,9 +1859,9 @@ class _StreamProgress:
     """
 
     def __init__(self) -> None:
-        self.total: float | None = None  # node count (from the queued manifest)
+        self.total: float | None = None  # node count (manifest or `total_seed`)
         self.done = 0  # nodes fully executed or served from cache
-        self.events = 0  # progress ticks recognized (see `events_seen` below)
+        self.events = 0  # execution events recognized (see `events_seen` below)
         self._last = -1.0  # last value reported (kept non-decreasing)
 
     def snapshot(self) -> dict:
@@ -1794,15 +1870,20 @@ class _StreamProgress:
         ``progress`` is None until the first tick is reported (``_last`` starts
         below zero), so a timed-out payload never claims phantom progress.
 
-        ``events_seen`` is the count of stream events :meth:`report` RECOGNIZED,
-        and it is the field that distinguishes the two very different runs that
-        both snapshot as ``progress: null, nodes_done: 0``: a job that has not
-        started yet (events arriving, none of them progress-bearing) from a
-        watch that received nothing at all — the shape a comfy-cli older than
-        :data:`_MIN_WATCH_COMFY_CLI` produces for an entire timeout, because its
-        ``jobs watch`` attaches to ComfyUI as a non-submitting session and no
-        execution event is ever addressed to it. Zero is a claim about the
-        WATCHER, not about the job.
+        ``events_seen`` is the count of EXECUTION events :meth:`report`
+        recognized — the progress-bearing branches plus
+        :data:`_NON_PROGRESS_EVENTS` — and it is the field that distinguishes
+        the two very different runs that both snapshot as ``progress: null,
+        nodes_done: 0``: a job that has not made progress yet (events arriving,
+        none of them progress-bearing) from a watch that received nothing at all
+        — the shape a comfy-cli older than :data:`_MIN_WATCH_COMFY_CLI` produces
+        for an entire timeout, because its ``jobs watch`` attaches to ComfyUI as
+        a non-submitting session and no execution event is ever addressed to it.
+        Zero is a claim about the WATCHER, not about the job. That is precisely
+        why the non-progress events count: an ``execution_error`` on the first
+        node PROVES the watcher is attached, and reporting ``events_seen: 0``
+        there would send the caller off to check its comfy-cli version over a
+        job that simply failed.
         """
         return {
             "progress": self._last if self._last >= 0 else None,
@@ -1867,16 +1948,30 @@ class _StreamProgress:
             progress = self.done + frac
             message = f"node {event.get('node')}: {completed}/{node_total}"
         else:
-            return  # output / execution_error / unknown -> not a progress tick
-        # Counted AFTER the dispatch above, so it tracks recognized progress
-        # ticks only — the `return` arm never reaches here. That is the point:
-        # `events_seen` answers "did any execution event reach this watcher?",
-        # which a count of every line read (envelopes, custom-node chatter)
-        # would not.
+            # Not a progress tick — but an `execution_error` or an `output` IS
+            # an execution event addressed to this watcher, and `events_seen`
+            # answers "did anything reach this watcher?", not "did it make
+            # progress?". Count those and return; anything outside the
+            # recognized set (a relayed envelope, a custom node's own chatter)
+            # proves nothing about the websocket attach and must not count.
+            if etype in _NON_PROGRESS_EVENTS:
+                self.events += 1
+            return
         self.events += 1
         # MCP guidance: progress should not go backwards, even as nodes reset.
         progress = max(progress, self._last)
         self._last = progress
+        # `total` is a LOWER BOUND that events can disprove. It is either the
+        # `queued` manifest's node count or — for a watch, which never sees a
+        # `queued` event — `jobs status`'s `workflow_size`, seeded from a
+        # different source than the stream it now bounds; and a watch's `done`
+        # counts a whole cached LIST per `execution_cached`. If the run gets
+        # further than the count promised, the count was wrong, so raise it
+        # rather than report a progress above its own total (which clients
+        # render as >100%). Growing beats clamping `done` down: `done` is what
+        # was actually observed, `total` is the estimate.
+        if self.total is not None and progress > self.total:
+            self.total = progress
         if ctx is not None:
             try:
                 await ctx.report_progress(
@@ -2110,21 +2205,50 @@ async def _run_comfy_async(
         await _reap_async(proc)
 
 
-# The diagnosis attached to a zero-event watch timeout whose fallback poll says
-# the job is still going. Both halves are load-bearing: "the job is still
-# running" stops a caller concluding the run died, and naming the version is the
-# whole point — an install below `_MIN_WATCH_COMFY_CLI` that slipped past the
-# gate (an unparseable `--version`, which fails OPEN) produces exactly this
-# payload, and this is the only place left to say so.
+# The fixed half of the diagnosis attached to a zero-event watch timeout whose
+# fallback poll says the job is still going: it stops a caller concluding the
+# run died. The half that names a CAUSE is conditional — see
+# `_watch_no_events_hint`.
 _WATCH_NO_EVENTS_HINT = (
-    "no execution events reached the watcher; the job is still running — this "
-    "usually means comfy-cli < 1.16.0 (jobs watch cannot attach as the "
-    "submitting session there)"
+    "no execution events reached the watcher; the job is still running"
 )
 
 
+def _watch_no_events_hint() -> str:
+    """The diagnosis for a zero-event watch timeout whose job is still running.
+
+    The cause half is conditional on what the version gate actually established,
+    because it is a claim about the installed comfy-cli rather than about this
+    job.
+
+    Naming an outdated comfy-cli is the whole point when the version is
+    UNREADABLE: an install below :data:`_MIN_WATCH_COMFY_CLI` that slipped past
+    the gate — which fails OPEN on an unparseable ``--version`` — produces
+    exactly this payload, and this is the only place left to say so. But when
+    the gate positively VERIFIED the floor, that half is a diagnosis the code
+    already knows is false: a job sitting queued behind another, or loading
+    models, for the whole 600s default yields zero events on a perfectly modern
+    CLI. Name the likely cause instead of one that has been ruled out.
+    """
+    version = _comfy_cli_version
+    if version is not None and version >= _MIN_WATCH_COMFY_CLI:
+        return (
+            f"{_WATCH_NO_EVENTS_HINT} — comfy-cli {'.'.join(map(str, version))} "
+            "is new enough for `jobs watch`, so the job is more likely queued "
+            "behind another or still loading models; poll "
+            '`job(action="status")`, or watch again with a longer '
+            "`timeout_seconds`"
+        )
+    return (
+        f"{_WATCH_NO_EVENTS_HINT} — this usually means comfy-cli < "
+        f"{_MIN_WATCH_COMFY_CLI_STR} (jobs watch cannot attach as the "
+        "submitting session there)"
+    )
+
+
 async def _timed_out_payload(
-    tracker: _StreamProgress, on_timeout_fallback: Callable[[], Any] | None
+    tracker: _StreamProgress,
+    on_timeout_fallback: Callable[[], Awaitable[Any]] | None,
 ) -> dict:
     """The ``raise_on_timeout=False`` expiry payload for a streamed run.
 
@@ -2139,10 +2263,18 @@ async def _timed_out_payload(
     ComfyUI down, a job id ``jobs status`` will not answer for) omits ``job``
     rather than replacing a truthful timeout with an exception about the
     diagnosis — the caller asked about the watch, not about the poll. And the
-    ``hint`` is added only when the poll positively reports a NON-terminal
-    status: on a payload this cannot read as a status report, "the job is still
-    running" would be a guess, and on a terminal one it would be wrong (the job
-    finished; the watch simply missed the end).
+    ``hint`` is added only when the poll positively reports an ACTIVE status
+    (:func:`_is_active`, NOT the negation of :func:`_is_terminal`): on a payload
+    this cannot read as a status report at all, "the job is still running" would
+    be a guess, and on a terminal one it would be wrong (the job finished; the
+    watch simply missed the end).
+
+    ``on_timeout_fallback`` is AWAITED, not off-loaded with
+    :func:`asyncio.to_thread`. It runs at the end of a watch that already burned
+    its whole budget — precisely when an MCP client is most likely to have given
+    up — and a cancellation on the thread-pool path reaches the awaiting
+    coroutine but never the worker thread or its ``comfy`` child, which is the
+    orphaned-child leak :func:`_run_comfy_async` exists to close.
     """
     payload: dict = {
         "timed_out": True,
@@ -2152,12 +2284,12 @@ async def _timed_out_payload(
     if tracker.events or on_timeout_fallback is None:
         return payload
     try:
-        job_status = await asyncio.to_thread(on_timeout_fallback)
+        job_status = await on_timeout_fallback()
     except Exception:  # noqa: BLE001 - diagnosis is best-effort; see docstring
         return payload
     payload["job"] = job_status
-    if isinstance(job_status, dict) and not _is_terminal(job_status):
-        payload["hint"] = _WATCH_NO_EVENTS_HINT
+    if _is_active(job_status):
+        payload["hint"] = _watch_no_events_hint()
     return payload
 
 
@@ -2167,7 +2299,7 @@ async def _run_comfy_streaming(
     timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     raise_on_timeout: bool = True,
     total_seed: float | None = None,
-    on_timeout_fallback: Callable[[], Any] | None = None,
+    on_timeout_fallback: Callable[[], Awaitable[Any]] | None = None,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
@@ -2197,12 +2329,15 @@ async def _run_comfy_streaming(
       ``null`` for the whole watch. The caller reads the same number from
       ``jobs status``'s ``workflow_size`` instead. A later ``queued`` event
       still overwrites it, so the run dialect is unaffected.
-    * ``on_timeout_fallback`` is called (in a thread — it is sync) ONLY on a
-      ``raise_on_timeout=False`` expiry that saw ZERO events, to embed a
-      one-shot status poll under ``job`` so the timeout payload is never LESS
-      informative than the ``job(action="wait")`` it competes with. It is
-      strictly best-effort: any failure omits the ``job`` key rather than
-      masking the timeout the caller actually asked about.
+    * ``on_timeout_fallback`` is awaited ONLY on a ``raise_on_timeout=False``
+      expiry that saw ZERO events, to embed a one-shot status poll under ``job``
+      so the timeout payload is never LESS informative than the
+      ``job(action="wait")`` it competes with. It is strictly best-effort: any
+      failure omits the ``job`` key rather than masking the timeout the caller
+      actually asked about. It must be CANCELLABLE (spawn via
+      :func:`_run_comfy_async`, not a thread) and must carry its own short
+      budget — the caller's ``timeout`` bounds this runner, not the poll that
+      runs after it.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
@@ -5205,6 +5340,47 @@ def _is_terminal(status: Any) -> bool:
     return False
 
 
+# The other side of `_TERMINAL_STATUSES`: the values a `jobs status` payload
+# uses to say the job is still going. Spelled out rather than derived as "not
+# terminal" because the two sets do NOT partition the space — a payload with no
+# readable `status` at all belongs to neither, and that gap is the whole reason
+# `_is_active` exists. Synonyms are listed defensively, exactly as the terminal
+# set lists them.
+_ACTIVE_STATUSES = frozenset(
+    {
+        "running",
+        "executing",
+        "processing",
+        "in_progress",
+        "in-progress",
+        "started",
+        "starting",
+        "pending",
+        "queued",
+        "in_queue",
+        "in-queue",
+        "waiting",
+    }
+)
+
+
+def _is_active(status: Any) -> bool:
+    """True if a ``jobs status`` payload POSITIVELY reports an unfinished state.
+
+    Deliberately not ``not _is_terminal(status)``. That negation is also True for
+    a payload carrying no readable ``status`` string — a renamed field, an error
+    blob, a shape this server has never seen — so a caller told "the job is
+    still running" on one of those is being handed a guess dressed as a report.
+    Answer only from a status this server recognizes; an unrecognized payload
+    gets no claim either way.
+    """
+    if isinstance(status, dict):
+        value = status.get("status")
+        if isinstance(value, str):
+            return value.lower() in _ACTIVE_STATUSES
+    return False
+
+
 def _poll_until_terminal(
     *args: str,
     timeout_seconds: float,
@@ -5310,6 +5486,25 @@ def _job_status_sync(prompt_id: str) -> Any:
     return _run_comfy("jobs", "status", prompt_id, timeout=60.0)
 
 
+async def _job_status_async(
+    prompt_id: str,
+    timeout: float,  # noqa: ASYNC109 - see the note above _reap_async
+) -> Any:
+    """:func:`_job_status_sync` on the cancellable spawn path, with a caller's budget.
+
+    ``job(action="watch")``'s two diagnostic polls use this rather than
+    ``asyncio.to_thread(_job_status_sync, ...)`` for both of the reasons
+    :func:`_run_comfy_async` exists: a client that gives up mid-watch cancels
+    the awaiting coroutine but could never cancel a worker thread or its
+    ``comfy jobs status`` child, and holding a default-executor slot for the
+    full 60s compounds under exactly the degraded conditions that produce
+    timeouts. ``timeout`` is required, not defaulted, because a poll that is
+    carved out of somebody else's budget must never quietly inherit a 60s one.
+    """
+    prompt_id = argv._guard_prompt_id(prompt_id)
+    return await _run_comfy_async("jobs", "status", prompt_id, timeout=timeout)
+
+
 def _job_error_sync(prompt_id: str) -> Any:
     """``job(action="error")``'s body — fetch, then :func:`_execution_error_verdict`."""
     prompt_id = argv._guard_prompt_id(prompt_id)
@@ -5401,6 +5596,13 @@ def _job_queue_sync() -> Any:
 _MIN_WATCH_COMFY_CLI = (1, 16, 0)
 _MIN_WATCH_COMFY_CLI_STR = "1.16.0"
 
+# Ceiling on each of a watch's two diagnostic `jobs status` polls (the `total`
+# seed before the stream, the fallback after the deadline). They are carved out
+# of the caller's own timeout — see the note at the call site — so this only
+# caps how much a LARGE budget may spend on diagnosis; a small one gets a tenth
+# of itself per poll and the cap never binds.
+_WATCH_POLL_MAX = 10.0
+
 _WATCH_VERSION_ERROR = (
     f'job(action="watch") requires comfy-cli {_MIN_WATCH_COMFY_CLI_STR} or '
     f"newer: before {_MIN_WATCH_COMFY_CLI_STR}, `jobs watch` attaches to the "
@@ -5410,7 +5612,10 @@ _WATCH_VERSION_ERROR = (
 )
 
 
-def _watch_total_seed(prompt_id: str) -> float | None:
+async def _watch_total_seed(
+    prompt_id: str,
+    timeout: float,  # noqa: ASYNC109 - see the note above _reap_async
+) -> float | None:
     """``jobs status``'s ``workflow_size`` for *prompt_id*, or None.
 
     Seeds :attr:`_StreamProgress.total` for a watch, which otherwise has no node
@@ -5421,14 +5626,18 @@ def _watch_total_seed(prompt_id: str) -> float | None:
 
     Entirely best-effort — every failure returns None, which is exactly the
     unseeded behavior that shipped before this existed, so a watch is never
-    blocked by a diagnostic poll. Non-positive and non-numeric values are
-    rejected rather than passed through: `total: 0` would render a progress bar
-    that can never fill, which is worse than the honest `null`. `bool` is
-    excluded explicitly because it is an `int` subclass in Python and
-    `total: 1.0` from a `True` would be a fabricated node count.
+    blocked by a diagnostic poll. Non-positive, non-finite and non-numeric
+    values are rejected rather than passed through: `total: 0` would render a
+    progress bar that can never fill, which is worse than the honest `null`, and
+    a non-finite one leaves the payload as non-standard JSON (see the branches
+    below). `bool` is excluded explicitly because it is an `int` subclass in
+    Python and `total: 1.0` from a `True` would be a fabricated node count.
+
+    ``timeout`` is the caller's carved-out budget, not this function's own — see
+    :func:`_job_status_async`.
     """
     try:
-        status = _job_status_sync(prompt_id)
+        status = await _job_status_async(prompt_id, timeout)
     except Exception:  # noqa: BLE001 - a seed is a nicety; see docstring
         return None
     if not isinstance(status, dict):
@@ -5436,7 +5645,22 @@ def _watch_total_seed(prompt_id: str) -> float | None:
     size = status.get("workflow_size")
     if isinstance(size, bool) or not isinstance(size, (int, float)):
         return None
-    return float(size) if size > 0 else None
+    try:
+        total = float(size)
+    except (OverflowError, ValueError):
+        # A JSON integer too large to be a float. Python ints are unbounded, so
+        # this is reachable from a payload, and it must not abort the watch over
+        # a cosmetic node count — unseeded is the behavior that shipped before
+        # the seed existed.
+        return None
+    if not math.isfinite(total) or total <= 0:
+        # `json.loads` accepts bare `Infinity`/`NaN` by default, and either one
+        # would flow straight into `ctx.report_progress` and the timeout payload
+        # as non-standard JSON. Same finiteness rule `argv._bounded_timeout`
+        # holds, and the same reason `total: 0` is rejected: a progress bar that
+        # can never fill is worse than the honest `null`.
+        return None
+    return total
 
 
 # The six actions `job` dispatches, in the order their old standalone tools
@@ -5480,7 +5704,8 @@ async def job(
       TIMEOUT, not a failure.
     - "watch" -> relay progress while waiting (default 600.0s, same ceiling);
       needs comfy-cli >= 1.16.0. Expiry: `{timed_out, events_seen, status:
-      {progress, total, nodes_done}}`; `events_seen: 0` adds `job` + `hint`.
+      {progress, total, nodes_done, events_seen}}`; `events_seen: 0` adds
+      `job` + `hint`.
     - "cancel" -> stop a queued/running job.
     - "queue" -> list known jobs (Comfy Cloud-tracked rows filtered out).
 
@@ -5535,7 +5760,19 @@ async def job(
         # block for up to an hour. `_check_comfy_version` is synchronous — the
         # same `asyncio.to_thread` off-load the runner gives it.
         await asyncio.to_thread(_check_comfy_version)
-        if _comfy_cli_version is not None and _comfy_cli_version < _MIN_WATCH_COMFY_CLI:
+        gate_version = _comfy_cli_version
+        if gate_version is not None and gate_version < _MIN_WATCH_COMFY_CLI:
+            # Drop the memoized probe on the way out. Anything in
+            # [_MIN_COMFY_CLI, _MIN_WATCH_COMFY_CLI) LATCHED the guard on its
+            # way through, so without this the refusal outlives the upgrade the
+            # error message just asked for: the user runs `pip install -U
+            # comfy-cli`, retries in the same server process, and is told to
+            # upgrade again. See `_invalidate_version_cache`.
+            # Off-loaded like the check above: `_invalidate_version_cache`
+            # takes `_version_lock`, and a concurrent first caller can be
+            # holding it for the length of a 30s `comfy --version`. Blocking the
+            # event loop on that is the very thing `ASYNC` is selected to catch.
+            await asyncio.to_thread(_invalidate_version_cache)
             raise ComfyCliError(_WATCH_VERSION_ERROR)
         # Fail OPEN on an unknown version (a source build, a fork, an
         # unparseable `--version`) — the same policy `_check_comfy_version`
@@ -5543,18 +5780,33 @@ async def job(
         # install it merely cannot identify. `_timed_out_payload`'s `hint`
         # covers the residual: a watch that slips through here and then streams
         # nothing is told what that usually means.
+
+        # Both diagnostic polls are carved OUT of `bound`, never added to it:
+        # `timeout_seconds` (and the `_MAX_WATCH_TIMEOUT` ceiling) bound the
+        # CALL's wall time, not merely the stream's. Unbudgeted they each ran
+        # the standard 60s `jobs status`, so `timeout_seconds=5` could hold the
+        # MCP request ~125s — a 60s seed, a 5s stream, a 60s fallback — and the
+        # ceiling stopped meaning anything. A tenth of the budget each, capped
+        # at `_WATCH_POLL_MAX`: a `jobs status` that cannot answer in ten
+        # seconds is not going to improve the timeout payload, and the shorter
+        # seed also narrows the window between submit and websocket attach in
+        # which execution events go unseen.
+        poll_budget = min(_WATCH_POLL_MAX, bound / 10.0)
+        stream_bound = max(bound - 2 * poll_budget, poll_budget)
         return await _run_comfy_streaming(
             "jobs",
             "watch",
             prompt_id,
             ctx=ctx,
-            timeout=bound,
+            timeout=stream_bound,
             raise_on_timeout=False,
-            total_seed=await asyncio.to_thread(_watch_total_seed, prompt_id),
+            total_seed=await _watch_total_seed(prompt_id, poll_budget),
             # A thunk, not the poll's result: it must run AT the timeout, so it
             # reports where the job is when the watch gave up rather than where
             # it was when the watch began.
-            on_timeout_fallback=functools.partial(_job_status_sync, prompt_id),
+            on_timeout_fallback=functools.partial(
+                _job_status_async, prompt_id, poll_budget
+            ),
         )
 
     # Every other branch is a blocking `subprocess` call or a `time.sleep`
