@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 
 import pytest
 from conftest import (
@@ -724,6 +725,15 @@ class _CountingLock:
     a loaded runner, and would race it in the direction that FAILS (a straggler
     samples the already-bumped counter and probes again).
 
+    That same point is the only place a test can stage state for ONE caller with
+    no wall-clock race at all, so `acquire` also fires a one-shot `on_queue`
+    hook there. It runs in the caller's own thread, after it sampled
+    `_version_probe_starts` and BEFORE its bound starts running — an ordering,
+    not a race the staging thread has to win. `_waiter_that_gives_up` is the
+    user; see it for why that distinction decides whether the test is
+    deterministic. Popped under `_counter` so a herd cannot fire it twice, and
+    called outside that lock so a hook may touch this lock.
+
     Only the three methods `server` and the tests use are forwarded; anything
     else is an interlock change that should fail loudly here rather than be
     silently absorbed by a `__getattr__`.
@@ -733,10 +743,14 @@ class _CountingLock:
         self._inner = threading.Lock()
         self._counter = threading.Lock()
         self.queued = 0
+        self.on_queue: Callable[[], None] | None = None
 
     def acquire(self, *args, **kwargs):
         with self._counter:
             self.queued += 1
+            hook, self.on_queue = self.on_queue, None
+        if hook is not None:
+            hook()
         return self._inner.acquire(*args, **kwargs)
 
     def release(self) -> None:
@@ -1066,9 +1080,20 @@ def test_version_guard_bounds_a_herd_that_lands_inside_an_in_flight_probe(
 def _waiter_that_gives_up(lock, before_timeout) -> BaseException | None:
     """Run one caller against a HELD lock, mutating state before it gives up.
 
-    `before_timeout()` fires once the caller has sampled `_version_probe_starts`
-    and blocked, so a test can stage exactly what the caller finds when its
+    `before_timeout()` fires from `_CountingLock.on_queue` — inside the caller's
+    OWN acquire, after it sampled `_version_probe_starts` and before its bound
+    starts running — so a test stages exactly what the caller finds when that
     bound expires. Returns what the caller raised, or ``None``.
+
+    Staging it from this thread instead would be a race the stager has to WIN:
+    it can only observe that the caller queued, and every way to observe that
+    (a poll, an event) lands some time after the caller's clock already started.
+    Lose that race and the caller times out reading `_version_probe_starts`
+    unchanged, takes the wedge branch, and latches open — the very outcome both
+    callers of this helper assert against, so the failure is a false one. The
+    hook removes the clock from the question: the mutation is ORDERED before the
+    wait, so `_VERSION_LOCK_WAIT_S` can stay small enough to keep these tests
+    fast without buying determinism in seconds of slack.
     """
     outcome: list[BaseException | None] = [None]
 
@@ -1081,16 +1106,15 @@ def _waiter_that_gives_up(lock, before_timeout) -> BaseException | None:
     lock.acquire()
     try:
         lock.queued = 0  # this helper's own acquire is not the caller's
+        lock.on_queue = before_timeout
         thread = threading.Thread(target=caller)
         thread.start()
-        deadline = time.monotonic() + 30
-        while lock.queued < 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert lock.queued == 1  # sampled the counter, now blocked on the lock
-        before_timeout()
         thread.join(timeout=30)
         assert not thread.is_alive()
+        assert lock.queued == 1  # it really did sample, queue, and give up
+        assert lock.on_queue is None  # ...and the staging really did fire
     finally:
+        lock.on_queue = None
         lock.release()
     return outcome[0]
 
