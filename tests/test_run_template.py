@@ -30,7 +30,7 @@ import asyncio
 import json
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx, envelope, stream_reader
+from conftest import _OK_STREAM, _RecordingCtx, envelope
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -503,44 +503,7 @@ def test_run_template_wait_false_still_forwards_consent(patched_run):
     ]
 
 
-class _BlockingProc:
-    """A child fake that emits ``first_lines`` and then never yields an envelope.
-
-    Local rather than in ``conftest`` because this is the one case where the call
-    genuinely differs (see AGENTS.md): the shared ``patched_stream`` fake drains a
-    canned stream to EOF instantly and reports itself already exited, so it can
-    never hold the read past a deadline — which is precisely the state this test
-    is about.
-
-    ``returncode`` starts None so the timeout handler's kill fires; no ``pid``, so
-    that kill takes ``server._kill_proc_tree_async``'s ``proc.kill()`` fallback
-    instead of signalling a made-up process group.
-    """
-
-    def __init__(self, cmd, first_lines):
-        self.cmd = cmd
-        self._lines = [line.encode("utf-8") for line in first_lines]
-        self.stdout = self  # the reader protocol lives on the proc itself
-        self.stderr = stream_reader("")
-        self.returncode = None
-        self.killed = False
-
-    async def readuntil(self, separator=b"\n"):
-        if self._lines:
-            return self._lines.pop(0)
-        # Outlives the test's tiny deadline; no envelope ever comes.
-        await asyncio.sleep(1.0)
-        raise asyncio.IncompleteReadError(b"", None)
-
-    async def wait(self):
-        self.returncode = 0
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-
-
-def test_run_template_timeout_raises_the_streaming_shape(monkeypatch):
+def test_run_template_timeout_raises_the_streaming_shape(monkeypatch, blocking_stream):
     """An expired `wait=True` run raises the STREAMING timeout error, with progress.
 
     The dialect change moves this failure off `_run_comfy`'s
@@ -552,15 +515,7 @@ def test_run_template_timeout_raises_the_streaming_shape(monkeypatch):
     test: the real one is 30s of deliberate slack past the caller's budget.
     """
     queued = json.dumps({"schema": "event/1", "type": "queued", "nodes": [{"id": "1"}]})
-    procs: list[_BlockingProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProc(cmd, [queued + "\n"])
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    procs = blocking_stream([queued + "\n"])
     monkeypatch.setattr(server, "_RUN_TEMPLATE_TIMEOUT_GRACE", 0.0)
 
     with pytest.raises(server.ComfyCliError) as exc:
