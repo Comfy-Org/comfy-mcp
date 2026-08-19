@@ -366,12 +366,21 @@ _MIN_COMFY_CLI_STR = "1.14.0"
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
 
-# The probe subprocess's own wall-clock cap, named because TWO places need the
-# same number: `_spawn_comfy_version`'s `timeout=`, and the bound on how long a
-# caller will wait for SOMEONE ELSE's probe (below). Keeping them one constant is
-# what makes "a waiter never pays more than its own probe would have cost" a
-# property of the code rather than of two literals staying in sync.
+# The probe subprocess's own wall-clock cap, named because the bound below is
+# derived from it: a waiter's budget has to be stated in terms of what it is
+# waiting FOR, not as a second literal that can drift away from this one.
 _VERSION_PROBE_TIMEOUT_S = 30.0
+
+# How long a caller will wait for SOMEONE ELSE's probe before giving up.
+#
+# Deliberately a little longer than the probe's own cap. A probe that finishes
+# AT its cap must win the race against a waiter's bound, because the two
+# outcomes are not interchangeable: if the holder finishes, the waiter gets a
+# real verdict, whereas if the waiter gives up first it fails open on a machine
+# whose comfy-cli may well be too old. The slack means a waiter only ever times
+# out when the holder has OVERRUN its own cap — the wedged case below, and the
+# one case where giving up is unambiguously the right answer.
+_VERSION_LOCK_WAIT_S = _VERSION_PROBE_TIMEOUT_S + 5.0
 
 # Serializes the probe itself, so racing FIRST calls share one `comfy --version`
 # instead of each spawning its own. The memo alone only dedupes calls that arrive
@@ -389,29 +398,51 @@ _VERSION_PROBE_TIMEOUT_S = 30.0
 # unbounded, because the holder can exceed the probe's nominal cap (on Windows,
 # `subprocess.run`'s post-`kill()` `communicate()` blocks until a leaked
 # grandchild closes the inherited handles) and every later `_run_comfy` would
-# then queue behind it forever. A caller that cannot get in within one probe's
-# full budget falls through to the guard's standard fail-OPEN — the same answer
-# it reaches when its own probe errors, and unlatched, so a later call re-checks.
+# then queue behind it forever. Giving up LATCHES open, for the same reason the
+# `TimeoutExpired` branch does and with the same force: a holder that overran its
+# cap is a hung `comfy --version` by another route, and without the latch every
+# later call would re-pay the full bound, turning a wedged probe into a permanent
+# per-call stall — worse than the pre-lock behavior, where whichever caller timed
+# out first latched open on everyone's behalf.
 _VERSION_CHECK_LOCK = threading.Lock()
 
-# The completed-probe counter and the verdict of the probe that last bumped it,
-# both written only under `_VERSION_CHECK_LOCK`.
+# The started-probe counter and the REFUSAL of the probe that last ran, both
+# written only under `_VERSION_CHECK_LOCK`. Together they let a caller that
+# queued behind a probe take its answer instead of running a second one.
 #
-# They exist because three of the guard's verdicts deliberately do NOT latch — a
-# transient spawn error, a too-old comfy-cli, and a TCC-denied start. Without
-# them, callers queued behind an in-flight probe would wake to `_version_checked
-# is False` and each run a probe of its OWN, turning N parallel cold starts into
-# N *serialized* ones: strictly worse than the bug this lock fixes, and on a
-# persistently too-old or TCC-denied install it never self-resolves. A caller
-# compares the counter it read before queueing against the one it sees after
-# getting in; if a probe completed in between, that probe started AFTER the
-# caller arrived, so its verdict is the caller's own answer and is replayed
-# rather than recomputed. That is not the memoization those three branches
-# refuse: a call arriving after the lock goes idle still re-probes, so
-# upgrade-and-retry (or grant-Full-Disk-Access-and-retry) in the same process
-# works exactly as documented.
-_version_probe_generation = 0
-_version_probe_verdict: ComfyCliError | None = None
+# The counter is bumped when a probe STARTS, not when it finishes, and that is
+# the whole subtlety. What makes another probe's answer usable is not that it
+# finished while you waited — it is that it started AFTER you arrived, because
+# only then did it observe a machine at least as current as the one you are
+# asking about. Bumping on completion would let a caller that arrived mid-probe
+# replay a verdict computed before it ever called, so an operator who upgrades
+# comfy-cli (or grants Full Disk Access) while a probe is in flight would get the
+# stale refusal on the very retry the guard promises to re-check. Sampling the
+# counter before queueing and finding it CHANGED means a probe both started and
+# finished in that window, which is exactly the usable case.
+_version_probe_starts = 0
+
+# Only a REFUSAL is shared; a fail-open never is. The refusal verdicts (a too-old
+# comfy-cli, a TCC-denied start, an invalid `COMFY_PROJECT`) are the ones worth
+# replaying: they are persistent, so re-probing costs a full cold start and
+# reaches the same conclusion, and on such an install a re-probing herd never
+# self-resolves — the serialization this counter exists to prevent. A fail-open
+# is the opposite on both counts. Its branch is documented as failing open "for
+# THIS call", it comes from a TRANSIENT spawn failure that the next probe is
+# likely to get past, and sharing it would send the whole herd unguarded into the
+# cryptic errors this guard exists to translate. So a queued caller with no
+# refusal to replay probes for itself, and that probe's success latches the memo
+# for everyone behind it — bounded, unlike the persistent case.
+#
+# Stored as the MESSAGE rather than the exception object: re-raising one instance
+# from many threads mutates shared state on it — each `raise` appends to
+# `__traceback__` and sets `__context__` to whatever the raising thread was
+# handling, chaining an unrelated request's error and its frame locals onto a
+# process-global and holding them until the next probe. Both refusals this guard
+# raises are message-only `ComfyCliError`s constructed at the branch, so the
+# message IS the whole verdict; a future verdict carrying structured fields would
+# have to widen this.
+_version_probe_refusal: str | None = None
 
 # `COMFY_PROJECT`'s raw value, read from the environment at most once per
 # process (see `_project_root`). The sentinel distinguishes "not read yet" from
@@ -841,46 +872,43 @@ def _check_comfy_version() -> None:
 
     This function is the interlock; :func:`_probe_comfy_version` is the policy.
     At most one probe runs at a time, and a caller that queued behind one takes
-    that probe's answer instead of running a second — including when the answer
-    is one of the three verdicts that deliberately do not latch, which is the
-    case that would otherwise serialize N cold starts where N used to run in
-    parallel. See ``_VERSION_CHECK_LOCK`` and ``_version_probe_generation`` for
-    why the wait is bounded and why replaying a verdict is not memoizing it.
+    its REFUSAL rather than re-deriving it — see ``_version_probe_starts`` for
+    why "started after I arrived" is the condition, and ``_version_probe_refusal``
+    for why a fail-open is never shared. Both the wait and the give-up are
+    bounded; see ``_VERSION_CHECK_LOCK``.
 
     The warm fast path stays OUTSIDE the lock: once the memo is set a call costs
     one global read and no acquisition, which matters because every
     ``_run_comfy`` goes through here.
     """
-    global _version_probe_generation, _version_probe_verdict
+    global _version_checked, _version_probe_starts, _version_probe_refusal
     if _version_checked:
         return
-    # Sampled BEFORE queueing, so a change observed after getting in means "a
-    # probe both started and finished while I waited" — the precise condition
-    # under which that probe's verdict is also mine.
-    queued_at = _version_probe_generation
-    if not _VERSION_CHECK_LOCK.acquire(timeout=_VERSION_PROBE_TIMEOUT_S):
-        return  # fail OPEN, unlatched — see `_VERSION_CHECK_LOCK`
+    # Sampled BEFORE queueing, so a change observed after getting in means a
+    # probe STARTED after this call began — the condition under which its answer
+    # is at least as current as one this caller would compute now.
+    queued_at = _version_probe_starts
+    if not _VERSION_CHECK_LOCK.acquire(timeout=_VERSION_LOCK_WAIT_S):
+        # The holder overran the probe's own cap. Latch open exactly as the
+        # `TimeoutExpired` branch does — see `_VERSION_CHECK_LOCK`.
+        _version_checked = True
+        return
     try:
         if _version_checked:
             return
-        if _version_probe_generation != queued_at:
-            if _version_probe_verdict is not None:
-                # Re-raised as the same instance, the way `Future.result()` hands
-                # one exception to every waiter: only ``__traceback__`` is
-                # shared, and MCP surfaces the message, never the traceback.
-                raise _version_probe_verdict
-            return
-        # Cleared first so an escape this function does not model (anything that
-        # is not a `ComfyCliError`) leaves NO stale verdict behind for the next
-        # waiter to replay — it falls open and re-probes, the guard's default.
-        _version_probe_verdict = None
+        if _version_probe_starts != queued_at and _version_probe_refusal is not None:
+            # A fresh probe already refused; that refusal is this caller's too.
+            # Rebuilt per caller rather than re-raising one shared instance.
+            raise ComfyCliError(_version_probe_refusal)
+        # Bumped BEFORE the probe, and the previous refusal dropped with it, so
+        # neither outlives the probe it describes.
+        _version_probe_starts += 1
+        _version_probe_refusal = None
         try:
             _probe_comfy_version()
         except ComfyCliError as exc:
-            _version_probe_verdict = exc
+            _version_probe_refusal = str(exc)
             raise
-        finally:
-            _version_probe_generation += 1
     finally:
         _VERSION_CHECK_LOCK.release()
 
