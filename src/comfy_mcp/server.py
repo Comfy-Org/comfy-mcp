@@ -391,6 +391,20 @@ _comfy_cli_version: tuple[int, int, int] | None = None
 # a stale read of it costs at most one redundant probe, never a wrong verdict.
 _version_lock = threading.Lock()
 
+# `time.monotonic()` at the end of the last completed `comfy --version` probe,
+# or None if none has run. Read only by `_invalidate_version_cache`, to keep a
+# per-verb floor's un-latching from turning into a re-probe per refused call —
+# see the rate-limit note there.
+_version_probed_at: float | None = None
+
+# How recently a `comfy --version` probe must have run for
+# `_invalidate_version_cache` to skip re-probing. Sized for the gap between two
+# refusals a CLIENT drives (a retry loop, a queue of watch calls: milliseconds),
+# not the one a HUMAN drives (read the error, `pip install -U comfy-cli`,
+# retry — tens of seconds at the very least), which is the only gap the
+# invalidation exists to serve.
+_VERSION_REPROBE_MIN_INTERVAL = 5.0
+
 # `COMFY_PROJECT`'s raw value, read from the environment at most once per
 # process (see `_project_root`). The sentinel distinguishes "not read yet" from
 # "read and unset" (`None`) without a second flag.
@@ -749,6 +763,27 @@ def _check_comfy_version() -> None:
         _check_comfy_version_locked()
 
 
+def _checked_comfy_version() -> tuple[int, int, int] | None:
+    """Run :func:`_check_comfy_version`'s guard and RETURN the version it established.
+
+    What a per-verb floor must call instead of running the guard and then
+    re-reading ``_comfy_cli_version``. That two-step is not atomic: between the
+    two, a concurrent refusal calls :func:`_invalidate_version_cache`, which
+    nulls the global — so the second caller reads ``None``, takes the
+    fail-OPEN path, and admits the very install the floor is there to refuse
+    (silently, for the full timeout). Holding ``_version_lock`` across the
+    check AND the read is what closes that window.
+
+    Unlike :func:`_check_comfy_version`'s memoized fast path this always takes
+    the lock, which it can afford: the fast path sits on every ``_run_comfy``
+    call, this sits on one ``job(action="watch")``. ``None`` still means
+    "unreadable" and still means fail OPEN.
+    """
+    with _version_lock:
+        _check_comfy_version_locked()
+        return _comfy_cli_version
+
+
 def _check_comfy_version_locked() -> None:
     """:func:`_check_comfy_version`'s body, run with ``_version_lock`` held.
 
@@ -757,7 +792,7 @@ def _check_comfy_version_locked() -> None:
     caller that queued on the lock while another thread ran the probe must not
     run a second one.
     """
-    global _version_checked, _comfy_cli_version
+    global _version_checked, _comfy_cli_version, _version_probed_at
     if _version_checked:
         return
     # Reset FIRST so every exit below either records a freshly parsed version or
@@ -794,6 +829,13 @@ def _check_comfy_version_locked() -> None:
         # A transient spawn failure fails OPEN for THIS call but is NOT latched —
         # a later call re-checks rather than permanently disabling the guard.
         return
+    # Stamped only once the spawn has RETURNED, which is the point
+    # `_invalidate_version_cache`'s rate limit measures from — a stamp taken
+    # before a 30s `--version` would already be 30s stale by the time the
+    # refusal it is meant to throttle happens. Every path that can reach that
+    # invalidation runs through here: it needs a version this probe positively
+    # parsed, so the exits above (which leave it None and fail OPEN) cannot.
+    _version_probed_at = time.monotonic()
     if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
         # comfy-cli's own interpreter could not start because macOS denied it
         # its venv — the reported failure for a ComfyUI install under
@@ -814,7 +856,21 @@ def _check_comfy_version_locked() -> None:
             "Original error: "
             f"{failure_log._scrubbed_stream_tail(proc.stderr, errors._MAX_ERROR_FIELD_CHARS)}"
         )
-    version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
+    # Parse STDOUT first and fall back to stderr only when stdout yields
+    # nothing: `_parse_version` takes the FIRST dotted number it finds, and
+    # stderr is where unrelated ones land — a pip deprecation warning, a
+    # traceback naming an embedded Python, a ComfyUI core `0.3.x` banner. While
+    # the only consumer was the 1.14.0 floor a misparse merely failed open;
+    # now it also drives `job(action="watch")`'s hard refusal, so the noisier
+    # stream must not outrank the one that actually answers `--version`.
+    #
+    # A nonzero exit is not parsed at all. `--version` that errors has not
+    # reported a version, whatever text it happened to print, and memoizing a
+    # number scraped out of a failure would latch it for the life of the
+    # process. Leaving it None is the documented fail-OPEN path.
+    version = None
+    if proc.returncode == 0:
+        version = _parse_version(proc.stdout) or _parse_version(proc.stderr)
     if version is not None:
         # Recorded BEFORE the floor check below, which raises WITHOUT latching
         # `_version_checked`: a too-old install the caller retries in the same
@@ -854,9 +910,25 @@ def _invalidate_version_cache() -> None:
     one, which is why it clears the parsed version too: leaving it would let the
     next probe's early-return path hand a per-verb floor the very tuple it just
     rejected.
+
+    RATE-LIMITED to at most one un-latch per
+    :data:`_VERSION_REPROBE_MIN_INTERVAL`. Every refused watch lands here, so
+    without the limit a client that retries ``job(action="watch")`` in a loop
+    on a sub-1.16 install forces a fresh ``comfy --version`` per call — each up
+    to 30s, each taken with ``_version_lock`` HELD, so every other tool call in
+    the process queues behind it and each concurrent refusal parks a
+    default-executor thread in ``asyncio.to_thread`` waiting its turn. A
+    refusal is cheap to repeat from the memo; re-probing is not. The window is
+    far shorter than the human upgrade-and-retry this exists to serve, so the
+    recovery story is unchanged.
     """
     global _version_checked, _comfy_cli_version
     with _version_lock:
+        if (
+            _version_probed_at is not None
+            and time.monotonic() - _version_probed_at < _VERSION_REPROBE_MIN_INTERVAL
+        ):
+            return
         _version_checked = False
         _comfy_cli_version = None
 
@@ -1842,6 +1914,17 @@ _NON_PROGRESS_EVENTS = frozenset(
         "execution_error",
         "execution_interrupted",
         "output",
+        # ComfyUI's per-step tick, whose relay is the handler
+        # `_MIN_WATCH_COMFY_CLI` exists to require. It is counted here rather
+        # than parsed into a progress value on purpose: its payload is a
+        # per-node `{value, max, state}` map that comfy-cli normalizes into the
+        # `progress` events the branches above already read, and guessing at
+        # the raw shape would fabricate a bar from a message we do not own.
+        # Counting it is what `events_seen` needs — a window carrying only
+        # `progress_state` otherwise reports `events_seen: 0` and earns the
+        # "nothing reached the watcher" hint from a demonstrably attached,
+        # mid-node watch.
+        "progress_state",
     }
 )
 
@@ -1863,6 +1946,22 @@ class _StreamProgress:
         self.done = 0  # nodes fully executed or served from cache
         self.events = 0  # execution events recognized (see `events_seen` below)
         self._last = -1.0  # last value reported (kept non-decreasing)
+
+    def seed(self, total: float) -> None:
+        """Apply a late ``total_seed`` without contradicting what was observed.
+
+        The seed races the stream (see ``total_seed`` on
+        :func:`_run_comfy_streaming`), so it can land after events have already
+        been counted. Two things it must not do on the way in: overwrite a
+        ``queued`` manifest, which is the authoritative node count and the
+        reason `total` is only structurally missing for ``jobs watch``; and
+        drop `total` BELOW the progress already reported, which would hand a
+        client the >100% bar the growth rule in :meth:`report` exists to
+        prevent. ``_last`` starts below zero, so on the ordinary
+        seed-lands-first path this is just the seed.
+        """
+        if self.total is None:
+            self.total = max(total, self._last)
 
     def snapshot(self) -> dict:
         """Last-known progress, for a bounded watch that timed out mid-run.
@@ -1954,7 +2053,12 @@ class _StreamProgress:
             # progress?". Count those and return; anything outside the
             # recognized set (a relayed envelope, a custom node's own chatter)
             # proves nothing about the websocket attach and must not count.
-            if etype in _NON_PROGRESS_EVENTS:
+            # `isinstance` before the membership test: `etype` is whatever
+            # JSON put in `type`, and a list or dict there raises `TypeError:
+            # unhashable type` out of a frozenset lookup — aborting the whole
+            # stream over one malformed line. The `==` comparisons above are
+            # already total; only this one needs the guard.
+            if isinstance(etype, str) and etype in _NON_PROGRESS_EVENTS:
                 self.events += 1
             return
         self.events += 1
@@ -2214,7 +2318,7 @@ _WATCH_NO_EVENTS_HINT = (
 )
 
 
-def _watch_no_events_hint() -> str:
+def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
     """The diagnosis for a zero-event watch timeout whose job is still running.
 
     The cause half is conditional on what the version gate actually established,
@@ -2229,8 +2333,14 @@ def _watch_no_events_hint() -> str:
     already knows is false: a job sitting queued behind another, or loading
     models, for the whole 600s default yields zero events on a perfectly modern
     CLI. Name the likely cause instead of one that has been ruled out.
+
+    *version* is the tuple the gate CAPTURED for this watch, passed in rather
+    than re-read from ``_comfy_cli_version`` here. That global is mutable and
+    nulled by :func:`_invalidate_version_cache` — which every refused watch
+    calls — and re-read unsynchronized at timeout time it would let a watch
+    that positively cleared the floor emit the "comfy-cli < 1.16.0" diagnosis
+    the paragraph above says it must not give.
     """
-    version = _comfy_cli_version
     if version is not None and version >= _MIN_WATCH_COMFY_CLI:
         return (
             f"{_WATCH_NO_EVENTS_HINT} — comfy-cli {'.'.join(map(str, version))} "
@@ -2249,6 +2359,7 @@ def _watch_no_events_hint() -> str:
 async def _timed_out_payload(
     tracker: _StreamProgress,
     on_timeout_fallback: Callable[[], Awaitable[Any]] | None,
+    no_events_hint: str | None = None,
 ) -> dict:
     """The ``raise_on_timeout=False`` expiry payload for a streamed run.
 
@@ -2269,6 +2380,11 @@ async def _timed_out_payload(
     be a guess, and on a terminal one it would be wrong (the job finished; the
     watch simply missed the end).
 
+    ``no_events_hint`` is that diagnosis, rendered by the WATCH GATE — the only
+    place that knows which comfy-cli version this watch actually cleared (see
+    :func:`_watch_no_events_hint`). :func:`_run_comfy_streaming` serves ``run
+    --wait`` too, and a caller that supplies none simply gets no ``hint``.
+
     ``on_timeout_fallback`` is AWAITED, not off-loaded with
     :func:`asyncio.to_thread`. It runs at the end of a watch that already burned
     its whole budget — precisely when an MCP client is most likely to have given
@@ -2288,8 +2404,8 @@ async def _timed_out_payload(
     except Exception:  # noqa: BLE001 - diagnosis is best-effort; see docstring
         return payload
     payload["job"] = job_status
-    if _is_active(job_status):
-        payload["hint"] = _watch_no_events_hint()
+    if no_events_hint is not None and _is_active(job_status):
+        payload["hint"] = no_events_hint
     return payload
 
 
@@ -2298,8 +2414,9 @@ async def _run_comfy_streaming(
     ctx: Context | None = None,
     timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     raise_on_timeout: bool = True,
-    total_seed: float | None = None,
+    total_seed: float | Callable[[], Awaitable[float | None]] | None = None,
     on_timeout_fallback: Callable[[], Awaitable[Any]] | None = None,
+    no_events_hint: str | None = None,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
@@ -2329,6 +2446,21 @@ async def _run_comfy_streaming(
       ``null`` for the whole watch. The caller reads the same number from
       ``jobs status``'s ``workflow_size`` instead. A later ``queued`` event
       still overwrites it, so the run dialect is unaffected.
+
+      It may be a THUNK rather than a number, and for ``jobs watch`` it must
+      be: reading ``workflow_size`` costs a whole extra ``comfy jobs status``
+      child, and awaiting that BEFORE the spawn serializes it between submit
+      and the websocket attach — every execution event in that window is lost,
+      which manufactures the very ``events_seen: 0`` payload a watch exists to
+      diagnose. Called here, it is scheduled alongside the stream and applied
+      whenever it lands (see ``_apply_seed``), so the attach is never delayed
+      by a diagnostic poll. A thunk rather than a bare coroutine for the same
+      reason ``on_timeout_fallback`` is one: nothing is created until this
+      runner decides to run it, so a spawn that fails first leaves no
+      never-awaited coroutine behind.
+    * ``no_events_hint`` is the caller's ready-rendered diagnosis for a
+      zero-event expiry whose fallback poll says the job is still running; see
+      :func:`_timed_out_payload`.
     * ``on_timeout_fallback`` is awaited ONLY on a ``raise_on_timeout=False``
       expiry that saw ZERO events, to embed a one-shot status poll under ``job``
       so the timeout payload is never LESS informative than the
@@ -2381,8 +2513,28 @@ async def _run_comfy_streaming(
         raise _spawn_failure(cmd, args, exc) from exc
     lines: list[str] = []
     tracker = _StreamProgress()
-    if total_seed is not None:
-        tracker.total = total_seed
+    seed_task: asyncio.Task | None = None
+    if isinstance(total_seed, (int, float)) and not isinstance(total_seed, bool):
+        tracker.total = float(total_seed)
+    elif total_seed is not None:
+
+        async def _apply_seed(make: Callable[[], Awaitable[float | None]]) -> None:
+            """Await the seed alongside the stream and apply it if still useful.
+
+            Runs as its own task so the spawn above is never delayed by it.
+            What a late arrival may and may not overwrite is
+            :meth:`_StreamProgress.seed`'s call. Failures are the caller's to
+            swallow — `_watch_total_seed` returns None for every one — so
+            nothing here is caught but the cancellation the `finally` below
+            raises. The thunk is CALLED here rather than at the call site
+            for one more reason: a task cancelled before it ever ran would
+            otherwise leave an un-awaited coroutine behind.
+            """
+            value = await make()
+            if value is not None:
+                tracker.seed(value)
+
+        seed_task = asyncio.ensure_future(_apply_seed(total_seed))
 
     async def _pump() -> bool:
         """Read stdout until the terminal ``envelope/1`` line or stdout EOF.
@@ -2488,7 +2640,9 @@ async def _run_comfy_streaming(
                 if proc.returncode is None:
                     _kill_proc_tree_async(proc)
                     await _reap_async(proc)
-                return await _timed_out_payload(tracker, on_timeout_fallback)
+                return await _timed_out_payload(
+                    tracker, on_timeout_fallback, no_events_hint
+                )
             # Surface what the child wrote before the deadline. Kill
             # the whole tree FIRST so every copy of the stderr pipe closes and
             # the drain returns the buffered output (a wedged child — or a
@@ -2592,6 +2746,23 @@ async def _run_comfy_streaming(
         # the pipe once the task is cancelled — no join is needed.
         if stderr_future is not None and not stderr_future.done():
             stderr_future.cancel()
+        # Same for the concurrent `total_seed`. It is a diagnostic nicety whose
+        # only consumer is the tracker this call is about to stop using, so a
+        # poll still in flight when the stream ends is cancelled rather than
+        # waited on — otherwise a fast run would pay for a slow `jobs status`
+        # it no longer needs, and the child would outlive the request.
+        if seed_task is not None and not seed_task.done():
+            seed_task.cancel()
+            # AWAITED after the cancel, unlike the stderr reader above. That
+            # one only holds a pipe; this one owns a `comfy jobs status` CHILD,
+            # and `_run_comfy_async`'s own `finally` is what kills its process
+            # tree — a cancellation nobody waits for may never get to run
+            # before this call returns, which is the orphaned child that runner
+            # exists to prevent. Everything is suppressed: the cleanup is
+            # best-effort and must not replace the result (or the timeout) the
+            # caller is actually owed.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await seed_task
 
 
 def _detect_comfy_cli_version() -> str | None:
@@ -5480,6 +5651,15 @@ def _poll_until_terminal(
         time.sleep(min(_POLL_INTERVAL, remaining))
 
 
+# Stdout bound for the async ``jobs status`` polls. `_run_comfy_async` keeps
+# only the TRAILING bytes, so this has to be comfortably larger than the biggest
+# envelope `jobs status` can produce — a many-output job, or a failed one whose
+# `error` carries a full Python traceback — or the JSON loses its head and
+# parses as nothing. Far below `upload_file`'s 4 MiB: a status payload does not
+# scale with caller input the way a staged batch does.
+_JOB_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
+
+
 def _job_status_sync(prompt_id: str) -> Any:
     """``job(action="status")``'s body — the exact ``job_status`` this replaced."""
     prompt_id = argv._guard_prompt_id(prompt_id)
@@ -5500,9 +5680,23 @@ async def _job_status_async(
     full 60s compounds under exactly the degraded conditions that produce
     timeouts. ``timeout`` is required, not defaulted, because a poll that is
     carved out of somebody else's budget must never quietly inherit a 60s one.
+
+    ``stdout_cap`` is widened for the same reason ``upload_file`` widens it:
+    :func:`_run_comfy_async` keeps only the TRAILING
+    :data:`_STDERR_MAX_CHARS` of stdout, and a ``jobs status`` envelope scales
+    with the job — every output file, and a failed run's whole traceback under
+    ``error``. Losing its opening brace to the tail makes it unparseable, so
+    both diagnostic callers would silently drop a status they did in fact
+    receive, which is the one thing a diagnosis must not do.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
-    return await _run_comfy_async("jobs", "status", prompt_id, timeout=timeout)
+    return await _run_comfy_async(
+        "jobs",
+        "status",
+        prompt_id,
+        timeout=timeout,
+        stdout_cap=_JOB_STATUS_STDOUT_MAX_CHARS,
+    )
 
 
 def _job_error_sync(prompt_id: str) -> Any:
@@ -5596,12 +5790,20 @@ def _job_queue_sync() -> Any:
 _MIN_WATCH_COMFY_CLI = (1, 16, 0)
 _MIN_WATCH_COMFY_CLI_STR = "1.16.0"
 
-# Ceiling on each of a watch's two diagnostic `jobs status` polls (the `total`
-# seed before the stream, the fallback after the deadline). They are carved out
-# of the caller's own timeout — see the note at the call site — so this only
-# caps how much a LARGE budget may spend on diagnosis; a small one gets a tenth
-# of itself per poll and the cap never binds.
+# Ceiling on each of a watch's two diagnostic `jobs status` polls: the `total`
+# seed, which RACES the stream, and the fallback after the deadline, which is
+# carved out of the caller's own timeout (see the note at the call site). So
+# this caps how much a LARGE budget may spend on diagnosis; a small one gets a
+# tenth of itself for the fallback and the cap never binds.
 _WATCH_POLL_MAX = 10.0
+
+# Floor on the FALLBACK poll's budget, and the same number used as the floor on
+# what must be left for the stream after carving it. `bound / 10` alone gives a
+# short watch less than comfy-cli's own startup takes, so the poll is spawned,
+# killed at its deadline and charged to the watch without ever producing a
+# status. Below this, diagnosis is skipped rather than shrunk — see the call
+# site.
+_WATCH_POLL_MIN = 5.0
 
 _WATCH_VERSION_ERROR = (
     f'job(action="watch") requires comfy-cli {_MIN_WATCH_COMFY_CLI_STR} or '
@@ -5633,8 +5835,10 @@ async def _watch_total_seed(
     below). `bool` is excluded explicitly because it is an `int` subclass in
     Python and `total: 1.0` from a `True` would be a fabricated node count.
 
-    ``timeout`` is the caller's carved-out budget, not this function's own — see
-    :func:`_job_status_async`.
+    ``timeout`` is the caller's chosen budget, not this function's own — see
+    :func:`_job_status_async`. It is NOT carved out of the watch's: this poll
+    races the stream rather than preceding it, so its only real bound is the
+    watch it runs alongside.
     """
     try:
         status = await _job_status_async(prompt_id, timeout)
@@ -5759,8 +5963,12 @@ async def job(
         # gets one sentence naming the fix, immediately, instead of a silent
         # block for up to an hour. `_check_comfy_version` is synchronous — the
         # same `asyncio.to_thread` off-load the runner gives it.
-        await asyncio.to_thread(_check_comfy_version)
-        gate_version = _comfy_cli_version
+        # `_checked_comfy_version`, not `_check_comfy_version` followed by a
+        # read of `_comfy_cli_version`: the check and the read have to be one
+        # atomic step, or a concurrent refusal's `_invalidate_version_cache`
+        # nulls the global in between and this caller fails OPEN on an install
+        # it could perfectly well read. See that function.
+        gate_version = await asyncio.to_thread(_checked_comfy_version)
         if gate_version is not None and gate_version < _MIN_WATCH_COMFY_CLI:
             # Drop the memoized probe on the way out. Anything in
             # [_MIN_COMFY_CLI, _MIN_WATCH_COMFY_CLI) LATCHED the guard on its
@@ -5781,18 +5989,28 @@ async def job(
         # covers the residual: a watch that slips through here and then streams
         # nothing is told what that usually means.
 
-        # Both diagnostic polls are carved OUT of `bound`, never added to it:
-        # `timeout_seconds` (and the `_MAX_WATCH_TIMEOUT` ceiling) bound the
-        # CALL's wall time, not merely the stream's. Unbudgeted they each ran
-        # the standard 60s `jobs status`, so `timeout_seconds=5` could hold the
-        # MCP request ~125s — a 60s seed, a 5s stream, a 60s fallback — and the
-        # ceiling stopped meaning anything. A tenth of the budget each, capped
-        # at `_WATCH_POLL_MAX`: a `jobs status` that cannot answer in ten
-        # seconds is not going to improve the timeout payload, and the shorter
-        # seed also narrows the window between submit and websocket attach in
-        # which execution events go unseen.
-        poll_budget = min(_WATCH_POLL_MAX, bound / 10.0)
-        stream_bound = max(bound - 2 * poll_budget, poll_budget)
+        # Only the FALLBACK poll is carved out of `bound`, because it is the
+        # only one that runs serially: `timeout_seconds` (and the
+        # `_MAX_WATCH_TIMEOUT` ceiling) bound the CALL's wall time, not merely
+        # the stream's, and unbudgeted this ran the standard 60s `jobs status`
+        # after an already-expired watch. The seed poll costs the budget
+        # nothing — it is handed to the runner as a thunk and races the stream
+        # (see `total_seed` there), which is also what keeps it from delaying
+        # the websocket attach.
+        #
+        # A tenth of the budget, capped at `_WATCH_POLL_MAX` and FLOORED at
+        # `_WATCH_POLL_MIN`: a `jobs status` that cannot answer in ten seconds
+        # will not improve the timeout payload, and one given less than five
+        # cannot outrun comfy-cli's own startup — it would be spawned, killed,
+        # and charged to the watch for nothing. When the floor leaves the
+        # stream itself under `_WATCH_POLL_MIN` the diagnosis is dropped
+        # entirely rather than shrunk: on a budget that small the watch is the
+        # deliverable, and a `timed_out` payload without the `job` key beats
+        # one whose watch never got time to attach.
+        poll_budget = min(_WATCH_POLL_MAX, max(bound / 10.0, _WATCH_POLL_MIN))
+        if bound - poll_budget < _WATCH_POLL_MIN:
+            poll_budget = 0.0
+        stream_bound = bound - poll_budget
         return await _run_comfy_streaming(
             "jobs",
             "watch",
@@ -5800,13 +6018,26 @@ async def job(
             ctx=ctx,
             timeout=stream_bound,
             raise_on_timeout=False,
-            total_seed=await _watch_total_seed(prompt_id, poll_budget),
+            # A thunk, NOT its result: awaiting the poll here would serialize
+            # a whole `comfy jobs status` child between submit and the
+            # websocket attach, losing every execution event in that window.
+            # The runner schedules it alongside the stream and cancels it on
+            # the way out.
+            total_seed=functools.partial(
+                _watch_total_seed, prompt_id, min(_WATCH_POLL_MAX, stream_bound)
+            ),
             # A thunk, not the poll's result: it must run AT the timeout, so it
             # reports where the job is when the watch gave up rather than where
             # it was when the watch began.
-            on_timeout_fallback=functools.partial(
-                _job_status_async, prompt_id, poll_budget
+            on_timeout_fallback=(
+                functools.partial(_job_status_async, prompt_id, poll_budget)
+                if poll_budget
+                else None
             ),
+            # Rendered from the version THIS watch cleared, not re-read at
+            # timeout time from a global another call can null. See
+            # `_watch_no_events_hint`.
+            no_events_hint=_watch_no_events_hint(gate_version),
         )
 
     # Every other branch is a blocking `subprocess` call or a `time.sleep`
