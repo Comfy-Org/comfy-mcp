@@ -4002,40 +4002,7 @@ def test_run_workflow_stream_works_without_ctx(patched_stream):
 # The `watch_job`-specific tests (streams-progress, stream-error-envelope,
 # times-out-returns-payload, times-out-without-ctx, rejects-unusable-id,
 # rejects-embedded-nul, clamps-oversized-timeout, rejects-bad-timeout) moved
-# to tests/test_jobs.py as `job(action="watch")`. `_BlockingProc` below stays
-# — it is still used by `test_run_workflow_timeout_error_includes_snapshot_and_hint`
-# and `_BlockingProcWithStderr`.
-
-
-class _BlockingProc:
-    """A fake child whose stdout yields ``first_lines`` then blocks (forces a timeout).
-
-    ``returncode`` starts None (the child is running) so the timeout handler's
-    kill actually fires; carries no ``pid`` so the kill takes the ``proc.kill()``
-    fallback rather than signalling a made-up group. See conftest's ``_FakeProc``.
-    """
-
-    def __init__(self, cmd, first_lines):
-        self.cmd = cmd
-        self._lines = [line.encode("utf-8") for line in first_lines]
-        self.stdout = self  # the reader protocol lives on the proc itself
-        self.stderr = stream_reader("")
-        self.returncode = None
-        self.killed = False
-
-    async def readuntil(self, separator=b"\n"):
-        if self._lines:
-            return self._lines.pop(0)
-        # Outlives the test's tiny timeout, so the envelope never arrives.
-        await asyncio.sleep(1.0)
-        raise asyncio.IncompleteReadError(b"", None)
-
-    async def wait(self):
-        self.returncode = 0
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
+# to tests/test_jobs.py as `job(action="watch")`.
 
 
 def test_run_workflow_wait_false_uses_plain_json_no_stream(monkeypatch):
@@ -4683,28 +4650,12 @@ def test_sync_non_timeout_failure_still_reaps_the_child(patched_run):
     assert calls[0]["proc"].killed is True
 
 
-class _BlockingProcWithStderr(_BlockingProc):
-    """A blocking child fake that also carries buffered stderr (a crashed traceback)."""
-
-    def __init__(self, cmd, first_lines, stderr_text):
-        super().__init__(cmd, first_lines)
-        self.stderr = stream_reader(stderr_text)
-
-
-def test_streaming_timeout_surfaces_stdout_and_stderr_tails(monkeypatch):
+def test_streaming_timeout_surfaces_stdout_and_stderr_tails(blocking_stream):
     """A raising streaming timeout appends the NDJSON stdout tail and the child's stderr tail."""
     queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
-    procs: list[_BlockingProcWithStderr] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProcWithStderr(
-            cmd, [queued + "\n"], "Traceback ...\nUnicodeEncodeError: boom"
-        )
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    procs = blocking_stream(
+        [queued + "\n"], stderr_text="Traceback ...\nUnicodeEncodeError: boom"
+    )
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -4719,18 +4670,10 @@ def test_streaming_timeout_surfaces_stdout_and_stderr_tails(monkeypatch):
     assert procs[0].killed  # child cleaned up
 
 
-def test_streaming_timeout_stdout_tail_is_bounded(monkeypatch):
+def test_streaming_timeout_stdout_tail_is_bounded(blocking_stream):
     """Even a chatty streaming child cannot inflate the raised message past the tail bound."""
     noisy = [("x" * 100 + "\n") for _ in range(50)]  # 5000+ chars of NDJSON
-    procs: list[_BlockingProcWithStderr] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProcWithStderr(cmd, noisy, "")
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    blocking_stream(noisy)
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -6028,20 +5971,12 @@ def test_two_overlapping_run_workflow_calls_complete_independently(monkeypatch):
     assert all(p.killed for p in procs)  # both cleaned up
 
 
-def test_run_workflow_timeout_error_includes_snapshot_and_hint(monkeypatch):
+def test_run_workflow_timeout_error_includes_snapshot_and_hint(blocking_stream):
     """A genuine timeout surfaces the progress snapshot + a job/wait=False hint."""
     queued = json.dumps(
         {"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]}
     )
-    procs: list[_BlockingProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProc(cmd, [queued + "\n"])
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    procs = blocking_stream([queued + "\n"])
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         asyncio.run(

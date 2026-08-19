@@ -32,7 +32,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx, envelope, stream_reader
+from conftest import _OK_STREAM, _RecordingCtx, envelope
 
 from comfy_mcp import server
 
@@ -884,49 +884,14 @@ def test_job_watch_stream_error_envelope_raises_with_code(patched_stream):
         asyncio.run(server.job(action="watch", prompt_id="pid"))
 
 
-class _BlockingProc:
-    """A fake child whose stdout yields ``first_lines`` then blocks (forces a
-    timeout). Copied from the former ``test_watch_job`` coverage — see
-    ``conftest._FakeProc`` for the sibling used by the non-timeout paths."""
-
-    def __init__(self, cmd, first_lines):
-        self.cmd = cmd
-        self._lines = [line.encode("utf-8") for line in first_lines]
-        self.stdout = self
-        self.stderr = stream_reader("")
-        self.returncode = None
-        self.killed = False
-
-    async def readuntil(self, separator=b"\n"):
-        if self._lines:
-            return self._lines.pop(0)
-        await asyncio.sleep(1.0)
-        raise asyncio.IncompleteReadError(b"", None)
-
-    async def wait(self):
-        self.returncode = 0
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-
-
-def test_job_watch_times_out_returns_payload(monkeypatch):
+def test_job_watch_times_out_returns_payload(blocking_stream):
     """R8: a genuine watch expiry is a `timed_out` payload, never a raise —
     proof that `job`'s "watch" branch passes `raise_on_timeout=False` through
     to `_run_comfy_streaming`, exactly as `watch_job` did."""
     queued = json.dumps(
         {"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]}
     )
-    procs: list[_BlockingProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProc(cmd, [queued + "\n"])
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    procs = blocking_stream([queued + "\n"])
 
     result = asyncio.run(
         server.job(
@@ -955,20 +920,12 @@ def test_job_watch_raise_on_timeout_is_false(monkeypatch):
     assert seen["raise_on_timeout"] is False
 
 
-def test_job_watch_times_out_reports_progress_without_ctx(monkeypatch):
+def test_job_watch_times_out_reports_progress_without_ctx(blocking_stream):
     queued = json.dumps(
         {"type": "queued", "nodes": [{"node_id": "1"}, {"node_id": "2"}]}
     )
     executed = json.dumps({"type": "executed", "node": "1"})
-    procs: list[_BlockingProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProc(cmd, [queued + "\n", executed + "\n"])
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    procs = blocking_stream([queued + "\n", executed + "\n"])
 
     result = asyncio.run(
         server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
