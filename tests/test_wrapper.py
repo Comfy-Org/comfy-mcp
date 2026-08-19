@@ -702,6 +702,55 @@ def _passing_version_proc() -> subprocess.CompletedProcess:
     )
 
 
+def _slow_version_spawns(monkeypatch, outcome):
+    """Patch `_spawn_comfy_version` with a probe slow enough to be raced.
+
+    ``outcome(n)`` produces the nth probe's result — returned, or raised to
+    exercise a failure verdict. The sleep is what makes the herd tests test
+    anything: without a probe that stays IN FLIGHT, the callers would queue and
+    complete one after another and a broken interlock would still look deduped.
+    Returns the list the fake appends to, so a test can count actual spawns.
+    """
+    spawns: list[float] = []
+    counter = threading.Lock()
+
+    def fake_spawn() -> subprocess.CompletedProcess:
+        with counter:
+            spawns.append(time.monotonic())
+            nth = len(spawns)
+        time.sleep(0.2)  # hold the probe open so a herd genuinely overlaps it
+        return outcome(nth)
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+    return spawns
+
+
+def _race_version_guard(count: int) -> list[BaseException | None]:
+    """Release ``count`` callers into `_check_comfy_version` at the same instant.
+
+    Returns each caller's outcome in start order — the exception it raised, or
+    ``None`` — so a test can assert BOTH that one probe ran and that every
+    caller got the right answer, which is the half a spawn count alone misses.
+    """
+    ready = threading.Barrier(count)
+    outcomes: list[BaseException | None] = [None] * count
+
+    def caller(index: int) -> None:
+        ready.wait(timeout=10)
+        try:
+            server._check_comfy_version()
+        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+            outcomes[index] = exc
+
+    threads = [threading.Thread(target=caller, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)  # no deadlock
+    return outcomes
+
+
 def test_version_guard_probes_once_for_a_herd_of_racing_first_calls(monkeypatch):
     """Concurrent FIRST calls share ONE probe instead of spawning one each.
 
@@ -713,36 +762,11 @@ def test_version_guard_probes_once_for_a_herd_of_racing_first_calls(monkeypatch)
     machine least able to afford them.
     """
     monkeypatch.setattr(server, "_version_checked", False)
+    spawns = _slow_version_spawns(monkeypatch, lambda _n: _passing_version_proc())
 
-    spawns: list[float] = []
-    counter = threading.Lock()
-    ready = threading.Barrier(5)
+    outcomes = _race_version_guard(5)
 
-    def fake_spawn() -> subprocess.CompletedProcess:
-        with counter:
-            spawns.append(time.monotonic())
-        time.sleep(0.2)  # hold the probe open so the herd genuinely overlaps
-        return _passing_version_proc()
-
-    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
-
-    raised: list[BaseException] = []
-
-    def caller() -> None:
-        ready.wait(timeout=10)  # release all five at the same instant
-        try:
-            server._check_comfy_version()
-        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
-            raised.append(exc)
-
-    threads = [threading.Thread(target=caller) for _ in range(5)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=30)
-
-    assert not any(thread.is_alive() for thread in threads)  # no deadlock
-    assert raised == []
+    assert outcomes == [None] * 5
     assert len(spawns) == 1  # the whole point: one probe, not five
     assert server._version_checked is True
     assert not server._VERSION_CHECK_LOCK.locked()
@@ -781,10 +805,10 @@ def test_version_guard_releases_the_lock_when_a_verdict_raises(monkeypatch):
     """A raising verdict must leave the lock free, not wedge every later call.
 
     Two of the guard's branches — a too-old version and a TCC-denied start —
-    raise from INSIDE the `with`, and neither latches, so the next call is
-    expected to take the lock again. If the raise leaked the lock, the first
-    upgrade-and-retry in the same process would hang forever instead of
-    re-checking; the `with` is what makes that impossible.
+    raise from INSIDE the locked region, and neither latches, so the next call
+    is expected to take the lock again. If the raise leaked the lock, the first
+    upgrade-and-retry in the same process would hang for the acquire bound and
+    then silently fail open instead of re-checking; the `finally` prevents that.
     """
     monkeypatch.setattr(server, "_version_checked", False)
 
@@ -803,6 +827,117 @@ def test_version_guard_releases_the_lock_when_a_verdict_raises(monkeypatch):
     assert server._version_checked is False
 
     server._check_comfy_version()  # the upgraded install: re-checked, not wedged
+    assert server._version_checked is True
+
+
+def test_version_guard_shares_an_unlatched_verdict_with_the_herd(monkeypatch):
+    """A herd hitting a NON-latching verdict still pays ONE probe, not N.
+
+    Three verdicts deliberately leave `_version_checked` False — a transient
+    spawn error, a too-old comfy-cli, and a TCC-denied start. Serializing the
+    herd on the lock and then letting each woken caller run its OWN probe would
+    turn N parallel cold starts into N *serialized* ones — strictly worse than
+    the bug the lock fixes, and on a persistently broken install it never
+    self-resolves. A caller already queued when the probe ran arrived before it
+    started, so its verdict is that probe's; only a call arriving after the lock
+    goes idle re-probes, which is what keeps this sharing and not memoization.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+
+    def outcome(nth: int) -> subprocess.CompletedProcess:
+        if nth == 1:
+            raise OSError("boom")
+        return _passing_version_proc()
+
+    spawns = _slow_version_spawns(monkeypatch, outcome)
+
+    outcomes = _race_version_guard(5)
+
+    assert outcomes == [None] * 5  # everyone failed open, nobody raised
+    assert len(spawns) == 1  # one probe for the whole herd, not five in a row
+    assert server._version_checked is False  # transient error still not latched
+    assert not server._VERSION_CHECK_LOCK.locked()
+
+    server._check_comfy_version()  # a LATER call re-probes rather than replaying
+    assert len(spawns) == 2
+    assert server._version_checked is True
+
+
+def test_version_guard_replays_a_raising_verdict_to_the_herd(monkeypatch):
+    """The queued callers get the too-old error itself, not a probe each.
+
+    The raising verdicts are the worst case for a re-probing herd: they do not
+    latch, so every woken caller would pay a full cold `comfy --version` only to
+    reach the same conclusion. Each caller must still see the real error — a
+    shared verdict that fails OPEN for the waiters would let a too-old install
+    through for four callers out of five.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+    spawns = _slow_version_spawns(
+        monkeypatch,
+        lambda _n: subprocess.CompletedProcess(
+            [server.COMFY_BIN, "--version"],
+            0,
+            stdout="comfy-cli, version 1.11.0",
+            stderr="",
+        ),
+    )
+
+    outcomes = _race_version_guard(5)
+
+    assert len(spawns) == 1
+    assert len(outcomes) == 5
+    for outcome in outcomes:
+        assert isinstance(outcome, server.ComfyCliError)
+        assert "too old" in str(outcome)
+    assert server._version_checked is False  # a too-old verdict never latches
+    assert not server._VERSION_CHECK_LOCK.locked()
+
+
+def test_version_guard_fails_open_rather_than_queue_past_the_probe_budget(monkeypatch):
+    """An overrunning holder must not wedge every later call process-wide.
+
+    `_spawn_comfy_version` caps its subprocess, but the cap is not a guarantee:
+    on Windows the post-`kill()` `communicate()` blocks until a leaked
+    grandchild closes the inherited handles. An unbounded acquire would promote
+    the guard's historically per-call worst case into a process-wide hang, so a
+    caller that cannot get in within one probe's full budget takes the guard's
+    standard fail-OPEN — unlatched, so a later call still re-checks.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_VERSION_PROBE_TIMEOUT_S", 0.05)
+
+    spawns: list[str] = []
+
+    def fake_spawn() -> subprocess.CompletedProcess:
+        spawns.append("call")
+        return _passing_version_proc()
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+
+    wedged = threading.Event()
+    released = threading.Event()
+
+    def holder() -> None:
+        server._VERSION_CHECK_LOCK.acquire()
+        wedged.set()
+        released.wait(timeout=30)
+        server._VERSION_CHECK_LOCK.release()
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert wedged.wait(timeout=10)
+        server._check_comfy_version()  # returns instead of blocking forever
+        assert spawns == []  # it never got in, so it never probed
+        assert server._version_checked is False  # and never latched
+    finally:
+        released.set()
+        thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    server._check_comfy_version()  # lock free again: the guard re-checks
+    assert spawns == ["call"]
     assert server._version_checked is True
 
 

@@ -366,19 +366,52 @@ _MIN_COMFY_CLI_STR = "1.14.0"
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
 
+# The probe subprocess's own wall-clock cap, named because TWO places need the
+# same number: `_spawn_comfy_version`'s `timeout=`, and the bound on how long a
+# caller will wait for SOMEONE ELSE's probe (below). Keeping them one constant is
+# what makes "a waiter never pays more than its own probe would have cost" a
+# property of the code rather than of two literals staying in sync.
+_VERSION_PROBE_TIMEOUT_S = 30.0
+
 # Serializes the probe itself, so racing FIRST calls share one `comfy --version`
 # instead of each spawning its own. The memo alone only dedupes calls that arrive
 # after a probe has FINISHED — the startup machine-snapshot probe (a daemon
 # thread) is usually first, and every tool call arriving while it is still inside
 # its 30s-capped subprocess would otherwise read `_version_checked is False` and
 # spawn a redundant cold comfy-cli interpreter, N concurrent first calls spawning
-# N of them on exactly the machine least able to afford it. Waiting on the lock
-# costs a caller no more wall time than running that duplicate probe would have,
-# and it leaves the machine less loaded. `threading.Lock` (not an asyncio one) is
-# correct for both call styles: the sync paths call `_check_comfy_version`
-# directly, the async paths via `asyncio.to_thread`, and it is never held across
-# an `await`.
+# N of them on exactly the machine least able to afford it. `threading.Lock` (not
+# an asyncio one) is correct for both call styles: the sync paths call
+# `_check_comfy_version` directly, the async paths via `asyncio.to_thread`, and
+# it is never held across an `await`.
+#
+# Acquired with a BOUND, never unconditionally. The guard's worst case has always
+# been per-call and finite; a bare `with` would make it process-wide and
+# unbounded, because the holder can exceed the probe's nominal cap (on Windows,
+# `subprocess.run`'s post-`kill()` `communicate()` blocks until a leaked
+# grandchild closes the inherited handles) and every later `_run_comfy` would
+# then queue behind it forever. A caller that cannot get in within one probe's
+# full budget falls through to the guard's standard fail-OPEN — the same answer
+# it reaches when its own probe errors, and unlatched, so a later call re-checks.
 _VERSION_CHECK_LOCK = threading.Lock()
+
+# The completed-probe counter and the verdict of the probe that last bumped it,
+# both written only under `_VERSION_CHECK_LOCK`.
+#
+# They exist because three of the guard's verdicts deliberately do NOT latch — a
+# transient spawn error, a too-old comfy-cli, and a TCC-denied start. Without
+# them, callers queued behind an in-flight probe would wake to `_version_checked
+# is False` and each run a probe of its OWN, turning N parallel cold starts into
+# N *serialized* ones: strictly worse than the bug this lock fixes, and on a
+# persistently too-old or TCC-denied install it never self-resolves. A caller
+# compares the counter it read before queueing against the one it sees after
+# getting in; if a probe completed in between, that probe started AFTER the
+# caller arrived, so its verdict is the caller's own answer and is replayed
+# rather than recomputed. That is not the memoization those three branches
+# refuse: a call arriving after the lock goes idle still re-probes, so
+# upgrade-and-retry (or grant-Full-Disk-Access-and-retry) in the same process
+# works exactly as documented.
+_version_probe_generation = 0
+_version_probe_verdict: ComfyCliError | None = None
 
 # `COMFY_PROJECT`'s raw value, read from the environment at most once per
 # process (see `_project_root`). The sentinel distinguishes "not read yet" from
@@ -711,10 +744,88 @@ def _spawn_comfy_version() -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         errors="replace",  # never crash on undecodable `--version` bytes
-        timeout=30.0,
+        timeout=_VERSION_PROBE_TIMEOUT_S,
         check=False,
         cwd=_project_root(),
     )
+
+
+def _probe_comfy_version() -> None:
+    """Run the guard's ``comfy --version`` once and apply its verdict.
+
+    The body of :func:`_check_comfy_version`, split out so that function is only
+    the memo plus the one-probe-at-a-time interlock and this one is only the
+    failure policy — which is the load-bearing half, and reads better as a flat
+    sequence of branches than nested inside a lock. Called from there and nowhere
+    else, always with ``_VERSION_CHECK_LOCK`` held, so its writes to
+    ``_version_checked`` need no synchronization of their own.
+
+    Each branch's choice to latch (or deliberately not to) is unchanged and
+    documented at the branch: a hung probe latches OPEN, a transient spawn error
+    fails open WITHOUT latching, and the two raising verdicts — too-old and
+    TCC-denied — do not latch either, so an upgrade or a Full Disk Access grant
+    inside the same process is re-checked rather than permanently rejected.
+    """
+    global _version_checked
+    try:
+        proc = _spawn_comfy_version()
+    except subprocess.TimeoutExpired:
+        # A hung `--version` is latched so we don't re-block every later call on
+        # the same 30s wait; fail OPEN for the rest of the process.
+        _version_checked = True
+        return
+    except PermissionError as exc:
+        # The spawn ITSELF was denied (not the child exiting non-zero) — e.g. a
+        # `comfy` launcher whose interpreter sits in a protected folder. Without
+        # this branch the generic handler below fails open and the raw EPERM
+        # escapes from the real spawn a moment later, unexplained. Must precede
+        # the OSError handler: PermissionError is a subclass of it.
+        denied = getattr(exc, "filename", None) or tcc._tcc_path_from(str(exc))
+        if tcc._is_macos() and (
+            tcc._looks_like_tcc_denial(str(exc))
+            or tcc._macos_protected_dir(denied) is not None
+        ):
+            raise ComfyCliError(
+                f"`{COMFY_BIN}` could not be started.\n\n{tcc._tcc_guidance(denied)}\n\n"
+                f"Original error: {exc}"
+            ) from exc
+        return  # any other permission problem: fail OPEN, exactly as before
+    except (OSError, subprocess.SubprocessError):
+        # A transient spawn failure fails OPEN for THIS call but is NOT latched —
+        # a later call re-checks rather than permanently disabling the guard.
+        return
+    if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
+        # comfy-cli's own interpreter could not start because macOS denied it
+        # its venv — the reported failure for a ComfyUI install under
+        # ~/Documents. This guard runs before the first tool call of the
+        # process, so catching it here is what turns the raw `Fatal Python
+        # error` traceback into the fix. Deliberately NOT memoized: granting
+        # Full Disk Access and retrying in the same process must re-check.
+        raise ComfyCliError(
+            f"`{COMFY_BIN}` could not start.\n\n"
+            f"{tcc._tcc_guidance(_scrubbed_tcc_path(proc.stderr))}\n\n"
+            # Same rule as `_unwrap_envelope`'s TCC branch: a captured stream is
+            # scrubbed on its way to the client, and so is the path pulled OUT
+            # of one (`_scrubbed_tcc_path`, a no-op on a real filesystem path).
+            # This probe is only `comfy --version`, so it carries no caller URL
+            # of its own — but comfy-cli reads its config at startup, so a
+            # warning naming a configured server URL can land on this stderr,
+            # and the asymmetry is not worth preserving.
+            "Original error: "
+            f"{failure_log._scrubbed_stream_tail(proc.stderr, errors._MAX_ERROR_FIELD_CHARS)}"
+        )
+    version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
+    if version is not None and version < _MIN_COMFY_CLI:
+        # Deliberately do NOT memoize a too-old verdict: if the user upgrades and
+        # retries within the same process, re-check rather than latch the failure.
+        raise ComfyCliError(
+            f"comfy-cli {'.'.join(map(str, version))} is too old — this server "
+            f"requires comfy-cli >= {_MIN_COMFY_CLI_STR}. Upgrade it with "
+            # Double-quoted for the same cross-shell reason as
+            # `_require_comfy_bin`'s install advice — see the note there.
+            f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
+        )
+    _version_checked = True
 
 
 def _check_comfy_version() -> None:
@@ -727,76 +838,51 @@ def _check_comfy_version() -> None:
     logs" deep inside a tool call. Fails OPEN on anything it can't positively read
     as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
     future comfy-cli output-format change can never wedge a working install.
+
+    This function is the interlock; :func:`_probe_comfy_version` is the policy.
+    At most one probe runs at a time, and a caller that queued behind one takes
+    that probe's answer instead of running a second — including when the answer
+    is one of the three verdicts that deliberately do not latch, which is the
+    case that would otherwise serialize N cold starts where N used to run in
+    parallel. See ``_VERSION_CHECK_LOCK`` and ``_version_probe_generation`` for
+    why the wait is bounded and why replaying a verdict is not memoizing it.
+
+    The warm fast path stays OUTSIDE the lock: once the memo is set a call costs
+    one global read and no acquisition, which matters because every
+    ``_run_comfy`` goes through here.
     """
-    global _version_checked
+    global _version_probe_generation, _version_probe_verdict
     if _version_checked:
         return
-    with _VERSION_CHECK_LOCK:
-        # Re-check under the lock: a caller that queued behind an in-flight probe
-        # must observe ITS verdict rather than duplicate it. Everything below is
-        # unchanged — each failure-policy branch latches (or deliberately does
-        # not) exactly as before; the lock only bounds the probe to one at a time.
+    # Sampled BEFORE queueing, so a change observed after getting in means "a
+    # probe both started and finished while I waited" — the precise condition
+    # under which that probe's verdict is also mine.
+    queued_at = _version_probe_generation
+    if not _VERSION_CHECK_LOCK.acquire(timeout=_VERSION_PROBE_TIMEOUT_S):
+        return  # fail OPEN, unlatched — see `_VERSION_CHECK_LOCK`
+    try:
         if _version_checked:
             return
+        if _version_probe_generation != queued_at:
+            if _version_probe_verdict is not None:
+                # Re-raised as the same instance, the way `Future.result()` hands
+                # one exception to every waiter: only ``__traceback__`` is
+                # shared, and MCP surfaces the message, never the traceback.
+                raise _version_probe_verdict
+            return
+        # Cleared first so an escape this function does not model (anything that
+        # is not a `ComfyCliError`) leaves NO stale verdict behind for the next
+        # waiter to replay — it falls open and re-probes, the guard's default.
+        _version_probe_verdict = None
         try:
-            proc = _spawn_comfy_version()
-        except subprocess.TimeoutExpired:
-            # A hung `--version` is latched so we don't re-block every later call on
-            # the same 30s wait; fail OPEN for the rest of the process.
-            _version_checked = True
-            return
-        except PermissionError as exc:
-            # The spawn ITSELF was denied (not the child exiting non-zero) — e.g. a
-            # `comfy` launcher whose interpreter sits in a protected folder. Without
-            # this branch the generic handler below fails open and the raw EPERM
-            # escapes from the real spawn a moment later, unexplained. Must precede
-            # the OSError handler: PermissionError is a subclass of it.
-            denied = getattr(exc, "filename", None) or tcc._tcc_path_from(str(exc))
-            if tcc._is_macos() and (
-                tcc._looks_like_tcc_denial(str(exc))
-                or tcc._macos_protected_dir(denied) is not None
-            ):
-                raise ComfyCliError(
-                    f"`{COMFY_BIN}` could not be started.\n\n{tcc._tcc_guidance(denied)}\n\n"
-                    f"Original error: {exc}"
-                ) from exc
-            return  # any other permission problem: fail OPEN, exactly as before
-        except (OSError, subprocess.SubprocessError):
-            # A transient spawn failure fails OPEN for THIS call but is NOT latched —
-            # a later call re-checks rather than permanently disabling the guard.
-            return
-        if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
-            # comfy-cli's own interpreter could not start because macOS denied it
-            # its venv — the reported failure for a ComfyUI install under
-            # ~/Documents. This guard runs before the first tool call of the
-            # process, so catching it here is what turns the raw `Fatal Python
-            # error` traceback into the fix. Deliberately NOT memoized: granting
-            # Full Disk Access and retrying in the same process must re-check.
-            raise ComfyCliError(
-                f"`{COMFY_BIN}` could not start.\n\n"
-                f"{tcc._tcc_guidance(_scrubbed_tcc_path(proc.stderr))}\n\n"
-                # Same rule as `_unwrap_envelope`'s TCC branch: a captured stream is
-                # scrubbed on its way to the client, and so is the path pulled OUT
-                # of one (`_scrubbed_tcc_path`, a no-op on a real filesystem path).
-                # This probe is only `comfy --version`, so it carries no caller URL
-                # of its own — but comfy-cli reads its config at startup, so a
-                # warning naming a configured server URL can land on this stderr,
-                # and the asymmetry is not worth preserving.
-                "Original error: "
-                f"{failure_log._scrubbed_stream_tail(proc.stderr, errors._MAX_ERROR_FIELD_CHARS)}"
-            )
-        version = _parse_version(f"{proc.stdout}\n{proc.stderr}")
-        if version is not None and version < _MIN_COMFY_CLI:
-            # Deliberately do NOT memoize a too-old verdict: if the user upgrades and
-            # retries within the same process, re-check rather than latch the failure.
-            raise ComfyCliError(
-                f"comfy-cli {'.'.join(map(str, version))} is too old — this server "
-                f"requires comfy-cli >= {_MIN_COMFY_CLI_STR}. Upgrade it with "
-                # Double-quoted for the same cross-shell reason as
-                # `_require_comfy_bin`'s install advice — see the note there.
-                f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
-            )
-        _version_checked = True
+            _probe_comfy_version()
+        except ComfyCliError as exc:
+            _version_probe_verdict = exc
+            raise
+        finally:
+            _version_probe_generation += 1
+    finally:
+        _VERSION_CHECK_LOCK.release()
 
 
 def _scrubbed_tcc_path(text: str | None) -> str | None:
