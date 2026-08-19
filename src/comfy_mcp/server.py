@@ -366,6 +366,93 @@ _MIN_COMFY_CLI_STR = "1.14.0"
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
 
+# The probe subprocess's own wall-clock cap, named because the bound below is
+# derived from it: a waiter's budget has to be stated in terms of what it is
+# waiting FOR, not as a second literal that can drift away from this one.
+_VERSION_PROBE_TIMEOUT_S = 30.0
+
+# How long a caller will wait for SOMEONE ELSE's probe before giving up.
+#
+# Deliberately a little longer than the probe's own cap. A probe that finishes
+# AT its cap must win the race against a waiter's bound, because the two
+# outcomes are not interchangeable: if the holder finishes, the waiter gets a
+# real verdict, whereas if the waiter gives up first it fails open on a machine
+# whose comfy-cli may well be too old. The slack means a waiter only ever times
+# out when the holder has OVERRUN its own cap — the wedged case below, and the
+# one case where giving up is unambiguously the right answer.
+_VERSION_LOCK_WAIT_S = _VERSION_PROBE_TIMEOUT_S + 5.0
+
+# Serializes the probe itself, so racing FIRST calls share one `comfy --version`
+# instead of each spawning its own. The memo alone only dedupes calls that arrive
+# after a probe has FINISHED — the startup machine-snapshot probe (a daemon
+# thread) is usually first, and every tool call arriving while it is still inside
+# its 30s-capped subprocess would otherwise read `_version_checked is False` and
+# spawn a redundant cold comfy-cli interpreter, N concurrent first calls spawning
+# N of them on exactly the machine least able to afford it. `threading.Lock` (not
+# an asyncio one) is correct for both call styles: the sync paths call
+# `_check_comfy_version` directly, the async paths via `asyncio.to_thread`, and
+# it is never held across an `await`.
+#
+# Acquired with a BOUND, never unconditionally. The guard's worst case has always
+# been per-call and finite; a bare `with` would make it process-wide and
+# unbounded, because the holder can exceed the probe's nominal cap (on Windows,
+# `subprocess.run`'s post-`kill()` `communicate()` blocks until a leaked
+# grandchild closes the inherited handles) and every later `_run_comfy` would
+# then queue behind it forever. Giving up latches open ONLY when no probe started
+# during the whole wait — the wedge, where it latches for the same reason the
+# `TimeoutExpired` branch does and with the same force: a holder that overran its
+# cap is a hung `comfy --version` by another route, and without the latch every
+# later call would re-pay the full bound, turning a wedged probe into a permanent
+# per-call stall — worse than the pre-lock behavior, where whichever caller timed
+# out first latched open on everyone's behalf. A waiter that timed out while
+# probes were STARTING has no wedge to report, only contention, and the give-up
+# branch is careful not to read the two as the same thing; see it for why.
+#
+# Because the wait and the probe are consecutive, a single contended first call
+# can cost the bound PLUS a full probe (~65s) before it answers. That is stated
+# at the three `to_thread(_check_comfy_version)` call sites, which is where a
+# reader is asking how long the guard can hold their tool call.
+_VERSION_CHECK_LOCK = threading.Lock()
+
+# The started-probe counter and the REFUSAL of the probe that last ran, both
+# written only under `_VERSION_CHECK_LOCK`. Together they let a caller that
+# queued behind a probe take its answer instead of running a second one.
+#
+# The counter is bumped when a probe STARTS, not when it finishes, and that is
+# the whole subtlety. What makes another probe's answer usable is not that it
+# finished while you waited — it is that it started AFTER you arrived, because
+# only then did it observe a machine at least as current as the one you are
+# asking about. Bumping on completion would let a caller that arrived mid-probe
+# replay a verdict computed before it ever called, so an operator who upgrades
+# comfy-cli (or grants Full Disk Access) while a probe is in flight would get the
+# stale refusal on the very retry the guard promises to re-check. Sampling the
+# counter before queueing and finding it CHANGED means a probe both started and
+# finished in that window, which is exactly the usable case.
+_version_probe_starts = 0
+
+# Only a REFUSAL is shared; a fail-open never is. The refusal verdicts (a too-old
+# comfy-cli, a TCC-denied start, an invalid `COMFY_PROJECT`) are the ones worth
+# replaying: they are persistent, so re-probing costs a full cold start and
+# reaches the same conclusion, and on such an install a re-probing herd never
+# self-resolves — the serialization this counter exists to prevent. A fail-open
+# is the opposite on both counts. Its branch is documented as failing open "for
+# THIS call", it comes from a TRANSIENT spawn failure that the next probe is
+# likely to get past, and sharing it would send the whole herd unguarded into the
+# cryptic errors this guard exists to translate. So a queued caller with no
+# refusal to replay probes for itself, and that probe's success latches the memo
+# for everyone behind it — bounded, unlike the persistent case.
+#
+# Stored as the MESSAGE rather than the exception object: re-raising one instance
+# from many threads mutates shared state on it — each `raise` appends to
+# `__traceback__` and sets `__context__` to whatever the raising thread was
+# handling, chaining an unrelated request's error and its frame locals onto a
+# process-global and holding them until the next probe. Every refusal this guard
+# raises is a message-only `ComfyCliError` constructed at its branch, so the
+# message IS the whole verdict — and `_replayable_refusal` CHECKS that rather
+# than assuming it, so a future verdict carrying structured fields falls back to
+# "the waiters re-probe" instead of reaching them with those fields dropped.
+_version_probe_refusal: str | None = None
+
 # `COMFY_PROJECT`'s raw value, read from the environment at most once per
 # process (see `_project_root`). The sentinel distinguishes "not read yet" from
 # "read and unset" (`None`) without a second flag.
@@ -697,26 +784,29 @@ def _spawn_comfy_version() -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         errors="replace",  # never crash on undecodable `--version` bytes
-        timeout=30.0,
+        timeout=_VERSION_PROBE_TIMEOUT_S,
         check=False,
         cwd=_project_root(),
     )
 
 
-def _check_comfy_version() -> None:
-    """Guard: refuse to run against a comfy-cli older than :data:`_MIN_COMFY_CLI`.
+def _probe_comfy_version() -> None:
+    """Run the guard's ``comfy --version`` once and apply its verdict.
 
-    Runs ``comfy --version`` once per process (memoized via ``_version_checked``).
-    If the reported version is below the floor, raises a clear, actionable
-    :class:`ComfyCliError` telling the user to upgrade — so a stale install fails
-    with "upgrade comfy-cli to >= 1.14.0" instead of a cryptic "No such command:
-    logs" deep inside a tool call. Fails OPEN on anything it can't positively read
-    as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
-    future comfy-cli output-format change can never wedge a working install.
+    The body of :func:`_check_comfy_version`, split out so that function is only
+    the memo plus the one-probe-at-a-time interlock and this one is only the
+    failure policy — which is the load-bearing half, and reads better as a flat
+    sequence of branches than nested inside a lock. Called from there and nowhere
+    else, always with ``_VERSION_CHECK_LOCK`` held, so its writes to
+    ``_version_checked`` need no synchronization of their own.
+
+    Each branch's choice to latch (or deliberately not to) is unchanged and
+    documented at the branch: a hung probe latches OPEN, a transient spawn error
+    fails open WITHOUT latching, and the two raising verdicts — too-old and
+    TCC-denied — do not latch either, so an upgrade or a Full Disk Access grant
+    inside the same process is re-checked rather than permanently rejected.
     """
     global _version_checked
-    if _version_checked:
-        return
     try:
         proc = _spawn_comfy_version()
     except subprocess.TimeoutExpired:
@@ -776,6 +866,118 @@ def _check_comfy_version() -> None:
             f'`pip install --upgrade "comfy-cli>={_MIN_COMFY_CLI_STR}"`.'
         )
     _version_checked = True
+
+
+def _replayable_refusal(exc: ComfyCliError) -> str | None:
+    """``exc``'s message if replaying it loses nothing, else ``None``.
+
+    The replay rebuilds the verdict from a stored string, so it carries the
+    message and nothing else. Every refusal this guard can raise today is a
+    message-only :class:`ComfyCliError` constructed at its branch, which makes
+    that lossless — but nothing about the class enforces it, and a future verdict
+    carrying ``code``, ``data`` or a ``returncode`` would reach every queued
+    caller but the first with those fields silently dropped. So the property is
+    CHECKED here rather than assumed: a refusal that would not survive the round
+    trip is simply not offered for replay, and the callers behind it re-probe.
+    Degrading to a redundant cold start is the right failure — it costs time, not
+    correctness, and it is what the guard did before the interlock existed.
+
+    ``__cause__`` is deliberately not part of the test. The TCC refusal chains
+    the originating ``PermissionError``, and dropping that chain on a replay is
+    the POINT: retaining one exception's traceback and frame locals on a
+    process-global is the leak that made this a stored message in the first
+    place, and the chained detail is already rendered into the message text.
+    """
+    if len(exc.args) != 1 or not isinstance(exc.args[0], str):
+        return None
+    if (
+        exc.code is not None
+        or exc.no_envelope
+        or exc.returncode is not None
+        or exc.timed_out
+        or exc.data is not None
+    ):
+        return None
+    return exc.args[0]
+
+
+def _check_comfy_version() -> None:
+    """Guard: refuse to run against a comfy-cli older than :data:`_MIN_COMFY_CLI`.
+
+    Runs ``comfy --version`` once per process (memoized via ``_version_checked``).
+    If the reported version is below the floor, raises a clear, actionable
+    :class:`ComfyCliError` telling the user to upgrade — so a stale install fails
+    with "upgrade comfy-cli to >= 1.14.0" instead of a cryptic "No such command:
+    logs" deep inside a tool call. Fails OPEN on anything it can't positively read
+    as too-old (an unparseable ``--version``, a ``--version`` that errors) so a
+    future comfy-cli output-format change can never wedge a working install.
+
+    This function is the interlock; :func:`_probe_comfy_version` is the policy.
+    At most one probe runs at a time, and a caller that queued behind one takes
+    its REFUSAL rather than re-deriving it — see ``_version_probe_starts`` for
+    why "started after I arrived" is the condition, and ``_version_probe_refusal``
+    for why a fail-open is never shared. Both the wait and the give-up are
+    bounded; see ``_VERSION_CHECK_LOCK``.
+
+    The warm fast path stays OUTSIDE the lock: once the memo is set a call costs
+    one global read and no acquisition, which matters because every
+    ``_run_comfy`` goes through here.
+    """
+    global _version_checked, _version_probe_starts, _version_probe_refusal
+    if _version_checked:
+        return
+    # Sampled BEFORE queueing, so a change observed after getting in means a
+    # probe STARTED after this call began — the condition under which its answer
+    # is at least as current as one this caller would compute now.
+    queued_at = _version_probe_starts
+    if not _VERSION_CHECK_LOCK.acquire(timeout=_VERSION_LOCK_WAIT_S):
+        # Ran out of patience. WHY decides what to do, because the bound measures
+        # total QUEUE time and only one of the two ways to exhaust it is a wedge.
+        #
+        # No probe STARTED in all that time: one holder has held the lock across
+        # the whole budget without making progress, which is the wedged case the
+        # bound exists for. Latch open exactly as the `TimeoutExpired` branch
+        # does — see `_VERSION_CHECK_LOCK`.
+        #
+        # Probes DID start: the interlock was busy, not stuck, and
+        # `threading.Lock` grants no fairness — so a waiter can exhaust its
+        # budget against a chain of perfectly in-cap probes, or be starved by
+        # later arrivals. Latching there would permanently disable the version
+        # floor process-wide on nothing but contention, which is the one way this
+        # guard must never come undone. Fail open for THIS call only, and first
+        # replay a refusal if one of those probes left one: a non-None refusal
+        # always belongs to the most recently STARTED probe (each probe clears it
+        # as it starts), and that probe started after this caller sampled, so the
+        # "at least as current as one I would compute now" test the in-lock
+        # replay applies is already satisfied. Reading the two globals without
+        # the lock is sound because every interleaving lands on a safe answer —
+        # a refusal that outranks this caller's own, or a fail-open it never
+        # latches.
+        if _version_probe_starts == queued_at:
+            _version_checked = True
+            return
+        refusal = _version_probe_refusal
+        if refusal is not None:
+            raise ComfyCliError(refusal)
+        return
+    try:
+        if _version_checked:
+            return
+        if _version_probe_starts != queued_at and _version_probe_refusal is not None:
+            # A fresh probe already refused; that refusal is this caller's too.
+            # Rebuilt per caller rather than re-raising one shared instance.
+            raise ComfyCliError(_version_probe_refusal)
+        # Bumped BEFORE the probe, and the previous refusal dropped with it, so
+        # neither outlives the probe it describes.
+        _version_probe_starts += 1
+        _version_probe_refusal = None
+        try:
+            _probe_comfy_version()
+        except ComfyCliError as exc:
+            _version_probe_refusal = _replayable_refusal(exc)
+            raise
+    finally:
+        _VERSION_CHECK_LOCK.release()
 
 
 def _scrubbed_tcc_path(text: str | None) -> str | None:
@@ -1933,9 +2135,11 @@ async def _run_comfy_async(
     calls are fine on the thread-pool path.
     """
     _require_comfy_bin()
-    # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
-    # the first call per process); offload it so the async event loop is never
-    # blocked while it runs. Same reason as `_run_comfy_streaming`.
+    # `_check_comfy_version` runs a synchronous `comfy --version` on the first
+    # call per process — up to 30s uncontended, and up to ~65s if it also has to
+    # wait out someone else's probe first (`_VERSION_CHECK_LOCK`). Offload it so
+    # the async event loop is never blocked while it runs. Same reason as
+    # `_run_comfy_streaming`.
     await asyncio.to_thread(_check_comfy_version)
     # Forward --host/--port into the subcommand for a configured remote ComfyUI
     # (no-op for the local default; see target._with_target). Reassigning args means the
@@ -2065,9 +2269,10 @@ async def _run_comfy_streaming(
     ``job(action="wait")``) rather than surface the deadline as an error.
     """
     _require_comfy_bin()
-    # `_check_comfy_version` runs a synchronous `comfy --version` (up to 30s on
-    # the first call per process); offload it so the async event loop is never
-    # blocked while it runs.
+    # `_check_comfy_version` runs a synchronous `comfy --version` on the first
+    # call per process — up to 30s uncontended, and up to ~65s if it also has to
+    # wait out someone else's probe first (`_VERSION_CHECK_LOCK`). Offload it so
+    # the async event loop is never blocked while it runs.
     await asyncio.to_thread(_check_comfy_version)
     # Forward --host/--port into the subcommand for a configured remote ComfyUI
     # (no-op for the local default; see target._with_target). run_workflow(wait=True)
@@ -2830,8 +3035,9 @@ async def _start_login() -> tuple[_LoginChild | None, dict]:
     """
     _require_comfy_bin()
     # Same offload as the streaming path: the guard shells out to
-    # `comfy --version` (up to 30s on the first call per process) and must not
-    # block the event loop.
+    # `comfy --version` on the first call per process (up to 30s uncontended,
+    # ~65s if it waits out another probe first — see `_VERSION_CHECK_LOCK`) and
+    # must not block the event loop.
     await asyncio.to_thread(_check_comfy_version)
     args = ("cloud", "login", "--no-browser", "--timeout", str(_LOGIN_TIMEOUT_S))
     # Materialized rather than spelled inline at the spawn so `_spawn_failure`
