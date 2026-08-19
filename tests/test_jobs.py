@@ -1579,9 +1579,14 @@ def test_a_rejected_per_verb_floor_un_memoizes_the_version(monkeypatch):
     with pytest.raises(server.ComfyCliError, match="1.16.0"):
         asyncio.run(server.job(action="watch", prompt_id="pid"))
 
-    # The refusal dropped BOTH halves of the memo, so the next call re-probes.
+    # The refusal drops the LATCH, so the next call re-probes — and deliberately
+    # does NOT clear `_comfy_cli_version`. That global is read without the
+    # interlock, so nulling it here is exactly the transient "unknown" that would
+    # make a concurrent watch fail OPEN on a readable install; the next probe
+    # rewrites it unconditionally, which is what keeps the stale tuple from being
+    # reused (see the re-probe test below).
     assert server._version_checked is False
-    assert server._comfy_cli_version is None
+    assert server._comfy_cli_version == (1, 15, 0)
 
     # Same process, upgraded install: the watch now runs.
     asyncio.run(server.job(action="watch", prompt_id="pid", timeout_seconds=0.25))
@@ -1592,10 +1597,12 @@ def test_a_rejected_per_verb_floor_un_memoizes_the_version(monkeypatch):
 
 
 def test_a_reprobe_that_cannot_read_the_version_clears_the_stale_one(monkeypatch):
-    """`_comfy_cli_version` is reset at the TOP of the probe, so "unparseable =>
-    fail OPEN" keeps holding on a retry. A source build installed over the
-    release an earlier probe read must leave the version UNKNOWN, not leave the
-    old tuple in place for a per-verb floor to keep refusing on."""
+    """The probe rewrites `_comfy_cli_version` on EVERY exit path, so
+    "unparseable => fail OPEN" keeps holding on a retry. A source build
+    installed over the release an earlier probe read must leave the version
+    UNKNOWN, not leave the old tuple in place for a per-verb floor to keep
+    refusing on. (Written at the exits rather than reset up front so the global
+    is never transiently `None` mid-probe — see `_checked_comfy_version`.)"""
     versions = iter(["comfy-cli, version 1.15.0", "comfy-cli, version unreleased-dev"])
 
     def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
@@ -1616,9 +1623,10 @@ def test_a_reprobe_that_cannot_read_the_version_clears_the_stale_one(monkeypatch
 
 
 def test_concurrent_first_callers_probe_the_version_once(monkeypatch):
-    """`_version_lock` closes the check-then-set: without it every thread that
-    arrives before the latch is set spawns its own 30s `comfy --version`, and a
-    reader can catch `_comfy_cli_version` mid-probe."""
+    """`_VERSION_CHECK_LOCK` closes the check-then-set: without it every thread
+    that arrives before the latch is set spawns its own 30s `comfy --version`.
+    Asserted here from the per-verb floor's angle — every caller comes away with
+    the SAME parsed tuple, none of them a mid-probe `None`."""
     probes: list[int] = []
 
     def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
@@ -1919,8 +1927,8 @@ def test_a_failed_version_probe_records_no_version(monkeypatch):
 def test_a_refused_watch_does_not_re_probe_the_version_on_every_retry(monkeypatch):
     """`_invalidate_version_cache` is rate-limited. Every refused watch calls it,
     so without the limit a client retrying `job(action="watch")` in a loop forces
-    a fresh `comfy --version` per call — each taken with `_version_lock` HELD, so
-    every other tool call in the process queues behind it."""
+    a fresh `comfy --version` per call — each taken with `_VERSION_CHECK_LOCK`
+    HELD, so every other tool call in the process queues behind it."""
     probes: list[int] = []
 
     def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
@@ -2104,3 +2112,38 @@ def test_the_watch_status_polls_widen_the_stdout_cap(monkeypatch):
 
     assert seen["stdout_cap"] == server._JOB_STATUS_STDOUT_MAX_CHARS
     assert seen["stdout_cap"] > server._STDERR_MAX_CHARS
+
+
+def test_an_invalidated_memo_leaves_the_parsed_version_readable(monkeypatch):
+    """The per-verb floor reads `_comfy_cli_version` WITHOUT the version
+    interlock, so a refusal that nulled it on the way out would hand a
+    CONCURRENT watch a transient "unknown" — and that watch would fail OPEN on
+    the very install this one just refused, then block silently for its whole
+    timeout. Dropping the latch is enough: the next probe rewrites the global on
+    every exit path, so the stale tuple is never the thing that gets reused."""
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.15.0")
+    monkeypatch.setattr(server, "_VERSION_REPROBE_MIN_INTERVAL", 0.0)
+
+    assert server._checked_comfy_version() == (1, 15, 0)
+
+    server._invalidate_version_cache()
+
+    assert server._version_checked is False  # the next call re-probes
+    assert server._comfy_cli_version == (1, 15, 0)  # but nobody reads "unknown"
+
+
+def test_a_failed_probe_clears_the_version_it_could_not_establish(monkeypatch):
+    """The other half of the write-once rule. A probe whose spawn dies leaves no
+    verdict, so it must leave no TUPLE either — otherwise a per-verb floor keeps
+    gating on a release that is no longer installed."""
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", (1, 15, 0))
+
+    def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
+        raise OSError("comfy vanished mid-upgrade")
+
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # fails OPEN, without latching
+
+    assert server._comfy_cli_version is None

@@ -64,9 +64,15 @@ def _skip_version_guard(monkeypatch):
     `test_wrapper.py` would leak into every later test in the session, and the
     readers that gate on a HIGHER floor — `job(action="watch")`, which needs
     1.16.0 — would refuse in tests that never mentioned a version at all.
+
+    ``_version_probed_at`` is reset for the same leak, one step removed: it is
+    what rate-limits `_invalidate_version_cache`, so a probe left stamped by an
+    earlier test would silently turn a later test's invalidation into a no-op
+    depending only on how fast the suite ran.
     """
     monkeypatch.setattr(server, "_version_checked", True)
     monkeypatch.setattr(server, "_comfy_cli_version", None)
+    monkeypatch.setattr(server, "_version_probed_at", None)
 
 
 @pytest.fixture(autouse=True)
