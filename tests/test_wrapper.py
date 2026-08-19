@@ -815,6 +815,62 @@ def _release_herd_into_guard(lock, count: int) -> list[BaseException | None]:
     return outcomes
 
 
+def _herd_inside_an_in_flight_probe(
+    lock, monkeypatch, count: int, verdict
+) -> tuple[list[int], list[BaseException | None]]:
+    """Queue ``count`` callers INSIDE a probe that is already running.
+
+    The other herd helper holds the lock before anything probes, so every caller
+    samples `_version_probe_starts` at its pre-bump value. This one stages the
+    scenario the interlock was actually written for — the startup snapshot probe
+    is already inside its cold `comfy --version` when the tool calls land — where
+    the callers instead sample the ALREADY-bumped value. Returns the spawn log
+    and each caller's outcome, the in-flight prober first.
+    """
+    spawns: list[int] = []
+    counter = threading.Lock()
+    probing = threading.Event()
+    finish = threading.Event()
+
+    def fake_spawn() -> subprocess.CompletedProcess:
+        with counter:
+            spawns.append(len(spawns) + 1)
+            nth = len(spawns)
+        if nth == 1:
+            probing.set()
+            assert finish.wait(timeout=30)
+        return verdict()
+
+    monkeypatch.setattr(server, "_spawn_comfy_version", fake_spawn)
+
+    outcomes: list[BaseException | None] = [None] * (count + 1)
+
+    def caller(index: int) -> None:
+        try:
+            server._check_comfy_version()
+        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+            outcomes[index] = exc
+
+    threads = [threading.Thread(target=caller, args=(0,))]
+    threads[0].start()
+    assert probing.wait(timeout=30)  # the first probe is genuinely in flight
+
+    for index in range(1, count + 1):
+        thread = threading.Thread(target=caller, args=(index,))
+        thread.start()
+        threads.append(thread)
+    deadline = time.monotonic() + 30
+    while lock.queued < count + 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert lock.queued == count + 1  # all of them arrived DURING that probe
+
+    finish.set()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)  # no deadlock
+    return spawns, outcomes
+
+
 def test_version_guard_probes_once_for_a_herd_of_racing_first_calls(
     monkeypatch, version_guard
 ):
@@ -969,6 +1025,181 @@ def test_version_guard_does_not_replay_a_probe_that_predates_the_caller(
     assert retry[0] is None  # the retry saw the upgrade rather than the refusal
     assert len(spawns) == 2
     assert server._version_checked is True
+
+
+def test_version_guard_bounds_a_herd_that_lands_inside_an_in_flight_probe(
+    monkeypatch, version_guard
+):
+    """The mid-probe herd costs TWO probes, not one per caller.
+
+    This is the production shape the interlock was written for, and the one the
+    other herd tests cannot stage: the callers arrive while the startup snapshot
+    probe is already inside its cold `comfy --version`, so they sample an
+    ALREADY-bumped `_version_probe_starts` and none of them may replay the
+    verdict of a probe that predates them — that refusal to replay is the
+    upgrade-and-retry promise, pinned next door.
+
+    What keeps that from degenerating into a probe per caller is that the FIRST
+    waiter's own probe starts after every one of the others arrived, so its
+    verdict is a legitimate answer to their question and they replay it. The
+    cost is therefore one re-probe per generation of arrivals, not one per
+    caller: two probes here for six callers, whatever the herd's size. Asserting
+    the exact count is the point — a change that made this N would restore the
+    serialization the lock exists to remove, while still passing every other
+    test in this group.
+    """
+    spawns, outcomes = _herd_inside_an_in_flight_probe(
+        version_guard, monkeypatch, 5, _too_old_version_proc
+    )
+
+    assert len(spawns) == 2  # the in-flight probe + ONE re-probe for the herd
+    assert len(outcomes) == 6
+    for outcome in outcomes:
+        # Bounded is not enough on its own: every caller still gets the real
+        # refusal, since a shared fail-open would admit a too-old install.
+        assert isinstance(outcome, server.ComfyCliError)
+        assert "too old" in str(outcome)
+    assert server._version_checked is False  # a too-old refusal never latches
+    assert not version_guard.locked()
+
+
+def _waiter_that_gives_up(lock, before_timeout) -> BaseException | None:
+    """Run one caller against a HELD lock, mutating state before it gives up.
+
+    `before_timeout()` fires once the caller has sampled `_version_probe_starts`
+    and blocked, so a test can stage exactly what the caller finds when its
+    bound expires. Returns what the caller raised, or ``None``.
+    """
+    outcome: list[BaseException | None] = [None]
+
+    def caller() -> None:
+        try:
+            server._check_comfy_version()
+        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+            outcome[0] = exc
+
+    lock.acquire()
+    try:
+        lock.queued = 0  # this helper's own acquire is not the caller's
+        thread = threading.Thread(target=caller)
+        thread.start()
+        deadline = time.monotonic() + 30
+        while lock.queued < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert lock.queued == 1  # sampled the counter, now blocked on the lock
+        before_timeout()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    finally:
+        lock.release()
+    return outcome[0]
+
+
+def test_version_guard_does_not_latch_open_when_it_only_lost_the_race(
+    monkeypatch, version_guard
+):
+    """Contention alone must never disable the version floor for the process.
+
+    The acquire bound measures total QUEUE time, not one holder's probe, and
+    `threading.Lock` grants no fairness — so a caller can exhaust it against a
+    chain of perfectly in-cap probes, or be starved by later arrivals, with
+    nothing wedged anywhere. Latching there would permanently disable the guard
+    on a machine whose comfy-cli may well be too old, on nothing but load. The
+    wedge is the case where NO probe started in all that time, and only it
+    latches.
+
+    Here a probe both started and refused while the caller waited, so the caller
+    is handed that refusal — it started after the caller arrived, which is the
+    same freshness test the in-lock replay applies.
+    """
+    monkeypatch.setattr(server, "_VERSION_LOCK_WAIT_S", 0.05)
+    spawns = _spawns_recorded(monkeypatch, lambda _n: _passing_version_proc())
+
+    def probe_ran_and_refused() -> None:
+        server._version_probe_starts += 1
+        server._version_probe_refusal = "comfy-cli 1.11.0 is too old"
+
+    outcome = _waiter_that_gives_up(version_guard, probe_ran_and_refused)
+
+    assert isinstance(outcome, server.ComfyCliError)
+    assert "too old" in str(outcome)
+    assert server._version_checked is False  # NOT latched: nothing was wedged
+    assert spawns == []  # it never got in, so it never probed
+
+
+def test_version_guard_fails_open_unlatched_when_it_loses_with_no_verdict(
+    monkeypatch, version_guard
+):
+    """Losing the race with no refusal to inherit fails open for THAT call only.
+
+    The sibling of the test above, for the interleaving where the probes that
+    ran left nothing to replay (they failed open, or a later one cleared the
+    slot as it started). The caller has no verdict, so it falls open — but still
+    does not latch, because the give-up was contention rather than a wedge. The
+    next call re-checks, which is what keeps a busy first second from costing
+    the guard permanently.
+    """
+    monkeypatch.setattr(server, "_VERSION_LOCK_WAIT_S", 0.05)
+    spawns = _spawns_recorded(monkeypatch, lambda _n: _passing_version_proc())
+
+    def probe_ran_and_left_nothing() -> None:
+        server._version_probe_starts += 1
+
+    outcome = _waiter_that_gives_up(version_guard, probe_ran_and_left_nothing)
+
+    assert outcome is None  # failed open
+    assert server._version_checked is False  # ...but did not latch
+    assert spawns == []
+
+    server._check_comfy_version()  # so the very next call still probes
+    assert len(spawns) == 1
+    assert server._version_checked is True
+
+
+def test_version_guard_does_not_replay_a_refusal_that_carries_more_than_a_message(
+    monkeypatch, version_guard
+):
+    """A structured verdict is re-probed rather than replayed lossily.
+
+    The replay rebuilds the error from a stored string, which is lossless only
+    because every refusal reachable today is a message-only `ComfyCliError`.
+    Nothing about the class enforces that, so `_replayable_refusal` checks it:
+    a verdict carrying `code`/`data`/`returncode` is not offered for replay, and
+    the callers behind it re-probe instead of receiving a copy with those fields
+    silently dropped. The cost of that fallback is a redundant cold start — time,
+    not correctness — which is what the guard did before the interlock existed.
+    """
+    probes: list[int] = []
+
+    def structured_refusal() -> None:
+        probes.append(len(probes) + 1)
+        raise server.ComfyCliError("engine said no", code="some_future_code")
+
+    monkeypatch.setattr(server, "_probe_comfy_version", structured_refusal)
+
+    outcomes = _release_herd_into_guard(version_guard, 3)
+
+    assert len(probes) == 3  # each caller re-derived it rather than replaying
+    for outcome in outcomes:
+        assert isinstance(outcome, server.ComfyCliError)
+        assert outcome.code == "some_future_code"  # the fields survive
+    assert server._version_probe_refusal is None  # never offered for replay
+
+
+def test_replayable_refusal_accepts_only_a_bare_message(monkeypatch):
+    """The predicate itself: message-only in, message out; anything else `None`."""
+    assert server._replayable_refusal(server.ComfyCliError("too old")) == "too old"
+
+    for structured in (
+        server.ComfyCliError("x", code="c"),
+        server.ComfyCliError("x", no_envelope=True),
+        server.ComfyCliError("x", returncode=2),
+        server.ComfyCliError("x", timed_out=True),
+        server.ComfyCliError("x", data={"valid": False}),
+        server.ComfyCliError("x", "y"),  # more than one arg: str() reshapes it
+        server.ComfyCliError(),  # no message at all
+    ):
+        assert server._replayable_refusal(structured) is None
 
 
 def test_version_guard_latches_open_when_the_lock_holder_overruns(
