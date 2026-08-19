@@ -599,31 +599,88 @@ def patched_stream(monkeypatch):
     return setup
 
 
+# Last-resort net, NOT a modelling choice: both pipes EOF on their own after
+# this long and ``wait()`` returns, so a regression that stops APPLYING the
+# deadline (a ``timeout`` that no longer reaches ``_run_comfy_streaming``) FAILS
+# instead of hanging the suite forever — there is no per-test timeout in
+# ``pyproject.toml`` to fall back on, and the hand-rolled fakes this fixture
+# replaced got the same bound from their ``asyncio.sleep(1.0)``. Deliberately
+# longer than every bound in the code under test (``_reap_async``'s 5s, the
+# timeout path's 2s stderr re-await): the net must never be what satisfies one
+# of those waits, or it would paper over the very ordering these tests pin.
+_BLOCKED_CHILD_EOF = 30.0
+
+
 class _BlockingStreamProc:
-    """A fake streaming child that emits ``first_lines`` and then never yields.
+    """A fake streaming child that emits ``first_lines`` and then blocks, ALIVE.
 
     The one case ``patched_stream`` cannot model: its ``_FakeProc`` drains a
     canned stream to EOF instantly and reports itself already exited, so it can
-    never hold a read past a deadline. ``returncode`` starts None so the timeout
-    handler's kill fires; no ``pid``, so ``server._kill_proc_tree_async`` takes
-    the ``proc.kill()`` fallback instead of signalling a made-up process group.
+    never hold a read past a deadline. Here BOTH pipes are left open, because a
+    child that is still running has EOF'd neither, and ``returncode`` starts
+    None so the timeout handler's kill actually fires. No ``pid``, so
+    ``server._kill_proc_tree_async`` takes the ``proc.kill()`` fallback instead
+    of signalling a made-up process group — same reasoning as :class:`_FakeProc`.
+
+    ``wait()`` does NOT return until the child terminates, and ``kill()`` is what
+    terminates it: it closes both pipes and sets ``returncode``, exactly as
+    :class:`_FakeAsyncRunProc` does and for the same reason — killing the process
+    GROUP drops every inherited copy of the write fd, which is the only thing
+    that lets a post-kill drain reach EOF instead of blocking. That fidelity is
+    what holds ``_run_comfy_streaming``'s ordering under test: it kills the tree
+    FIRST and only then re-awaits the bounded stderr drain, so a fake whose
+    stderr had already EOF'd would stay green with the kill removed, and one
+    whose ``wait()`` returned early would stay green with the wait moved ahead of
+    the kill — while a real child wedged on both counts.
     """
 
-    def __init__(self, cmd, first_lines, stderr_text=""):
+    def __init__(
+        self,
+        cmd,
+        first_lines,
+        stderr_text="",
+        env=None,
+        stdin=None,
+        limit=None,
+        cwd=None,
+        start_new_session=None,
+    ):
         self.cmd = cmd
-        # Real reader left OPEN: the lines are readable, then the next read
-        # blocks until the caller's deadline cancels it (see stream_reader).
-        self.stdout = stream_reader("".join(first_lines), eof=False)
-        self.stderr = stream_reader(stderr_text)
+        self.env = env
+        self.limit = limit  # what `server` asked for, for the argv assertions
+        self.stdin_arg = stdin  # what `server` asked for, not a writable pipe
+        self.cwd = cwd  # the COMFY_PROJECT anchor `server` resolved, if any
+        self.start_new_session = start_new_session
+        # Real readers left OPEN: the canned output is readable, then the next
+        # read blocks — the caller's deadline is what ends it (see stream_reader).
+        self.stdout = stream_reader("".join(first_lines), limit, eof=False)
+        self.stderr = stream_reader(stderr_text, limit, eof=False)
         self.returncode = None
         self.killed = False
+        self._exited = asyncio.Event()
+        self._expiry = asyncio.get_running_loop().call_later(
+            _BLOCKED_CHILD_EOF, self._expire, 0
+        )
+
+    def _expire(self, returncode: int) -> None:
+        """End the block: EOF both pipes and let ``wait()`` return."""
+        if self.returncode is not None:
+            return
+        self.returncode = returncode
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self._exited.set()
 
     async def wait(self):
-        self.returncode = 0
+        # A live child does not reap: block until something terminates it, so a
+        # cleanup path that waits BEFORE it kills wedges here rather than passing.
+        await self._exited.wait()
         return self.returncode
 
     def kill(self):
         self.killed = True
+        self._expiry.cancel()
+        self._expire(-9)
 
 
 @pytest.fixture
@@ -632,15 +689,49 @@ def blocking_stream(monkeypatch):
 
     Returns ``setup(first_lines, stderr_text=…) -> procs`` — the list capturing
     each spawned :class:`_BlockingStreamProc`, so a test can assert
-    ``procs[0].killed`` (the timeout handler reaped the child) or the argv it
-    was spawned with. The timeout-path counterpart of :func:`patched_stream`.
+    ``procs[0].killed`` (the timeout handler reaped the child), the argv it was
+    spawned with, or the spawn kwargs. The timeout-path counterpart of
+    :func:`patched_stream`, and like it as strict as a real POSIX spawn about the
+    argv it is handed (see :func:`_encode_argv_like_posix`).
+
+    ``first_lines`` is a list of NEWLINE-TERMINATED lines, checked rather than
+    assumed: an unterminated tail sits in the reader's buffer forever, so the
+    event it holds never reaches the progress tracker, and a bare string would
+    otherwise be accepted silently by the ``"".join`` below.
     """
 
     def setup(first_lines, *, stderr_text: str = "") -> list[_BlockingStreamProc]:
+        assert not isinstance(first_lines, str), (
+            "first_lines is a LIST of lines, not a single string"
+        )
+        first_lines = list(first_lines)  # so the check below can't drain a generator
+        assert all(line.endswith("\n") for line in first_lines), (
+            "every line must be newline-terminated or it never leaves the buffer"
+        )
         procs: list[_BlockingStreamProc] = []
 
-        async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-            proc = _BlockingStreamProc(list(cmd), first_lines, stderr_text)
+        async def fake_exec(
+            *cmd,
+            stdout,
+            stderr,
+            env,
+            stdin=None,
+            limit=None,
+            cwd=None,
+            start_new_session=None,
+            **kwargs,
+        ):
+            _encode_argv_like_posix(cmd)
+            proc = _BlockingStreamProc(
+                list(cmd),
+                first_lines,
+                stderr_text,
+                env=env,
+                stdin=stdin,
+                limit=limit,
+                cwd=cwd,
+                start_new_session=start_new_session,
+            )
             procs.append(proc)
             return proc
 
