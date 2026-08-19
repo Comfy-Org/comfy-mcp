@@ -162,7 +162,7 @@ They mirror how `server` spawns the CLI: a spawn-signature change is one edit, n
   conftest's `stream_reader(text, limit)` — reuse it, never hand-roll an awaitable, so
   buffer limits stay exercised.
 - `blocking_stream(first_lines, stderr_text=…) -> procs` — its TIMEOUT counterpart: a child
-  that BLOCKS with both pipes open and `wait()` parked until `kill()` EOFs and reaps it.
+  that BLOCKS with both pipes open, `wait()` parked until `kill()` — or a 30s net — EOFs them.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) -> procs` — the
   plain-JSON *async* path (`_run_comfy_async`): same spawn and real `StreamReader` pipes as
   `patched_stream`, but parses the capture once at the end, not line-by-line. `hang=True`
