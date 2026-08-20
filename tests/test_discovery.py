@@ -225,6 +225,79 @@ def test_nodes_categories_argv(patched_run):
     assert calls[0]["cmd"][4:] == ["nodes", "categories"]
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"action": "search", "query": "sampler"}, ["nodes", "search", "sampler"]),
+        ({"action": "get", "name": "KSampler"}, ["nodes", "show", "KSampler"]),
+        ({"action": "list"}, ["nodes", "ls"]),
+        (
+            {"action": "upstream", "name": "KSampler"},
+            ["nodes", "upstream", "KSampler"],
+        ),
+        (
+            {"action": "downstream", "name": "KSampler"},
+            ["nodes", "downstream", "KSampler"],
+        ),
+        (
+            {"action": "path", "from_type": "MODEL", "to_type": "IMAGE"},
+            [
+                "nodes",
+                "path",
+                "MODEL",
+                "IMAGE",
+                "--max-depth",
+                "6",
+                "--max-paths",
+                "10",
+            ],
+        ),
+        ({"action": "types"}, ["nodes", "types"]),
+        ({"action": "categories"}, ["nodes", "categories"]),
+    ],
+    ids=(
+        "search",
+        "get",
+        "list",
+        "upstream",
+        "downstream",
+        "path",
+        "types",
+        "categories",
+    ),
+)
+def test_every_nodes_action_forwards_object_info_path(patched_run, kwargs, expected):
+    """The saved catalog is one shared option on every grouped action."""
+    calls = patched_run(envelope(data={}))
+
+    server.nodes(**kwargs, object_info_path="catalog.json")
+
+    assert calls[0]["cmd"][4:] == [*expected, "--input", "catalog.json"]
+
+
+@pytest.mark.parametrize(
+    ("object_info_path", "match"),
+    [
+        ("--catalog.json", r"object_info_path.*leading '-'"),
+        ("catalog\0.json", r"object_info_path.*embedded NUL"),
+        ("c" * (argv._MAX_PATH_ARG_LEN + 1), r"object_info_path.*exceeds"),
+        ("/tmp/\ud800.json", r"object_info_path.*cannot be encoded"),
+    ],
+    ids=("option-like", "nul", "oversized", "unencodable"),
+)
+def test_nodes_rejects_invalid_object_info_path_before_spawn(
+    patched_run, object_info_path, match
+):
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=match):
+        server.nodes(
+            action="search", query="sampler", object_info_path=object_info_path
+        )
+
+    assert calls == []
+
+
 # --- `exclude_api` (paid partner-API nodes) --------------------------------
 
 # The shape `comfy nodes search` actually emits: `total` counts every match,
