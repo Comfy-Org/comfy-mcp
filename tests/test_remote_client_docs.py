@@ -45,6 +45,21 @@ def test_claude_code_documents_http_command_and_project_json():
     assert '"url": "${COMFY_MCP_URL:-http://127.0.0.1:9000/mcp}"' in section
 
 
+def test_claude_code_stdio_command_puts_name_before_variadic_env_options():
+    section = _client_section()
+
+    command = "\n".join(
+        [
+            "claude mcp add --transport stdio comfy-mcp \\",
+            "  --env COMFY_BIN=/path/to/venv/bin/comfy \\",
+            "  --env COMFY_API_KEY=YOUR_COMFY_API_KEY \\",
+            "  -- comfy-mcp",
+        ]
+    )
+    assert command in section
+    assert "missing required argument 'commandOrUrl'" in section
+
+
 def test_desktop_and_cursor_document_their_distinct_http_configuration():
     section = _client_section()
 

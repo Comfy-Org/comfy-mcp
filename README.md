@@ -346,8 +346,7 @@ URL:
 claude mcp add --transport http comfy-mcp http://127.0.0.1:9000/mcp
 ```
 
-To check that HTTP registration into the project, add `--scope project` (all Claude options must
-come before the server name):
+To check that HTTP registration into the project, add `--scope project` before the server name:
 
 ```bash
 claude mcp add --transport http --scope project \
@@ -373,11 +372,15 @@ For client-launched local stdio, use:
 ```bash
 # COMFY_API_KEY is optional — add it only if you use partner-API nodes
 # (see the Partner-API nodes section).
-claude mcp add --transport stdio \
+claude mcp add --transport stdio comfy-mcp \
   --env COMFY_BIN=/path/to/venv/bin/comfy \
   --env COMFY_API_KEY=YOUR_COMFY_API_KEY \
-  comfy-mcp -- comfy-mcp
+  -- comfy-mcp
 ```
+
+Keep the server name before the first `--env`: Claude Code's `--env <env...>` option accepts
+multiple values, so putting it first can consume the name and produce a misleading
+`missing required argument 'commandOrUrl'` error.
 
 Or check the stdio form into a project with this `.mcp.json`:
 
