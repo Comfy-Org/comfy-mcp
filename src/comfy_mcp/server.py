@@ -9306,21 +9306,37 @@ def _without_api_nodes(data: Any) -> Any:
     }
 
 
-def _nodes_search_sync(query: str, exclude_api: bool = False) -> Any:
+def _object_info_args(object_info_path: str) -> tuple[str, ...]:
+    """Render comfy-cli's optional saved-catalog argument."""
+    return ("--input", object_info_path) if object_info_path else ()
+
+
+def _nodes_search_sync(
+    query: str, exclude_api: bool = False, object_info_path: str = ""
+) -> Any:
     """``nodes(action="search")``'s body — the exact ``search_nodes`` this replaced."""
-    data = _run_comfy("nodes", "search", query, timeout=60.0)
+    data = _run_comfy(
+        "nodes", "search", query, *_object_info_args(object_info_path), timeout=60.0
+    )
     # Untouched unless asked: `exclude_api=False` is byte-identical passthrough,
     # payload guard included.
     return _without_api_nodes(data) if exclude_api else data
 
 
-def _nodes_get_sync(name: str) -> Any:
+def _nodes_get_sync(name: str, object_info_path: str = "") -> Any:
     """``nodes(action="get")``'s body — the exact ``get_node`` this replaced."""
-    return _run_comfy("nodes", "show", name, timeout=60.0)
+    return _run_comfy(
+        "nodes", "show", name, *_object_info_args(object_info_path), timeout=60.0
+    )
 
 
 def _nodes_list_sync(
-    produces: str, accepts: str, category: str, pack: str, label: str
+    produces: str,
+    accepts: str,
+    category: str,
+    pack: str,
+    label: str,
+    object_info_path: str = "",
 ) -> Any:
     """``nodes(action="list")``'s body — the exact ``list_nodes`` this replaced."""
     args = ["nodes", "ls"]
@@ -9333,27 +9349,35 @@ def _nodes_list_sync(
     ):
         if value:
             args += [flag, value]
-    return _run_comfy(*args, timeout=60.0)
+    return _run_comfy(*args, *_object_info_args(object_info_path), timeout=60.0)
 
 
-def _nodes_upstream_sync(name: str, limit: int | None) -> Any:
+def _nodes_upstream_sync(
+    name: str, limit: int | None, object_info_path: str = ""
+) -> Any:
     """``nodes(action="upstream")``'s body — the exact ``nodes_upstream`` this replaced."""
     args = ["nodes", "upstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
-    return _run_comfy(*args, timeout=60.0)
+    return _run_comfy(*args, *_object_info_args(object_info_path), timeout=60.0)
 
 
-def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
+def _nodes_downstream_sync(
+    name: str, limit: int | None, object_info_path: str = ""
+) -> Any:
     """``nodes(action="downstream")``'s body — the exact ``nodes_downstream`` this replaced."""
     args = ["nodes", "downstream", name]
     if limit is not None:
         args += ["--limit", str(limit)]
-    return _run_comfy(*args, timeout=60.0)
+    return _run_comfy(*args, *_object_info_args(object_info_path), timeout=60.0)
 
 
 def _nodes_path_sync(
-    from_type: str, to_type: str, max_depth: int, max_paths: int
+    from_type: str,
+    to_type: str,
+    max_depth: int,
+    max_paths: int,
+    object_info_path: str = "",
 ) -> Any:
     """``nodes(action="path")``'s body — the exact ``nodes_path`` this replaced."""
     return _run_comfy(
@@ -9365,18 +9389,23 @@ def _nodes_path_sync(
         str(max_depth),
         "--max-paths",
         str(max_paths),
+        *_object_info_args(object_info_path),
         timeout=60.0,
     )
 
 
-def _nodes_types_sync() -> Any:
+def _nodes_types_sync(object_info_path: str = "") -> Any:
     """``nodes(action="types")``'s body — the exact ``nodes_types`` this replaced."""
-    return _run_comfy("nodes", "types", timeout=60.0)
+    return _run_comfy(
+        "nodes", "types", *_object_info_args(object_info_path), timeout=60.0
+    )
 
 
-def _nodes_categories_sync() -> Any:
+def _nodes_categories_sync(object_info_path: str = "") -> Any:
     """``nodes(action="categories")``'s body — the exact ``nodes_categories`` this replaced."""
-    return _run_comfy("nodes", "categories", timeout=60.0)
+    return _run_comfy(
+        "nodes", "categories", *_object_info_args(object_info_path), timeout=60.0
+    )
 
 
 # The eight actions `nodes` dispatches, in the order their old standalone tools
@@ -9432,8 +9461,9 @@ def nodes(
     max_depth: int | None = None,
     max_paths: int | None = None,
     exclude_api: bool = False,
+    object_info_path: str = "",
 ) -> Any:
-    """Search, inspect, filter, or graph-walk node classes in the LOCAL live catalog.
+    """Search, inspect, filter, or graph-walk node classes in a catalog.
 
     Wraps the `comfy nodes` family (`object_info`, incl. custom nodes).
     `action`:
@@ -9468,8 +9498,8 @@ def nodes(
     only for "path"; `exclude_api` only for "search" — elsewhere each is
     rejected.
 
-    Freshness: LIVE — read from `object_info` every call; an outdated
-    install lists outdated nodes.
+    Freshness: LIVE by default; an outdated install lists outdated nodes.
+    SNAPSHOT with `object_info_path`; reads saved `object_info`.
     """
     if action not in _NODES_ACTIONS:
         raise ComfyCliError(
@@ -9596,31 +9626,36 @@ def nodes(
                 field, value, expected="a connection type (e.g. 'MODEL' or 'IMAGE')"
             )
             argv._reject_nul(field, value)
+    if object_info_path:
+        argv._guard_object_info_path(object_info_path)
     # `max_depth` / `max_paths` need no guard: they are typed ints (so they
     # cannot carry an arbitrary caller string at all) and they ride behind
     # `--max-depth` / `--max-paths` as option values, which Click takes
     # verbatim — even the `"-1"` a negative bound would render as.
 
     if action == "search":
-        return _nodes_search_sync(query, exclude_api)
+        return _nodes_search_sync(query, exclude_api, object_info_path)
     if action == "get":
-        return _nodes_get_sync(name)
+        return _nodes_get_sync(name, object_info_path)
     if action == "list":
-        return _nodes_list_sync(produces, accepts, category, pack, label)
+        return _nodes_list_sync(
+            produces, accepts, category, pack, label, object_info_path
+        )
     if action == "upstream":
-        return _nodes_upstream_sync(name, limit)
+        return _nodes_upstream_sync(name, limit, object_info_path)
     if action == "downstream":
-        return _nodes_downstream_sync(name, limit)
+        return _nodes_downstream_sync(name, limit, object_info_path)
     if action == "path":
         return _nodes_path_sync(
             from_type,
             to_type,
             6 if max_depth is None else max_depth,
             10 if max_paths is None else max_paths,
+            object_info_path,
         )
     if action == "types":
-        return _nodes_types_sync()
-    return _nodes_categories_sync()
+        return _nodes_types_sync(object_info_path)
+    return _nodes_categories_sync(object_info_path)
 
 
 # Freshness: the installed-pack half is LIVE (re-read off disk and diffed
@@ -9632,7 +9667,8 @@ def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """Report a custom node pack's Python dependency requirements vs the installed venv (read-only).
 
     Wraps ``comfy node deps``. Separate from ``nodes``
-    (that reads live ``object_info``; this reads the venv's ``pip list``) —
+    (that reads selected ``object_info``, live by default; this reads the venv's
+    ``pip list``) —
     nothing is installed or changed.
 
     Args:
@@ -10973,11 +11009,13 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
 
 
 @mcp.tool()
-def validate_workflow(workflow_path: str) -> Any:
-    """Pre-flight a workflow against the live local ComfyUI before running it.
+def validate_workflow(workflow_path: str, object_info_path: str = "") -> Any:
+    """Pre-flight a workflow against ComfyUI's node catalog before running it.
 
-    Wraps ``comfy validate --workflow <path>`` — checks class_types, input
-    shapes, enums and wiring against the running ComfyUI's ``object_info``.
+    Wraps ``comfy validate --workflow <path> [--input <object_info.json>]`` —
+    checks class_types, input shapes, enums and wiring against the running
+    ComfyUI's ``object_info`` by default, or a saved snapshot when
+    ``object_info_path`` is supplied.
 
     Returns:
         comfy-cli's own report: ``{"valid": bool, "errors": [...], "warnings":
@@ -10985,7 +11023,7 @@ def validate_workflow(workflow_path: str) -> Any:
         read ``.get("valid")`` before running; a missing key means "not
         cleared". Each finding's keys (``node_id``, ``field``, ``code``,
         ``suggestions``) are OPTIONAL — use ``.get()``, never ``[]``. Raising
-        means NO VERDICT came back (e.g. no ComfyUI running).
+        means NO VERDICT came back (e.g. the live or saved catalog was unreadable).
 
     Gotchas:
         - Known blind spots (a pass here does not guarantee the server accepts
@@ -11003,8 +11041,16 @@ def validate_workflow(workflow_path: str) -> Any:
     # `filename` make. A dash-leading path reaches comfy-cli as a usage error (or
     # prints `--help`) that fails envelope parsing; a named error is better.
     argv._guard_workflow_path(workflow_path)
+    if object_info_path:
+        argv._guard_object_info_path(object_info_path)
     try:
-        result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
+        result = _run_comfy(
+            "validate",
+            "--workflow",
+            workflow_path,
+            *_object_info_args(object_info_path),
+            timeout=60.0,
+        )
     except ComfyCliError as exc:
         # `comfy validate` sets the envelope's `ok` to the VERDICT and leaves
         # `error` null, carrying its full `{valid, errors, warnings}` report in

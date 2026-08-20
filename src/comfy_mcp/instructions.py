@@ -77,8 +77,9 @@ flows:
   node CLASS and you do not know which pack provides it, `workflow_deps`
   names the packs a workflow's classes come from and which are missing:
   `validate_workflow` -> `workflow_deps` -> `install_node` ->
-  `restart_comfyui`. `nodes(action="search")` cannot answer this — it only ever finds
-  classes already installed. A `workflow_deps` key that is a repo URL rather
+  `restart_comfyui`. `nodes(action="search")` cannot answer this — it only finds
+  classes in its selected `object_info` catalog (the live install by default).
+  A `workflow_deps` key that is a repo URL rather
   than a registry id is NOT installable by `install_node`; hand those to the
   USER. A missing MODEL is `download_model`.
 - Manage in-flight work with `job(action="queue")` (list jobs) and
@@ -156,7 +157,8 @@ flows:
 Argument naming is uniform across the tool surface — do not guess it: input
 workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `list_workflow_slots`, `list_workflow_notes`, `set_workflow_slot`,
-`vary_workflow`); output files use `out_path` (`fetch_template`,
+`vary_workflow`); saved node catalogs use `object_info_path` (`nodes`,
+`validate_workflow`); output files use `out_path` (`fetch_template`,
 `partner_generate`, `emit_partner_workflow`); output directories use
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
 (`get_template`, `nodes`, `run_template`); job handles use `prompt_id`
