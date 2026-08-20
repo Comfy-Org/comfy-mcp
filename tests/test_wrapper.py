@@ -39,7 +39,8 @@ from conftest import (
     stream_reader,
 )
 
-from comfy_mcp import argv, clitext, errors, failure_log, server, tcc, textutil
+from comfy_mcp import argv, clitext, errors, failure_log, tcc, textutil
+from comfy_mcp.server import _internal as server
 
 
 def _launch(*args, **kwargs):
@@ -1752,7 +1753,7 @@ def test_free_memory_sends_no_unload_models_when_off(patched_run):
     """`unload_models=False` sends the paired OFF flag and drops `--free-memory`.
 
     The pair must not go out as `--no-unload-models --free-memory`: ComfyUI's
-    `POST /free` only records `unload_models` when it is TRUE (server.py's
+    `POST /free` only records `unload_models` when it is TRUE (`_internal.py`'s
     `if unload_models: set_flag(...)`), and the queue worker then resolves
     `flags.get("unload_models", free_memory)` — so a `free_memory` left on would
     supply the default and unload every model, the exact opposite of what
@@ -2931,7 +2932,7 @@ def test_fetch_outputs_omits_url_only_by_default(patched_run):
 def test_server_instructions_cover_canonical_flows():
     """Instructions ride the handshake and teach submit->poll->fetch + templates."""
     instructions = server.mcp.instructions
-    assert instructions  # present on the MCPServer instance
+    assert instructions  # present on the FastMCP instance
 
     # Call-server-info-first + the async submit -> poll -> fetch generation loop.
     # "wait_for_job" -> "job": the six job tools consolidated into
@@ -2975,7 +2976,7 @@ def test_tool_arguments_follow_the_naming_convention():
     """
     schemas = {
         tool.name: tool.parameters.get("properties", {})
-        for tool in server.mcp._tool_manager.list_tools()
+        for tool in asyncio.run(server.mcp.list_tools())
     }
 
     # Every tool that consumes a workflow FILE names it `workflow_path`.
@@ -3009,7 +3010,7 @@ def test_the_readme_tool_count_matches_the_live_tool_set():
     thing a reader can check and the first thing that costs the rest of the
     document its credibility, so it gets a tripwire rather than a convention.
     """
-    count = len(server.mcp._tool_manager.list_tools())
+    count = len(asyncio.run(server.mcp.list_tools()))
     readme = (pathlib.Path(__file__).resolve().parent.parent / "README.md").read_text(
         encoding="utf-8"
     )
@@ -5291,7 +5292,7 @@ def test_restart_comfyui_returns_new_server_status(monkeypatch):
 #
 # `launch` / `stop` / `restart` all drive comfy-cli's ONE recorded pid and the one
 # ComfyUI port. Being dispatched onto a worker thread does not order them — both
-# `asyncio.to_thread` and MCPServer's sync-tool pool have many workers — so
+# `asyncio.to_thread` and FastMCP's sync-tool pool have many workers — so
 # `_LIFECYCLE_LOCK` has to, and a `stop` slipping into the gap between a restart's
 # stop and its launch is exactly the interleaving that leaves a server comfy-cli
 # can no longer stop.

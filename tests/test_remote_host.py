@@ -32,7 +32,8 @@ import subprocess
 import pytest
 from conftest import _OK_STREAM, envelope
 
-from comfy_mcp import server, target
+from comfy_mcp import target
+from comfy_mcp.server import _internal as server
 
 # --- _comfy_target env parsing ---------------------------------------------
 

@@ -1,7 +1,7 @@
-"""The client-handshake instructions text.
+"""The server application's client-handshake instructions text.
 
 Leaf module: a single constant, no imports from this package, so anything may
-depend on it. ``server`` hands this to ``MCPServer(..., instructions=...)`` so
+depend on it. ``server`` hands this to ``FastMCP(..., instructions=...)`` so
 every client sees it once, at connection time, before any tool call — the
 canonical flows an agent would otherwise have to rediscover tool-by-tool.
 """

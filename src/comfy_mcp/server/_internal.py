@@ -1,4 +1,4 @@
-"""comfy-mcp — a thin MCP wrapper over comfy-cli.
+"""Private implementation of comfy-mcp's thin wrapper over comfy-cli.
 
 Every tool shells out to the ``comfy`` command (comfy-cli), pinned to the LOCAL
 target (``--where local``, defaulting to ComfyUI on ``127.0.0.1:8188``), asks
@@ -63,6 +63,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import inspect
 import ipaddress
 import json
 import logging
@@ -78,27 +79,32 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import anyio.to_thread
+from fastmcp import Context
+from fastmcp.utilities.types import Image
 from mcp import types
-from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
 
-from . import (
+from .. import (
     argv,
-    cli,
     clitext,
     errors,
     failure_log,
-    instructions,
     params,
     target,
     tcc,
 )
-from .errors import ComfyCliError
-from .params import SlotOverride, SlotVariants
+from ..client import context as client_context
+from ..client import protocols as client_protocols
+from ..client import subprocess_client
+from ..errors import ComfyCliError
+from ..params import SlotOverride, SlotVariants
+from . import cli, instructions
+from .mcp_app import McpApplicationBuilder
 
 
 def _server_version() -> str:
@@ -129,16 +135,59 @@ def _server_version() -> str:
     return cli._version()
 
 
-# `version` is passed explicitly because the SDK does not infer one: it defaults
-# to `""` and `Server.server_info` hands that straight to the client, so an
-# unversioned server answers `initialize` with `"serverInfo": {"name":
-# "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
-# correlate a bug report against.
-mcp = MCPServer(
-    "comfy-mcp",
+# One builder and one application resource. `version` is explicit because the
+# SDK does not infer one: an unversioned initialize response gives clients
+# nothing useful to display or correlate with a bug report. Transport is
+# selected only in `main()` after every tool below has registered on this app.
+MCP_APPLICATION_BUILDER = McpApplicationBuilder(
+    name="comfy-mcp",
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
 )
+mcp = MCP_APPLICATION_BUILDER.build()
+
+
+class _ModernApprovalRequired(Exception):
+    """Internal control flow carrying a modern-protocol guard result."""
+
+    def __init__(self, result: types.InputRequiredResult) -> None:
+        super().__init__("modern MCP client input is required")
+        self.result = result
+
+
+_approval_round: ContextVar[frozenset[str]] = ContextVar(
+    "comfy_mcp_approval_round", default=frozenset()
+)
+
+
+def _interactive_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Adapt a consent-gated tool to FastMCP 4's modern guard result.
+
+    Handshake-era calls remain ordinary blocking ``ctx.elicit`` calls.  A
+    modern call ends the current round with ``InputRequiredResult``; FastMCP's
+    client fulfils it and invokes the same wrapped function again.  The
+    ContextVar is request-scoped and reset even on cancellation/error, so
+    concurrent clients cannot share approvals.
+    """
+
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    async def guarded(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind_partial(*args, **kwargs)
+        ctx = bound.arguments.get("ctx")
+        approved = _approval_state_from_context(ctx)
+        token = _approval_round.set(approved)
+        try:
+            try:
+                return await fn(*args, **kwargs)
+            except _ModernApprovalRequired as exc:
+                return exc.result
+        finally:
+            _approval_round.reset(token)
+
+    return guarded
+
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
@@ -1180,7 +1229,7 @@ def _spawn_failure(
     return ComfyCliError(message)
 
 
-def _run_comfy_raw(
+def _run_comfy_raw_impl(
     *args: str, timeout: float | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
     """Run ``comfy --json --where local <args>`` and return the RAW envelope + context.
@@ -1283,7 +1332,9 @@ def _run_comfy_raw(
     )
 
 
-def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
+def _run_comfy_impl(
+    *args: str, timeout: float | None = None, plain_ok: bool = False
+) -> Any:
     """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
 
     comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
@@ -1298,7 +1349,9 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     an action that actually succeeded. A non-zero exit, or a real error
     envelope, still raises as usual.
     """
-    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw_impl(
+        *args, timeout=timeout
+    )
     # A plain_ok command that exits 0 without a *real* envelope is a success
     # (the lifecycle verbs and model download, per the docstring above).
     # `_last_json_object` may return a stray non-envelope JSON line (e.g. a
@@ -2089,7 +2142,7 @@ async def _drain_timed_out_async(
         return
 
 
-async def _run_comfy_async(
+async def _run_comfy_async_impl(
     *args: str,
     timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     plain_ok: bool = False,
@@ -2247,7 +2300,7 @@ async def _run_comfy_async(
         await _reap_async(proc)
 
 
-async def _run_comfy_streaming(
+async def _run_comfy_streaming_impl(
     *args: str,
     ctx: Context | None = None,
     timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
@@ -2513,6 +2566,71 @@ async def _run_comfy_streaming(
         # the pipe once the task is cancelled — no join is needed.
         if stderr_future is not None and not stderr_future.done():
             stderr_future.cancel()
+
+
+def _build_comfy_cli_client() -> subprocess_client.SubprocessComfyCliClient:
+    """Compose the outbound engine client without reversing dependencies.
+
+    The lambdas resolve runner globals at call time.  That preserves the
+    established low-level monkeypatch seam while every application/tool call
+    now depends on the client port instead of reaching a runner directly.
+    """
+
+    return subprocess_client.SubprocessComfyCliClient(
+        raw_runner=_run_comfy_raw_impl,
+        runner=_run_comfy_impl,
+        async_runner=_run_comfy_async_impl,
+        streaming_runner=_run_comfy_streaming_impl,
+    )
+
+
+client_context.configure_default_factory(_build_comfy_cli_client)
+
+
+def _run_comfy_raw(
+    *args: str, timeout: float | None = None
+) -> client_protocols.RawComfyResult:
+    """Compatibility entry point routed through the outbound client port."""
+
+    return client_context.get_client().run_raw(*args, timeout=timeout)
+
+
+def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
+    """Compatibility entry point routed through the outbound client port."""
+
+    return client_context.get_client().run(*args, timeout=timeout, plain_ok=plain_ok)
+
+
+async def _run_comfy_async(
+    *args: str,
+    timeout: float | None = None,  # noqa: ASYNC109 - engine deadline, not cancellation
+    plain_ok: bool = False,
+    stdout_cap: int | None = None,
+) -> Any:
+    """Compatibility entry point routed through the outbound client port."""
+
+    return await client_context.get_client().run_async(
+        *args,
+        timeout=timeout,
+        plain_ok=plain_ok,
+        stdout_cap=stdout_cap,
+    )
+
+
+async def _run_comfy_streaming(
+    *args: str,
+    ctx: Context | None = None,
+    timeout: float | None = None,  # noqa: ASYNC109 - engine deadline, not cancellation
+    raise_on_timeout: bool = True,
+) -> Any:
+    """Compatibility entry point routed through the outbound client port."""
+
+    return await client_context.get_client().run_streaming(
+        *args,
+        ctx=ctx,
+        timeout=timeout,
+        raise_on_timeout=raise_on_timeout,
+    )
 
 
 def _detect_comfy_cli_version() -> str | None:
@@ -3215,6 +3333,7 @@ async def auth_login() -> Any:
 
 
 @mcp.tool()
+@_interactive_tool
 async def run_workflow(
     workflow_path: str,
     wait: bool = True,
@@ -3777,6 +3896,44 @@ class SpendApproval(BaseModel):
     )
 
 
+_APPROVAL_STATE_PREFIX = "comfy-mcp-approvals/1:"
+
+
+def _is_modern_protocol(ctx: object | None) -> bool:
+    """Whether FastMCP negotiated the sessionless 2026 protocol era."""
+
+    if ctx is None:
+        return False
+    try:
+        request_context = getattr(ctx, "request_context")
+        version = getattr(request_context, "protocol_version")
+    except (AttributeError, RuntimeError, ValueError):
+        return False
+    return str(version) >= str(types.LATEST_PROTOCOL_VERSION)
+
+
+def _approval_state_from_context(ctx: object | None) -> frozenset[str]:
+    """Read only approval keys sealed by FastMCP in a prior modern round."""
+
+    if not _is_modern_protocol(ctx):
+        return frozenset()
+    try:
+        raw = getattr(ctx, "request_state")
+    except (AttributeError, RuntimeError, ValueError):
+        return frozenset()
+    if not isinstance(raw, str) or not raw.startswith(_APPROVAL_STATE_PREFIX):
+        return frozenset()
+    try:
+        values = json.loads(raw.removeprefix(_APPROVAL_STATE_PREFIX))
+    except (json.JSONDecodeError, ValueError):
+        return frozenset()
+    if not isinstance(values, list) or not all(
+        isinstance(value, str) for value in values
+    ):
+        return frozenset()
+    return frozenset(values)
+
+
 def _client_elicitation_support(ctx: Context | None) -> bool | None:
     """Whether the connected MCP client advertised the elicitation capability.
 
@@ -3794,12 +3951,19 @@ def _client_elicitation_support(ctx: Context | None) -> bool | None:
       no human prompt — the one outcome this tool exists to prevent. The caller
       treats ``None`` as "ask anyway" (see :func:`_resolve_spend_consent`).
     """
+    if _is_modern_protocol(ctx):
+        # Modern clients answer an InputRequiredResult on a subsequent call;
+        # there is no session back-channel capability to probe. Treat this as
+        # interactive so an agent-supplied confirm_* flag cannot bypass the
+        # human gate.
+        return True
     if ctx is None or not callable(getattr(ctx, "elicit", None)):
         return False
     try:
         session = ctx.session
-    except (AttributeError, ValueError):
-        # `Context.session` raises ValueError outside a live request.
+    except (AttributeError, RuntimeError, ValueError):
+        # MCPServer raised ValueError and FastMCP raises RuntimeError outside a
+        # live request. Both mean there is no back-channel to ask.
         return False
     check = getattr(session, "check_client_capability", None)
     if check is None:
@@ -3916,6 +4080,70 @@ class _ApprovalWording(NamedTuple):
     #: pre-authorize this gate. EMPTY means the gate can never be pre-authorized
     #: — which is how the spend gates are held out of the mechanism entirely.
     consent_token: str = ""
+
+
+def _approval_key(wording: _ApprovalWording) -> str:
+    """Stable key shared by every round of one approval gate."""
+
+    return f"comfy_mcp_{wording.consent_token or 'spend'}"
+
+
+def _modern_approval_request(
+    message: str, schema: type[BaseModel], wording: _ApprovalWording
+) -> types.InputRequiredResult:
+    """Describe one confirmation for FastMCP 4's modern guard loop."""
+
+    requested_schema = schema.model_json_schema()
+    request = types.ElicitRequest(
+        method="elicitation/create",
+        params=types.ElicitRequestFormParams(
+            message=message,
+            requested_schema=requested_schema,
+        ),
+    )
+    approved = sorted(_approval_round.get())
+    return types.InputRequiredResult(
+        result_type="input_required",
+        input_requests={_approval_key(wording): request},
+        request_state=f"{_APPROVAL_STATE_PREFIX}{json.dumps(approved)}",
+    )
+
+
+def _modern_approval_answer(
+    ctx: Context, message: str, schema: type[BaseModel], wording: _ApprovalWording
+) -> bool:
+    """Consume or request one modern-protocol confirmation round."""
+
+    key = _approval_key(wording)
+    approved = _approval_round.get()
+    if key in approved:
+        return True
+    try:
+        responses = ctx.input_responses
+    except (AttributeError, RuntimeError, ValueError):
+        responses = None
+    if responses is None or key not in responses:
+        raise _ModernApprovalRequired(
+            _modern_approval_request(message, schema, wording)
+        )
+    response = responses[key]
+    action = getattr(response, "action", None)
+    if action == "decline":
+        return False
+    if action != "accept":
+        raise ComfyCliError(
+            f"{wording.subject} not confirmed: the client did not present the "
+            f"confirmation prompt (it answered {action!r} without a user "
+            f"decision), so nobody was asked. {wording.nothing_done}"
+            f"{wording.escape_hatch}"
+        )
+    content = getattr(response, "content", None)
+    did_approve = (
+        isinstance(content, dict) and content.get("approve") is True
+    ) or getattr(content, "approve", False) is True
+    if did_approve:
+        _approval_round.set(approved | {key})
+    return did_approve
 
 
 _SPEND_APPROVAL_WORDING = _ApprovalWording(
@@ -4037,9 +4265,11 @@ async def _elicit_approval(
             _ASSUME_CONSENT_ENV,
         )
         return True
+    if _is_modern_protocol(ctx):
+        return _modern_approval_answer(ctx, message, schema, wording)
     try:
         result = await asyncio.wait_for(
-            ctx.elicit(message=message, schema=schema),
+            ctx.elicit(message, schema),
             timeout=_ELICIT_TIMEOUT,
         )
     except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -4351,6 +4581,7 @@ def partner_model_schema(model: str) -> Any:
 
 
 @mcp.tool()
+@_interactive_tool
 async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
@@ -4392,7 +4623,7 @@ async def partner_generate(
     # `params` ARGUMENT (this tool's public schema — cannot be renamed) shadows
     # the module import for the rest of this function body, so it is imported
     # again here under a distinct name to reach it qualified anyway.
-    from . import params as _params
+    from .. import params as _params
 
     _params._validate_generate_model(model)
     timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_GENERATE_TIMEOUT)
@@ -4564,7 +4795,7 @@ async def emit_partner_workflow(
     # `params` ARGUMENT (this tool's public schema — cannot be renamed) shadows
     # the module import for the rest of this function body, so it is imported
     # again here under a distinct name to reach it qualified anyway.
-    from . import params as _params
+    from .. import params as _params
 
     _params._validate_generate_model(model)
     if not out_path:
@@ -5006,6 +5237,7 @@ async def _run_template_exec(
 # unrelated subsystem and wrongly refuse free, local-only template runs on a
 # CLI that lacks it.
 @mcp.tool()
+@_interactive_tool
 async def run_template(
     name: str,
     params: dict[str, Any] | None = None,
@@ -5043,7 +5275,7 @@ async def run_template(
     # `params` ARGUMENT (this tool's public schema — cannot be renamed) shadows
     # the module import for the rest of this function body, so it is imported
     # again here under a distinct name to reach it qualified anyway.
-    from . import params as _params
+    from .. import params as _params
 
     if not name:
         raise ComfyCliError(
@@ -5696,7 +5928,7 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 
 
 # Image suffixes we return inline from ``fetch_outputs`` — kept to the formats
-# ``mcp.server.mcpserver.Image`` maps to a real ``image/*`` MIME type (an unknown
+# FastMCP's ``Image`` maps to a real ``image/*`` MIME type (an unknown
 # suffix would fall back to ``application/octet-stream`` and not render).
 _INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
@@ -6204,7 +6436,7 @@ async def _resolve_network_exposure_consent(
 # `restart_comfyui`'s stop and its launch, or two launches racing, leaves either
 # an untracked server nothing can stop or a restart that killed the old server
 # and then lost the port to it. Being dispatched onto a worker thread — an
-# `asyncio.to_thread` hop for the two async tools, MCPServer's own sync-tool pool
+# `asyncio.to_thread` hop for the two async tools, FastMCP's own sync-tool pool
 # for `stop_comfyui` — is NOT serialization: those pools have many workers, so a
 # second call runs alongside the first. This lock is.
 #
@@ -6302,6 +6534,7 @@ def _launch_comfyui_sync(extra_args: list[str]) -> Any:
 # upstream fix — re-invoking via `sys.executable -m comfy_cli` instead of a
 # bare name — is still desirable, but this server no longer depends on it.
 @mcp.tool()
+@_interactive_tool
 async def launch_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -7101,6 +7334,7 @@ def _recycle_untracked_server(
 
 
 @mcp.tool()
+@_interactive_tool
 async def restart_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -7320,6 +7554,7 @@ async def _resolve_update_all_consent(
 
 
 @mcp.tool()
+@_interactive_tool
 async def update_comfyui(
     target: str = "comfy",
     confirm_update_all: bool = False,
@@ -7645,6 +7880,7 @@ def _run_version_switch(version: str) -> Any:
 
 
 @mcp.tool()
+@_interactive_tool
 async def switch_comfyui_version(
     version: str,
     confirm_switch: bool = False,
@@ -8174,6 +8410,7 @@ def _run_node_install(names: list[str]) -> Any:
 # disturb a running server is a pack that upgrades a dependency ComfyUI already
 # imported, which is another reason to restart promptly after installing.
 @mcp.tool()
+@_interactive_tool
 async def install_node(
     names: list[str],
     confirm_install: bool = False,
@@ -11503,13 +11740,9 @@ def _apply_startup_instructions() -> None:
     discarded: the instructions are only ever written HERE, on the main
     thread, before ``mcp.run()`` — never late, never concurrently.
 
-    The SDK exposes ``MCPServer.instructions`` read-only, so the write lands on
-    the low-level server attribute — the field ``create_initialization_options``
-    reads per handshake, which makes a single assignment before ``mcp.run()``
-    sufficient and keeps this the ONE place instructions are ever rebuilt.
-    ``test_machine_snapshot.py`` asserts the public ``mcp.instructions`` getter
-    reflects the write, so an SDK release that moves the attribute fails a test
-    here rather than silently shipping a handshake without the snapshot. A
+    FastMCP exposes ``instructions`` as a mutable application property backed
+    by its low-level server, so one public assignment before serving reaches
+    every later handshake. ``test_machine_snapshot.py`` pins that behavior. A
     ``None`` block (probe failed) or an overrun probe changes nothing: the
     static ``instructions.INSTRUCTIONS`` already tell the agent to call
     ``server_info`` first.
@@ -11531,19 +11764,19 @@ def _apply_startup_instructions() -> None:
     block = result[0]
     if block is None:
         return
-    mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
+    mcp.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
 
 
 def main(args: list[str] | None = None) -> None:
-    """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
+    """Entry point for legacy stdio or long-running Streamable HTTP.
 
     ``args`` defaults to the process's arguments and exists so a test can drive
     the entry point without rewriting ``sys.argv``; the console script calls
     this with none. It is a ``list``, not a ``Sequence``, because a bare ``str``
     satisfies ``Sequence[str]`` and would be read character by character, which
-    :func:`cli._handle_argv` rejects outright. Only the two human-facing flags
-    are intercepted (see that function) — every other argument still falls
-    through to the server exactly as it did when argv was ignored outright.
+    :func:`cli._handle_argv` rejects outright. Only an explicit leading
+    ``serve`` selects HTTP; every other unrecognized argument still falls
+    through to stdio exactly as it did when argv was ignored outright.
 
     A macOS protected-folder denial hit during startup (a config, log, or module
     the server itself reads from under ~/Documents, say) arrives as a bare
@@ -11566,20 +11799,28 @@ def main(args: list[str] | None = None) -> None:
         # version out of installed metadata walks `sys.path`, so it is one more
         # startup read a protected-folder denial can land on, and it deserves
         # the same translated guidance as the rest.
-        if cli._handle_argv(sys.argv[1:] if args is None else args, _MIN_COMFY_CLI_STR):
+        invocation = sys.argv[1:] if args is None else args
+        if cli._handle_argv(invocation, _MIN_COMFY_CLI_STR):
             return
+        remote_config = cli._serve_config(invocation)
         # Before serving: enrich the handshake instructions with the one-shot
         # machine snapshot. Runs inside this try on purpose — the
         # probe swallows its own failures (including a PermissionError, an
         # OSError subclass) and falls open, so nothing here can keep the
         # server from starting.
         _apply_startup_instructions()
-        # Name the transport rather than inheriting the SDK's default: the whole
-        # stdio design rests on it — `failure_log`'s rule that stdout is the
-        # JSON-RPC channel and must never be written to is only true under
-        # stdio. 2.x defaults to "stdio" today, but a default is a thing a
-        # future SDK is free to change, and this one is load-bearing.
-        mcp.run(transport="stdio")
+        if remote_config is None:
+            # Name the transport rather than inheriting the SDK's default: in
+            # stdio stdout is the JSON-RPC channel and must never carry logs.
+            # 2.x defaults to stdio today, but that default is load-bearing.
+            mcp.run(transport="stdio", show_banner=False)
+        else:
+            # Imported only for the explicit HTTP path. The adapter receives
+            # this exact FastMCP application; it never constructs or registers
+            # a second server/tool surface.
+            from . import remote
+
+            remote.serve(remote_config, mcp)
     except PermissionError as exc:
         # Prefer the exception's structured `filename` over re-parsing its text:
         # it is the authoritative path, and it is present for errnos the text
@@ -11596,7 +11837,3 @@ def main(args: list[str] | None = None) -> None:
             flush=True,
         )
         raise SystemExit(1) from exc
-
-
-if __name__ == "__main__":
-    main()

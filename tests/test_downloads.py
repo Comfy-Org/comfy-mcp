@@ -40,9 +40,16 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import pytest
 from conftest import NO_SUCH_OPTION_STDERR, envelope
 
-from comfy_mcp import argv, failure_log, server
+from comfy_mcp import argv, failure_log
+from comfy_mcp.server import _internal as server
 
-_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
+_SERVER_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "comfy_mcp"
+    / "server"
+    / "_internal.py"
+)
 
 
 def _download_model(*args, **kwargs):
@@ -2295,7 +2302,7 @@ def test_download_tool_docstring_within_its_own_token_budget():
             est_tokens = len(doc) // 4
             assert est_tokens <= 220, f"download() docstring ~{est_tokens} est. tokens"
             return
-    pytest.fail("download() tool not found in server.py")
+    pytest.fail("download() tool not found in server/_internal.py")
 
 
 def test_download_docstring_disambiguates_from_download_model():

@@ -11,11 +11,8 @@ the UNKNOWN wording when a healthy payload has no ``hardware``, the
 remote-target note, the scrubbing/redaction, and ``main()`` actually applying
 it before ``mcp.run``.
 
-The write lands on ``mcp._lowlevel_server.instructions`` (the SDK exposes the
-public property read-only), so every assertion here reads the PUBLIC
-``mcp.instructions`` getter on purpose: an SDK release that moves the
-attribute breaks these tests rather than silently shipping a handshake
-without the snapshot.
+FastMCP exposes ``mcp.instructions`` as the mutable application-level setting;
+every assertion reads that public property so a framework change fails loudly.
 """
 
 from __future__ import annotations
@@ -26,7 +23,7 @@ import time
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 HARDWARE = {
     "os": "Darwin",
@@ -56,9 +53,9 @@ def _real_probe(monkeypatch):
 @pytest.fixture(autouse=True)
 def _restore_instructions():
     """Never leak a mutated handshake between tests — ``mcp`` is module-global."""
-    original = server.mcp._lowlevel_server.instructions
+    original = server.mcp.instructions
     yield
-    server.mcp._lowlevel_server.instructions = original
+    server.mcp.instructions = original
 
 
 def test_snapshot_appends_hardware_to_the_handshake(patched_run):
@@ -252,8 +249,9 @@ def test_main_applies_the_snapshot_before_serving(monkeypatch):
         server, "_machine_snapshot_block", lambda: order.append("probe") or "SNAP"
     )
 
-    def fake_run(*, transport):
+    def fake_run(*, transport, show_banner):
         order.append(f"run:{transport}")
+        assert show_banner is False
 
     monkeypatch.setattr(server.mcp, "run", fake_run)
 

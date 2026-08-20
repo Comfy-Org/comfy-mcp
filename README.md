@@ -70,10 +70,11 @@ those same hosted models, while [`COMFYUI_URL`](#driving-a-remote-comfyui) point
 at a ComfyUI on another machine you control.
 
 **This server vs. [Comfy Cloud MCP](#comfy-cloud-mcp).** Two different servers, and running both is
-normal. This one is **stdio**: your client launches it as a subprocess on **your own machine**, and
-it drives the ComfyUI installed there (or one on another machine you control). Comfy Cloud MCP is a
-**remote HTTP** server at `https://cloud.comfy.org/mcp` that your client connects to over the
-network, and it executes workflows on **Comfy Cloud GPUs** — no local GPU, no ComfyUI install. Both
+normal. This one runs on **a machine you control**, either as a client-launched stdio subprocess or
+as your own [long-running Remote HTTP server](#remote-streamable-http); it drives that machine's
+comfy-cli and ComfyUI install (or a separately configured ComfyUI you control). Comfy Cloud MCP is
+a managed HTTP server at `https://cloud.comfy.org/mcp` that executes workflows on **Comfy Cloud
+GPUs** — no local GPU or ComfyUI install. Both
 authenticate: this one signs in to Comfy through comfy-cli ([`auth_login`](#partner-api-nodes) or
 `COMFY_API_KEY`), the cloud one through OAuth in your browser or a Comfy Cloud API key. Both can
 spend credits on **partner** models, so partner generation is not the dividing line — what this
@@ -81,7 +82,7 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 39 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. stdio and Streamable HTTP serve the same 39-tool FastMCP application. The core loop is validated against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -108,9 +109,9 @@ Four steps take you from a fresh install to your first generated image.
    `pip install comfy-mcp` puts a `comfy-mcp` console script on your `PATH`; that command is what
    you point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
-   `comfy-mcp --version` confirms it landed — but don't run `comfy-mcp` itself to test it: it
-   is a **stdio** server that talks MCP over stdin/stdout, so in a terminal it just waits and
-   exits without printing anything. `comfy-mcp --help` says the same thing in one screen.
+   `comfy-mcp --version` confirms it landed — but a bare `comfy-mcp` is the **stdio** mode, so in a
+   terminal it waits for MCP on stdin and exits without printing anything. Use `comfy-mcp serve`
+   for a persistent HTTP listener; `comfy-mcp --help` shows both modes.
 
    To install from a checkout of this repo instead, run `pip install .` there (`pip install -e .`
    for a working copy) — the comfy-cli half is the same either way.
@@ -126,8 +127,8 @@ Four steps take you from a fresh install to your first generated image.
    ```
 
 3. **Add the server to your client** using the snippet for your client in
-   [Configure your AI client](#configure-your-ai-client) just below, then restart / reload it so
-   the tools appear.
+   [Configure your AI client](#configure-your-ai-client), then restart / reload it so the tools
+   appear.
 
 4. **Ask your agent to run a workflow.** For example:
 
@@ -195,10 +196,128 @@ the rename is **not** something `pip install .` finishes on its own, because `co
    The glob carries the two rotations (`failures.jsonl.1`, `failures.jsonl.2`) along with the
    live file, and `mkdir -p` first means this is also safe once the new directory exists.
 
+## Remote Streamable HTTP
+
+Run a long-lived MCP server independently of any client's stdin lifecycle:
+
+```bash
+COMFY_BIN=/path/to/venv/bin/comfy \
+COMFY_API_KEY=YOUR_COMFY_API_KEY \
+COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+comfy-mcp serve \
+  --transport streamable-http \
+  --host 127.0.0.1 \
+  --port 9000 \
+  --log-level INFO
+```
+
+The endpoint is `http://127.0.0.1:9000/mcp`. The application is pinned to
+FastMCP 4.0.0b3 and MCP SDK 2.0.0. One minimal builder owns its name, version,
+and base instructions and creates **one FastMCP application**. Every tool is
+registered on that instance once. The process then selects one adapter:
+`mcp.run(transport="stdio")` or `mcp.http_app(...)` handed to uvicorn.
+
+Consequently both transports expose the same 39 tools, parameters, results,
+confirmations, machine snapshot, and `ComfyCliClient` path. HTTP is not a
+second product API and has no DTO/VO translation layer. A workflow path or any
+other filesystem argument still resolves on the machine running `comfy-mcp`.
+
+The Python module boundary follows the same rule. `comfy_mcp.server` is a
+small public package that exports only `mcp`, `main`, and the 39 registered tool
+callables. Guarded runners, locks, parsers, consent state, and startup helpers
+remain private in `comfy_mcp.server._internal`; importing the public package
+does not make those implementation details part of the supported API.
+
+FastMCP owns JSON-RPC, modern/legacy protocol negotiation, validation,
+Streamable HTTP, and the ASGI lifespan. Stateless JSON responses prevent a
+stale session ID from selecting half-initialized server state. This project
+does not implement parallel JSON-RPC, legacy SSE, reconnect logic, or a private
+session patch. Application/server logs go to stderr; child stdout is parsed
+only as comfy-cli `envelope/1` data.
+
+A minimal FastMCP 4 client (auto-negotiates the modern protocol and falls back
+to a legacy handshake when required):
+
+```python
+import asyncio
+
+from fastmcp import Client
+
+
+async def main() -> None:
+    async with Client("http://127.0.0.1:9000/mcp") as client:
+        tools = await client.list_tools()
+        print([tool.name for tool in tools])
+
+        info = await client.call_tool("server_info")
+        print(info.data)
+
+
+asyncio.run(main())
+```
+
+The listener address is separate from the ComfyUI target:
+
+| Concern | CLI / environment | Example |
+| --- | --- | --- |
+| MCP listener | `--host` / `COMFY_MCP_HOST`, `--port` / `COMFY_MCP_PORT`, `--path` / `COMFY_MCP_PATH` | `127.0.0.1:9000/mcp` |
+| Same-machine ComfyUI | `COMFY_LOCAL_URL` (optional at the default address) | `http://127.0.0.1:8188` |
+| Different-machine ComfyUI | `COMFYUI_URL`, or `COMFYUI_HOST` + `COMFYUI_PORT` | `http://gpu-box:8188` |
+
+`COMFY_MCP_TRANSPORT`, `COMFY_MCP_LOG_LEVEL`, and comma-separated
+`COMFY_MCP_ALLOWED_HOSTS` provide the other `serve` defaults. CLI flags override
+their matching environment values.
+
+The default loopback bind is intentional. To bind a non-loopback interface you
+must explicitly allow the Host header patterns accepted by the SDK's
+DNS-rebinding protection, for example:
+
+```bash
+comfy-mcp serve \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --allowed-host 'mcp.example.test:*'
+```
+
+That check is not authentication. This release does not add an account system,
+OAuth implementation, or TLS termination; for access beyond a trusted private
+network, put the listener behind an authenticated TLS reverse proxy and allow
+only that proxy's public Host value. HTTP exposes the complete tool surface,
+including lifecycle, installation, and update tools; the same MCP elicitation,
+comfy-cli consent, argument guards, and local-state protections apply in both
+transports, but they are not a substitute for authenticating an untrusted
+network deployment.
+
 ## Configure your AI client
 
-All three clients speak the same MCP stdio contract: run the `comfy-mcp` command as a
-server. Pick your client.
+Choose one connection mode, then use the matching client configuration below:
+
+| Mode | Who starts `comfy-mcp` | Client points to | Tool surface |
+| --- | --- | --- | --- |
+| stdio | The AI client, as a subprocess | the `comfy-mcp` command | all 39 tools |
+| Streamable HTTP | You or a service manager, before the client connects | `http://127.0.0.1:9000/mcp` by default | the same 39 tools |
+
+For HTTP, first start the independently managed listener as described in
+[Remote Streamable HTTP](#remote-streamable-http), then register its URL with the client. Do not
+register both examples under different names unless you intentionally want two separately running
+server processes that expose the same application contract.
+
+HTTP mode still needs the same comfy-cli environment. It creates a **second listener**, not a
+replacement for ComfyUI: ComfyUI continues on its own port (normally `8188`), while MCP listens on
+another port (here `9000`). Start ComfyUI first, then start the MCP listener:
+
+```bash
+# COMFY_API_KEY is optional unless you use partner-API nodes.
+# COMFY_LOCAL_URL is optional when ComfyUI already uses 127.0.0.1:8188.
+COMFY_BIN=/path/to/venv/bin/comfy \
+COMFY_API_KEY=YOUR_COMFY_API_KEY \
+COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+comfy-mcp serve --host 127.0.0.1 --port 9000
+```
+
+The AI client connects to `http://127.0.0.1:9000/mcp`; `comfy-mcp` reaches ComfyUI through
+comfy-cli at `http://127.0.0.1:8188`. When a service manager starts `comfy-mcp serve`, put these
+environment variables in that service definition.
 
 > The **server key** (`comfy-mcp` in every snippet below) is just the label your client files
 > these tools under — it is yours to choose, and the `"command"` (`comfy-mcp`) is the only part
@@ -207,11 +326,11 @@ server. Pick your client.
 > pasting a second one** — two keys pointing at the same command register the server twice and
 > your client shows every tool twice. Keeping the old key is equally fine; nothing reads it.
 
-> The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
-> environment your client launches the server with; keep it (pointing at the absolute path) if
-> it isn't. `COMFY_API_KEY` is also shown, commented as optional — keep it only if you use
-> [partner-API nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …); drop it
-> otherwise.
+> `COMFY_BIN` is needed whenever `comfy` is not already on the server process's `PATH`: in stdio
+> that process is launched by the AI client, while in HTTP it is the independently started
+> `comfy-mcp serve`. `COMFY_API_KEY` is optional — keep it only if you use [partner-API
+> nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …). In HTTP mode these variables
+> belong to the `comfy-mcp serve` process, not to the client's URL-only configuration.
 
 > **On macOS, keep ComfyUI out of `~/Documents`, `~/Desktop` and `~/Downloads`** — or grant your
 > client Full Disk Access. macOS blocks apps (and everything they launch) from reading those
@@ -220,18 +339,47 @@ server. Pick your client.
 
 ### Claude Code
 
-One command registers the server:
+Claude Code supports both transports. For HTTP, start `comfy-mcp serve` first, then register its
+URL:
+
+```bash
+claude mcp add --transport http comfy-mcp http://127.0.0.1:9000/mcp
+```
+
+To check that HTTP registration into the project, add `--scope project` (all Claude options must
+come before the server name):
+
+```bash
+claude mcp add --transport http --scope project \
+  comfy-mcp http://127.0.0.1:9000/mcp
+```
+
+The resulting `.mcp.json` may also be written directly. Environment expansion lets each developer
+override the listener URL without editing the checked-in file:
+
+```json
+{
+  "mcpServers": {
+    "comfy-mcp": {
+      "type": "http",
+      "url": "${COMFY_MCP_URL:-http://127.0.0.1:9000/mcp}"
+    }
+  }
+}
+```
+
+For client-launched local stdio, use:
 
 ```bash
 # COMFY_API_KEY is optional — add it only if you use partner-API nodes
 # (see the Partner-API nodes section).
-claude mcp add comfy-mcp \
-  -e COMFY_BIN=/path/to/venv/bin/comfy \
-  -e COMFY_API_KEY=<your-comfy-api-key> \
-  -- comfy-mcp
+claude mcp add --transport stdio \
+  --env COMFY_BIN=/path/to/venv/bin/comfy \
+  --env COMFY_API_KEY=YOUR_COMFY_API_KEY \
+  comfy-mcp -- comfy-mcp
 ```
 
-Or, to check it into a project, add a `.mcp.json` at the repo root:
+Or check the stdio form into a project with this `.mcp.json`:
 
 ```json
 {
@@ -249,9 +397,16 @@ Or, to check it into a project, add a `.mcp.json` at the repo root:
 
 ### Claude Desktop
 
-Edit `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS it lives at
-`~/Library/Application Support/Claude/claude_desktop_config.json`) and add the server, then
-restart Claude Desktop:
+For a remotely reachable HTTP deployment, open **Settings → Connectors → Add custom connector**
+and enter its HTTPS `/mcp` URL. Claude Desktop does not load remote servers from
+`claude_desktop_config.json`; that file is only for locally spawned integrations. A loopback
+`http://127.0.0.1:9000/mcp` listener is not a remotely reachable connector, so use stdio for a
+same-Mac ComfyUI unless you have deliberately published the HTTP service behind an authenticated
+TLS reverse proxy.
+
+For local stdio, edit `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS
+it lives at `~/Library/Application Support/Claude/claude_desktop_config.json`) and add the server,
+then restart Claude Desktop:
 
 ```json
 {
@@ -269,7 +424,20 @@ restart Claude Desktop:
 
 ### Cursor
 
-Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a project:
+Cursor accepts a Streamable HTTP URL directly. After starting `comfy-mcp serve`, add this to
+`~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a project:
+
+```json
+{
+  "mcpServers": {
+    "comfy-mcp": {
+      "url": "http://127.0.0.1:9000/mcp"
+    }
+  }
+}
+```
+
+For client-launched local stdio, use the command form instead:
 
 ```json
 {
@@ -388,6 +556,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 
 - [Quickstart](#quickstart)
 - [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
+- [Remote Streamable HTTP](#remote-streamable-http)
 - [Configure your AI client](#configure-your-ai-client)
 - [Comfy Cloud MCP](#comfy-cloud-mcp)
 - [Prerequisites](#prerequisites)
@@ -1096,15 +1265,37 @@ Default paths — the same per-OS local-state convention comfy-cli itself uses:
 | Linux / other | `~/.config/comfy-mcp/failures.jsonl` |
 
 Each line records the failure `kind` (`error_envelope`, `no_json`, `timeout`, `binary_missing`,
-`schema_mismatch`), a UTC `ts`, the comfy-cli `args`, its `exit_code` and the envelope's
+`spawn_failed`, `schema_mismatch`), a UTC `ts`, the comfy-cli `args`, its `exit_code` and the envelope's
 `error_code`, the message you saw in your client, and up to 4,000 characters of `stdout_tail` /
 `stderr_tail` — deliberately more output than an error message can carry:
 
 ```console
-$ COMFY_MCP_DEBUG_LOG=1 …            # in your MCP client config's env block
 $ jq -r 'select(.kind == "timeout") | .ts + "  " + (.args | join(" "))' \
     ~/Library/Application\ Support/comfy-mcp/failures.jsonl
 ```
+
+The setting is read when the **MCP server process starts**:
+
+- **stdio:** put `COMFY_MCP_DEBUG_LOG=1` in the same MCP client `env` block as
+  `COMFY_BIN` / `COMFY_API_KEY`, then fully restart that client-launched server.
+- **Streamable HTTP:** set it on the machine and service that run
+  `comfy-mcp serve`, not in the remote client's URL-only configuration, then
+  restart that HTTP process. For example:
+
+  ```bash
+  COMFY_MCP_DEBUG_LOG=1 \
+  COMFY_BIN=/path/to/venv/bin/comfy \
+  COMFY_API_KEY=YOUR_COMFY_API_KEY \
+  COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+  comfy-mcp serve --host 127.0.0.1 --port 9000
+  ```
+
+In both modes the runner publishes the same immutable failure event. A single
+JSONL writer observes those events and returns immediately while the setting is
+off; when enabled it writes on the **MCP server host**. This deliberately small
+observer design keeps subprocess code independent of storage without adding a
+general event bus. Both adapters therefore produce the same failure kinds,
+redaction, rotation, and owner-only permissions.
 
 The file rotates itself: 1 MiB per file with two older generations kept (`failures.jsonl.1`,
 `failures.jsonl.2`), so it stops growing at roughly 3 MiB no matter how long you leave it on.
@@ -1120,27 +1311,52 @@ full stop.
 
 ## Smoke test
 
-Turn the manual validation ritual into one command. The e2e smoke test drives the
-real tools end-to-end (no mocks): `server_info` → `run_workflow` on a checkpoint-free
-`EmptyImage` → `SaveImage` graph → `fetch_outputs`, and asserts a valid PNG lands in
-a temp out_dir.
+Validation has two complementary stages. Run both when changing the MCP
+transport, shared client boundary, runner, or workflow/job behavior.
+
+**1. Automated MCP transport and business-flow smoke (no live ComfyUI).** This
+starts a real stdio child and a real loopback Streamable HTTP/ASGI server, uses
+FastMCP clients for negotiation and discovery, and exercises the shared
+comfy-cli path with a deterministic fake engine:
+
+```bash
+pytest -q \
+  tests/test_stdio_business_flow.py \
+  tests/test_remote_transport.py \
+  tests/test_remote_http.py \
+  tests/test_fastmcp_app.py \
+  tests/test_failure_log.py
+```
+
+Both transports cover `server_info` → workflow submission → job status →
+`fetch_outputs` against the same 39-tool application. The tests use a deterministic
+fake engine (including a real temporary executable on the stdio path). HTTP coverage also checks
+concurrent clients, legacy and modern protocol negotiation, native tool-error
+behavior, opt-in failure observation, and clean ASGI/uvicorn shutdown.
+
+**2. Live ComfyUI smoke.** This drives the actual tools through the actual
+`comfy` binary into a running local ComfyUI:
 
 ```bash
 ./scripts/smoke.sh            # or: python -m pytest tests/e2e -m e2e
 ```
 
-It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`)
-**and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
-rather than fails. The e2e tests are deselected by default from plain `pytest`
-runs, so it's safe to run anywhere — and the `pytest` gate stays green on CI
-runners that have neither.
+It needs a running same-machine ComfyUI (`COMFY_LOCAL_URL`, default
+`http://127.0.0.1:8188`) and the `comfy` binary on `PATH` (or `COMFY_BIN`). Keep
+`COMFY_API_KEY` set when that local ComfyUI requires it. If the binary or
+ComfyUI is absent, the tests **skip** rather than fail. The checkpoint-free
+`EmptyImage` → `SaveImage` round trip and `system_stats` need no model; the
+additional `generate_image` regression test requires the documented SD1.5
+checkpoint and fails with comfy-cli's own missing-model error when it is not
+installed. These e2e tests are deselected from plain `pytest` and CI by default.
 
 ## Contributing
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
-setup (`pip install -e '.[dev]'`, `pytest`, `ruff`) and the thin-wrapper
-architecture rule, and [`AGENTS.md`](AGENTS.md) for the full guidelines. This
-project follows a [Code of Conduct](CODE_OF_CONDUCT.md). To report a
+setup, the thin-wrapper/shared-client architecture, FastMCP 4 transport
+guardrails, failure-log requirements, and the mandatory targeted + full test
+gates. [`AGENTS.md`](AGENTS.md) contains the complete implementation rules.
+This project follows a [Code of Conduct](CODE_OF_CONDUCT.md). To report a
 vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License

@@ -1,8 +1,9 @@
 # Contributing to comfy-mcp
 
 Thanks for your interest in improving `comfy-mcp`! This is a small,
-standalone [MCP](https://modelcontextprotocol.io) server that lets AI agents
-drive a user's **local** ComfyUI by shelling out to
+standalone [MCP](https://modelcontextprotocol.io) application with stdio and
+Streamable HTTP adapters. Both let AI agents drive the ComfyUI owned by the
+server host by shelling out to
 [`comfy-cli`](https://github.com/Comfy-Org/comfy-cli).
 
 By participating in this project you agree to abide by our
@@ -17,23 +18,56 @@ response-time SLA.
 
 Before you write any code, read [`AGENTS.md`](AGENTS.md). The core rule:
 
-**Every tool is a passthrough to the `comfy` binary.** There is exactly one way
-to reach comfy-cli — the `_run_comfy(*args)` helper in
-`src/comfy_mcp/server.py`, which shells out to
-`comfy --json --where local <args>`, parses comfy-cli's versioned `envelope/1`
-result, and returns its `data`. Do not bypass it.
+**Every tool is a passthrough to the `comfy` binary.** Application functions
+resolve a `ComfyCliClient` from `src/comfy_mcp/client/`; its concrete
+implementation delegates to the established guarded runners in
+`src/comfy_mcp/server/_internal.py`. Those runners are the only code that may spawn
+`comfy --json[--stream] --where local <args>`, parse comfy-cli's versioned
+`envelope/1` result, and return its data. Do not bypass this boundary.
 
 This means:
 
-- **No HTTP client.** This server never talks to ComfyUI (or anything else) over
-  HTTP directly — comfy-cli owns all I/O with ComfyUI.
+- **No outbound ComfyUI HTTP client.** comfy-cli owns all I/O with ComfyUI. The
+  inbound Remote MCP listener is SDK-managed Streamable HTTP; it is not a
+  second ComfyUI integration.
 - **New functionality belongs in comfy-cli.** If a feature can't be expressed as
   a `comfy` subcommand, the fix is a comfy-cli change, not a workaround here.
 - **No code from the cloud MCP.** Don't copy code, patterns, or dependencies
-  from the Comfy Cloud MCP — this repo is local-only and single-process.
+  from the Comfy Cloud MCP — this repo has no cloud API, signed-URL,
+  multi-tenant, or filesystem-isolation layer.
+- **No transport-owned application path.** `server/remote.py` only adapts the shared
+  FastMCP instance to ASGI/uvicorn. It may not construct a server, register or
+  wrap tools, spawn comfy-cli, or derive product verdicts independently.
 
 A PR that breaks any of these guardrails will be asked to change. See
 [`AGENTS.md`](AGENTS.md) for the full rationale.
+
+## FastMCP 4 and transport guardrails
+
+The framework baseline is the exact pair in `pyproject.toml`:
+`fastmcp==4.0.0b3` and `mcp==2.0.0`. They are upgraded together, with the
+transport, consent, schema, lifecycle, and packaging tests updated in the same
+PR.
+
+- `McpApplicationBuilder` owns the name, version, and base instructions and is
+  called once to create `server.mcp`; every tool registers on that instance.
+- `comfy_mcp.server` exports only `mcp`, `main`, and the 39 tool callables.
+  Runtime helpers live in `comfy_mcp.server._internal`; do not add private
+  aliases to the public package. Tests of private behavior import the owning
+  module explicitly.
+- Bare `comfy-mcp` serves that application through stdio. `comfy-mcp serve`
+  serves the same 39 tools, schemas, results, and confirmations at `/mcp`.
+- Remote mode uses FastMCP's public `http_app(..., stateless_http=True)` ASGI
+  surface and uvicorn lifecycle. Do not add legacy SSE, hand-written JSON-RPC,
+  private session monkeypatches, or catch-all protocol-error suppression.
+- Both adapters use the same application functions and `ComfyCliClient`.
+  `client/` must not import the MCP server, and request-local injection remains
+  a `ContextVar` so concurrent HTTP requests cannot share mutable client state.
+- stdio stdout is protocol-only. Diagnostics go to stderr; the optional failure
+  trail goes only to its configured file.
+
+The rationale, including the LightRAG change-history bugs this avoids, is in
+[`docs/remote-http-design.md`](docs/remote-http-design.md).
 
 ## Dev setup
 
@@ -54,19 +88,55 @@ ruff check .               # lint
 ruff format --check .      # format check (run `ruff format .` to fix)
 ```
 
-The tests mock comfy-cli — they never require a real ComfyUI or the `comfy`
-binary, so `pytest` runs anywhere. There is also an opt-in end-to-end smoke test
-(`./scripts/smoke.sh`) that drives the real tools against a running local
-ComfyUI; it **skips** cleanly when ComfyUI or the `comfy` binary is absent.
+Most tests mock or fake comfy-cli, so `pytest` runs anywhere. Before running
+tests, review the files and paths affected by the change and select a focused
+regression set; after it passes, run the complete three-command gate above.
+
+Changes to the transport, shared client boundary, failure handling, or workflow
+business flow must also run this focused smoke set:
+
+```bash
+pytest -q \
+  tests/test_stdio_business_flow.py \
+  tests/test_remote_http.py \
+  tests/test_remote_transport.py \
+  tests/test_fastmcp_app.py \
+  tests/test_failure_log.py
+```
+
+This uses real stdio and loopback Streamable HTTP MCP transports with a
+deterministic fake engine. It is distinct from the opt-in live-engine smoke
+test (`./scripts/smoke.sh`), which drives the real `comfy` binary against a
+running same-machine ComfyUI selected with `COMFY_LOCAL_URL`. The live suite
+skips when ComfyUI or the binary is absent; its `generate_image` case also
+requires the documented SD1.5 checkpoint.
+
+## Failure log changes
+
+`COMFY_MCP_DEBUG_LOG` is deliberately off by default, local to the MCP server
+host, owner-only, bounded by rotation, and best-effort. Runners publish one
+immutable `_FailureEvent`; the JSONL writer is its sole default observer and
+returns without filesystem work while disabled. Keep this small—do not turn it
+into a general event bus. Any new runner failure must call
+`failure_log._log_failure(...)` immediately before its exception reaches the
+shared application. Preserve URL credential/query redaction for arguments,
+messages, and stream tails. Update the README's kind list and both stdio/HTTP
+configuration guidance whenever this contract changes, and add a regression
+at the runner and observer boundary.
 
 ## Adding or changing a tool
 
-- Every tool is a thin `_run_comfy(...)` call — keep it that way.
+- Every tool is a thin call through the shared `ComfyCliClient` runners — keep
+  it that way.
 - Add or update the tool's test in the same PR (`tests/` mirrors the tool
   groups: `test_wrapper.py`, `test_parser.py`, `test_discovery.py`,
   `test_templates.py`, …).
+- A registered tool is available over both transports. Review network exposure
+  and confirmation semantics as part of every tool change; do not hide the
+  issue by creating a transport-specific registry or wrapper.
 - Keep [`README.md`](README.md) and [`AGENTS.md`](AGENTS.md) in sync when you
-  change the tool set, the architecture rule, or the toolchain.
+  change the tool set, client architecture, transport, failure-log contract,
+  smoke stages, or toolchain.
 
 ## Opening a pull request
 

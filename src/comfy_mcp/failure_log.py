@@ -2,8 +2,8 @@
 
 Leaf module over :mod:`comfy_mcp.textutil`: it owns the log's configuration,
 its module-level state (``_FAILURE_LOG_PATH`` and the lazily-opened rotating
-handler) and the single ``_log_failure`` entry point ``server`` calls before
-each raise. Nothing here imports ``server``.
+handler), and the small failure-event publisher ``server`` calls before each
+raise. The JSONL writer observes those events. Nothing here imports ``server``.
 
 Tests that need the log on (or off) must patch ``failure_log._FAILURE_LOG_PATH``
 — the state lives here, so patching a name on ``server`` would have no effect.
@@ -17,6 +17,8 @@ import os
 import re
 import sys
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -56,10 +58,26 @@ _FAILURE_LOG_MESSAGE_CHARS = 2000
 _FAILURE_LOG_MAX_BYTES = 1_048_576
 _FAILURE_LOG_BACKUPS = 2
 
-# A dedicated logger with `propagate = False`. Non-propagation is not cosmetic:
-# this is an MCP **stdio** server, so stdout is the protocol transport, and a
-# record reaching a default root handler could corrupt the session.
+# A dedicated logger with `propagate = False`. In stdio mode stdout is the MCP
+# protocol transport, so inheriting an arbitrary root stdout handler could
+# corrupt the session. Streamable HTTP does not need that protocol reservation, but
+# keeps the same predictable policy: application/server logs go to stderr and
+# this opt-in diagnostic trail goes only to its owner-only file.
 _FAILURE_LOGGER_NAME = "comfy_mcp.failures"
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureEvent:
+    """One immutable runner failure delivered to diagnostic observers."""
+
+    kind: str
+    args: tuple[str, ...]
+    exit_code: int | None = None
+    error_code: str | None = None
+    message: str = ""
+    stdout: str | bytes | None = None
+    stderr: str | bytes | None = None
+    streaming: bool = False
 
 
 def _default_failure_log_path() -> str:
@@ -68,7 +86,7 @@ def _default_failure_log_path() -> str:
     Mirrors comfy-cli's own local-state convention (its ``constants.py``
     ``DEFAULT_CONFIG``) with a ``comfy-mcp`` leaf, hand-rolled rather than
     imported: comfy-cli is the *engine* this server shells out to, not a Python
-    dependency of it (``mcp`` is the only one), so there is nothing to import.
+    dependency of it (the MCP framework is), so there is nothing to import.
 
     Deliberately NOT under the ComfyUI workspace: resolving that requires
     *running* comfy-cli, and this log's prime scenarios — a missing binary, a
@@ -372,6 +390,36 @@ def _failure_logger(path: str) -> logging.Logger:
     return logger
 
 
+def _write_failure_event(event: _FailureEvent) -> None:
+    """Observe one event and append its scrubbed JSONL record when opted in."""
+
+    path = _FAILURE_LOG_PATH
+    if path is None:
+        return
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "kind": event.kind,
+        "args": [_scrub_arg(arg) for arg in event.args],
+        "exit_code": event.exit_code,
+        "error_code": event.error_code,
+        # Scrub first, THEN cap. Capping first would cut a credential URL
+        # before its `@`, leaving an unrecognized raw userinfo fragment.
+        "message": _scrub_text(event.message)[:_FAILURE_LOG_MESSAGE_CHARS],
+        "stdout_tail": _scrubbed_stream_tail(event.stdout, _FAILURE_LOG_TAIL_CHARS),
+        "stderr_tail": _scrubbed_stream_tail(event.stderr, _FAILURE_LOG_TAIL_CHARS),
+        "streaming": event.streaming,
+    }
+    _failure_logger(path).info(json.dumps(entry, ensure_ascii=False))
+
+
+# One observer is enough: this is not a general event bus. Keeping it as a
+# tuple makes the publisher testable and leaves room for a process embedding
+# the server to observe failures without coupling the runners to file I/O.
+_FAILURE_OBSERVERS: tuple[Callable[[_FailureEvent], None], ...] = (
+    _write_failure_event,
+)
+
+
 def _log_failure(
     kind: str,
     args: tuple[str, ...] | list[str],
@@ -382,57 +430,32 @@ def _log_failure(
     stderr: str | bytes | None = None,
     streaming: bool = False,
 ) -> None:
-    """Append one JSONL record for a comfy-cli failure, if the log is enabled.
+    """Publish one runner failure to the registered best-effort observers.
 
-    Called immediately before each raise, so every line recorded corresponds to a
-    failure a caller actually saw. ``kind`` is one of ``error_envelope`` /
-    ``no_json`` / ``timeout`` / ``binary_missing`` / ``schema_mismatch``.
+    Called immediately before each raise, so every event corresponds to a
+    failure a caller actually saw. The default observer writes JSONL only when
+    ``COMFY_MCP_DEBUG_LOG`` selected a path; while disabled it has zero
+    filesystem effects.
 
-    The record is STRUCTURED, not just the formatted sentence, so the log is
-    ``jq``/grep-able without parsing prose — ``message`` is kept alongside it so
-    QA can correlate a line with what the MCP client displayed. Stream tails go
-    through :func:`_stream_tail` (tail-not-head, ``<empty>`` marker, ``...``
-    truncation prefix) for consistency with those messages.
-
-    Best-effort by construction: a disabled log returns before touching
-    anything, and ANY error while writing is swallowed — a diagnostic aid must
-    never mask, replace, or delay the real error.
+    Observer failures are isolated from one another and swallowed after a
+    debug message. Diagnostics must never replace the real ``ComfyCliError``.
     """
-    path = _FAILURE_LOG_PATH
-    if path is None:
-        return
-    try:
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "kind": kind,
-            "args": [_scrub_arg(arg) for arg in args],
-            "exit_code": exit_code,
-            "error_code": error_code,
-            # Scrub first, THEN cap. Capping first would cut a
-            # `https://<user>:<pass>@host` URL straddling the boundary, and
-            # `_redact_url` only masks userinfo when it still finds the `@` in
-            # the netloc — so the surviving `user:pass` half would be written
-            # unredacted. `_URL_RE` is a linear single-pass scan, so running it
-            # over the full message before bounding costs nothing worth the
-            # leak.
-            "message": _scrub_text(message)[:_FAILURE_LOG_MESSAGE_CHARS],
-            "stdout_tail": _scrubbed_stream_tail(stdout, _FAILURE_LOG_TAIL_CHARS),
-            "stderr_tail": _scrubbed_stream_tail(stderr, _FAILURE_LOG_TAIL_CHARS),
-            "streaming": streaming,
-        }
-        _failure_logger(path).info(json.dumps(entry, ensure_ascii=False))
-    except Exception:  # a diagnostic aid must never mask the real error
-        # Swallowed by design (see the contract in this function's docstring):
-        # this runs while a REAL error is being reported, so letting a logging
-        # fault replace it would lose the failure the user actually needs.
-        #
-        # But swallowing it SILENTLY is how a failure log ends up reading healthy
-        # while writing nothing — a disabled log and a broken one would look
-        # identical. So the drop is recorded on the module logger, which is a
-        # different, PROPAGATING logger from the non-propagating
-        # `comfy_mcp.failures` one that just failed: it can neither recurse
-        # nor re-enter the broken handler. `debug` because this file is an opt-in
-        # diagnostic, so its own faults belong at diagnostic level too.
-        logging.getLogger(__name__).debug(
-            "failure-log write failed; the entry was dropped", exc_info=True
-        )
+
+    event = _FailureEvent(
+        kind=kind,
+        args=tuple(args),
+        exit_code=exit_code,
+        error_code=error_code,
+        message=message,
+        stdout=stdout,
+        stderr=stderr,
+        streaming=streaming,
+    )
+    for observer in _FAILURE_OBSERVERS:
+        try:
+            observer(event)
+        except Exception:  # diagnostic observers must never mask the real error
+            logging.getLogger(__name__).debug(
+                "failure observer failed; the event was dropped",
+                exc_info=True,
+            )

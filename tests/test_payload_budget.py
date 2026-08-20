@@ -17,9 +17,15 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from comfy_mcp import instructions
+from comfy_mcp.server import instructions
 
-_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
+_SERVER_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "comfy_mcp"
+    / "server"
+    / "_internal.py"
+)
 
 # Ceiling, in estimated tokens (chars/4). Measured 2026-08-07 after the
 # tool-consolidation series' third and final commit (`nodes(action=...)`,

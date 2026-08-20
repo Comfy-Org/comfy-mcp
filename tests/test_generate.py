@@ -22,7 +22,7 @@ import asyncio
 import pytest
 from conftest import _OK_STREAM, _RecordingCtx
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 
 def test_generate_image_streams_and_maps_command(patched_stream):

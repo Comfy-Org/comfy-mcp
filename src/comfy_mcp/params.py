@@ -343,7 +343,7 @@ _SlotModel = TypeVar("_SlotModel", bound=BaseModel)
 def _as_slot_model(item: Any, model: type[_SlotModel]) -> _SlotModel:
     """Coerce one structured slot item to its model.
 
-    Over MCP, MCPServer has already validated the item into ``model``. A plain
+    Over MCP, FastMCP has already validated the item into ``model``. A plain
     mapping only reaches here from an in-process caller (this module's own
     tests, a script importing the tool), so it is validated through the same
     model rather than read key-by-key — one definition of the shape, one set of

@@ -30,7 +30,7 @@ import json
 import pytest
 from conftest import _FakeRunProc, _raises_at_spawn, envelope
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 #: The pid comfy-cli records: the `comfy … launch` wrapper, reparented to init.
 WRAPPER_PID = 64063

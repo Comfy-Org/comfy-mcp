@@ -34,13 +34,13 @@ import asyncio
 
 import pytest
 from conftest import envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 
 def _restart(*args, **kwargs):
@@ -59,7 +59,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     A local copy of the other gates' fake rather than a shared one, following the
     convention those files set: this gate's prompt must be assertable on its own,
@@ -72,10 +72,10 @@ class _FakeCtx:
         self._approve = approve
         self.elicitations: list[str] = []
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
@@ -293,7 +293,7 @@ def test_an_unanswered_prompt_lapses_into_a_refusal(clash, monkeypatch):
     state = clash([_dry_run()])
 
     class _SilentCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             self.elicitations.append(message)
             await asyncio.sleep(3600)
 
@@ -313,7 +313,7 @@ def test_a_client_that_errors_on_the_prompt_is_a_refusal(clash):
     state = clash([_dry_run()])
 
     class _BoomCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             raise RuntimeError("no prompt surface")
 
     with pytest.raises(server.ComfyCliError) as excinfo:

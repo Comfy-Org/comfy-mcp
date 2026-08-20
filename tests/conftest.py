@@ -51,7 +51,8 @@ import os
 
 import pytest
 
-from comfy_mcp import failure_log, server, target
+from comfy_mcp import failure_log, target
+from comfy_mcp.server import _internal as server
 
 
 @pytest.fixture(autouse=True)
@@ -553,7 +554,7 @@ class _FakeProc:
 
 
 class _RecordingCtx:
-    """A fake MCPServer Context that records each ``report_progress`` call."""
+    """A fake FastMCP Context that records each ``report_progress`` call."""
 
     def __init__(self):
         self.calls: list[dict] = []

@@ -23,7 +23,9 @@ import os
 import pytest
 from conftest import envelope
 
-from comfy_mcp import argv, instructions, server
+from comfy_mcp import argv
+from comfy_mcp.server import _internal as server
+from comfy_mcp.server import instructions
 
 # A representative slice of the real comfy-cli `templates ls` payload shape.
 ROWS = [

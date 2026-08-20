@@ -19,9 +19,16 @@ from pathlib import Path
 import pytest
 from conftest import envelope
 
-from comfy_mcp import argv, server
+from comfy_mcp import argv
+from comfy_mcp.server import _internal as server
 
-_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
+_SERVER_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "comfy_mcp"
+    / "server"
+    / "_internal.py"
+)
 
 
 def test_nodes_search_argv(patched_run):
@@ -1053,7 +1060,7 @@ def test_nodes_tool_docstring_within_its_own_token_budget():
                 f"nodes() docstring ~{est_tokens} est. tokens"
             )
             return
-    pytest.fail("nodes() tool not found in server.py")
+    pytest.fail("nodes() tool not found in server/_internal.py")
 
 
 # ---------------------------------------------------------------------------

@@ -17,10 +17,13 @@ tools (no mocks):
    installed locally; without it the run fails with comfy-cli's own missing-model
    error rather than skipping.
 
-**Gated.** They require BOTH a live local ComfyUI answering on ``COMFYUI_URL`` (or
-``http://127.0.0.1:8188``) AND the ``comfy`` binary on ``PATH`` (or ``COMFY_BIN``).
-CI runners have neither, so they SKIP cleanly there — CI stays green via skip, not
-failure. Run them on a machine that has both with::
+**Gated.** They require BOTH a live same-machine ComfyUI answering on
+``COMFY_LOCAL_URL`` (or ``http://127.0.0.1:8188``) AND the ``comfy`` binary on
+``PATH`` (or ``COMFY_BIN``). ``COMFYUI_URL`` / ``COMFYUI_HOST`` are deliberately
+rejected here: those configure the wrapper's remote ComfyUI routing, while this
+suite validates its local engine boundary. CI runners have neither, so they SKIP
+cleanly there — CI stays green via skip, not failure. Run them on a machine that
+has both with::
 
     python -m pytest tests/e2e -m e2e      # or: scripts/smoke.sh
 """
@@ -36,7 +39,7 @@ from pathlib import Path
 
 import pytest
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 # PNG signature — the 8 magic bytes every PNG starts with. Enough to prove a real
 # image landed without pulling in an image library (Pillow etc.).
@@ -50,7 +53,7 @@ _DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
 
 def _comfyui_url() -> str:
     """Base URL of the local ComfyUI to probe (env override, else the default)."""
-    return os.environ.get("COMFYUI_URL", _DEFAULT_COMFYUI_URL).rstrip("/")
+    return os.environ.get("COMFY_LOCAL_URL", _DEFAULT_COMFYUI_URL).rstrip("/")
 
 
 def _server_responds() -> bool:
@@ -65,10 +68,23 @@ def _server_responds() -> bool:
 
 def _skip_reason() -> str | None:
     """Return why the smoke test can't run here, or None if the prereqs are met."""
+    remote_vars = tuple(
+        name
+        for name in ("COMFYUI_URL", "COMFYUI_HOST", "COMFYUI_PORT")
+        if os.environ.get(name, "").strip()
+    )
+    if remote_vars:
+        configured = ", ".join(remote_vars)
+        return (
+            f"live smoke is local-only; unset {configured} and use "
+            "COMFY_LOCAL_URL for a non-default same-machine address"
+        )
     if shutil.which(server.COMFY_BIN) is None:
         return f"`{server.COMFY_BIN}` not on PATH — install comfy-cli or set COMFY_BIN"
     if not _server_responds():
-        return f"no live ComfyUI at {_comfyui_url()} — launch one or set COMFYUI_URL"
+        return (
+            f"no live ComfyUI at {_comfyui_url()} — launch one or set COMFY_LOCAL_URL"
+        )
     return None
 
 
@@ -145,18 +161,10 @@ def test_system_stats_reports_devices():
     exactly what this tool's version-skew hint exists for, so it is worth one
     real call.
 
-    Skipped when `COMFYUI_URL` points somewhere other than the default loopback:
-    the module gate probes THAT url, but `system_stats` is explicitly not
-    diverted by it (`comfy system-stats` takes no `--host`/`--port`), so it would
-    query whatever comfy-cli resolves locally — possibly nothing. Without this
-    guard a remote-ComfyUI setup fails the test spuriously instead of skipping.
+    ``COMFY_LOCAL_URL`` is the same local-address setting comfy-cli resolves for
+    this verb, so the prerequisite probe and the command stay on one target.
+    Remote routing variables are rejected by the module gate above.
     """
-    if _comfyui_url() != _DEFAULT_COMFYUI_URL:
-        pytest.skip(
-            f"COMFYUI_URL={_comfyui_url()} is remote, but `comfy system-stats` "
-            "always targets comfy-cli's own local resolution"
-        )
-
     stats = server.system_stats()
 
     assert isinstance(stats, dict), f"system-stats returned {stats!r}"

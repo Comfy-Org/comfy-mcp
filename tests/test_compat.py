@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from conftest import _FakeRunProc, _raises_at_spawn
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 # --- envelope-version assertion (_unwrap_envelope) --------------------------
 
@@ -980,7 +980,7 @@ def test_no_capability_claim_hedges_a_version_the_floor_already_covers():
         hedged.extend(_hedged_versions(rendered))
     offenders = [v for v in hedged if v <= server._MIN_COMFY_CLI]
     assert offenders == [], (
-        f"{len(offenders)} capability claim(s) in server.py hedge a comfy-cli "
+        f"{len(offenders)} capability claim(s) in server/_internal.py hedge a comfy-cli "
         f"version at or below the {server._MIN_COMFY_CLI_STR} floor "
         f"({', '.join('.'.join(map(str, v)) for v in offenders)}) — the floor "
         "already guarantees it, so the sentence is vacuous or false. Name the "
@@ -1026,7 +1026,7 @@ def test_the_degrade_messages_name_the_release_that_carries_their_verb():
         ("freshness unavailable", "comfy-cli 1.13.0 and newer"),
     ):
         matches = [text for text in rendered if text.startswith(prefix)]
-        assert matches, f"no {prefix!r} degrade message found in server.py"
+        assert matches, f"no {prefix!r} degrade message found in server/_internal.py"
         # `ast.walk` yields the joined string AND the leading fragment it was
         # concatenated from, so take the longest — the fully assembled message.
         assert expected in max(matches, key=len)

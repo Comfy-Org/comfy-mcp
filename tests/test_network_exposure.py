@@ -36,13 +36,14 @@ import contextlib
 
 import pytest
 from conftest import envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import argv, server
+from comfy_mcp import argv
+from comfy_mcp.server import _internal as server
 
 
 def _launch(*args, **kwargs):
@@ -79,7 +80,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     A local copy of the other gates' fakes rather than a shared one, following
     the convention those files set: this gate's prompt must be assertable on its
@@ -93,10 +94,10 @@ class _FakeCtx:
         self._approve = approve
         self.elicitations: list[str] = []
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
