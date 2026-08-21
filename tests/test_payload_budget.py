@@ -49,8 +49,8 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # a whole new TOOL, not docstring growth on an existing one: its description
 # is ~1,110 chars, which is the mean length of the 39 that were already here,
 # so there was no version of it that fit the slack left after the
-# `generate_image` bump. The ceiling moves by what the tool costs (~277
-# tokens) and no further.
+# `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
+# next growth is still a decision.
 _BUDGET_TOKENS = 15_650
 
 

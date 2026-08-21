@@ -4708,23 +4708,9 @@ _QUEUED_WITH_HANDLE = json.dumps(
 )
 
 
-def _blocking_streaming_child(monkeypatch, first_lines):
-    """Spawn fake emitting ``first_lines``, then blocking past any deadline."""
-    procs: list[_BlockingProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProc(cmd, first_lines)
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-    return procs
-
-
-def test_streaming_timeout_message_names_the_prompt_id(monkeypatch):
+def test_streaming_timeout_message_names_the_prompt_id(blocking_stream):
     """The raised timeout names the submitted job, so it can still be recovered."""
-    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n"])
+    blocking_stream([_QUEUED_WITH_HANDLE + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -4738,13 +4724,13 @@ def test_streaming_timeout_message_names_the_prompt_id(monkeypatch):
     assert "wait=False" in msg  # the existing pointer at the non-blocking shape
 
 
-def test_streaming_timeout_returns_the_handle_only_when_asked(monkeypatch):
+def test_streaming_timeout_returns_the_handle_only_when_asked(blocking_stream):
     """`timeout_returns_handle` is what turns the expiry into a payload.
 
     Without it the deadline stays a `ComfyCliError` — `run_workflow` /
     `run_template` document that contract and their callers branch on it.
     """
-    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n"])
+    blocking_stream([_QUEUED_WITH_HANDLE + "\n"])
 
     result = asyncio.run(
         server._run_comfy_streaming(
@@ -4760,7 +4746,7 @@ def test_streaming_timeout_returns_the_handle_only_when_asked(monkeypatch):
     assert _HANDLE in result["note"]
 
 
-def test_streaming_timeout_handle_payload_needs_a_submitted_job(monkeypatch):
+def test_streaming_timeout_handle_payload_needs_a_submitted_job(blocking_stream):
     """No `prompt_id` reported means no job to hand back — it stays an error.
 
     A deadline reached before the submit (ComfyUI down, a stalled fetch) has
@@ -4768,7 +4754,7 @@ def test_streaming_timeout_handle_payload_needs_a_submitted_job(monkeypatch):
     invent a job the caller could never find.
     """
     preflight = json.dumps({"schema": "event/1", "type": "converted", "node_count": 1})
-    _blocking_streaming_child(monkeypatch, [preflight + "\n"])
+    blocking_stream([preflight + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -4783,13 +4769,13 @@ def test_streaming_timeout_handle_payload_needs_a_submitted_job(monkeypatch):
     assert "already submitted as prompt_id" not in str(exc.value)
 
 
-def test_streaming_bounded_tail_payload_is_unchanged(monkeypatch):
+def test_streaming_bounded_tail_payload_is_unchanged(blocking_stream):
     """`raise_on_timeout=False` (the `job(action="watch")` tail) keeps its shape.
 
     The caller of a watch already HAS the prompt_id — it passed it in — so the
     new key must not appear there and change a payload other tools parse.
     """
-    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n"])
+    blocking_stream([_QUEUED_WITH_HANDLE + "\n"])
 
     result = asyncio.run(
         server._run_comfy_streaming(
@@ -4901,7 +4887,9 @@ def test_engine_errors_other_than_ws_timeout_still_raise(patched_stream, code):
     assert exc.value.code == code
 
 
-def test_expired_wait_after_an_execution_error_does_not_claim_a_live_job(monkeypatch):
+def test_expired_wait_after_an_execution_error_does_not_claim_a_live_job(
+    blocking_stream,
+):
     """A run that reported an error is inspectable, not RUNNING — say so.
 
     The handle stays in the raised message (it is what makes the failure
@@ -4911,7 +4899,7 @@ def test_expired_wait_after_an_execution_error_does_not_claim_a_live_job(monkeyp
     errored = json.dumps(
         {"schema": "event/1", "type": "execution_error", "prompt_id": _HANDLE}
     )
-    _blocking_streaming_child(monkeypatch, [_QUEUED_WITH_HANDLE + "\n", errored + "\n"])
+    blocking_stream([_QUEUED_WITH_HANDLE + "\n", errored + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -4935,7 +4923,7 @@ def test_expired_wait_after_an_execution_error_does_not_claim_a_live_job(monkeyp
         1_000_000,  # and grossly over it
     ],
 )
-def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(monkeypatch, id_len):
+def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(blocking_stream, id_len):
     """An id the `job` verbs would refuse is not handed back as a handle.
 
     `_readline_unbounded` has no line ceiling by design, so a malformed event can
@@ -4959,7 +4947,7 @@ def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(monkeypatch, id_len
             "nodes": [{"id": "1"}],
         }
     )
-    _blocking_streaming_child(monkeypatch, [junk + "\n"])
+    blocking_stream([junk + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
