@@ -3044,7 +3044,7 @@ _BILLING_STATUS_TIMEOUT = 180.0
 
 
 @mcp.tool()
-def billing_status() -> Any:
+async def billing_status() -> Any:
     """Comfy Cloud credit balance, plan tier and job concurrency — READ-ONLY, spends nothing.
 
     Wraps ``comfy cloud status``. The tool for "how many credits do I have",
@@ -3065,10 +3065,23 @@ def billing_status() -> Any:
 
     Signed out raises comfy-cli's own error — get the user signed in with
     ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
-    degrades to ``{"error", "unsupported": True}``.
+    degrades to ``{"error", "unsupported": True, "balance_confirmed": False}``
+    — the verdict key travels with the degrade so reading it is always safe.
     """
+    # `_run_comfy_async`, NOT the thread-pool path, for the same reason
+    # `workflow_deps` gives: this is a `_BILLING_STATUS_TIMEOUT`-long child, and
+    # `asyncio.to_thread(_run_comfy, …)`'s cancellation never reaches the
+    # thread. A client that disconnects or gives up mid-fan-out would otherwise
+    # leave both the pool worker and the `comfy` child alive for the whole 180s
+    # budget, waiting on a cloud that is slow rather than dead. The async
+    # runner's `finally` reaps the process tree on every exit path,
+    # cancellation included, and its result contract is `_run_comfy`'s own —
+    # the same envelope unwrap and the same `ComfyCliError` shapes the degrade
+    # below reads.
     try:
-        return _run_comfy("cloud", "status", timeout=_BILLING_STATUS_TIMEOUT)
+        return await _run_comfy_async(
+            "cloud", "status", timeout=_BILLING_STATUS_TIMEOUT
+        )
     except ComfyCliError as exc:
         # Same degrade shape and same strictness as `_freshness_report` /
         # `list_workflow_notes`: `clitext._is_missing_verb_error` requires the
@@ -3091,7 +3104,24 @@ def billing_status() -> Any:
         # `list_workflow_notes` needs): this tool takes no arguments, so nothing
         # caller-supplied reaches argv and there is no path by which a caller
         # could plant the phrase Click is being read for.
-        if not clitext._is_missing_verb_error(exc, "status"):
+        #
+        # EITHER verb name degrades, because this version gap has two shapes.
+        # A comfy-cli that has the `cloud` group but not this leaf fails with
+        # Click's `No such command 'status'`; one predating the whole group —
+        # reachable because the `_MIN_COMFY_CLI` floor guard fails OPEN for a
+        # source build whose `--version` cannot be parsed — fails identically
+        # (exit 2, no envelope) while naming `cloud` instead. Reading only the
+        # leaf would hand that second caller the raw usage dump this branch
+        # exists to hide, and the fix it needs is the same upgrade either way.
+        missing = next(
+            (
+                verb
+                for verb in ("status", "cloud")
+                if clitext._is_missing_verb_error(exc, verb)
+            ),
+            None,
+        )
+        if missing is None:
             raise
         # Names what still works rather than dead-ending — but the balance
         # itself genuinely has no second source to point at: `comfy cloud
@@ -3101,17 +3131,54 @@ def billing_status() -> Any:
             "error": (
                 "billing status unavailable: the installed comfy-cli does not "
                 "support 'comfy cloud status' (the verb ships in a comfy-cli "
-                "newer than the one installed here). Nothing else is affected "
-                "— sign-in, runs and jobs are unchanged, and no credits "
-                "were touched. Upgrade comfy-cli — "
-                '`update_comfyui(target="cli")`, or `comfy update cli` in a '
-                "terminal — and call this again. Until then there is no "
-                "balance figure to be had here: comfy-cli exposes it through "
-                "this verb only. `auth_status` still reports which account is "
-                "signed in and its `base_url`, whose billing page shows the "
-                "balance in a browser."
+                "newer than the one installed here). Nothing was broken by "
+                # Deliberately about STATE, not about capability: on the
+                # whole-group-missing branch below, sign-in is not available
+                # either, so a blanket "sign-in is unchanged" would contradict
+                # the pointer that closes this message.
+                "this call — no local state changed, no run or job was "
+                "touched, and no credits were spent. Upgrade comfy-cli — "
+                "`comfy update cli` in a terminal — and call this again. "
+                # The terminal command leads and the MCP tool is qualified,
+                # rather than the other way round: `update_comfyui` prompts
+                # only for `target="all"`, so `target="cli"` would pip-upgrade
+                # the user's Python environment straight off the back of a
+                # READ-ONLY balance query. Naming it still (dead-ending helps
+                # nobody) but flagging whose decision it is keeps that call
+                # with the user.
+                '(`update_comfyui(target="cli")` does the same from here, but '
+                'unlike `target="all"` it raises no confirmation prompt, so it '
+                "would pip-upgrade the user's Python environment off the back "
+                "of a read-only balance query — ask them first.) Until then "
+                "there is no balance figure to be had here: comfy-cli exposes "
+                "it through this verb only. "
+                # Which fallback is honest depends on WHICH name was missing.
+                # A CLI that has `comfy cloud` but not its `status` leaf still
+                # answers `cloud whoami`, so `auth_status` works and its
+                # `base_url` gets the user to a billing page in a browser. One
+                # missing the whole group answers neither — pointing at
+                # `auth_status` there would send them to a second usage dump.
+                + (
+                    "`auth_status` still reports which account is signed in "
+                    "and its `base_url`, whose billing page shows the balance "
+                    "in a browser."
+                    if missing == "status"
+                    else "This comfy-cli has no `comfy cloud` group at all, so "
+                    "`auth_status` and `auth_login` are unavailable on it too "
+                    "— the upgrade is the only route to any cloud state from "
+                    "here."
+                )
             ),
             "unsupported": True,
+            # The promised verdict key travels with the degrade, the way
+            # `_download_verb_unsupported` carries `download-cancel`'s whole
+            # verdict. The docstring tells consumers to read
+            # `balance_confirmed` before rendering any figure, so omitting it
+            # here would hand a caller that believed it a `KeyError` — or, on
+            # the `.get(..., 0)` spelling, the rendered $0 the field exists to
+            # prevent. `False` is the only honest value: no balance was
+            # established, because no balance call was made.
+            "balance_confirmed": False,
         }
 
 
