@@ -220,8 +220,12 @@ The affected test layers are:
    and failure-log non-disclosure.
 6. `test_failure_log.py`: opt-in behavior, immutable event delivery, observer
    isolation, scrubbing, permissions, rotation, and concurrency.
-7. `tests/e2e`: separately marked live ComfyUI smoke. A missing real `comfy`
-   binary must be reported as a skip, never described as a live pass.
+7. `tests/e2e/test_smoke.py`: separately marked same-machine ComfyUI smoke. A
+   missing real `comfy` binary must be reported as a skip, never described as a
+   live pass.
+8. `tests/e2e/test_remote_mcp.py`: opt-in deployed Streamable HTTP smoke through
+   `COMFY_MCP_TEST_URL`; it is a client only and proves real single-use upload,
+   checkpoint-free submit/poll, and signed download behavior.
 
 Every transport/client/logging change runs the focused layers first, then the
 full pytest, lint, format, dependency, and diff checks.

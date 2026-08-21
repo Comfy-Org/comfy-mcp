@@ -1397,6 +1397,24 @@ additional `generate_image` regression test requires the documented SD1.5
 checkpoint and fails with comfy-cli's own missing-model error when it is not
 installed. These e2e tests are deselected from plain `pytest` and CI by default.
 
+**3. Live remote Streamable HTTP MCP smoke.** When the MCP server and ComfyUI
+run on another machine, point the opt-in client test at a reachable endpoint
+(an SSH local-forward is fine) and name the checkpoint-free workflow on the
+**server** filesystem:
+
+```bash
+COMFY_MCP_TEST_URL=http://127.0.0.1:9000/mcp \
+COMFY_MCP_TEST_WORKFLOW=/absolute/server/path/tests/e2e/workflow_smoke.json \
+  pytest -q tests/e2e/test_remote_mcp.py -m e2e
+```
+
+This test never imports the server application locally. It negotiates both
+modern and legacy protocols, discovers the 39-tool shared application, uploads
+a generated client-local PNG through the single-use PUT URL, runs the no-model
+workflow, polls it, and downloads the result through the five-minute signed
+URL. It consumes no cloud credits, but it deliberately leaves one tiny input
+image and one smoke output in the configured ComfyUI.
+
 ## Contributing
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev

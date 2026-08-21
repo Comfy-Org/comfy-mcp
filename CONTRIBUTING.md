@@ -117,6 +117,20 @@ running same-machine ComfyUI selected with `COMFY_LOCAL_URL`. The live suite
 skips when ComfyUI or the binary is absent; its `generate_image` case also
 requires the documented SD1.5 checkpoint.
 
+For a deployed Streamable HTTP server, run the client-side live smoke through
+its reachable endpoint (an SSH local-forward is supported):
+
+```bash
+COMFY_MCP_TEST_URL=http://127.0.0.1:9000/mcp \
+COMFY_MCP_TEST_WORKFLOW=/absolute/server/path/tests/e2e/workflow_smoke.json \
+  pytest -q tests/e2e/test_remote_mcp.py -m e2e
+```
+
+The workflow path is server-side; the generated upload and output paths are
+client-side. This opt-in test performs one tiny upload and one checkpoint-free
+ComfyUI job, so do not run it against a deployment where those mutations are
+unexpected.
+
 ## Failure log changes
 
 `COMFY_MCP_DEBUG_LOG` is deliberately off by default, local to the MCP server

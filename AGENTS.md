@@ -238,6 +238,13 @@ requests, concurrency, native tool errors, signed-link tampering/expiry, scratch
 and cleanup, failure observation/non-disclosure, and clean lifecycle. Never
 label fake-engine coverage a real ComfyUI end-to-end test.
 
+`tests/e2e/test_remote_mcp.py` is the separately opt-in deployed-HTTP check. It
+requires `COMFY_MCP_TEST_URL` plus a server-side
+`COMFY_MCP_TEST_WORKFLOW`, behaves only as an MCP client, and covers real
+upload → submit → poll → signed fetch through a reachable endpoint. Keep it
+environment-driven: never hardcode a deployment hostname, port, credential, or
+server filesystem path.
+
 **Mock comfy-cli via the shared fixtures in `tests/conftest.py`, never a hand-rolled stub.**
 They mirror how `server._internal` spawns the CLI: a spawn-signature change is one edit, not a sweep:
 
