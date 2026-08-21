@@ -24,6 +24,8 @@ def test_failure_log_docs_cover_stdio_http_and_server_side_ownership():
     assert "COMFY_MCP_DEBUG_LOG=1" in section
     assert "immutable failure event" in section
     assert "JSONL writer observes those events" in section
+    assert "base64 representation" in section
+    assert "never enter the failure event or JSONL file" in section
 
 
 def test_smoke_docs_require_transport_business_flow_and_live_engine_stages():
@@ -32,9 +34,11 @@ def test_smoke_docs_require_transport_business_flow_and_live_engine_stages():
     assert "tests/test_stdio_business_flow.py" in section
     assert "tests/test_remote_http.py" in section
     assert "tests/test_fastmcp_app.py" in section
+    assert "tests/test_file_transfer.py" in section
     assert "real loopback Streamable HTTP/ASGI server" in section
     assert "`server_info` → workflow submission → job status" in section
     assert "same 39-tool application" in section
+    assert "temporary signed URL from the same listener" in section
     assert "./scripts/smoke.sh" in section
     assert "COMFY_LOCAL_URL" in section
     assert "SD1.5" in section
@@ -57,4 +61,7 @@ def test_contributing_docs_pin_framework_architecture_and_required_checks():
     assert "39 tool callables" in _CONTRIBUTING
     assert "immutable `_FailureEvent`" in _CONTRIBUTING
     assert "tests/test_failure_log.py" in _CONTRIBUTING
+    assert "## Remote file-transfer changes" in _CONTRIBUTING
+    assert "same MCP listener" in _CONTRIBUTING
+    assert "upload → submit → poll → fetch" in _CONTRIBUTING
     assert "COMFY_LOCAL_URL" in _CONTRIBUTING

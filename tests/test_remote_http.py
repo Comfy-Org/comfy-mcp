@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import pathlib
 import signal
 import socket
 import subprocess
@@ -19,7 +21,7 @@ from conftest import envelope
 from fastmcp import Client
 from fastmcp.client.elicitation import ElicitResult
 
-from comfy_mcp import failure_log
+from comfy_mcp import failure_log, file_transfer
 from comfy_mcp.server import _internal as server
 from comfy_mcp.server import remote
 from comfy_mcp.server.config import RemoteServerConfig
@@ -87,11 +89,14 @@ async def _discover_and_call(
 
 
 def test_http_exposes_the_same_39_tools_and_complete_business_flow(
-    remote_http_server, patched_run, monkeypatch
+    remote_http_server, patched_run, patched_async_run, monkeypatch
 ):
-    """One HTTP client completes the same submit/poll/fetch flow as stdio."""
+    """HTTP carries input bytes in and signed output bytes back on one app."""
 
     monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.14.0")
+    upload_bytes = b"RIFF\x00\x01fake-webp"
+    upload_scratch: list[str] = []
+    download_scratch: list[str] = []
 
     async def run_flow():
         async with Client(remote_http_server, mode="legacy") as client:
@@ -101,6 +106,37 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
                 envelope(data={"running": True, "url": "http://127.0.0.1:8188"})
             )
             info = await client.call_tool("server_info", {})
+
+            def inspect_upload(cmd):
+                source = cmd[cmd.index("upload") + 1]
+                upload_scratch.append(source)
+                assert pathlib.Path(source).read_bytes() == upload_bytes
+
+            upload_procs = patched_async_run(
+                envelope(
+                    data={
+                        "uploads": [
+                            {
+                                "local_path": "task_04.webp",
+                                "cloud_name": "task_04.webp",
+                            }
+                        ]
+                    }
+                ),
+                on_spawn=inspect_upload,
+            )
+            uploaded = await client.call_tool(
+                "upload_file",
+                {
+                    "paths": [
+                        {
+                            "name": "task_04.webp",
+                            "mimeType": "image/webp",
+                            "data": base64.b64encode(upload_bytes).decode(),
+                        }
+                    ]
+                },
+            )
 
             submit_calls = patched_run(envelope(data={"prompt_id": "prompt-http"}))
             submitted = await client.call_tool(
@@ -118,20 +154,44 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
                 "job", {"action": "status", "prompt_id": "prompt-http"}
             )
 
+            def write_output(cmd):
+                scratch = cmd[cmd.index("-o") + 1]
+                path = pathlib.Path(scratch) / "result.png"
+                path.write_bytes(b"\x89PNG\r\n\x1a\nremote-result")
+                download_scratch.append(scratch)
+
             output_calls = patched_run(
-                envelope(data={"files": [{"path": "/tmp/results/result.png"}]})
+                envelope(
+                    data={
+                        "prompt_id": "prompt-http",
+                        "out_dir": "unused-engine-path",
+                        "files": [{"path": "result.png", "size": 21}],
+                    }
+                ),
+                on_spawn=write_output,
             )
             outputs = await client.call_tool(
                 "fetch_outputs",
                 {"prompt_id": "prompt-http", "out_dir": "/tmp/results"},
             )
+            async with httpx2.AsyncClient() as http_client:
+                downloaded = await http_client.get(outputs.data["files"][0]["url"])
+                tampered = await http_client.get(
+                    outputs.data["files"][0]["url"].replace(
+                        "signature=", "signature=0", 1
+                    )
+                )
         return (
             discovered,
             info,
+            uploaded,
             submitted,
             status,
             outputs,
+            downloaded,
+            tampered,
             info_calls,
+            upload_procs,
             submit_calls,
             status_calls,
             output_calls,
@@ -140,10 +200,14 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
     (
         discovered,
         info,
+        uploaded,
         submitted,
         status,
         outputs,
+        downloaded,
+        tampered,
         info_calls,
+        upload_procs,
         submit_calls,
         status_calls,
         output_calls,
@@ -151,12 +215,32 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
 
     names = {tool.name for tool in discovered}
     assert len(names) == 39
-    assert {"server_info", "run_workflow", "job", "fetch_outputs"} <= names
+    assert {
+        "server_info",
+        "upload_file",
+        "run_workflow",
+        "job",
+        "fetch_outputs",
+    } <= names
     assert info.data["running"] is True
+    assert uploaded.data["uploads"][0]["cloud_name"] == "task_04.webp"
     assert submitted.data["prompt_id"] == "prompt-http"
     assert status.data["status"] == "completed"
-    assert outputs.data["files"][0]["path"].endswith("result.png")
+    output = outputs.data["files"][0]
+    assert output["path"] == "/tmp/results/result.png"
+    assert output["url"].startswith(remote_http_server.removesuffix("/mcp"))
+    assert "expires=" in output["url"] and "signature=" in output["url"]
+    assert output["url"] in output["command"]
+    assert outputs.data["download_url_ttl_seconds"] == 600
+    assert 1 <= output["expires_at"] - int(time.time()) <= 600
+    assert f'"{output["url"]}"' in output["windows_command"]
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"\x89PNG\r\n\x1a\nremote-result"
+    assert tampered.status_code == 404
     assert info_calls[0]["cmd"][4:] == ["env"]
+    assert upload_procs[0].cmd[4] == "upload"
+    assert upload_procs[0].cmd[-1] == "--no-overwrite"
+    assert upload_scratch and not pathlib.Path(upload_scratch[0]).exists()
     assert submit_calls[0]["cmd"][4:] == [
         "run",
         "--workflow",
@@ -167,8 +251,41 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
         "download",
         "prompt-http",
         "-o",
-        "/tmp/results",
+        download_scratch[0],
     ]
+    assert pathlib.Path(download_scratch[0]).exists()
+    file_transfer._DOWNLOAD_STORE.close()
+    assert not pathlib.Path(download_scratch[0]).exists()
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+def test_http_missing_client_path_explains_inline_transfer(
+    mode, remote_http_server, patched_async_run
+):
+    patched_async_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "upload_failed",
+                "message": "File not found: /client/inputs/task_04.webp",
+                "hint": "check the file path and try again",
+            },
+        )
+    )
+
+    _, result = asyncio.run(
+        _discover_and_call(
+            remote_http_server,
+            "upload_file",
+            {"paths": ["/client/inputs/task_04.webp"]},
+            mode=mode,
+            raise_on_error=False,
+        )
+    )
+
+    assert result.is_error is True
+    assert "string paths are resolved on the remote MCP server" in str(result)
+    assert "inline {name, mimeType, data}" in str(result)
 
 
 async def _accept_approval(message, response_type, params, ctx):

@@ -26,7 +26,9 @@ comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, every
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import pathlib
 import subprocess
 
 import pytest
@@ -521,6 +523,42 @@ def test_upload_file_forwards_host_port(patched_async_run, monkeypatch):
         "--port",
         "9001",
     ]
+
+
+def test_inline_upload_keeps_remote_target_forwarding(patched_async_run, monkeypatch):
+    """MCP-side byte staging changes only the file argv, never its target."""
+
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    observed: list[pathlib.Path] = []
+
+    def inspect(cmd):
+        source = pathlib.Path(cmd[cmd.index("upload") + 1])
+        assert source.read_bytes() == b"remote-input"
+        observed.append(source)
+
+    procs = patched_async_run(envelope(data={"uploads": []}), on_spawn=inspect)
+
+    _upload_file(
+        [
+            {
+                "name": "input.bin",
+                "mimeType": "application/octet-stream",
+                "data": base64.b64encode(b"remote-input").decode(),
+            }
+        ]
+    )
+
+    source = observed[0]
+    assert procs[0].cmd[4:] == [
+        "upload",
+        str(source),
+        "--no-overwrite",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+    assert not source.exists()
 
 
 def test_upload_file_local_default_is_byte_identical(patched_async_run):

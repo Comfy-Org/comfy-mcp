@@ -51,7 +51,7 @@ import os
 
 import pytest
 
-from comfy_mcp import failure_log, target
+from comfy_mcp import failure_log, file_transfer, target
 from comfy_mcp.server import _internal as server
 
 
@@ -191,6 +191,14 @@ def _isolate_failure_log(monkeypatch):
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
+
+
+@pytest.fixture(autouse=True)
+def _clear_signed_downloads():
+    """Never let an HTTP output token/temp directory cross a test boundary."""
+
+    yield
+    file_transfer._DOWNLOAD_STORE.close()
 
 
 @pytest.fixture(autouse=True)

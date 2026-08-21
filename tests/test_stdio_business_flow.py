@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
 
@@ -41,6 +42,16 @@ if command == ["env"]:
     }})
 elif command == ["outdated"]:
     envelope({{"core": {{"outdated": False}}, "packs": []}})
+elif command[0] == "upload" and command[-1] == "--no-overwrite":
+    with open(command[1], "rb") as handle:
+        if handle.read() != b"stdio-input":
+            raise SystemExit(4)
+    envelope({{
+        "uploads": [{{
+            "local_path": command[1],
+            "cloud_name": "stdio-input.bin",
+        }}],
+    }})
 elif command == ["run", "--workflow", "/srv/workflows/smoke.json"]:
     envelope({{"prompt_id": "prompt-stdio"}})
 elif command == ["jobs", "status", "prompt-stdio"]:
@@ -65,7 +76,20 @@ async def _run_stdio_flow(fake_comfy: str):
         env=env,
     )
     async with Client(transport, mode="legacy") as client:
+        tools = await client.list_tools()
         info = await client.call_tool("server_info", {})
+        uploaded = await client.call_tool(
+            "upload_file",
+            {
+                "paths": [
+                    {
+                        "name": "stdio-input.bin",
+                        "mimeType": "application/octet-stream",
+                        "data": base64.b64encode(b"stdio-input").decode(),
+                    }
+                ]
+            },
+        )
         submitted = await client.call_tool(
             "run_workflow",
             {
@@ -80,7 +104,7 @@ async def _run_stdio_flow(fake_comfy: str):
             "fetch_outputs",
             {"prompt_id": "prompt-stdio", "out_dir": "/tmp/results"},
         )
-    return info, submitted, status, outputs
+    return tools, info, uploaded, submitted, status, outputs
 
 
 def test_real_stdio_process_completes_submit_poll_fetch(tmp_path):
@@ -88,9 +112,15 @@ def test_real_stdio_process_completes_submit_poll_fetch(tmp_path):
     fake.write_text(_FAKE_COMFY.format(python=sys.executable), encoding="utf-8")
     fake.chmod(0o755)
 
-    info, submitted, status, outputs = asyncio.run(_run_stdio_flow(str(fake)))
+    tools, info, uploaded, submitted, status, outputs = asyncio.run(
+        _run_stdio_flow(str(fake))
+    )
 
+    assert len(tools) == 39
     assert info.data["server"]["running"] is True
+    assert uploaded.data["uploads"] == [
+        {"local_path": "stdio-input.bin", "cloud_name": "stdio-input.bin"}
+    ]
     assert submitted.data["prompt_id"] == "prompt-stdio"
     assert status.data["status"] == "completed"
     assert outputs.data["files"][0]["path"].endswith("result.png")

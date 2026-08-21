@@ -33,8 +33,10 @@ This means:
 - **New functionality belongs in comfy-cli.** If a feature can't be expressed as
   a `comfy` subcommand, the fix is a comfy-cli change, not a workaround here.
 - **No code from the cloud MCP.** Don't copy code, patterns, or dependencies
-  from the Comfy Cloud MCP — this repo has no cloud API, signed-URL,
-  multi-tenant, or filesystem-isolation layer.
+  from the Comfy Cloud MCP — this repo has no cloud API, multi-tenant storage,
+  analytics, or per-session filesystem layer. Its narrow HTTP file boundary is
+  implemented locally: inline bytes become temporary `comfy upload` paths and
+  completed `comfy download` files receive short-lived capability URLs.
 - **No transport-owned application path.** `server/remote.py` only adapts the shared
   FastMCP instance to ASGI/uvicorn. It may not construct a server, register or
   wrap tools, spawn comfy-cli, or derive product verdicts independently.
@@ -60,6 +62,9 @@ PR.
 - Remote mode uses FastMCP's public `http_app(..., stateless_http=True)` ASGI
   surface and uvicorn lifecycle. Do not add legacy SSE, hand-written JSON-RPC,
   private session monkeypatches, or catch-all protocol-error suppression.
+- The signed download route is registered on that same FastMCP application and
+  served by the same ASGI listener/port. Do not add a second file server,
+  transport-specific tool registry, or direct ComfyUI HTTP client.
 - Both adapters use the same application functions and `ComfyCliClient`.
   `client/` must not import the MCP server, and request-local injection remains
   a `ContextVar` so concurrent HTTP requests cannot share mutable client state.
@@ -101,6 +106,7 @@ pytest -q \
   tests/test_remote_http.py \
   tests/test_remote_transport.py \
   tests/test_fastmcp_app.py \
+  tests/test_file_transfer.py \
   tests/test_failure_log.py
 ```
 
@@ -122,7 +128,28 @@ into a general event bus. Any new runner failure must call
 shared application. Preserve URL credential/query redaction for arguments,
 messages, and stream tails. Update the README's kind list and both stdio/HTTP
 configuration guidance whenever this contract changes, and add a regression
-at the runner and observer boundary.
+at the runner and observer boundary. Inline upload content and its base64 form
+must never be published in a failure event or written to JSONL.
+
+## Remote file-transfer changes
+
+`upload_file` keeps its one required `paths` list: each entry is a server path
+or an inline `{name, mimeType, data}` object. Inline content is strict base64,
+bounded below the MCP request ceiling, written owner-only, and removed after
+success, failure, or cancellation. It still reaches ComfyUI only through the
+same `ComfyCliClient.run_async("upload", ...)` path.
+
+`fetch_outputs` keeps `comfy download` as its engine. stdio writes directly to
+the caller's path; HTTP downloads into owner-only scratch and returns a
+10-minute HMAC-signed URL on the same MCP listener. Validate that comfy-cli
+reported every served path inside that scratch directory, make the URL
+non-cacheable, and clean the directory on expiry. A reverse proxy deployment
+must forward `/downloads/` along with `/mcp`.
+
+Changes here require the complete upload → submit → poll → fetch flow over real
+stdio and loopback HTTP transports, both modern and legacy HTTP negotiation,
+signature tamper/expiry and path-boundary tests, failure-log non-disclosure,
+and cleanup assertions.
 
 ## Adding or changing a tool
 

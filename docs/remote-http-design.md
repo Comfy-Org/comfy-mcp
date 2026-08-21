@@ -61,6 +61,12 @@ Keeping these entry/composition modules in `server/` separates them from the
 package-level public types (`ComfyCliError`, `SlotOverride`, `SlotVariants`) and
 from reusable leaf helpers without introducing another abstraction layer.
 
+`comfy_mcp.file_transfer` is the one package-level leaf for the HTTP filesystem
+boundary. It validates/materializes inline upload objects and owns signed
+download tokens, expiry, and cleanup; it neither imports the server package nor
+talks to ComfyUI. `_internal.py` composes it with the same `ComfyCliClient`
+upload/download calls used by stdio.
+
 ## Runtime composition
 
 ```mermaid
@@ -101,6 +107,33 @@ reconnect logic, or private session patches.
 addressing persisted server session state. Long jobs should still use
 submit/poll (`wait=False`, then `job`) rather than depend on a long HTTP
 response.
+
+The shared application also registers one public `custom_route` at
+`/downloads/{token}/{filename}` before either transport is selected. In HTTP
+mode, `fetch_outputs` first calls `comfy download` into owner-only scratch, then
+returns a 10-minute HMAC-signed capability URL on that route. It is still the
+same FastMCP ASGI application and listener: there is no second server, port,
+session system, or transport-specific tool registry. stdio never uses the route
+and preserves direct output writes.
+
+## Remote filesystem boundary
+
+MCP tool arguments are JSON, so a client-local pathname does not make the file
+visible to a remote MCP process. `upload_file.paths` therefore accepts either:
+
+- a string path visible on the MCP server; or
+- `{name, mimeType, data}` with strict base64 bytes.
+
+Inline data is capped at 2 MiB decoded per call, staged owner-only, handed to
+the existing async `comfy upload` runner, and removed on every exit path. The
+base64 value is never a subprocess argument or failure-log field.
+
+The inverse boundary applies to `fetch_outputs`: HTTP `out_dir` is a desired
+client path, not a server write target. The response rewrites scratch paths to
+that client destination and supplies signed URL plus POSIX/Windows commands.
+Only comfy-cli-reported regular files contained by the scratch root can be
+published. Links are non-cacheable, signature/expiry checked, and removed after
+ten minutes. A reverse proxy must forward `/downloads/` as well as `/mcp`.
 
 ## Shared engine client
 
@@ -178,11 +211,13 @@ The affected test layers are:
 3. `test_stdio_business_flow.py`: real stdio child plus fake executable,
    covering `server_info -> run_workflow -> job -> fetch_outputs`.
 4. `test_remote_http.py`: real loopback HTTP over the same 39 tools and the
-   same complete business flow, plus failure observation, negotiation,
-   concurrency, stale requests, and lifecycle.
-5. `test_failure_log.py`: opt-in behavior, immutable event delivery, observer
+   same complete upload/submit/poll/signed-fetch business flow, plus failure
+   observation, negotiation, concurrency, stale requests, and lifecycle.
+5. `test_file_transfer.py`: inline schema/limits, exact bytes, path containment,
+   scratch cleanup, signed capabilities, and failure-log non-disclosure.
+6. `test_failure_log.py`: opt-in behavior, immutable event delivery, observer
    isolation, scrubbing, permissions, rotation, and concurrency.
-6. `tests/e2e`: separately marked live ComfyUI smoke. A missing real `comfy`
+7. `tests/e2e`: separately marked live ComfyUI smoke. A missing real `comfy`
    binary must be reported as a skip, never described as a live pass.
 
 Every transport/client/logging change runs the focused layers first, then the
@@ -192,7 +227,9 @@ full pytest, lint, format, dependency, and diff checks.
 
 - production contains one `FastMCP(...)` constructor and one built application;
 - stdio and HTTP each discover the same 39 tools;
-- both complete the submit/poll/fetch business flow through `ComfyCliClient`;
+- both complete the upload/submit/poll/fetch business flow through
+  `ComfyCliClient`; HTTP fetch returns a working short-lived signed URL on the
+  MCP listener;
 - both report the same instructions and installed version;
 - HTTP uses public `http_app()` plus uvicorn, with no SSE/session patch;
 - failure logging is an opt-in observer with zero disabled filesystem effects;
