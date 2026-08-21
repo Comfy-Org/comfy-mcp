@@ -116,6 +116,21 @@ def _skip_machine_snapshot_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _skip_template_gallery_warm(monkeypatch):
+    """Neuter ``main()``'s startup gallery warm.
+
+    ``main()`` also starts a daemon thread running
+    ``_warm_template_gallery``, which shells out to ``comfy templates ls``.
+    Left live, any test that calls ``server.main()`` would spawn whatever real
+    ``comfy`` this developer machine has — and, worse, would do it on a thread
+    racing the assertions, either consuming a stubbed spawn or landing a
+    ``patched_run`` call record mid-test. The dedicated warm tests
+    (``test_gallery_warm.py``) restore the real function.
+    """
+    monkeypatch.setattr(server, "_warm_template_gallery", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_comfyui_target_env(monkeypatch):
     """Default every test to the LOCAL target (no configured remote ComfyUI).
 

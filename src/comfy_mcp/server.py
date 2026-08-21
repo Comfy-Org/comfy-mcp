@@ -12223,6 +12223,84 @@ def _apply_startup_instructions() -> None:
     mcp._lowlevel_server.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
 
 
+def _warm_template_gallery() -> None:
+    """Best-effort: pull comfy-cli's template gallery index into cache at startup.
+
+    comfy-cli caches the gallery index (``~/.cache/comfy-cli/gallery/index.json``,
+    24h TTL) and refreshes a merely STALE cache in a detached background
+    process — but an ABSENT or corrupt cache is fetched SYNCHRONOUSLY inside
+    the command, on a network timeout of its own. So on a fresh machine the
+    first :func:`search_templates` pays a cold comfy-cli start PLUS that fetch
+    inside its own request window, and a QA pass under parallel load watched
+    cold first calls like this one stack up into client-side transport
+    timeouts. This moves that cost off the request path, the same way
+    :func:`_apply_startup_instructions`' probe already pre-pays the
+    ``comfy --version`` gate and the interpreter/page cache — leaving the
+    gallery the one cold component still billed to a caller.
+
+    ``templates ls``, NOT ``templates refresh``: ``ls`` is a no-op fetch-wise
+    when the cache is present and fresh (it fetches only when the cache is
+    absent or corrupt, and stale-refreshes detached), while ``refresh`` forces
+    a network fetch on EVERY startup — which is the opposite trade for a
+    machine that is already warm.
+
+    Best-effort in every direction. The result is discarded; every failure this
+    tolerates (the same set :func:`_machine_snapshot_block` tolerates) returns
+    silently, because a warm that fails costs nothing but the cold first call
+    the caller would have paid anyway. SILENTLY includes the failure log: the
+    whole body runs inside :func:`failure_log._unattributed_calls`, because that
+    log exists to explain a call the user actually made and nothing about this
+    one is ever surfaced to anybody. (The snapshot probe above is unprompted
+    too, but its result rides the handshake, so a record explaining why it came
+    back degraded is worth its line; it keeps writing them.) Suppressing only
+    ``binary_missing`` (which the ``shutil.which`` short-circuit below happens
+    to do) would leave ``timeout`` / ``spawn_failed`` / ``no_json`` /
+    ``error_envelope`` writing a record at EVERY startup on an offline or slow
+    host, spending the log's fixed rotation budget evicting real diagnostics.
+    The ``which`` check stays because it is also a cheap skip — no error path,
+    no macOS TCC stat walk — on the machine that has no comfy-cli at all.
+
+    Same 60s cap ``search_templates`` gives the identical command
+    (:data:`_run_comfy`'s house timeout for a metadata call), and deliberately
+    NOT a shorter one: the warm exists precisely for the cold-cache case, so it
+    is the invocation MOST likely to need the fetch's full budget, and a warm
+    that expires is worse than a slow one — ``_run_comfy_raw`` SIGKILLs the
+    process group on expiry, which can land mid-write of comfy-cli's
+    ``index.json`` and leave behind exactly the corrupt cache named at the top
+    of this docstring, making the NEXT ``search_templates`` slower rather than
+    faster.
+    It is a SUBPROCESS cap either way, never a startup stall: ``main()`` starts
+    this on a daemon thread and nothing ever joins it, so this function cannot
+    delay the initialize response however long it takes.
+
+    Not joining has a shutdown consequence worth stating: when ``mcp.run()``
+    returns because the client closed stdin, the interpreter finalizes while
+    this thread may still be parked in ``communicate()``, so its own
+    timeout/kill path never runs and the ``comfy templates ls`` child — spawned
+    ``start_new_session=True`` — is orphaned in its own process group. That is
+    tolerated rather than reaped: this is comfy-cli's most read-only verb, it
+    mutates nothing but its own cache, and it exits on its own, so the orphan
+    just finishes the warm we wanted. It is also not new — the snapshot probe
+    above already outlives its bounded join the same way. What would NOT be
+    tolerable here is a mutating verb (the reason :func:`_kill_proc_tree`
+    exists for ``update`` / ``model download``); keep this thread on verbs of
+    this kind.
+    """
+    with failure_log._unattributed_calls():
+        try:
+            # Inside the `try` (and the suppression), not above it: this
+            # resolution walks whatever `PATH` holds, and anything it can raise
+            # on a hostile entry would otherwise reach `threading.excepthook`
+            # and print a raw traceback into the client's server-log channel —
+            # the one thing a warm documented as silent must not do. Nothing is
+            # left outside the handler for a nonzero cost.
+            if shutil.which(COMFY_BIN) is None:
+                return
+            _run_comfy("templates", "ls", timeout=60.0)
+        except (ComfyCliError, OSError, UnicodeDecodeError):
+            return
+
+
 def main(args: list[str] | None = None) -> None:
     """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
 
@@ -12263,6 +12341,38 @@ def main(args: list[str] | None = None) -> None:
         # OSError subclass) and falls open, so nothing here can keep the
         # server from starting.
         _apply_startup_instructions()
+        # Then warm comfy-cli's template gallery cache off the request path.
+        # Started and never joined: unlike the snapshot probe above there is no
+        # result to collect, so there is nothing to wait for and this can never
+        # delay the initialize response.
+        #
+        # It therefore runs CONCURRENTLY with two things. With the snapshot
+        # probe, whenever that probe outlived its bounded join: both funnel
+        # through `_check_comfy_version`, and its shared `_version_checked`
+        # flag is read and written without a lock, so a race there can latch
+        # the fail-open verdict early — which is the same outcome that guard
+        # already documents for a hung or unreadable `--version`, and it is
+        # fail-OPEN by design in all four of its other branches too. And with
+        # the REQUEST path: a client that calls `search_templates` immediately
+        # after `initialize` gets a second comfy-cli that also sees an absent
+        # cache and fetches, so both write comfy-cli's `index.json`. Nothing
+        # here coordinates that, deliberately — the cache and the atomicity of
+        # its write belong to comfy-cli (AGENTS.md: no product behavior in this
+        # repo), and the caller's worst case is what it already pays today, one
+        # synchronous fetch, plus a redundant background one.
+        try:
+            threading.Thread(
+                target=_warm_template_gallery,
+                name="comfy-mcp-gallery-warm",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            # "can't start new thread" under thread/resource exhaustion. A warm
+            # that is best-effort in every other direction must not be the one
+            # thing that aborts startup: skipping it costs only the cold first
+            # `search_templates` the caller would have paid anyway. Narrow on
+            # purpose — anything else here is a real bug, not a warm we can drop.
+            pass
         # Name the transport rather than inheriting the SDK's default: the whole
         # stdio design rests on it — `failure_log`'s rule that stdout is the
         # JSON-RPC channel and must never be written to is only true under
