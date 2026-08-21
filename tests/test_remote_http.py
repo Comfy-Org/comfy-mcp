@@ -20,6 +20,8 @@ import uvicorn
 from conftest import envelope
 from fastmcp import Client
 from fastmcp.client.elicitation import ElicitResult
+from fastmcp.client.transports import StreamableHttpTransport
+from starlette.requests import Request
 
 from comfy_mcp import failure_log, file_transfer
 from comfy_mcp.server import _internal as server
@@ -314,6 +316,159 @@ def test_http_upload_mints_command_without_reading_client_path(
     assert "/api/uploads/" in result.content[0].text
     assert "Base64/data-inline upload is unsupported" not in result.content[0].text
     assert procs == []
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (
+            {"forwarded": ('for=192.0.2.1;proto=https;host="mcp.example.test:8443"')},
+            "https://mcp.example.test:8443",
+        ),
+        (
+            {
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "mcp.example.test",
+                "x-forwarded-port": "8443",
+            },
+            "https://mcp.example.test:8443",
+        ),
+        (
+            {
+                "x-forwarded-proto": "https, http",
+                "x-forwarded-host": "mcp.example.test:9443, proxy.internal",
+                "x-forwarded-port": "8443, 6008",
+            },
+            "https://mcp.example.test:9443",
+        ),
+    ],
+)
+def test_remote_http_base_url_reads_complete_client_facing_proxy_origin(
+    headers, expected, monkeypatch
+):
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("127.0.0.1", 6008),
+            "path": "/mcp",
+            "headers": [
+                (name.encode(), value.encode())
+                for name, value in {"host": "127.0.0.1:6008", **headers}.items()
+            ],
+        }
+    )
+    monkeypatch.setattr(server, "get_http_request", lambda: request)
+
+    assert server._remote_http_base_url() == expected
+
+
+def test_remote_http_base_url_rejects_malformed_proxy_authority(monkeypatch):
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("127.0.0.1", 6008),
+            "path": "/mcp",
+            "headers": [
+                (b"host", b"127.0.0.1:6008"),
+                (b"x-forwarded-proto", b"javascript"),
+                (b"x-forwarded-host", b"attacker.example/path"),
+                (b"x-forwarded-port", b"70000"),
+            ],
+        }
+    )
+    monkeypatch.setattr(server, "get_http_request", lambda: request)
+
+    assert server._remote_http_base_url() == "http://127.0.0.1:6008"
+
+
+def test_remote_http_base_url_prefers_complete_operator_public_url(monkeypatch):
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "http",
+            "server": ("127.0.0.1", 6008),
+            "path": "/mcp",
+            "headers": [(b"host", b"proxy-rewritten.example")],
+        }
+    )
+    monkeypatch.setattr(server, "get_http_request", lambda: request)
+    monkeypatch.setenv(
+        "COMFY_MCP_PUBLIC_URL",
+        "https://mcp.example.test:8443/",
+    )
+
+    assert server._remote_http_base_url() == "https://mcp.example.test:8443"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ftp://mcp.example.test:8443",
+        "https://user:pass@mcp.example.test:8443",
+        "https://mcp.example.test:8443/prefix",
+        "https://mcp.example.test:8443/?token=secret",
+        "https://mcp.example.test:70000",
+    ],
+)
+def test_remote_http_base_url_rejects_invalid_operator_public_url(value, monkeypatch):
+    monkeypatch.setenv("COMFY_MCP_PUBLIC_URL", value)
+
+    with pytest.raises(server.ComfyCliError, match="COMFY_MCP_PUBLIC_URL must"):
+        server._remote_http_base_url()
+
+
+def test_http_transfer_reports_preserve_forwarded_scheme_host_and_port(
+    remote_http_server, patched_run, monkeypatch, tmp_path
+):
+    """Both Cloud-style transfer directions use the public proxy origin."""
+
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.14.0")
+
+    def write_output(cmd):
+        scratch = pathlib.Path(cmd[cmd.index("-o") + 1])
+        (scratch / "result.png").write_bytes(b"public-origin-output")
+
+    patched_run(
+        envelope(data={"files": [{"path": "result.png"}]}),
+        on_spawn=write_output,
+    )
+    transport = StreamableHttpTransport(
+        remote_http_server,
+        headers={
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "mcp.example.test",
+            "X-Forwarded-Port": "8443",
+        },
+    )
+
+    async def read_reports():
+        async with Client(transport, mode="legacy") as client:
+            uploaded = await client.call_tool(
+                "upload_file",
+                {
+                    "file_path": "/client/input.png",
+                    "client_os": "linux",
+                },
+            )
+            outputs = await client.call_tool(
+                "fetch_outputs",
+                {
+                    "prompt_id": "public-origin",
+                    "out_dir": str(tmp_path / "client"),
+                    "client_os": "linux",
+                },
+            )
+        return uploaded, outputs
+
+    uploaded, outputs = asyncio.run(read_reports())
+
+    assert "https://mcp.example.test:8443/api/uploads/" in uploaded.content[0].text
+    assert outputs.data["files"][0]["url"].startswith(
+        "https://mcp.example.test:8443/downloads/"
+    )
+    file_transfer._DOWNLOAD_STORE.close()
 
 
 async def _accept_approval(message, response_type, params, ctx):

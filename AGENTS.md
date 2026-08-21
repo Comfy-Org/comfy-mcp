@@ -85,7 +85,11 @@ single-use, credential-free PUT command on the SAME FastMCP listener. That route
 `{name, subfolder, type}`, and always removes scratch. In the other direction, HTTP
 `fetch_outputs` first calls `comfy download` into owner-only scratch, then publishes only contained
 regular files through a five-minute HMAC-signed URL and one `client_os`-selected command. stdio keeps
-direct output paths. This is MCP protocol adaptation, not an alternate ComfyUI client: bytes still
+direct output paths. Behind a reverse proxy, both directions derive the complete client-facing
+scheme/Host/port per request from `Forwarded` or `X-Forwarded-*`; never mint an internal or
+port-stripped capability URL. If the proxy strips those fields, its launcher may map the
+authoritative upstream origin to `COMFY_MCP_PUBLIC_URL`; validate it as a credential-free HTTP(S)
+origin and keep platform-specific environment names outside this package. This is MCP protocol adaptation, not an alternate ComfyUI client: bytes still
 enter/leave ComfyUI only through comfy-cli; never add a second server, storage API, per-session
 filesystem, base64-in-tool fallback, or direct ComfyUI HTTP call.
 
@@ -171,7 +175,9 @@ application: `/api/uploads/{token}` consumes one short-lived PUT and forwards ow
 through the guarded upload runner; `/downloads/{token}/{filename}` serves only HMAC-signed,
 unexpired files that `comfy download` placed inside its owner-only scratch directory. They use the
 same ASGI app and port. Reverse proxies must forward `/api/uploads/` and `/downloads/` with the
-configured MCP path. Do not build a second file listener or patch SDK sessions to carry files.
+configured MCP path, plus the client-facing scheme, Host, and port via `Forwarded` or
+`X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Port`. Do not build a second file listener
+or patch SDK sessions to carry files.
 
 FastMCP 4 serves both modern sessionless and legacy handshake protocols. Legacy consent uses
 `ctx.elicit`; modern consent returns `InputRequiredResult` and resumes from FastMCP-sealed

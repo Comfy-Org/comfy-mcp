@@ -163,7 +163,13 @@ five-minute HMAC-signed URL and one `client_os`-selected command on the same MCP
 listener. Validate that comfy-cli reported every served path inside that
 scratch directory, make the URL non-cacheable, and clean the directory on
 expiry. A reverse proxy deployment must forward `/api/uploads/` and
-`/downloads/` along with `/mcp`.
+`/downloads/` along with `/mcp`, and preserve the client-facing origin through
+`Forwarded` or the `X-Forwarded-Proto` / `X-Forwarded-Host` /
+`X-Forwarded-Port` trio. Tests must pin a non-default external port so a proxy
+regression cannot emit an internal or incomplete capability URL. A platform
+launcher whose proxy strips those fields maps its authoritative upstream URL
+to `COMFY_MCP_PUBLIC_URL`; the core remains platform-neutral and validates that
+override as a credential-free HTTP(S) origin.
 
 Changes here require the complete upload → submit → poll → fetch flow over real
 stdio and loopback HTTP transports, both modern and legacy HTTP negotiation,

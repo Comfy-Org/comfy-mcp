@@ -249,7 +249,11 @@ first runs `comfy download` into an owner-only temporary directory, then returns
 **temporary signed download URL (valid for five minutes)** on the same MCP listener port and one ready
 command selected by `client_os`. The URL is a bearer capability: do not share or log it. It expires
 automatically, cannot be edited, and the temporary bytes are removed with it. A reverse proxy must
-forward `/mcp`, `/api/uploads/`, and `/downloads/`; no second file server or port is started. This follows the
+forward `/mcp`, `/api/uploads/`, and `/downloads/`, plus the client-facing scheme, Host, and port via
+`Forwarded` or `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Port`. Transfer commands and
+signed links use that upstream origin, including a non-default external port; no second file server
+or port is started. If the proxy does not preserve those fields, set the complete origin explicitly,
+for example `COMFY_MCP_PUBLIC_URL=https://mcp.example.test:8443` (no path or credentials). This follows the
 [Comfy MCP upload/download contract](https://docs.comfy.org/agent-tools/mcp#uploads-and-downloads):
 the server returns a download link because it cannot write directly into a remote client's
 filesystem.

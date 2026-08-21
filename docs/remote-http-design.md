@@ -135,7 +135,12 @@ that client destination and supplies a signed URL plus one command selected by
 Only comfy-cli-reported regular files contained by the scratch root can be
 published. Links are non-cacheable, signature/expiry checked, and removed after
 five minutes. A reverse proxy must forward `/api/uploads/` and `/downloads/` as
-well as `/mcp`.
+well as `/mcp`. It must also pass the client-facing scheme, authority, and port
+through RFC 7239 `Forwarded` or `X-Forwarded-Proto` / `X-Forwarded-Host` /
+`X-Forwarded-Port`; both transfer directions derive their complete public
+origin from the current MCP request. A proxy platform that strips those fields
+must provide its authoritative origin through `COMFY_MCP_PUBLIC_URL`; paths,
+queries, fragments, credentials, and non-HTTP(S) schemes are rejected.
 
 ## Shared engine client
 

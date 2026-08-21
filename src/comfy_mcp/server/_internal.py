@@ -6057,10 +6057,120 @@ def _is_remote_http_request(ctx: Context | None) -> bool:
     return ctx is not None and ctx.transport == "streamable-http"
 
 
-def _remote_http_base_url() -> str:
-    """Public request origin used for same-listener signed download links."""
+def _first_proxy_value(value: str | None) -> str:
+    """Return the client-facing value from one proxy-header chain."""
 
-    return str(get_http_request().base_url).rstrip("/")
+    return value.split(",", 1)[0].strip() if value else ""
+
+
+def _forwarded_parameter(value: str, name: str) -> str:
+    """Read one token/quoted parameter from the first RFC 7239 hop."""
+
+    first = _first_proxy_value(value)
+    match = re.search(
+        rf"(?:^|;)\s*{re.escape(name)}\s*=\s*(?:\"([^\"]*)\"|([^;\s]+))",
+        first,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+    return (match.group(1) or match.group(2) or "").strip()
+
+
+def _valid_public_host(value: str) -> str:
+    """Accept an authority-only proxy value, preserving any explicit port."""
+
+    value = value.strip()
+    if (
+        not value
+        or any(char.isspace() for char in value)
+        or any(char in value for char in "/\\?#@")
+    ):
+        return ""
+    try:
+        parsed = urlparse(f"//{value}")
+        # Accessing ``port`` also rejects malformed/out-of-range authorities.
+        parsed.port
+    except ValueError:
+        return ""
+    if parsed.hostname is None or parsed.username is not None:
+        return ""
+    return value
+
+
+def _host_has_port(host: str) -> bool:
+    """Whether a validated authority already carries an explicit port."""
+
+    return urlparse(f"//{host}").port is not None
+
+
+def _configured_public_base_url() -> str:
+    """Return the operator-provided reverse-proxy origin, when configured."""
+
+    value = os.environ.get("COMFY_MCP_PUBLIC_URL", "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    host = _valid_public_host(parsed.netloc)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not host
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ComfyCliError(
+            "COMFY_MCP_PUBLIC_URL must be an http(s) origin with no path, query, "
+            "fragment, or credentials (for example https://mcp.example.test:8443)"
+        )
+    return f"{parsed.scheme.lower()}://{host}"
+
+
+def _remote_http_base_url() -> str:
+    """Public request origin used for same-listener transfer capability URLs.
+
+    A TLS reverse proxy commonly leaves the ASGI socket at ``http://127.0.0.1``.
+    Prefer its client-facing ``Forwarded`` / ``X-Forwarded-*`` values so upload
+    commands and signed downloads retain the original scheme and external port.
+    The first hop is the address the MCP client used; malformed values fall back
+    field-by-field to Starlette's validated request URL.
+    """
+
+    configured = _configured_public_base_url()
+    if configured:
+        return configured
+
+    request = get_http_request()
+    forwarded = request.headers.get("forwarded", "")
+
+    scheme = _forwarded_parameter(forwarded, "proto") or _first_proxy_value(
+        request.headers.get("x-forwarded-proto")
+    )
+    scheme = scheme.lower()
+    if scheme not in {"http", "https"}:
+        scheme = request.url.scheme
+
+    host = _valid_public_host(
+        _forwarded_parameter(forwarded, "host")
+        or _first_proxy_value(request.headers.get("x-forwarded-host"))
+    )
+    if not host:
+        host = _valid_public_host(request.headers.get("host", ""))
+    if not host:
+        return str(request.base_url).rstrip("/")
+
+    forwarded_port = _first_proxy_value(request.headers.get("x-forwarded-port"))
+    if (
+        not _host_has_port(host)
+        and forwarded_port.isascii()
+        and forwarded_port.isdigit()
+    ):
+        port = int(forwarded_port)
+        if 1 <= port <= 65535:
+            host = f"{host}:{port}"
+
+    return f"{scheme}://{host}"
 
 
 @mcp.tool()
