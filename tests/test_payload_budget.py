@@ -44,7 +44,14 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # failing, is not inferable from any other tool's docs — and an agent that does
 # not know it re-runs a generation that is already on the GPU. Measured ~15,256
 # after the edit, itself already trimmed twice against this ceiling.
-_BUDGET_TOKENS = 15_400
+#
+# 15,400 -> 15,650 when `billing_status` was added on top of that. This one is
+# a whole new TOOL, not docstring growth on an existing one: its description
+# is ~1,110 chars, which is the mean length of the 39 that were already here,
+# so there was no version of it that fit the slack left after the
+# `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
+# next growth is still a decision.
+_BUDGET_TOKENS = 15_650
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
