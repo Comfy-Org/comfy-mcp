@@ -639,6 +639,14 @@ def test_run_workflow_stream_forwards_host_port(patched_stream, monkeypatch):
 def test_job_watch_stream_forwards_host_port(patched_stream, monkeypatch):
     """job(action="watch") tails `comfy jobs watch <id>` with --host/--port forwarded."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+
+    # The watch branch's two `jobs status` polls spawn through the same
+    # `create_subprocess_exec` this fixture patches; stub them so `procs[0]` is
+    # the `jobs watch` child this test is about.
+    async def fake_status(*args, **kwargs):
+        return {"status": "running"}
+
+    monkeypatch.setattr(server, "_run_comfy_async", fake_status)
     procs = patched_stream(_OK_STREAM)
 
     asyncio.run(server.job(action="watch", prompt_id="pid"))
