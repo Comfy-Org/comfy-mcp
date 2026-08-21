@@ -230,7 +230,7 @@ NO_SUCH_OPTION_STDERR = (
 _UNSET = object()
 
 
-def envelope(*, ok: bool = True, data=_UNSET, error=None) -> dict:
+def envelope(*, ok: bool = True, data=_UNSET, error=None, changed=_UNSET) -> dict:
     """Build a comfy-cli ``envelope/1`` result body.
 
     Mirrors what the CLI emits on its ``--json`` path: an ``error`` object when
@@ -240,12 +240,20 @@ def envelope(*, ok: bool = True, data=_UNSET, error=None) -> dict:
     ``data`` defaults to ``{}`` only when it is OMITTED — an explicit
     ``data=None`` stays ``None``, which several tests rely on to exercise the
     non-dict-payload branches.
+
+    ``changed`` is the envelope's OPTIONAL top-level mutation flag (schema:
+    *"present on mutating commands; true iff state changed"*). Omitted by
+    default, exactly as comfy-cli omits it on a read-only verb — so a test that
+    does not pass it exercises the "engine said nothing" path rather than a
+    silent ``False``.
     """
     body: dict = {"schema": "envelope/1", "type": "envelope", "ok": ok}
     if error is not None:
         body["error"] = error
     else:
         body["data"] = {} if data is _UNSET else data
+    if changed is not _UNSET:
+        body["changed"] = changed
     return body
 
 

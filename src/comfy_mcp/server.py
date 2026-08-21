@@ -189,6 +189,17 @@ _MAX_DOWNLOAD_WAIT_TIMEOUT = 3600.0
 # worker owns and this call never waits on.
 _DOWNLOAD_SUBMIT_TIMEOUT = 120.0
 
+# Budget for `model download-cancel`. Deliberately its own constant, and
+# deliberately far below any transfer: cancelling is metadata plus a signal, and
+# comfy-cli's own worst case is bounded — `download_state.stop_worker` gives the
+# worker 5s to honour SIGTERM, then 2s to die on SIGKILL, around a few state
+# reads and an unlink. 30s is ~4x that, and it is what makes "the cancel blocked
+# for the rest of the download" structurally impossible here rather than merely
+# unobserved: whatever the engine does, this call is killed at the bound and
+# reports that it could not cancel (see `_download_cancel_sync`) instead of
+# holding the MCP request open for the transfer's remaining duration.
+_DOWNLOAD_CANCEL_TIMEOUT = 30.0
+
 # CEILING for the LEGACY foreground `model download` — the whole multi-GB
 # transfer happens inside that one call, hence the generous bound. It is a cap,
 # NOT the flat bound: a waiting caller is held only for what is left of their own
@@ -1318,6 +1329,36 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     # like any other missing envelope. A real error envelope still has
     # `type==envelope`, so it flows through and raises with its code as usual.
     return _unwrap_envelope(real_envelope, args, returncode, stderr, stdout=stdout)
+
+
+def _run_comfy_with_changed(
+    *args: str, timeout: float | None = None
+) -> tuple[Any, bool | None]:
+    """:func:`_run_comfy`, plus the envelope's top-level ``changed`` flag.
+
+    ``changed`` is an envelope field, not a ``data`` field (``envelope.json``:
+    *"present on mutating commands; true iff state changed"*), so
+    :func:`_run_comfy` — which unwraps straight down to ``data`` — drops it. For
+    most verbs that is the right trade. For a MUTATING one whose ``data`` looks
+    identical whether or not anything happened, it is the whole answer: `model
+    download-cancel` returns the download's status row either way, and only
+    ``changed`` says whether this call is what stopped the transfer (see
+    :func:`_with_cancel_verdict`).
+
+    Same envelope contract as ``_run_comfy`` — the `_real_envelope` filter and
+    the raising `_unwrap_envelope` — following :func:`server_info`, the other
+    caller that needs the envelope itself rather than its payload. A missing or
+    non-boolean ``changed`` is reported as ``None`` (unknown), never coerced to
+    ``False``: an older comfy-cli that omits the flag has not told us the call
+    changed nothing.
+    """
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    envelope = _real_envelope(envelope)
+    # Raises when `envelope` is None, exactly as `_run_comfy` does, so it is
+    # non-None on the line below.
+    data = _unwrap_envelope(envelope, args, returncode, stderr, stdout=stdout)
+    changed = envelope.get("changed")
+    return data, changed if isinstance(changed, bool) else None
 
 
 # git's own wording, and the state it describes. Matched on BOTH streams because
@@ -10174,6 +10215,14 @@ _DOWNLOAD_TERMINAL_STATUSES = frozenset(
 # this work?".
 _DOWNLOAD_FAILURE_STATUSES = frozenset({"failed", "cancelled", "canceled"})
 
+# The subset that means a transfer was STOPPED, as opposed to having failed on
+# its own. Split out from `_DOWNLOAD_FAILURE_STATUSES` because `cancel` asks a
+# third question the other two sets do not answer — "is this download cancelled
+# *now*?" — and answering it off the failure set would read a `failed` transfer
+# as a successful cancel. Carries the US spelling for the same reason the
+# terminal set does.
+_DOWNLOAD_CANCELLED_STATUSES = frozenset({"cancelled", "canceled"})
+
 
 def _download_status_of(payload: Any) -> str | None:
     """The lower-cased ``status`` of a ``download-status`` payload, if it has one."""
@@ -10192,6 +10241,131 @@ def _is_download_terminal(payload: Any) -> bool:
 def _download_failed(payload: Any) -> bool:
     """True if a terminal ``download-status`` payload means the file did not land."""
     return _download_status_of(payload) in _DOWNLOAD_FAILURE_STATUSES
+
+
+def _download_cancel_note(
+    status: str | None, cancelled: bool, changed: bool | None
+) -> str:
+    """One line saying what the cancel actually did, and what is left to do.
+
+    The prose half of :func:`_with_cancel_verdict`; the booleans beside it are
+    what an agent branches on. Every branch is phrased from comfy-cli's own two
+    answers — the resulting ``status`` and the envelope's ``changed`` — and the
+    NOT-cancelled ones name the way forward rather than dead-ending, because on
+    every one of them the caller still has a decision to make (a file that
+    landed anyway, a transfer that may still be running).
+
+    ``changed`` is REPORTED here, never interpreted. The engine's flag says only
+    THAT state moved on this call, not WHAT moved, so a note that named the
+    file's disposition from it — "comfy-cli kept the completed file at `dest`",
+    "comfy-cli reclaimed its partial file" — would be this wrapper guessing, and
+    guessing the same flag two contradictory ways on two adjacent branches.
+    Worse, it is the guess whose cost is asymmetric: comfy-cli downloads to the
+    final ``dest`` and a state-changing cancel may unlink it, so telling the
+    caller the file is there to delete can be exactly backwards. The three
+    values are kept distinct on the cancelled branch for the same reason
+    ``_run_comfy_with_changed`` refuses to coerce a missing flag to ``False``:
+    ``None`` is "the engine did not say", which cannot carry the ``True``
+    branch's claim that THIS call is what stopped the transfer.
+    """
+    if cancelled:
+        if changed is False:
+            return (
+                "no-op: this download was ALREADY cancelled before this call, so "
+                "nothing was stopped now."
+            )
+        if changed is None:
+            return (
+                "cancelled: comfy-cli reports this download cancelled, but "
+                "emitted no `changed` flag — so whether THIS call stopped it or "
+                "it was already cancelled is unknown."
+            )
+        return "cancelled: comfy-cli stopped the transfer's worker."
+    moved = (
+        " comfy-cli reports this call changed state, but not what it changed."
+        if changed
+        else ""
+    )
+    if status == "completed":
+        return (
+            "NOT cancelled: the transfer had already finished, so there was no "
+            f"running transfer to stop.{moved} Nothing was aborted; check `dest` "
+            "and delete the file yourself if the download was a mistake."
+        )
+    if status in _DOWNLOAD_TERMINAL_STATUSES:
+        return (
+            f"NOT cancelled: this download was ALREADY {status} before this "
+            f"call, so there was no running transfer to stop.{moved}"
+        )
+    # SCRUBBED and capped like every other engine-derived string this server
+    # renders (`_unwrap_envelope`, `errors._render_error_details`): `status` is
+    # comfy-cli's, and a version-skewed engine or a tampered state file could
+    # put a credential-bearing URL or a blob where a one-word status belongs.
+    # The terminal branch above needs no such treatment — it only ever
+    # interpolates a member of `_DOWNLOAD_TERMINAL_STATUSES`.
+    where = (
+        f"status {failure_log._scrub_text(status)[: errors._MAX_ERROR_FIELD_CHARS]!r}"
+        if status
+        else "no status"
+    )
+    return (
+        f"NOT cancelled: comfy-cli returned {where}, so this transfer may still "
+        f'be running.{moved} Re-check it with `download(action="status")` and '
+        "re-issue the cancel if it is."
+    )
+
+
+def _with_cancel_verdict(payload: Any, changed: bool | None) -> Any:
+    """Add the branchable cancel verdict to a ``model download-cancel`` payload.
+
+    comfy-cli answers a cancel with the download's ``download-status`` row —
+    which on its own is indistinguishable from the row a transfer nobody touched
+    would produce. A cancel that arrived too late comes back ``status:
+    "completed"``, ``percent: 100.0``, ``error: null``: a success payload for a
+    cancel that stopped nothing, with no field an agent could branch on to
+    discover that. Hence three fields, in the same shape ``job(action="cancel")``
+    already uses — independent facts reported separately rather than one
+    overloaded verdict:
+
+    - ``cancelled`` — comfy-cli's resulting ``status`` reads cancelled. This is
+      the field to branch on, NOT ``status``/``error``.
+    - ``changed`` — comfy-cli's OWN envelope flag for this call: did it change
+      any state (kill a worker, reclaim a partial file)? It is what separates a
+      cancel that did something from a no-op against an id that was already
+      terminal, including the already-``cancelled`` id whose ``status`` alone
+      would read as a fresh success. ``None`` when the engine emitted no flag,
+      which is honestly "unknown", not "no".
+    - ``note`` — :func:`_download_cancel_note`.
+
+    Nothing here is derived beyond reading those two engine answers: the verdict
+    is comfy-cli's, which is what keeps this inside the thin-wrapper rule. The
+    MCP surface being served is the same one ``_with_download_id`` serves — an
+    agent has one round trip and no terminal to read the CLI's printed
+    "already completed; nothing to cancel" line from.
+    """
+    status = _download_status_of(payload)
+    cancelled = status in _DOWNLOAD_CANCELLED_STATUSES
+    verdict = {
+        "cancelled": cancelled,
+        "changed": changed,
+        "note": _download_cancel_note(status, cancelled, changed),
+    }
+    if not isinstance(payload, dict):
+        # comfy-cli always emits a status row here, so a non-dict is a broken
+        # engine contract — but handing it back bare is the very failure this
+        # function exists to close (a reply with nothing to branch on). Report
+        # the verdict anyway and keep the engine's own reply under `data`; the
+        # note's last branch already says the status is missing.
+        return {**verdict, "data": payload}
+    # The verdict wins a name clash deliberately, unlike `_with_download_id`,
+    # which keeps comfy-cli's `id` beside the spelling it adds. The asymmetry is
+    # the source: `id` and `download_id` are two spellings of a value the ENGINE
+    # owns, so dropping one would drop an engine answer, while `cancelled` /
+    # `changed` / `note` name no field of comfy-cli's `download-status` row —
+    # `changed` in particular is an ENVELOPE field, so the one here is already
+    # the engine's own, read one level up. A row that grew a `changed` of its
+    # own would therefore be shadowed by the same flag, not by an inference.
+    return {**payload, **verdict}
 
 
 def _with_download_id(payload: Any, download_id: str) -> Any:
@@ -10530,6 +10704,28 @@ def _download_verb_unsupported(
             f"{'check on' if verb == 'download-status' else 'cancel'}."
         ),
         "unsupported": True,
+        # The cancel half carries the WHOLE verdict, set to the only honest
+        # values: this comfy-cli has no abort verb, so no cancel was attempted
+        # and nothing changed. All three keys, not just `cancelled` — the tool
+        # docstring promises callers that "`changed` and `note` say what
+        # happened instead", so shipping the degrade with `cancelled` alone
+        # would hand an agent that believed it a `KeyError`, which is the same
+        # read-the-absence failure the field exists to prevent. `download-status`
+        # gets no such key: it is not a cancel and has no verdict to report.
+        **(
+            {
+                "cancelled": False,
+                "changed": False,
+                "note": (
+                    "NOT cancelled: this comfy-cli has no `model "
+                    "download-cancel`, so no cancel was attempted and nothing "
+                    "changed. There is no background transfer to stop here — "
+                    "`download_model` runs the download inline on this install."
+                ),
+            }
+            if verb == "download-cancel"
+            else {}
+        ),
     }
 
 
@@ -10805,10 +11001,42 @@ def _download_wait_sync(download_id: str, timeout_seconds: float) -> Any:
 
 
 def _download_cancel_sync(download_id: str) -> Any:
-    """``download(action="cancel")``'s body — the exact ``cancel_download`` this replaced."""
-    return _with_download_id(
-        _run_comfy("model", "download-cancel", download_id, timeout=60.0), download_id
-    )
+    """``download(action="cancel")``'s body — one bounded ``model download-cancel``.
+
+    comfy-cli owns the abort itself and it is a real one: `download-cancel`
+    writes a cancel sentinel, then `killpg`s the detached worker's process group
+    (SIGTERM, then SIGKILL), then reclaims the partial file. This call never
+    waits on the transfer — it waits on that, under
+    :data:`_DOWNLOAD_CANCEL_TIMEOUT`.
+
+    Two things are added on the way out, and neither is a verdict of this
+    server's own. :func:`_with_cancel_verdict` surfaces comfy-cli's answers —
+    the resulting ``status`` and the envelope's ``changed`` — as fields an agent
+    can branch on, because the raw status row cannot tell an effective cancel
+    from a no-op. And the bound expiring is re-raised saying exactly that much:
+    the child's process group was killed at the deadline, so what happened to
+    the download is UNKNOWN from here — the one thing that must not be reported
+    is a cancel that may not have happened.
+    """
+    try:
+        payload, changed = _run_comfy_with_changed(
+            "model", "download-cancel", download_id, timeout=_DOWNLOAD_CANCEL_TIMEOUT
+        )
+    except ComfyCliError as exc:
+        if not exc.timed_out:
+            raise
+        raise ComfyCliError(
+            f"{exc} — nothing here claims the transfer stopped: comfy-cli did "
+            "not answer within the bound, so the download may still be running. "
+            f"Re-check it with `download(action='status', "
+            f"download_id={download_id!r})` and re-issue the cancel.",
+            code=exc.code,
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+            timed_out=exc.timed_out,
+            data=exc.data,
+        ) from exc
+    return _with_download_id(_with_cancel_verdict(payload, changed), download_id)
 
 
 # The three actions `download` dispatches, in the order their old standalone
@@ -10852,6 +11080,8 @@ def download(
       the final payload, or `{"timed_out": True, "download_id": ...,
       "status": <last>}` on expiry -- a TIMEOUT, not a failure.
     - "cancel" -> stop a running transfer and its partial file.
+      `cancelled` (NOT `status`) says whether it did; `changed` and
+      `note` say what happened instead.
 
     `download_id` required for every action; `timeout_seconds` only for
     "wait" -- rejected elsewhere. Payloads key the handle `download_id`;
