@@ -99,6 +99,26 @@ def test_billing_status_argv(patched_async_run):
     assert procs[0].start_new_session is True
 
 
+def test_billing_status_reads_an_envelope_larger_than_the_default_stdout_bound(
+    patched_async_run,
+):
+    """A big payload survives: the call widens `_run_comfy_async`'s stdout cap.
+
+    That runner keeps only the TRAILING `_STDERR_MAX_CHARS` of stdout by
+    default — a bound meant for a multi-GB download's progress spew. An
+    envelope clipped from the front loses its opening brace and comes back as
+    "returned no JSON" instead of the payload, so a `cloud status` snapshot that
+    outgrew 64 KiB would vanish. The schema is `additionalProperties: true` and
+    already grows rows, so its size is the engine's to decide.
+    """
+    # Comfortably past the default bound, well inside the widened one.
+    big = {**_STATUS, "blocked_upgrades": ["plan-%04d" % n for n in range(6000)]}
+    assert len(str(big)) > server._STDERR_MAX_CHARS
+    patched_async_run(envelope(data=big))
+
+    assert _billing_status() == big
+
+
 def test_billing_status_forwards_the_whole_payload_unfiltered(patched_async_run):
     """Every field comfy-cli emits reaches the caller, not a hand-picked subset.
 
@@ -197,8 +217,13 @@ def test_billing_status_degrade_carries_the_balance_verdict(patched_async_run):
     result = _billing_status()
 
     assert result["balance_confirmed"] is False
-    # No invented balance travels alongside the verdict.
-    assert "credit_balance_usd" not in result
+    # The fields the verdict is ABOUT come with it, so a consumer implementing
+    # the docstring's "false means the balance fields are null" invariant by
+    # subscript does not hit a `KeyError` on the one shape where the verdict is
+    # always false. `None` invents nothing — it is precisely "no figure".
+    assert result["credit_balance_usd"] is None
+    assert result["credit_balance_credits"] is None
+    assert result["effective_balance_micros"] is None
 
 
 def test_billing_status_degrade_does_not_push_an_unprompted_pip_upgrade(

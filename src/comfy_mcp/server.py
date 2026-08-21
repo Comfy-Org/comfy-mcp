@@ -3042,6 +3042,19 @@ def auth_status() -> Any:
 # request itself.
 _BILLING_STATUS_TIMEOUT = 180.0
 
+# `_run_comfy_async` keeps only the trailing `_STDERR_MAX_CHARS` (64 KiB) of
+# stdout by default, which is the one place its contract is narrower than
+# `_run_comfy`'s unbounded `communicate()`. That bound exists for a multi-GB
+# download's progress spew, not for an envelope — and an envelope clipped from
+# the FRONT loses its opening brace and surfaces as "returned no JSON" rather
+# than as the payload. `cloud status` reads `additionalProperties: true` and
+# already grows rows (`seats`, `blocked_upgrades`, `upgrade_suggestion`), so
+# its size is the engine's to decide, not ours. Widen the way `upload_file`
+# does (`_UPLOAD_STDOUT_MAX_CHARS`): 1 MiB is orders of magnitude above any
+# plausible billing snapshot, so moving to the async runner costs no payload
+# this tool could previously return, while still bounding the allocation.
+_BILLING_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
+
 
 @mcp.tool()
 async def billing_status() -> Any:
@@ -3065,9 +3078,20 @@ async def billing_status() -> Any:
 
     Signed out raises comfy-cli's own error — get the user signed in with
     ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
-    degrades to ``{"error", "unsupported": True, "balance_confirmed": False}``
-    — the verdict key travels with the degrade so reading it is always safe.
+    degrades to ``{"error", "unsupported": True}`` carrying
+    ``balance_confirmed: False`` and the balance fields ``null``, so the rule
+    above holds there too.
     """
+    # The success path is a straight RELAY of comfy-cli's envelope `data`: the
+    # field list in the docstring describes what the ENGINE returns, and a
+    # payload disagreeing with comfy-cli's own `cloud_status.json` (a non-dict
+    # `data`, a missing `balance_confirmed`) is handed back as it came rather
+    # than reshaped here. Deciding the engine's payload is invalid, or
+    # substituting a shape of our own, is the guardrail breach `AGENTS.md`
+    # names; `auth_status` sets the near precedent — it WRAPS a non-dict whoami
+    # payload rather than rejecting it, and only because it has a flag of its
+    # own to keep top-level. There is nothing to add here, so there is nothing
+    # to wrap.
     # `_run_comfy_async`, NOT the thread-pool path, for the same reason
     # `workflow_deps` gives: this is a `_BILLING_STATUS_TIMEOUT`-long child, and
     # `asyncio.to_thread(_run_comfy, …)`'s cancellation never reaches the
@@ -3080,7 +3104,10 @@ async def billing_status() -> Any:
     # below reads.
     try:
         return await _run_comfy_async(
-            "cloud", "status", timeout=_BILLING_STATUS_TIMEOUT
+            "cloud",
+            "status",
+            timeout=_BILLING_STATUS_TIMEOUT,
+            stdout_cap=_BILLING_STATUS_STDOUT_MAX_CHARS,
         )
     except ComfyCliError as exc:
         # Same degrade shape and same strictness as `_freshness_report` /
@@ -3179,6 +3206,17 @@ async def billing_status() -> Any:
             # prevent. `False` is the only honest value: no balance was
             # established, because no balance call was made.
             "balance_confirmed": False,
+            # ...and the fields that verdict is ABOUT come with it, for the
+            # same reason one step further out. The docstring's invariant is
+            # "`balance_confirmed: false` means the balance fields are
+            # `null`", so a consumer implementing it by subscript
+            # (`result["credit_balance_usd"] is None`) must not hit a
+            # `KeyError` on the one shape where the verdict is always false.
+            # `None` invents nothing — it is precisely "no figure", the same
+            # value comfy-cli itself emits when it could not confirm one.
+            "credit_balance_usd": None,
+            "credit_balance_credits": None,
+            "effective_balance_micros": None,
         }
 
 
