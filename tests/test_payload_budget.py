@@ -35,7 +35,16 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # than by this change. Measured ~15,112 after it. Deliberately tight — the
 # point of this ceiling is that the next growth is a decision too, not that
 # there is room for one.
-_BUDGET_TOKENS = 15_250
+#
+# 15,250 -> 15,400 for `generate_image`'s expired-wait contract (+~145 tokens
+# across its docstring and the long-generation flow in INSTRUCTIONS). Growth a
+# caller cannot do without: that a `wait=True` call is bounded by the CLIENT's
+# invisible transport cap as much as by `timeout_seconds`, and that an expired
+# wait returns the `prompt_id` of a job that is still running rather than
+# failing, is not inferable from any other tool's docs — and an agent that does
+# not know it re-runs a generation that is already on the GPU. Measured ~15,256
+# after the edit, itself already trimmed twice against this ceiling.
+_BUDGET_TOKENS = 15_400
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

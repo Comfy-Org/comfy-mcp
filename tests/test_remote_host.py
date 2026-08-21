@@ -677,7 +677,10 @@ def test_generate_image_stream_forwards_host_port(patched_stream, monkeypatch):
         "run-template",
         "image_z_image_turbo",
         '--param=57.text="a cat"',
-        "--timeout=120",
+        # Lowered from comfy-cli's 120s default by `generate_image`'s own 60s
+        # default budget (`_T2I_DEFAULT_TIMEOUT`); the forwarding is what this
+        # test is about and is unaffected.
+        "--timeout=60",
         "--host",
         "gpu.example",
         "--port",
