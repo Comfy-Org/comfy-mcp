@@ -77,15 +77,17 @@ The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
 handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
 
-The third is the remote MCP **filesystem boundary** (`file_transfer.py`). A path string names
-the MCP server's filesystem, never an HTTP client's. `upload_file` may therefore materialize a
-bounded inline `{name, mimeType, data}` object long enough to pass its path to the unchanged
-`comfy upload` call. In the other direction, HTTP `fetch_outputs` must first call `comfy
-download` into owner-only scratch, then publish only contained regular files through a
-10-minute HMAC-signed URL on the SAME FastMCP listener. stdio keeps direct paths. This is MCP
-protocol adaptation, not an alternate ComfyUI client: bytes still enter/leave ComfyUI only
-through comfy-cli; never add a second server, storage API, per-session filesystem, or direct
-ComfyUI HTTP call. Inline base64 must never enter subprocess argv or the failure log.
+The third is the remote MCP **filesystem boundary** (`file_transfer.py`). Its public schema follows
+ComfyCloud's command-oriented contract: `upload_file(file_path, client_os)` treats `file_path` as
+client-local. stdio passes that path directly to `comfy upload`; HTTP mints a five-minute,
+single-use, credential-free PUT command on the SAME FastMCP listener. That route stages at most
+50 MiB owner-only, calls the same guarded `ComfyCliClient` upload runner, returns
+`{name, subfolder, type}`, and always removes scratch. In the other direction, HTTP
+`fetch_outputs` first calls `comfy download` into owner-only scratch, then publishes only contained
+regular files through a five-minute HMAC-signed URL and one `client_os`-selected command. stdio keeps
+direct output paths. This is MCP protocol adaptation, not an alternate ComfyUI client: bytes still
+enter/leave ComfyUI only through comfy-cli; never add a second server, storage API, per-session
+filesystem, base64-in-tool fallback, or direct ComfyUI HTTP call.
 
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` — differ where
 the engine's own shape differs, and those differences are load-bearing: `comfy generate`
@@ -139,13 +141,13 @@ after initialization.
 | `server/mcp_app.py` | the minimal `McpApplicationBuilder`; owns name/version/base instructions and performs the repository's only `FastMCP(...)` construction |
 | `server/remote.py` | transport-only adapter: calls `http_app()` on the supplied shared FastMCP instance and composes it with uvicorn; owns no tools, models, client, or application factory |
 | `server/_internal.py` | private composition root, guarded runners, envelope/stream machinery, consent state, tool implementations, and startup logic |
-| `file_transfer.py` | remote MCP filesystem adapter: bounded inline upload staging plus same-listener signed output tokens, containment, expiry, and cleanup; no ComfyUI I/O |
+| `file_transfer.py` | remote MCP filesystem adapter: Cloud-compatible single-use upload commands/routes plus same-listener signed output tokens, containment, expiry, and cleanup; no ComfyUI I/O |
 | `textutil.py` | pure text helpers: `_tail` / `_stream_tail` (bounded stream tails) and `_redact_url` (userinfo masking) |
 | `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
 | `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` observer: `_log_failure` publishes immutable `_FailureEvent`s and the JSONL observer owns config, rotation, permissions and lazy file state. Its URL scrubbers also mask credentials on the way to the MCP CLIENT and disk |
 | `errors.py` | `ComfyCliError`; the "nothing recorded to stop" detector; the `error.details` renderer + per-field char cap |
 | `clitext.py` | comfy-cli **human-output** parsing for verbs with no envelope — `Saved:`-block/install-failure extraction, `plain_ok` synthesis, missing-verb/-option probes, `install_node`'s per-pack verdict, echoed-argv forgery guards. Its extractors are the documented cm-cli contract (see architecture rule above) — move or edit byte-for-byte |
-| `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload paths) |
+| `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload path) |
 | `target.py` | remote-target resolution/redaction/provenance for run/job tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, and divergence notes on `system_stats`/`free_memory` so an agent doesn't gate a remote run on local numbers |
 | `params.py` | param/slot marshaling into comfy-cli argv for `generate`/`run-template`/`set-slot`/`vary`, incl. the structured slot machinery — `SlotOverride`/`SlotVariants` are this module's public TYPES (carve-out below) |
 | `client/protocols.py` | `ComfyCliClient`, the outbound engine port used by all application/tool code |
@@ -164,11 +166,12 @@ method. Never implement JSON-RPC, sessions, SSE, WebSockets, or reconnect here. 
 therefore share tool names, schemas, returns, instructions/version, consent, and
 `ComfyCliClient`; the Remote layer must never shell out independently.
 
-The one non-MCP route is registered with FastMCP's public `custom_route` on that shared
-application: `/downloads/{token}/{filename}` serves only HMAC-signed, unexpired files that
-`comfy download` placed inside its owner-only scratch directory. It uses the same ASGI app and
-port. Reverse proxies must forward `/downloads/` with the configured MCP path. Do not build a
-second file listener or patch SDK sessions to carry files.
+The two non-MCP routes are registered with FastMCP's public `custom_route` on that shared
+application: `/api/uploads/{token}` consumes one short-lived PUT and forwards owner-only scratch
+through the guarded upload runner; `/downloads/{token}/{filename}` serves only HMAC-signed,
+unexpired files that `comfy download` placed inside its owner-only scratch directory. They use the
+same ASGI app and port. Reverse proxies must forward `/api/uploads/` and `/downloads/` with the
+configured MCP path. Do not build a second file listener or patch SDK sessions to carry files.
 
 FastMCP 4 serves both modern sessionless and legacy handshake protocols. Legacy consent uses
 `ctx.elicit`; modern consent returns `InputRequiredResult` and resumes from FastMCP-sealed
@@ -185,8 +188,8 @@ Keep console logs on stderr in both modes. Under stdio, stdout is the JSON-RPC c
 HTTP it is technically free but deliberately stays unused so behavior is predictable across
 launch modes. Child stdout remains captured data for `envelope/1` parsing only. The opt-in
 failure publisher has one JSONL observer. While disabled it returns before any filesystem
-effect; while enabled it remains non-propagating and file-only. Inline upload bytes/base64 are
-never failure-event fields. Keep this diagnostic-only—do
+effect; while enabled it remains non-propagating and file-only. Upload request bytes are never
+failure-event fields. Keep this diagnostic-only—do
 not introduce a general event bus.
 
 The private runtime reaches leaf modules **module-qualified** (for example,

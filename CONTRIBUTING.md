@@ -128,23 +128,28 @@ into a general event bus. Any new runner failure must call
 shared application. Preserve URL credential/query redaction for arguments,
 messages, and stream tails. Update the README's kind list and both stdio/HTTP
 configuration guidance whenever this contract changes, and add a regression
-at the runner and observer boundary. Inline upload content and its base64 form
-must never be published in a failure event or written to JSONL.
+at the runner and observer boundary. Upload request bytes must never be
+published in a failure event or written to JSONL.
 
 ## Remote file-transfer changes
 
-`upload_file` keeps its one required `paths` list: each entry is a server path
-or an inline `{name, mimeType, data}` object. Inline content is strict base64,
-bounded below the MCP request ceiling, written owner-only, and removed after
-success, failure, or cancellation. It still reaches ComfyUI only through the
-same `ComfyCliClient.run_async("upload", ...)` path.
+`upload_file` keeps the ComfyCloud-compatible required pair `file_path` and
+`client_os`. stdio passes the absolute client path to `comfy upload`; HTTP
+returns a credential-free single-use PUT command on `/api/uploads/{token}`.
+The route accepts only the image filename bound at mint time, caps the body at
+50 MiB, writes it owner-only, and removes it after success, failure, or
+cancellation. It still reaches ComfyUI only through the same
+`ComfyCliClient.run_async("upload", ...)` path. Base64-in-tool upload is not a
+fallback.
 
+Both capability routes use the same MCP listener and FastMCP ASGI application.
 `fetch_outputs` keeps `comfy download` as its engine. stdio writes directly to
 the caller's path; HTTP downloads into owner-only scratch and returns a
-10-minute HMAC-signed URL on the same MCP listener. Validate that comfy-cli
-reported every served path inside that scratch directory, make the URL
-non-cacheable, and clean the directory on expiry. A reverse proxy deployment
-must forward `/downloads/` along with `/mcp`.
+five-minute HMAC-signed URL and one `client_os`-selected command on the same MCP
+listener. Validate that comfy-cli reported every served path inside that
+scratch directory, make the URL non-cacheable, and clean the directory on
+expiry. A reverse proxy deployment must forward `/api/uploads/` and
+`/downloads/` along with `/mcp`.
 
 Changes here require the complete upload → submit → poll → fetch flow over real
 stdio and loopback HTTP transports, both modern and legacy HTTP negotiation,

@@ -80,12 +80,13 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 from urllib.parse import urlparse
 
 import anyio.to_thread
 from fastmcp import Context
 from fastmcp.server.dependencies import get_http_request
+from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import Image
 from mcp import types
 from pydantic import BaseModel, Field
@@ -148,10 +149,24 @@ MCP_APPLICATION_BUILDER = McpApplicationBuilder(
 )
 mcp = MCP_APPLICATION_BUILDER.build()
 
-# Public FastMCP route on the SAME ASGI application/port as ``/mcp``. The URL
-# itself is the authorization: the random capability plus expiry is signed by a
-# per-process secret in ``file_transfer``. No SDK session method is patched and
+# Public FastMCP routes on the SAME ASGI application/port as ``/mcp``. The URLs
+# themselves are short-lived capabilities. No SDK session method is patched and
 # no second HTTP application is constructed.
+
+
+async def _serve_upload(request: Any) -> Any:
+    """Adapt the HTTP upload route to the shared guarded comfy-cli runner."""
+
+    return await file_transfer.receive_upload(request, _upload_one_file)
+
+
+mcp.custom_route(
+    file_transfer._UPLOAD_ROUTE,
+    methods=["PUT"],
+    name=file_transfer._UPLOAD_ROUTE_NAME,
+    include_in_schema=False,
+)(_serve_upload)
+
 mcp.custom_route(
     file_transfer._DOWNLOAD_ROUTE,
     methods=["GET"],
@@ -6054,16 +6069,18 @@ def fetch_outputs(
     out_dir: str,
     url_only: bool = False,
     inline_images: bool = False,
+    client_os: Literal["darwin", "linux", "windows"] = "darwin",
     ctx: Context | None = None,
 ) -> Any:
     """Deliver a completed job's outputs to the MCP client's ``out_dir``.
 
     Wraps ``comfy download``. stdio writes to ``out_dir``; ``url_only=True``
     emits engine URLs, while ``inline_images=True`` also returns bounded MCP
-    image content. HTTP treats ``out_dir`` as a CLIENT path and returns
-    10-minute signed URLs on the MCP listener plus ready ``curl``/``curl.exe``
-    commands; do not edit their signed queries. HTTP always uses that transfer
-    path regardless of ``url_only``/``inline_images``.
+    image content. HTTP treats ``out_dir`` as a CLIENT path and returns the
+    ComfyCloud-style pair: temporary signed URL(s) on the MCP listener and one
+    ready shell command selected by ``client_os``. Do not edit signed queries.
+    HTTP always uses that transfer path regardless of
+    ``url_only``/``inline_images``.
 
     A configured remote works even though ``download`` is not in
     ``_TARGET_AWARE_SUBCOMMANDS``: comfy-cli resolves ``prompt_id`` through the
@@ -6080,6 +6097,10 @@ def fetch_outputs(
     # ahead of the NUL refusal for the ordering reason `argv._guard_arg_len` gives.
     argv._guard_arg_len("out_dir", out_dir)
     out_dir = argv._reject_nul("out_dir", out_dir)
+    if client_os not in {"darwin", "linux", "windows"}:
+        raise ComfyCliError(
+            "invalid client_os: expected one of 'darwin', 'linux', or 'windows'"
+        )
 
     if _is_remote_http_request(ctx):
         base_url = _remote_http_base_url()
@@ -6089,13 +6110,26 @@ def fetch_outputs(
                 "download", prompt_id, "-o", directory.name, timeout=300.0
             )
             # Ownership of ``directory`` transfers to the signed-URL store on
-            # success; it expires and removes the bytes after ten minutes. A
+            # success; it expires and removes the bytes after five minutes. A
             # publish failure cleans immediately and never returns a dead URL.
-            return file_transfer.publish_downloads(
+            published = file_transfer.publish_downloads(
                 directory,
                 data,
                 base_url=base_url,
                 client_out_dir=out_dir,
+                client_os=client_os,
+            )
+            return ToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text=file_transfer.download_message(
+                            published,
+                            client_os=client_os,
+                        ),
+                    )
+                ],
+                structured_content=published,
             )
         except BaseException:
             directory.cleanup()
@@ -11159,110 +11193,73 @@ def download(
         return degraded
 
 
-# `comfy upload`'s envelope echoes every file it staged — the resolved local
-# path plus the server-assigned name per entry — so its size scales with the
-# argv the caps above allow: `argv._MAX_UPLOAD_PATHS_TOTAL_BYTES` of path text
-# appearing twice per entry, worst-case sextupled by JSON `\uXXXX` string
-# escaping, plus keys and punctuation for each of up to `argv._MAX_UPLOAD_PATHS`
-# entries — past 2 MiB, and far past the `_STDERR_MAX_CHARS` tail
-# `_run_comfy_async` keeps by default. Clipping the FRONT of that one-line
-# envelope would misreport a SUCCESSFUL full-batch upload as "comfy-cli
-# returned no JSON", so `upload_file` widens its stdout bound to this instead:
-# comfortably above the derivation, still a bound.
+# Keep verbose upload metadata intact without making the async runner's default
+# capture unbounded. A clipped one-line envelope loses its JSON prefix and turns
+# a successful upload into the misleading "returned no JSON" error.
 _UPLOAD_STDOUT_MAX_CHARS = 4 * 1024 * 1024
 
 
-async def _prepare_uploads(sources: Any) -> file_transfer.PreparedUploads:
-    """Materialize inline bytes off-loop without leaking scratch on cancellation."""
+async def _upload_one_file(path: str) -> Any:
+    """Run the one comfy-cli upload shared by stdio and capability PUTs."""
 
-    task = asyncio.create_task(
-        asyncio.to_thread(file_transfer.prepare_uploads, sources)
-    )
     try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # ``to_thread`` keeps running after its awaiter is cancelled. Wait for
-        # that writer before cleanup so a cancelled request cannot either leak
-        # its directory or delete beneath a still-open file descriptor.
-        prepared: file_transfer.PreparedUploads | None = None
-        with contextlib.suppress(Exception):
-            prepared = await task
-        if prepared is not None and prepared.directory is not None:
-            await asyncio.to_thread(prepared.directory.cleanup)
-        raise
+        return await _run_comfy_async(
+            "upload",
+            path,
+            "--no-overwrite",
+            timeout=300.0,
+            stdout_cap=_UPLOAD_STDOUT_MAX_CHARS,
+        )
+    except ComfyCliError as exc:
+        # Never retry without remote target flags: that would upload to the
+        # wrong ComfyUI. Translate only Click's pre-execution option error.
+        if not clitext._is_missing_option_error(exc, "--host"):
+            raise
+        raise ComfyCliError(
+            "the installed comfy-cli cannot be pointed at a remote ComfyUI for "
+            "this verb: its `comfy upload` does not accept `--host`, which "
+            "ships in comfy-cli 1.14.0. Nothing was uploaded — and nothing was "
+            "uploaded locally either, since files staged on this machine are "
+            "invisible to the remote ComfyUI the run submits to. Two ways "
+            'forward: upgrade comfy-cli (`update_comfyui(target="cli")`, or '
+            "`comfy update cli` in a terminal) and call this again; or, "
+            "without upgrading, unset COMFYUI_URL / COMFYUI_HOST and set "
+            "comfy-cli's own COMFY_LOCAL_URL=http://<host>:<port> to the same "
+            "address instead — every comfy-cli verb resolves it, upload "
+            "included, so uploads and runs both land there."
+        ) from exc
 
 
 @mcp.tool()
 async def upload_file(
-    paths: list[str | file_transfer.UploadContent],
-    overwrite: bool = False,
+    file_path: str,
+    client_os: Literal["darwin", "linux", "windows"],
     ctx: Context | None = None,
 ) -> Any:
-    """Upload server paths or inline client files into the target ComfyUI input.
+    """Upload one local image into the target ComfyUI input directory.
 
-    Wraps ``comfy upload`` to stage workflow images/masks.
+    The schema and remote response match ComfyCloud's ``upload_file`` contract.
+    ``file_path`` is an absolute path on the MCP CLIENT. In stdio the server can
+    read it and immediately runs ``comfy upload``. Over HTTP the tool returns a
+    credential-free, single-use ``PUT`` command for the client's own shell; the
+    upload route then stages the bytes owner-only and runs that same command.
 
     Args:
-        paths: Server-visible paths or inline ``{name, mimeType, data}``
-            objects with strict base64; use inline when an HTTP client has a
-            different filesystem (2 MiB decoded total per call).
-        overwrite: True replaces an existing file; False (default) keeps it
-            and stores the upload under a deduplicated name.
+        file_path: Absolute path to a JPG, JPEG, PNG, WebP, or GIF image.
+        client_os: ``darwin``, ``linux``, or ``windows``; selects shell quoting.
 
     Targets the configured local/remote ComfyUI; remote upload needs comfy-cli
-    >= 1.14.0. String paths should be absolute and must exist on the MCP SERVER.
-    Inline scratch is owner-only and always removed. Cancellation can leave a
-    partial target batch; re-run to finish it.
+    >= 1.14.0. A remote URL is valid for five minutes and one attempt only;
+    re-invoke this tool after an expiry/failure rather than reusing it. Images
+    are limited to 50 MiB. Base64/data-inline upload is not supported.
     """
-    prepared = await _prepare_uploads(paths)
-    try:
-        args = ["upload", *prepared.paths]
-        # BOTH legs explicit: comfy-cli's `--overwrite/--no-overwrite` pair
-        # defaults to overwrite, so omission would invert our default.
-        args.append("--overwrite" if overwrite else "--no-overwrite")
-        try:
-            data = await _run_comfy_async(
-                *args, timeout=300.0, stdout_cap=_UPLOAD_STDOUT_MAX_CHARS
-            )
-        except ComfyCliError as exc:
-            if (
-                _is_remote_http_request(ctx)
-                and exc.code == "upload_failed"
-                and "File not found:" in str(exc)
-                and any(isinstance(source, str) for source in paths)
-            ):
-                raise ComfyCliError(
-                    f"{exc}\nhint: string paths are resolved on the remote MCP "
-                    "server, not on the MCP client's machine; resend each "
-                    "client-local file as an inline {name, mimeType, data} "
-                    "object with base64 data",
-                    code=exc.code,
-                    no_envelope=exc.no_envelope,
-                    returncode=exc.returncode,
-                    timed_out=exc.timed_out,
-                    data=exc.data,
-                ) from exc
-            # Never retry without remote target flags: that would upload to the
-            # wrong ComfyUI. Translate only Click's pre-execution option error.
-            if not clitext._is_missing_option_error(exc, "--host"):
-                raise
-            raise ComfyCliError(
-                "the installed comfy-cli cannot be pointed at a remote ComfyUI for "
-                "this verb: its `comfy upload` does not accept `--host`, which "
-                "ships in comfy-cli 1.14.0. Nothing was uploaded — and nothing was "
-                "uploaded locally either, since files staged on this machine are "
-                "invisible to the remote ComfyUI the run submits to. Two ways "
-                'forward: upgrade comfy-cli (`update_comfyui(target="cli")`, or '
-                "`comfy update cli` in a terminal) and call this again; or, "
-                "without upgrading, unset COMFYUI_URL / COMFYUI_HOST and set "
-                "comfy-cli's own COMFY_LOCAL_URL=http://<host>:<port> to the same "
-                "address instead — every comfy-cli verb resolves it, upload "
-                "included, so uploads and runs both land there."
-            ) from exc
-        return file_transfer.rewrite_upload_result(data, prepared.display_by_path)
-    finally:
-        if prepared.directory is not None:
-            await asyncio.to_thread(prepared.directory.cleanup)
+    request = file_transfer.prepare_upload_request(file_path, client_os)
+    if _is_remote_http_request(ctx):
+        return file_transfer.mint_upload_command(
+            request,
+            base_url=_remote_http_base_url(),
+        )
+    return await _upload_one_file(request.file_path)
 
 
 @mcp.tool()

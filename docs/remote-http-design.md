@@ -62,10 +62,10 @@ package-level public types (`ComfyCliError`, `SlotOverride`, `SlotVariants`) and
 from reusable leaf helpers without introducing another abstraction layer.
 
 `comfy_mcp.file_transfer` is the one package-level leaf for the HTTP filesystem
-boundary. It validates/materializes inline upload objects and owns signed
-download tokens, expiry, and cleanup; it neither imports the server package nor
-talks to ComfyUI. `_internal.py` composes it with the same `ComfyCliClient`
-upload/download calls used by stdio.
+boundary. It validates the Cloud-compatible upload request, owns single-use
+upload tokens plus signed download tokens, and handles expiry/cleanup; it
+neither imports the server package nor talks to ComfyUI. `_internal.py`
+composes it with the same `ComfyCliClient` upload/download calls used by stdio.
 
 ## Runtime composition
 
@@ -108,32 +108,34 @@ addressing persisted server session state. Long jobs should still use
 submit/poll (`wait=False`, then `job`) rather than depend on a long HTTP
 response.
 
-The shared application also registers one public `custom_route` at
-`/downloads/{token}/{filename}` before either transport is selected. In HTTP
-mode, `fetch_outputs` first calls `comfy download` into owner-only scratch, then
-returns a 10-minute HMAC-signed capability URL on that route. It is still the
-same FastMCP ASGI application and listener: there is no second server, port,
-session system, or transport-specific tool registry. stdio never uses the route
-and preserves direct output writes.
+The shared application also registers two public `custom_route`s before either
+transport is selected: single-use PUT at `/api/uploads/{token}` and signed GET
+at `/downloads/{token}/{filename}`. In HTTP mode, `upload_file` mints the first;
+its handler stages the request owner-only and calls the shared upload runner.
+`fetch_outputs` first calls `comfy download` into owner-only scratch, then mints
+a five-minute HMAC-signed capability on the second. Both remain on the same
+FastMCP ASGI application and listener: there is no second server, port, session
+system, or transport-specific tool registry. stdio uses direct paths.
 
 ## Remote filesystem boundary
 
 MCP tool arguments are JSON, so a client-local pathname does not make the file
-visible to a remote MCP process. `upload_file.paths` therefore accepts either:
-
-- a string path visible on the MCP server; or
-- `{name, mimeType, data}` with strict base64 bytes.
-
-Inline data is capped at 2 MiB decoded per call, staged owner-only, handed to
-the existing async `comfy upload` runner, and removed on every exit path. The
-base64 value is never a subprocess argument or failure-log field.
+visible to a remote MCP process. `upload_file(file_path, client_os)` therefore
+uses the same contract as ComfyCloud: stdio reads the absolute client path;
+HTTP returns a credential-free command that PUTs the file to a five-minute,
+single-use capability. The route is limited to the validated image filename
+bound at mint time and 50 MiB, stages owner-only, hands only its generated path
+to the existing async `comfy upload` runner, and removes it on every exit. Raw
+request bytes are never subprocess arguments or failure-log fields.
 
 The inverse boundary applies to `fetch_outputs`: HTTP `out_dir` is a desired
 client path, not a server write target. The response rewrites scratch paths to
-that client destination and supplies signed URL plus POSIX/Windows commands.
+that client destination and supplies a signed URL plus one command selected by
+`client_os` (with structured aliases retained for programmatic clients).
 Only comfy-cli-reported regular files contained by the scratch root can be
 published. Links are non-cacheable, signature/expiry checked, and removed after
-ten minutes. A reverse proxy must forward `/downloads/` as well as `/mcp`.
+five minutes. A reverse proxy must forward `/api/uploads/` and `/downloads/` as
+well as `/mcp`.
 
 ## Shared engine client
 
@@ -213,8 +215,9 @@ The affected test layers are:
 4. `test_remote_http.py`: real loopback HTTP over the same 39 tools and the
    same complete upload/submit/poll/signed-fetch business flow, plus failure
    observation, negotiation, concurrency, stale requests, and lifecycle.
-5. `test_file_transfer.py`: inline schema/limits, exact bytes, path containment,
-   scratch cleanup, signed capabilities, and failure-log non-disclosure.
+5. `test_file_transfer.py`: Cloud-compatible schema/commands, single-use upload
+   limits and exact bytes, path containment, scratch cleanup, signed downloads,
+   and failure-log non-disclosure.
 6. `test_failure_log.py`: opt-in behavior, immutable event delivery, observer
    isolation, scrubbing, permissions, rotation, and concurrency.
 7. `tests/e2e`: separately marked live ComfyUI smoke. A missing real `comfy`

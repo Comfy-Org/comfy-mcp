@@ -24,8 +24,8 @@ def test_failure_log_docs_cover_stdio_http_and_server_side_ownership():
     assert "COMFY_MCP_DEBUG_LOG=1" in section
     assert "immutable failure event" in section
     assert "JSONL writer observes those events" in section
-    assert "base64 representation" in section
-    assert "never enter the failure event or JSONL file" in section
+    assert "HTTP upload request bytes" in section
+    assert "never enter the failure event" in section
 
 
 def test_smoke_docs_require_transport_business_flow_and_live_engine_stages():
@@ -39,6 +39,7 @@ def test_smoke_docs_require_transport_business_flow_and_live_engine_stages():
     assert "`server_info` → workflow submission → job status" in section
     assert "same 39-tool application" in section
     assert "temporary signed URL from the same listener" in section
+    assert "upload URL is single-use" in section
     assert "./scripts/smoke.sh" in section
     assert "COMFY_LOCAL_URL" in section
     assert "SD1.5" in section

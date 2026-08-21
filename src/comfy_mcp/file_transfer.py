@@ -1,15 +1,15 @@
 """MCP-side file transfer adapters for remote HTTP clients.
 
-The engine remains ``comfy-cli``: inbound bytes are materialized only long
-enough to become ordinary ``comfy upload`` path arguments, and completed
-outputs are downloaded by ``comfy download`` before this module exposes them
-through short-lived capability URLs on the MCP listener.
+The engine remains ``comfy-cli``.  A remote caller receives a short-lived
+single-use upload command; the corresponding route materializes those bytes
+only long enough to pass a normal path to ``comfy upload``.  Completed outputs
+take the inverse path: ``comfy download`` writes owner-only scratch and this
+module publishes short-lived capability URLs on the same MCP listener.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
+import asyncio
 import hashlib
 import hmac
 import os
@@ -18,11 +18,12 @@ import shlex
 import tempfile
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any, Literal
 from urllib.parse import quote, urlencode
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
@@ -30,92 +31,30 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from . import argv
 from .errors import ComfyCliError
 
-# MCP SDK 2.0 caps a Streamable HTTP POST body at 4 MiB. Two MiB of decoded
-# content expands to at most ~2.67 MiB of base64, leaving room for JSON-RPC,
-# filenames, and the rest of the tool arguments without touching that ceiling.
-_MAX_INLINE_UPLOAD_BYTES = 2 * 1024 * 1024
-_MAX_INLINE_UPLOAD_BASE64_CHARS = 4 * ((_MAX_INLINE_UPLOAD_BYTES + 2) // 3)
 _MAX_UPLOAD_NAME_BYTES = 255
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+_UPLOAD_TTL_SECONDS = 5 * 60
+_UPLOAD_ROUTE = "/api/uploads/{token}"
+_UPLOAD_ROUTE_NAME = "comfy_mcp_upload"
+_UPLOAD_MIME_TYPES = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
-_DOWNLOAD_TTL_SECONDS = 10 * 60
+_DOWNLOAD_TTL_SECONDS = 5 * 60
 _DOWNLOAD_ROUTE = "/downloads/{token}/{filename}"
 _DOWNLOAD_ROUTE_NAME = "comfy_mcp_download"
 
-
-class UploadContent(BaseModel):
-    """A file whose bytes travel inside a JSON MCP tool argument."""
-
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    name: str = Field(
-        description="Safe basename to give the staged file (for example input.webp)."
-    )
-    mime_type: str = Field(
-        default="application/octet-stream",
-        alias="mimeType",
-        description="File MIME type metadata; the filename still controls ComfyUI use.",
-        max_length=255,
-    )
-    data: str = Field(
-        description="Base64-encoded file bytes (2 MiB decoded total per call).",
-        max_length=_MAX_INLINE_UPLOAD_BASE64_CHARS,
-        json_schema_extra={"contentEncoding": "base64"},
-    )
+ClientOS = Literal["darwin", "linux", "windows"]
 
 
-@dataclass(frozen=True)
-class PreparedUploads:
-    """Concrete paths plus optional scratch ownership for one upload call."""
+def _posix_quote(value: str) -> str:
+    """Always single-quote one shell argument, matching ComfyCloud's command."""
 
-    directory: tempfile.TemporaryDirectory | None
-    paths: list[str]
-    display_by_path: dict[str, str]
-
-
-def _upload_name(name: str, index: int) -> str:
-    label = f"inline upload paths[{index}].name"
-    if not name or name in {".", ".."}:
-        raise ComfyCliError(f"invalid {label}: expected a non-empty filename")
-    if "/" in name or "\\" in name or "\0" in name:
-        raise ComfyCliError(
-            f"invalid {label}: expected a basename without '/', '\\', or NUL"
-        )
-    try:
-        encoded = os.fsencode(name)
-    except UnicodeEncodeError as exc:
-        raise ComfyCliError(f"invalid {label}: filename cannot be encoded") from exc
-    if len(encoded) > _MAX_UPLOAD_NAME_BYTES:
-        raise ComfyCliError(
-            f"invalid {label}: encoded filename exceeds {_MAX_UPLOAD_NAME_BYTES} bytes"
-        )
-    return name
-
-
-def _coerce_upload_content(value: Any, index: int) -> UploadContent:
-    if isinstance(value, UploadContent):
-        return value
-    if not isinstance(value, dict):
-        raise ComfyCliError(
-            f"invalid paths[{index}]: expected a string path or inline file object"
-        )
-    try:
-        return UploadContent.model_validate(value)
-    except ValidationError as exc:
-        # Pydantic's rendered error can include ``data`` verbatim. Never place a
-        # caller's base64 payload in an MCP error or the opt-in failure log.
-        raise ComfyCliError(
-            f"invalid inline upload paths[{index}]: expected name, optional "
-            "mimeType, and valid base64 data within the 2 MiB call limit"
-        ) from exc
-
-
-def _decode_upload_data(content: UploadContent, index: int) -> bytes:
-    try:
-        return base64.b64decode(content.data, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ComfyCliError(
-            f"invalid inline upload paths[{index}].data: expected strict base64"
-        ) from exc
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
 def _write_owner_only(path: str, data: bytes) -> None:
@@ -127,92 +66,198 @@ def _write_owner_only(path: str, data: bytes) -> None:
         handle.write(data)
 
 
-def prepare_uploads(sources: Any) -> PreparedUploads:
-    """Validate/materialize local paths and inline objects without network I/O."""
+@dataclass(frozen=True, slots=True)
+class UploadRequest:
+    """Validated client-local path metadata; no file access occurs here."""
 
-    if not isinstance(sources, list):
-        # Preserve the established error wording/order for a bare string and
-        # every other wrong container type.
-        argv._validate_upload_paths(sources)
-        raise AssertionError("upload path validation unexpectedly returned")
-    if not sources:
-        argv._validate_upload_paths([])
-        raise AssertionError("empty upload path validation unexpectedly returned")
-    if all(isinstance(source, str) for source in sources):
-        paths = list(sources)
-        argv._validate_upload_paths(paths)
-        return PreparedUploads(None, paths, {})
+    file_path: str
+    filename: str
+    mime_type: str
+    client_os: ClientOS
 
-    # Refuse an oversized batch before decoding or touching disk. Reusing the
-    # established list validator keeps the public count error byte-identical.
-    if len(sources) > argv._MAX_UPLOAD_PATHS:
-        argv._validate_upload_paths(["x"] * len(sources))
+
+@dataclass(frozen=True, slots=True)
+class _UploadEntry:
+    filename: str
+    mime_type: str
+    expires: int
+
+
+def prepare_upload_request(file_path: str, client_os: ClientOS) -> UploadRequest:
+    """Validate the Cloud-compatible upload arguments without opening the path."""
+
+    argv._guard_arg_len("file_path", file_path)
+    file_path = argv._reject_nul("file_path", file_path)
+    if client_os == "windows":
+        path = PureWindowsPath(file_path)
+    elif client_os in {"darwin", "linux"}:
+        path = PurePosixPath(file_path)
+    else:
+        raise ComfyCliError(
+            "invalid client_os: expected one of 'darwin', 'linux', or 'windows'"
+        )
+    if not path.is_absolute() or not path.name:
+        raise ComfyCliError("file_path must be an absolute path to an image file")
+    try:
+        encoded_name = os.fsencode(path.name)
+    except UnicodeEncodeError as exc:
+        raise ComfyCliError("file_path filename cannot be encoded") from exc
+    if len(encoded_name) > _MAX_UPLOAD_NAME_BYTES:
+        raise ComfyCliError(
+            f"file_path filename exceeds {_MAX_UPLOAD_NAME_BYTES} encoded bytes"
+        )
+    mime_type = _UPLOAD_MIME_TYPES.get(path.suffix.lower())
+    if mime_type is None:
+        raise ComfyCliError(
+            "upload_file accepts image files ending in .jpg, .jpeg, .png, .webp, "
+            "or .gif"
+        )
+    return UploadRequest(file_path, path.name, mime_type, client_os)
+
+
+class _UploadStore:
+    """Small process-local registry for single-use upload capability URLs."""
+
+    def __init__(self, ttl_seconds: int = _UPLOAD_TTL_SECONDS) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._entries: dict[str, _UploadEntry] = {}
+        self._lock = threading.Lock()
+
+    def mint(self, request: UploadRequest, *, base_url: str) -> str:
+        now = int(time.time())
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._entries = {
+                key: value
+                for key, value in self._entries.items()
+                if value.expires >= now
+            }
+            self._entries[token] = _UploadEntry(
+                request.filename,
+                request.mime_type,
+                now + self._ttl_seconds,
+            )
+        url = f"{base_url.rstrip('/')}/api/uploads/{token}"
+        if request.client_os == "windows":
+            command = " ".join(
+                (
+                    "curl.exe",
+                    "-sS",
+                    "--fail-with-body",
+                    "-X",
+                    "PUT",
+                    "-H",
+                    f'"Content-Type: {request.mime_type}"',
+                    "--upload-file",
+                    _SignedDownloadStore._windows_quote(request.file_path),
+                    "--",
+                    _SignedDownloadStore._windows_quote(url),
+                )
+            )
+            shell = "PowerShell"
+        else:
+            command = (
+                "curl -sS --fail-with-body -X PUT "
+                f"-H {_posix_quote(f'Content-Type: {request.mime_type}')} "
+                f"--upload-file {_posix_quote(request.file_path)} -- "
+                f"{_posix_quote(url)}"
+            )
+            shell = "Bash"
+        return (
+            f"Run this command via {shell} to upload the file. It is "
+            "credential-free — the single-use URL is the authorization — so run "
+            "it exactly as emitted; do NOT add any Authorization header or "
+            f"credential.\n\n{command}\n\nOn success it prints a JSON body like "
+            '{"name":"...","subfolder":"","type":"input"} — use that '
+            '"name" as the "image" value in your workflow\'s LoadImage node; no '
+            "further upload_file call is needed. The URL is single-use with a "
+            "short TTL: if the command fails (404 = used/expired), re-invoke "
+            "upload_file for a fresh URL instead of re-running this one. Images "
+            "must be at most 50 MiB — a larger file returns 413 and consumes the "
+            "URL, so shrink it first rather than retrying. The PUT targets the "
+            "same MCP host as this session."
+        )
+
+    def consume(self, token: str) -> _UploadEntry | None:
+        now = int(time.time())
+        with self._lock:
+            entry = self._entries.pop(token, None)
+        if entry is None or entry.expires < now:
+            return None
+        return entry
+
+    def close(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_UPLOAD_STORE = _UploadStore()
+
+
+def mint_upload_command(request: UploadRequest, *, base_url: str) -> str:
+    """Mint the same command-oriented remote upload response as ComfyCloud."""
+
+    return _UPLOAD_STORE.mint(request, base_url=base_url)
+
+
+def uploaded_name(data: Any) -> str:
+    """Read the uploaded input name from comfy-cli's own envelope data."""
+
+    if isinstance(data, dict):
+        direct = data.get("name")
+        if isinstance(direct, str) and direct:
+            return direct
+        uploads = data.get("uploads")
+        if isinstance(uploads, list) and uploads and isinstance(uploads[0], dict):
+            for key in ("cloud_name", "name", "filename"):
+                value = uploads[0].get(key)
+                if isinstance(value, str) and value:
+                    return value
+    raise ComfyCliError("comfy-cli upload returned no uploaded input name")
+
+
+async def receive_upload(
+    request: Request,
+    uploader: Callable[[str], Awaitable[Any]],
+) -> Response:
+    """Consume one capability URL, then forward its bytes through comfy-cli."""
+
+    entry = _UPLOAD_STORE.consume(request.path_params.get("token", ""))
+    if entry is None:
+        return JSONResponse(
+            {"error": "upload URL is invalid, used, or expired"},
+            status_code=404,
+            headers={"Cache-Control": "no-store"},
+        )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _MAX_UPLOAD_BYTES:
+            return JSONResponse(
+                {"error": "file exceeds the 50 MiB upload limit"},
+                status_code=413,
+                headers={"Cache-Control": "no-store"},
+            )
+        chunks.append(chunk)
 
     directory = tempfile.TemporaryDirectory(prefix="comfy-mcp-upload-")
-    paths: list[str] = []
-    display_by_path: dict[str, str] = {}
-    names: set[str] = set()
-    total_bytes = 0
+    path = os.path.join(directory.name, entry.filename)
     try:
-        for index, source in enumerate(sources):
-            if isinstance(source, str):
-                paths.append(source)
-                continue
-            content = _coerce_upload_content(source, index)
-            name = _upload_name(content.name, index)
-            name_key = os.path.normcase(name)
-            if name_key in names:
-                raise ComfyCliError(
-                    f"invalid inline upload paths[{index}].name: duplicate filename "
-                    f"{name!r} in one call"
-                )
-            names.add(name_key)
-            data = _decode_upload_data(content, index)
-            total_bytes += len(data)
-            if total_bytes > _MAX_INLINE_UPLOAD_BYTES:
-                raise ComfyCliError(
-                    "invalid inline uploads: decoded content exceeds the 2 MiB "
-                    "total per call (the MCP HTTP request limit is 4 MiB)"
-                )
-            path = os.path.join(directory.name, name)
-            try:
-                _write_owner_only(path, data)
-            except OSError as exc:
-                raise ComfyCliError(
-                    f"invalid inline upload paths[{index}].name: the MCP server "
-                    "cannot stage this filename"
-                ) from exc
-            paths.append(path)
-            display_by_path[path] = name
-
-        argv._validate_upload_paths(paths)
-        return PreparedUploads(directory, paths, display_by_path)
-    except BaseException:
-        directory.cleanup()
-        raise
-
-
-def rewrite_upload_result(data: Any, display_by_path: dict[str, str]) -> Any:
-    """Replace only scratch-path echoes with the caller-visible inline name."""
-
-    if not display_by_path or not isinstance(data, dict):
-        return data
-    uploads = data.get("uploads")
-    if not isinstance(uploads, list):
-        return data
-    rewritten = dict(data)
-    rows: list[Any] = []
-    for upload in uploads:
-        if not isinstance(upload, dict):
-            rows.append(upload)
-            continue
-        row = dict(upload)
-        local_path = row.get("local_path")
-        if isinstance(local_path, str) and local_path in display_by_path:
-            row["local_path"] = display_by_path[local_path]
-        rows.append(row)
-    rewritten["uploads"] = rows
-    return rewritten
+        await asyncio.to_thread(_write_owner_only, path, b"".join(chunks))
+        data = await uploader(path)
+        return JSONResponse(
+            {"name": uploaded_name(data), "subfolder": "", "type": "input"},
+            headers={"Cache-Control": "no-store"},
+        )
+    except ComfyCliError as exc:
+        return JSONResponse(
+            {"error": str(exc)},
+            status_code=502,
+            headers={"Cache-Control": "no-store"},
+        )
+    finally:
+        await asyncio.to_thread(directory.cleanup)
 
 
 @dataclass
@@ -291,6 +336,7 @@ class _SignedDownloadStore:
         *,
         base_url: str,
         client_out_dir: str,
+        client_os: ClientOS,
     ) -> dict[str, Any]:
         """Own a completed ``comfy download`` directory and publish its files."""
 
@@ -337,6 +383,7 @@ class _SignedDownloadStore:
                 client_path = self._client_path(client_out_dir, filename)
                 row["path"] = client_path
                 row["url"] = url
+                row["download_url"] = url
                 row["expires_at"] = expires
                 row["command"] = " ".join(
                     shlex.quote(part)
@@ -359,6 +406,9 @@ class _SignedDownloadStore:
                         self._windows_quote(url),
                     )
                 )
+                row["download_command"] = (
+                    row["windows_command"] if client_os == "windows" else row["command"]
+                )
                 batch.tokens.add(token)
                 self._entries[token] = _DownloadEntry(path, filename, batch)
                 published.append(row)
@@ -375,6 +425,9 @@ class _SignedDownloadStore:
         result["out_dir"] = client_out_dir
         result["files"] = published
         result["download_url_ttl_seconds"] = self._ttl_seconds
+        result["download_command"] = " && ".join(
+            row["download_command"] for row in published
+        )
         return result
 
     def acquire(
@@ -431,12 +484,30 @@ def publish_downloads(
     *,
     base_url: str,
     client_out_dir: str,
+    client_os: ClientOS,
 ) -> dict[str, Any]:
     return _DOWNLOAD_STORE.publish(
         directory,
         data,
         base_url=base_url,
         client_out_dir=client_out_dir,
+        client_os=client_os,
+    )
+
+
+def download_message(data: dict[str, Any], *, client_os: ClientOS) -> str:
+    """Render the Cloud-style URL + ready command response for MCP content."""
+
+    files = data.get("files", [])
+    urls = [row.get("download_url") for row in files if isinstance(row, dict)]
+    links = "\n".join(f"- {url}" for url in urls if isinstance(url, str))
+    shell = "PowerShell" if client_os == "windows" else "Bash"
+    return (
+        "Output is ready. Temporary download URL(s):\n\n"
+        f"{links}\n\nRun this command via {shell} to download the output. "
+        "Run it exactly as emitted; do not edit or re-encode the signed URL.\n\n"
+        f"{data.get('download_command', '')}\n\nThe URL is valid for a short "
+        "window. If it expires, call fetch_outputs again for a fresh URL."
     )
 
 

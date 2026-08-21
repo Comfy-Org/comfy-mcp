@@ -194,10 +194,11 @@ def _isolate_failure_log(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _clear_signed_downloads():
-    """Never let an HTTP output token/temp directory cross a test boundary."""
+def _clear_file_capabilities():
+    """Never let an HTTP upload/download capability cross a test boundary."""
 
     yield
+    file_transfer._UPLOAD_STORE.close()
     file_transfer._DOWNLOAD_STORE.close()
 
 

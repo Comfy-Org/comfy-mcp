@@ -21,9 +21,10 @@ flows:
   `job(action="status")` (or stream live via `job(action="watch")`) ->
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
   does not block.
-- Remote HTTP files: string upload paths exist on the MCP SERVER; otherwise use
-  `{name, mimeType, data}` base64 (2 MiB total). HTTP `fetch_outputs` returns
-  10-minute signed URLs/commands on the MCP listener; do not edit the query.
+- Remote HTTP files: `upload_file(file_path, client_os)` returns a short-lived,
+  single-use, credential-free PUT command for the CLIENT's own shell; run it
+  verbatim. HTTP `fetch_outputs` returns five-minute signed URLs plus one command
+  selected by `client_os`; do not edit the signed query.
 - Large model downloads: `download_model` submits to a background worker and
   returns a `download_id`; poll `download(action="wait")` /
   `download(action="status")`, or `download(action="cancel")` to stop one.

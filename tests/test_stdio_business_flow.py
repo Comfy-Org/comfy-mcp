@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import sys
 
@@ -64,7 +63,7 @@ else:
 """
 
 
-async def _run_stdio_flow(fake_comfy: str):
+async def _run_stdio_flow(fake_comfy: str, input_path: str):
     env = {
         **os.environ,
         "COMFY_BIN": fake_comfy,
@@ -81,13 +80,8 @@ async def _run_stdio_flow(fake_comfy: str):
         uploaded = await client.call_tool(
             "upload_file",
             {
-                "paths": [
-                    {
-                        "name": "stdio-input.bin",
-                        "mimeType": "application/octet-stream",
-                        "data": base64.b64encode(b"stdio-input").decode(),
-                    }
-                ]
+                "file_path": input_path,
+                "client_os": "darwin",
             },
         )
         submitted = await client.call_tool(
@@ -111,15 +105,17 @@ def test_real_stdio_process_completes_submit_poll_fetch(tmp_path):
     fake = tmp_path / "fake-comfy"
     fake.write_text(_FAKE_COMFY.format(python=sys.executable), encoding="utf-8")
     fake.chmod(0o755)
+    input_path = tmp_path / "stdio-input.png"
+    input_path.write_bytes(b"stdio-input")
 
     tools, info, uploaded, submitted, status, outputs = asyncio.run(
-        _run_stdio_flow(str(fake))
+        _run_stdio_flow(str(fake), str(input_path))
     )
 
     assert len(tools) == 39
     assert info.data["server"]["running"] is True
     assert uploaded.data["uploads"] == [
-        {"local_path": "stdio-input.bin", "cloud_name": "stdio-input.bin"}
+        {"local_path": str(input_path), "cloud_name": "stdio-input.bin"}
     ]
     assert submitted.data["prompt_id"] == "prompt-stdio"
     assert status.data["status"] == "completed"

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import subprocess
@@ -128,15 +128,27 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
             uploaded = await client.call_tool(
                 "upload_file",
                 {
-                    "paths": [
-                        {
-                            "name": "task_04.webp",
-                            "mimeType": "image/webp",
-                            "data": base64.b64encode(upload_bytes).decode(),
-                        }
-                    ]
+                    "file_path": "/client/inputs/task_04.webp",
+                    "client_os": "linux",
                 },
             )
+            upload_message = uploaded.content[0].text
+            upload_url_match = re.search(
+                r"https?://[^'\s]+/api/uploads/[\w-]+", upload_message
+            )
+            assert upload_url_match is not None
+            upload_url = upload_url_match.group(0)
+            async with httpx2.AsyncClient() as http_client:
+                upload_response = await http_client.put(
+                    upload_url,
+                    content=upload_bytes,
+                    headers={"Content-Type": "image/webp"},
+                )
+                repeated_upload = await http_client.put(
+                    upload_url,
+                    content=upload_bytes,
+                    headers={"Content-Type": "image/webp"},
+                )
 
             submit_calls = patched_run(envelope(data={"prompt_id": "prompt-http"}))
             submitted = await client.call_tool(
@@ -172,7 +184,11 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
             )
             outputs = await client.call_tool(
                 "fetch_outputs",
-                {"prompt_id": "prompt-http", "out_dir": "/tmp/results"},
+                {
+                    "prompt_id": "prompt-http",
+                    "out_dir": "/tmp/results",
+                    "client_os": "linux",
+                },
             )
             async with httpx2.AsyncClient() as http_client:
                 downloaded = await http_client.get(outputs.data["files"][0]["url"])
@@ -185,6 +201,9 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
             discovered,
             info,
             uploaded,
+            upload_message,
+            upload_response,
+            repeated_upload,
             submitted,
             status,
             outputs,
@@ -201,6 +220,9 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
         discovered,
         info,
         uploaded,
+        upload_message,
+        upload_response,
+        repeated_upload,
         submitted,
         status,
         outputs,
@@ -223,7 +245,14 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
         "fetch_outputs",
     } <= names
     assert info.data["running"] is True
-    assert uploaded.data["uploads"][0]["cloud_name"] == "task_04.webp"
+    assert "curl -sS --fail-with-body -X PUT" in upload_message
+    assert "/client/inputs/task_04.webp" in upload_message
+    assert upload_response.json() == {
+        "name": "task_04.webp",
+        "subfolder": "",
+        "type": "input",
+    }
+    assert repeated_upload.status_code == 404
     assert submitted.data["prompt_id"] == "prompt-http"
     assert status.data["status"] == "completed"
     output = outputs.data["files"][0]
@@ -231,8 +260,13 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
     assert output["url"].startswith(remote_http_server.removesuffix("/mcp"))
     assert "expires=" in output["url"] and "signature=" in output["url"]
     assert output["url"] in output["command"]
-    assert outputs.data["download_url_ttl_seconds"] == 600
-    assert 1 <= output["expires_at"] - int(time.time()) <= 600
+    assert output["download_url"] == output["url"]
+    assert output["download_command"] == output["command"]
+    assert outputs.data["download_command"] == output["command"]
+    assert "Temporary download URL" in outputs.content[0].text
+    assert output["url"] in outputs.content[0].text
+    assert outputs.data["download_url_ttl_seconds"] == 300
+    assert 1 <= output["expires_at"] - int(time.time()) <= 300
     assert f'"{output["url"]}"' in output["windows_command"]
     assert downloaded.status_code == 200
     assert downloaded.content == b"\x89PNG\r\n\x1a\nremote-result"
@@ -259,33 +293,27 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
-def test_http_missing_client_path_explains_inline_transfer(
+def test_http_upload_mints_command_without_reading_client_path(
     mode, remote_http_server, patched_async_run
 ):
-    patched_async_run(
-        envelope(
-            ok=False,
-            error={
-                "code": "upload_failed",
-                "message": "File not found: /client/inputs/task_04.webp",
-                "hint": "check the file path and try again",
-            },
-        )
-    )
+    procs = patched_async_run(envelope(data={"uploads": []}))
 
     _, result = asyncio.run(
         _discover_and_call(
             remote_http_server,
             "upload_file",
-            {"paths": ["/client/inputs/task_04.webp"]},
+            {
+                "file_path": "/client/inputs/task_04.webp",
+                "client_os": "linux",
+            },
             mode=mode,
-            raise_on_error=False,
         )
     )
 
-    assert result.is_error is True
-    assert "string paths are resolved on the remote MCP server" in str(result)
-    assert "inline {name, mimeType, data}" in str(result)
+    assert result.is_error is False
+    assert "/api/uploads/" in result.content[0].text
+    assert "Base64/data-inline upload is unsupported" not in result.content[0].text
+    assert procs == []
 
 
 async def _accept_approval(message, response_type, params, ctx):
@@ -390,6 +418,49 @@ def test_http_comfy_cli_failure_reaches_the_shared_optin_failure_log(
         "/srv/workflows/smoke.json",
     ]
     assert "ComfyUI is offline" in entry["message"]
+
+
+def test_http_upload_failure_log_never_records_uploaded_bytes(
+    remote_http_server, patched_async_run, monkeypatch, tmp_path
+):
+    """The observer sees comfy-cli diagnostics, never the capability PUT body."""
+
+    log_path = tmp_path / "failures.jsonl"
+    monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(log_path))
+    procs = patched_async_run(
+        envelope(
+            ok=False,
+            error={"code": "upload_failed", "message": "ComfyUI rejected upload"},
+        )
+    )
+    private_bytes = b"PRIVATE-CAPABILITY-BODY-7f59a"
+
+    async def run_failure():
+        _, result = await _discover_and_call(
+            remote_http_server,
+            "upload_file",
+            {
+                "file_path": "/client/inputs/private.png",
+                "client_os": "linux",
+            },
+        )
+        match = re.search(
+            r"https?://[^'\s]+/api/uploads/[\w-]+", result.content[0].text
+        )
+        assert match is not None
+        async with httpx2.AsyncClient() as http_client:
+            return await http_client.put(match.group(0), content=private_bytes)
+
+    response = asyncio.run(run_failure())
+    serialized = log_path.read_text(encoding="utf-8")
+    entry = json.loads(serialized.strip())
+
+    assert response.status_code == 502
+    assert entry["kind"] == "error_envelope"
+    assert entry["error_code"] == "upload_failed"
+    assert private_bytes.decode() not in serialized
+    scratch = pathlib.Path(procs[0].cmd[5])
+    assert not scratch.exists()
 
 
 def test_http_auto_mode_negotiates_the_modern_sessionless_protocol(
