@@ -35,7 +35,14 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # than by this change. Measured ~15,112 after it. Deliberately tight — the
 # point of this ceiling is that the next growth is a decision too, not that
 # there is room for one.
-_BUDGET_TOKENS = 15_250
+#
+# 15,250 -> 15,500 when `billing_status` was added. This one is a
+# whole new TOOL, not docstring growth on an existing one: its description is
+# ~1,110 chars, which is the mean length of the 39 that were already here, so
+# there was no version of it that fit the 552 chars of slack left. The ceiling
+# moves by what the tool costs (~277 tokens) and no further — measured ~15,390
+# after it, so the next growth is still a decision.
+_BUDGET_TOKENS = 15_500
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
