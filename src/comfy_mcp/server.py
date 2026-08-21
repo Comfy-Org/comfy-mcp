@@ -9694,11 +9694,134 @@ def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
     return _run_comfy(*args, timeout=60.0)
 
 
+# The marker key that tells this server WHICH `nodes path` contract the
+# installed comfy-cli speaks. comfy-cli added `mode` to the `nodes path`
+# payload in the same commit that made its `--exact` walker type-constrained
+# (comfy-cli #695, released in 1.16.0), so its presence is the engine's own
+# statement that its default mode is sound. Nothing else in the payload
+# distinguishes the two: every field the OLD one emitted, the new one still
+# emits, with the same names and the same meanings.
+_PATH_TYPED_EXACT_MARKER = "mode"
+
+
+# The `nodes path` pair's SHARED wall-clock budget, and the floor the `--loose`
+# re-ask is never squeezed below. Every other `nodes` verb is one 60s call, and
+# so is this one wherever the fallback does not fire; what the fallback must not
+# do is spend 60s TWICE. ~120s is the whole request budget a typical MCP client
+# allows — the ceiling `download_model`'s 110s default is sized to sit under —
+# and `nodes` is a SYNC tool on the shared thread pool, where a client's
+# cancellation never reaches the worker, so a second child would be spawned, and
+# run to term, after the caller had already given up. The re-ask therefore gets
+# what is LEFT of the 60s rather than a fresh 60s of its own.
+#
+# Floored rather than allowed to reach zero because the re-ask is the call whose
+# answer is actually returned: a first call that ate the budget producing a
+# payload this server is about to discard must not reduce the sound query to an
+# instant synthetic timeout. So the worst case is 60 + 15, not 60 + 60, and it
+# is still comfortably inside the client's budget.
+_NODES_PATH_TIMEOUT = 60.0
+_NODES_PATH_RETRY_MIN_TIMEOUT = 15.0
+
+
+def _nodes_path_is_type_constrained(data: Any) -> bool:
+    """Does this engine's ``nodes path`` default mode route on socket TYPE?
+
+    Reads the answer out of comfy-cli's own payload rather than off a version
+    number this repo would then have to keep in sync. ``True`` only for a
+    payload carrying :data:`_PATH_TYPED_EXACT_MARKER`; anything else — a
+    pre-fix payload, or a shape this server cannot read at all — is treated as
+    the old contract, which costs one extra ``--loose`` call and never a wrong
+    answer.
+    """
+    return isinstance(data, dict) and _PATH_TYPED_EXACT_MARKER in data
+
+
 def _nodes_path_sync(
     from_type: str, to_type: str, max_depth: int, max_paths: int
 ) -> Any:
-    """``nodes(action="path")``'s body — the exact ``nodes_path`` this replaced."""
-    return _run_comfy(
+    """``nodes(action="path")``'s body — ``nodes_path`` plus a mode fallback.
+
+    Two passthroughs, and the ONLY thing decided here is which of comfy-cli's
+    two traversal modes the installed engine can be trusted to answer in. Both
+    are the engine's own walk over the live ``object_info`` graph and the
+    payload is relayed verbatim either way, so this stays inside the
+    thin-wrapper rule: no graph is parsed here and no verdict is derived here.
+
+    **Why a fallback at all.** comfy-cli's ``--exact`` default was not always
+    type-constrained. Before comfy-cli #695 (released in 1.16.0) its
+    ``exact_paths`` walked EVERY node and admitted any whose *required link
+    inputs* were already satisfied — vacuously true of a node with no link
+    inputs at all. So it answered with widget-only loaders and generators that
+    never consume ``from_type``, reported their step's ``from_type`` as the
+    empty string (it had no consumed type to name), and burned ``max_paths`` on
+    them before a real route was reached. This server's floor is comfy-cli
+    1.14.0, so that engine is inside the supported range, and the payload it
+    produces is the right shape and the wrong answer — indistinguishable from a
+    correct one to a caller that cannot re-derive it. Measured against
+    comfy-cli's own ``nodes_path_object_info`` fixture on the pre-fix engine:
+    ``MODEL`` -> ``IMAGE`` returns ``ByteDanceImageNode`` (which takes no MODEL
+    link) and omits ``KSampler -> VAEDecode`` entirely, and the routeless
+    ``IMAGE`` -> ``MODEL`` comes back as a bare ``CheckpointLoaderSimple``
+    instead of as no answer.
+
+    ``--loose`` on that same engine is sound: it walks the consumers index,
+    which is keyed on socket type and built from link inputs only (an
+    enum/COMBO widget is not a link), so every step genuinely accepts the type
+    the step before it produced, every step names that type, and an unroutable
+    pair comes back as no paths. On the fixture it gives
+    ``KSampler -> VAEDecode`` and nothing for ``IMAGE`` -> ``MODEL``.
+
+    **Why not just pin ``--loose``.** On a post-fix engine ``--exact`` is
+    type-constrained too — it is loose PLUS a satisfiability filter — and it
+    answers strictly better: it reports each path's other required inputs under
+    ``support`` (the ``VAE`` for ``VAEDecode``, and which node can supply it),
+    and it is the only mode that can claim ``exact: true``, which on an empty
+    result is a PROOF that no route exists rather than merely no route found.
+    Pinning ``--loose`` unconditionally would take both away from every
+    up-to-date install to fix an engine most of them are not running, and would
+    reinstate a milder version of the same complaint — routes whose steps
+    cannot actually be wired.
+
+    So: ask in the default mode, and re-ask in ``--loose`` only when the answer
+    comes back in the pre-fix contract
+    (:func:`_nodes_path_is_type_constrained`). An up-to-date engine pays
+    exactly one call and behaves as it does today; a pre-fix engine pays a
+    second call and gets a sound answer instead of a plausible-looking wrong
+    one. The verdict is re-read per call rather than latched, matching this
+    module's "never memoize the negative" policy — an engine upgraded under a
+    running server is picked up on the next call, not on the next restart.
+
+    The flag itself needs no capability probe, unlike ``run_workflow``'s
+    ``--allow-spend``: ``nodes path``, ``--exact/--loose`` and the ``envelope/1``
+    contract ``_run_comfy`` itself requires all landed in the SAME comfy-cli
+    commit, so no engine this server can talk to has the verb without the flag.
+    A source build or a fork could still carry the verb without the option, and
+    that one shape degrades the way every other option-shaped gap in this module
+    does (``--registry``, ``--background``, ``--host``/``--port``): Click's
+    ``No such option: --loose`` is caught and the FIRST payload is returned
+    instead. That is not a retreat from the fix — on an engine with no
+    ``--loose`` there is no sounder answer to be had, so the choice is between
+    this file's behavior before this change and no answer at all, and the
+    degrade is narrow enough (:func:`clitext._is_missing_option_error`, minus a
+    phrase :func:`clitext._phrase_is_only_the_caller_s` shows the caller merely
+    echoed through ``from_type``/``to_type``) that it cannot swallow the errors
+    that MUST propagate. A timeout on the re-ask, or ComfyUI going away between
+    the two spawns, is re-raised: there the engine HAS a sound mode and simply
+    did not answer, and relaying the discarded payload would hand back the
+    plausible-looking wrong route this function exists to withhold, with nothing
+    in it to say so.
+
+    Neither mode is exposed as a caller-facing toggle. ``--exact`` is what a
+    caller gets wherever it is trustworthy, and offering the pre-fix engine's
+    version of it would hand an agent a mode whose wrong answers it has no way
+    to spot. Nor is a "the fallback fired" flag synthesized into the reply —
+    that would be this repo deriving a field comfy-cli did not emit, and the
+    marker already IS the signal in both directions: a payload with ``mode`` was
+    answered in the engine's own default, one without it was answered by the
+    ``--loose`` re-ask (and correspondingly carries no ``support`` and no
+    ``exact: true``).
+    """
+    args = (
         "nodes",
         "path",
         from_type,
@@ -9707,8 +9830,42 @@ def _nodes_path_sync(
         str(max_depth),
         "--max-paths",
         str(max_paths),
-        timeout=60.0,
     )
+    started = time.monotonic()
+    data = _run_comfy(*args, timeout=_NODES_PATH_TIMEOUT)
+    if _nodes_path_is_type_constrained(data):
+        return data
+    retry_timeout = max(
+        _NODES_PATH_RETRY_MIN_TIMEOUT,
+        _NODES_PATH_TIMEOUT - (time.monotonic() - started),
+    )
+    try:
+        return _run_comfy(*args, "--loose", timeout=retry_timeout)
+    except ComfyCliError as exc:
+        # The one failure that is better answered than raised: an engine whose
+        # `nodes path` has no `--loose` at all. Narrow on purpose, exactly as at
+        # `node_dependencies`' `--registry` — `_is_missing_option_error` matches
+        # Click's parser error and nothing else, and
+        # `_phrase_is_only_the_caller_s` subtracts the phrase when a caller put
+        # it there themselves through `from_type`/`to_type` (the bounds are
+        # stringified ints, but they are passed for the same reason the other
+        # sites pass every caller value: the set is what the argv carries, not
+        # what looks plausible today). Every OTHER failure — the re-ask timing
+        # out, ComfyUI going away between the two spawns — propagates, because
+        # relaying `data` there would silently hand back the pre-fix engine's
+        # wrong-but-well-shaped route that this function exists to withhold.
+        if not clitext._is_missing_option_error(
+            exc, "--loose"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--loose")),
+            from_type,
+            to_type,
+            str(max_depth),
+            str(max_paths),
+        ):
+            raise
+        return data
 
 
 def _nodes_types_sync() -> Any:
@@ -9791,7 +9948,8 @@ def nodes(
     - "upstream"/"downstream" -> `nodes upstream|downstream <name>
       [--limit N]`: what feeds INTO / is fed FROM `name`.
     - "path" -> `nodes path <from_type> <to_type> --max-depth N
-      --max-paths N`: chains between two types; depth/paths default 6/10.
+      --max-paths N`: chains between two types, every step a real
+      socket link; depth/paths 6/10. No route -> no paths.
     - "types" -> `nodes types`: connection types by connectivity.
     - "categories" -> `nodes categories`: the category tree.
 
