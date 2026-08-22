@@ -20,7 +20,9 @@ flows:
 - Long generations: `run_workflow(wait=False)` -> poll `job(action="wait")` /
   `job(action="status")` (or stream live via `job(action="watch")`) ->
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
-  does not block.
+  does not block; same for `generate_image` / `run_template` on slow hardware,
+  where YOUR transport cap bounds a `wait=True` call too. A run that outlives
+  a wait keeps going — poll its `prompt_id`, never re-run it.
 - Remote HTTP files: `upload_file(file_path, client_os)` returns a short-lived,
   single-use, credential-free PUT command for the CLIENT's own shell; run it
   verbatim. HTTP `fetch_outputs` returns five-minute signed URLs plus one command

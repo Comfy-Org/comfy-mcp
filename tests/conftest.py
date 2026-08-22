@@ -117,6 +117,21 @@ def _skip_machine_snapshot_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _skip_template_gallery_warm(monkeypatch):
+    """Neuter ``main()``'s startup gallery warm.
+
+    ``main()`` also starts a daemon thread running
+    ``_warm_template_gallery``, which shells out to ``comfy templates ls``.
+    Left live, any test that calls ``server.main()`` would spawn whatever real
+    ``comfy`` this developer machine has — and, worse, would do it on a thread
+    racing the assertions, either consuming a stubbed spawn or landing a
+    ``patched_run`` call record mid-test. The dedicated warm tests
+    (``test_gallery_warm.py``) restore the real function.
+    """
+    monkeypatch.setattr(server, "_warm_template_gallery", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_comfyui_target_env(monkeypatch):
     """Default every test to the LOCAL target (no configured remote ComfyUI).
 
@@ -240,7 +255,7 @@ NO_SUCH_OPTION_STDERR = (
 _UNSET = object()
 
 
-def envelope(*, ok: bool = True, data=_UNSET, error=None) -> dict:
+def envelope(*, ok: bool = True, data=_UNSET, error=None, changed=_UNSET) -> dict:
     """Build a comfy-cli ``envelope/1`` result body.
 
     Mirrors what the CLI emits on its ``--json`` path: an ``error`` object when
@@ -250,12 +265,20 @@ def envelope(*, ok: bool = True, data=_UNSET, error=None) -> dict:
     ``data`` defaults to ``{}`` only when it is OMITTED — an explicit
     ``data=None`` stays ``None``, which several tests rely on to exercise the
     non-dict-payload branches.
+
+    ``changed`` is the envelope's OPTIONAL top-level mutation flag (schema:
+    *"present on mutating commands; true iff state changed"*). Omitted by
+    default, exactly as comfy-cli omits it on a read-only verb — so a test that
+    does not pass it exercises the "engine said nothing" path rather than a
+    silent ``False``.
     """
     body: dict = {"schema": "envelope/1", "type": "envelope", "ok": ok}
     if error is not None:
         body["error"] = error
     else:
         body["data"] = {} if data is _UNSET else data
+    if changed is not _UNSET:
+        body["changed"] = changed
     return body
 
 

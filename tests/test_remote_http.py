@@ -90,7 +90,7 @@ async def _discover_and_call(
     return discovered, result
 
 
-def test_http_exposes_the_same_39_tools_and_complete_business_flow(
+def test_http_exposes_the_same_40_tools_and_complete_business_flow(
     remote_http_server, patched_run, patched_async_run, monkeypatch
 ):
     """HTTP carries input bytes in and signed output bytes back on one app."""
@@ -238,7 +238,7 @@ def test_http_exposes_the_same_39_tools_and_complete_business_flow(
     ) = asyncio.run(run_flow())
 
     names = {tool.name for tool in discovered}
-    assert len(names) == 39
+    assert len(names) == 40
     assert {
         "server_info",
         "upload_file",
@@ -632,7 +632,7 @@ def test_http_auto_mode_negotiates_the_modern_sessionless_protocol(
         )
     )
 
-    assert len({tool.name for tool in discovered}) == 39
+    assert len({tool.name for tool in discovered}) == 40
     assert result.data["running"] is True
 
 
@@ -765,7 +765,7 @@ def test_installed_http_process_shuts_down_cleanly(
             async with Client(f"http://127.0.0.1:{port}/mcp") as client:
                 return await client.list_tools()
 
-        assert len(asyncio.run(discover())) == 39
+        assert len(asyncio.run(discover())) == 40
         proc.send_signal(shutdown_signal)
         stdout, stderr = proc.communicate(timeout=15)
     finally:

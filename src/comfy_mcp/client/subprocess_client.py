@@ -69,10 +69,13 @@ class SubprocessComfyCliClient:
         ctx: object | None = None,
         timeout: float | None = None,
         raise_on_timeout: bool = True,
+        timeout_returns_handle: bool = False,
     ) -> Any:
         kwargs: dict[str, object] = {"timeout": timeout}
         if ctx is not None:
             kwargs["ctx"] = ctx
         if not raise_on_timeout:
             kwargs["raise_on_timeout"] = False
+        if timeout_returns_handle:
+            kwargs["timeout_returns_handle"] = True
         return await self.streaming_runner(*args, **kwargs)

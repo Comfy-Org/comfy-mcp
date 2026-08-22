@@ -262,6 +262,25 @@ def test_declining_leaves_the_server_running_and_names_it(clash):
     assert len(state["launches"]) == 1
 
 
+def test_the_decline_does_not_assert_that_a_person_refused(clash):
+    """This gate reaches `decline` the same way every other one does.
+
+    `_elicit_approval` returns False on `action == "decline"` and raises on
+    everything else, so this refusal is the one shape a client can produce with
+    nobody in the room. It reports the refusal without naming who made it.
+    """
+    clash([_dry_run()])
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart(ctx=ctx)
+
+    message = str(excinfo.value)
+    assert "declined" in message  # still reports the refusal
+    assert "You declined" not in message  # but not who made it
+    assert "cannot display a prompt" in message
+
+
 def test_an_accept_that_never_said_yes_is_a_refusal(clash):
     """The affirmative-answer design: the `approve` default is False."""
     state = clash([_dry_run()])

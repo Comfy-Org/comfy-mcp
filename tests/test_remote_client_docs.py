@@ -23,8 +23,8 @@ def test_remote_http_precedes_client_configuration():
 def test_client_setup_documents_both_transports_and_environment_ownership():
     section = _client_section()
 
-    assert "all 39 tools" in section
-    assert "the same 39 tools" in section
+    assert "all 40 tools" in section
+    assert "the same 40 tools" in section
     assert "two separately running" in section
     assert "same application contract" in section
     assert "ComfyUI continues on its own port (normally `8188`)" in section

@@ -37,7 +37,7 @@ def test_smoke_docs_require_transport_business_flow_and_live_engine_stages():
     assert "tests/test_file_transfer.py" in section
     assert "real loopback Streamable HTTP/ASGI server" in section
     assert "`server_info` → workflow submission → job status" in section
-    assert "same 39-tool application" in section
+    assert "same 40-tool application" in section
     assert "temporary signed URL from the same listener" in section
     assert "upload URL is single-use" in section
     assert "./scripts/smoke.sh" in section
@@ -59,7 +59,7 @@ def test_contributing_docs_pin_framework_architecture_and_required_checks():
     assert "private session monkeypatches" in _CONTRIBUTING
     assert "McpApplicationBuilder" in _CONTRIBUTING
     assert "comfy_mcp.server._internal" in _CONTRIBUTING
-    assert "39 tool callables" in _CONTRIBUTING
+    assert "40 tool callables" in _CONTRIBUTING
     assert "immutable `_FailureEvent`" in _CONTRIBUTING
     assert "tests/test_failure_log.py" in _CONTRIBUTING
     assert "## Remote file-transfer changes" in _CONTRIBUTING

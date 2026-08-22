@@ -51,7 +51,12 @@ class _FlowClient:
         return {"ok": True}
 
     async def run_streaming(
-        self, *args: str, ctx=None, timeout=None, raise_on_timeout=True
+        self,
+        *args: str,
+        ctx=None,
+        timeout=None,
+        raise_on_timeout=True,
+        timeout_returns_handle=False,
     ):
         self.calls.append(args)
         return {"prompt_id": "prompt-1", "status": "completed"}
@@ -89,7 +94,7 @@ def test_stdio_application_surface_runs_the_complete_submit_poll_fetch_flow(
         _main_application_flow(engine)
     )
 
-    assert len(tools) == 39
+    assert len(tools) == 40
     assert info.data["server"]["running"] is True
     assert submitted.data["prompt_id"] == "prompt-1"
     assert status.data["status"] == "completed"

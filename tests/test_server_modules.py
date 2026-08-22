@@ -12,7 +12,7 @@ def test_public_server_exports_only_application_and_tool_api():
     expected = {"main", "mcp", *tools.__all__}
 
     assert set(public_server.__all__) == expected
-    assert len(tools.__all__) == 39
+    assert len(tools.__all__) == 40
     assert "_run_comfy" not in public_server.__all__
     assert not hasattr(public_server, "_run_comfy")
 

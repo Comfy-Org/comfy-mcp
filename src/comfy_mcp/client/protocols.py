@@ -39,4 +39,5 @@ class ComfyCliClient(Protocol):
         ctx: object | None = None,
         timeout: float | None = None,
         raise_on_timeout: bool = True,
+        timeout_returns_handle: bool = False,
     ) -> Any: ...

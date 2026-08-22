@@ -88,7 +88,7 @@ def test_remote_mcp_negotiates_and_discovers_shared_application(mode):
         async with Client(endpoint, mode=mode) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
             assert client.protocol_version is not None
-            assert len(tools) == 39
+            assert len(tools) == 40
             assert tools["upload_file"].input_schema["required"] == [
                 "file_path",
                 "client_os",

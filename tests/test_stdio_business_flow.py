@@ -112,7 +112,7 @@ def test_real_stdio_process_completes_submit_poll_fetch(tmp_path):
         _run_stdio_flow(str(fake), str(input_path))
     )
 
-    assert len(tools) == 39
+    assert len(tools) == 40
     assert info.data["server"]["running"] is True
     assert uploaded.data["uploads"] == [
         {"local_path": str(input_path), "cloud_name": "stdio-input.bin"}

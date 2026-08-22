@@ -53,12 +53,12 @@ PR.
 
 - `McpApplicationBuilder` owns the name, version, and base instructions and is
   called once to create `server.mcp`; every tool registers on that instance.
-- `comfy_mcp.server` exports only `mcp`, `main`, and the 39 tool callables.
+- `comfy_mcp.server` exports only `mcp`, `main`, and the 40 tool callables.
   Runtime helpers live in `comfy_mcp.server._internal`; do not add private
   aliases to the public package. Tests of private behavior import the owning
   module explicitly.
 - Bare `comfy-mcp` serves that application through stdio. `comfy-mcp serve`
-  serves the same 39 tools, schemas, results, and confirmations at `/mcp`.
+  serves the same 40 tools, schemas, results, and confirmations at `/mcp`.
 - Remote mode uses FastMCP's public `http_app(..., stateless_http=True)` ASGI
   surface and uvicorn lifecycle. Do not add legacy SSE, hand-written JSON-RPC,
   private session monkeypatches, or catch-all protocol-error suppression.

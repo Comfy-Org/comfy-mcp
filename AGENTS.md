@@ -119,7 +119,7 @@ custom nodes included — not a static catalog.
 ## Module layout
 
 `server/` is the application package. Its public package API is deliberately small:
-`server/__init__.py` exports only `mcp`, `main`, and the 39 tool callables;
+`server/__init__.py` exports only `mcp`, `main`, and the 40 tool callables;
 `server/tools.py` holds the explicit tool export list without wrapping or duplicating the
 callables. The tightly coupled runner state, envelope parser, `--json-stream`
 machinery, consent plumbing, tool implementations, and startup logic remain private in
@@ -137,7 +137,7 @@ after initialization.
 
 | Module | Owns |
 |---|---|
-| `server/__init__.py` | stable public Python API: `mcp`, `main`, and the 39 registered tool callables; no private runtime names |
+| `server/__init__.py` | stable public Python API: `mcp`, `main`, and the 40 registered tool callables; no private runtime names |
 | `server/tools.py` | explicit public tool export list; the objects are the exact callables registered by the private runtime |
 | `server/cli.py` | the console script's human argv surface — `--help`, `--version`, and validated `serve` options — plus the installed-metadata version lookup (`_version`) |
 | `server/config.py` | immutable Remote MCP listener configuration (`COMFY_MCP_*`), including the non-loopback Host-header policy. It never owns or reads the `COMFYUI_*` target |
@@ -160,7 +160,7 @@ after initialization.
 
 ## Transport modes and logging
 
-No arguments serves the shared 39-tool FastMCP application over stdio. `comfy-mcp serve`
+No arguments serves the shared 40-tool FastMCP application over stdio. `comfy-mcp serve`
 passes that exact instance to FastMCP 4's
 `http_app(json_response=True, stateless_http=True)` and hands the SDK-owned ASGI app to an
 explicit `uvicorn.Server`. Do not create a second FastMCP instance or transport-specific
@@ -239,7 +239,7 @@ in-process FastMCP business flows live in `test_fastmcp_app.py`; the real stdio 
 lives in `test_stdio_business_flow.py`; real-loopback Streamable HTTP integration lives in
 `test_remote_http.py`; transfer edge cases live in `test_file_transfer.py`. Both transport
 flows cover the full upload/submit/poll/fetch path and the
-same 39-tool discovery result. Also cover modern+legacy negotiation, pre-initialize/stale
+same 40-tool discovery result. Also cover modern+legacy negotiation, pre-initialize/stale
 requests, concurrency, native tool errors, signed-link tampering/expiry, scratch containment
 and cleanup, failure observation/non-disclosure, and clean lifecycle. Never
 label fake-engine coverage a real ComfyUI end-to-end test.

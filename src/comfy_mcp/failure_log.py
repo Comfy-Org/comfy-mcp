@@ -11,6 +11,7 @@ Tests that need the log on (or off) must patch ``failure_log._FAILURE_LOG_PATH``
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -420,6 +421,40 @@ _FAILURE_OBSERVERS: tuple[Callable[[_FailureEvent], None], ...] = (
 )
 
 
+# Thread-local "the comfy-cli calls on this thread are not user-facing" flag.
+# This log's contract is that every line explains a failure a caller ACTUALLY
+# saw, so a call nobody asked for must write nothing — today that is `server`'s
+# startup gallery warm, which runs on its own dedicated thread and discards its
+# result. Thread-local rather than a parameter threaded down through
+# `_run_comfy` -> `_run_comfy_raw` -> each raise site: the suppressed call owns
+# its whole thread for its whole lifetime, so the scope is exact and no shared
+# signature has to grow a flag every raise site then has to honor.
+_unattributed = threading.local()
+
+
+@contextlib.contextmanager
+def _unattributed_calls():
+    """Suppress failure-log writes for comfy-cli calls made on THIS thread.
+
+    For a call the user did not make. ``_require_comfy_bin``'s
+    ``binary_missing`` is only the first of the records such a call can leave —
+    ``timeout``, ``spawn_failed``, ``no_json`` and ``error_envelope`` all write
+    one too — and on an offline or slow host those recur at EVERY startup,
+    spending the log's fixed rotation budget on a call no reader can correlate
+    with anything they did.
+
+    Nests and restores rather than clearing, so an inner use cannot un-suppress
+    an outer one. Thread-local, so a suppressed thread never quiets the failures
+    a real tool call is reporting on another thread at the same moment.
+    """
+    previous = getattr(_unattributed, "on", False)
+    _unattributed.on = True
+    try:
+        yield
+    finally:
+        _unattributed.on = previous
+
+
 def _log_failure(
     kind: str,
     args: tuple[str, ...] | list[str],
@@ -437,10 +472,15 @@ def _log_failure(
     ``COMFY_MCP_DEBUG_LOG`` selected a path; while disabled it has zero
     filesystem effects.
 
-    Observer failures are isolated from one another and swallowed after a
-    debug message. Diagnostics must never replace the real ``ComfyCliError``.
+    A thread inside :func:`_unattributed_calls` returns before publishing an
+    event. Observer failures are isolated from one another and swallowed after
+    a debug message. Diagnostics must never replace the real ``ComfyCliError``.
     """
 
+    if getattr(_unattributed, "on", False):
+        # A call the user never made (see `_unattributed_calls`). Checked before
+        # event construction so suppression holds however observers are wired.
+        return
     event = _FailureEvent(
         kind=kind,
         args=tuple(args),

@@ -9,7 +9,7 @@ Framework baseline: `fastmcp==4.0.0b3`, `mcp==2.0.0`
 adapters:
 
 ```text
-McpApplicationBuilder.build() -> server.mcp (39 registered tools)
+McpApplicationBuilder.build() -> server.mcp (40 registered tools)
                                   ├── stdio: mcp.run(transport="stdio")
                                   └── HTTP:  mcp.http_app(...) -> uvicorn
 ```
@@ -42,7 +42,7 @@ details:
 
 ```text
 comfy_mcp.server
-├── __init__.py       public: mcp, main, 39 tool callables
+├── __init__.py       public: mcp, main, 40 tool callables
 ├── tools.py          explicit public tool exports
 ├── cli.py            console argv and stdio/HTTP mode selection
 ├── config.py         validated HTTP listener settings
@@ -71,7 +71,7 @@ composes it with the same `ComfyCliClient` upload/download calls used by stdio.
 
 ```mermaid
 flowchart LR
-    B["McpApplicationBuilder"] --> M["one FastMCP app\n39 tools"]
+    B["McpApplicationBuilder"] --> M["one FastMCP app\n40 tools"]
     M --> S["stdio adapter"]
     M --> H["http_app()"]
     H --> U["uvicorn.Server"]
@@ -189,7 +189,7 @@ both modes. A remote ComfyUI target remains a separate `COMFYUI_URL` or
 
 The HTTP listener defaults to loopback. Non-loopback binds require explicit
 Host patterns for DNS-rebinding protection. That is not authentication: HTTP
-exposes all 39 tools, including lifecycle and installation tools, so an
+exposes all 40 tools, including lifecycle and installation tools, so an
 untrusted-network deployment belongs behind an authenticated TLS reverse
 proxy. Existing MCP elicitation, comfy-cli consent, and argument guards remain
 active in both transports.
@@ -217,7 +217,7 @@ The affected test layers are:
    modern/legacy consent.
 3. `test_stdio_business_flow.py`: real stdio child plus fake executable,
    covering `server_info -> run_workflow -> job -> fetch_outputs`.
-4. `test_remote_http.py`: real loopback HTTP over the same 39 tools and the
+4. `test_remote_http.py`: real loopback HTTP over the same 40 tools and the
    same complete upload/submit/poll/signed-fetch business flow, plus failure
    observation, negotiation, concurrency, stale requests, and lifecycle.
 5. `test_file_transfer.py`: Cloud-compatible schema/commands, single-use upload
@@ -238,7 +238,7 @@ full pytest, lint, format, dependency, and diff checks.
 ## Acceptance criteria
 
 - production contains one `FastMCP(...)` constructor and one built application;
-- stdio and HTTP each discover the same 39 tools;
+- stdio and HTTP each discover the same 40 tools;
 - both complete the upload/submit/poll/fetch business flow through
   `ComfyCliClient`; HTTP fetch returns a working short-lived signed URL on the
   MCP listener;

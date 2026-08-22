@@ -10,6 +10,7 @@ from __future__ import annotations
 from ._internal import (
     auth_login,
     auth_status,
+    billing_status,
     discover,
     download,
     download_model,
@@ -52,6 +53,7 @@ from ._internal import (
 __all__ = (
     "auth_login",
     "auth_status",
+    "billing_status",
     "discover",
     "download",
     "download_model",

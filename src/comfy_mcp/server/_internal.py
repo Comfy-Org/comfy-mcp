@@ -266,6 +266,17 @@ _MAX_DOWNLOAD_WAIT_TIMEOUT = 3600.0
 # worker owns and this call never waits on.
 _DOWNLOAD_SUBMIT_TIMEOUT = 120.0
 
+# Budget for `model download-cancel`. Deliberately its own constant, and
+# deliberately far below any transfer: cancelling is metadata plus a signal, and
+# comfy-cli's own worst case is bounded — `download_state.stop_worker` gives the
+# worker 5s to honour SIGTERM, then 2s to die on SIGKILL, around a few state
+# reads and an unlink. 30s is ~4x that, and it is what makes "the cancel blocked
+# for the rest of the download" structurally impossible here rather than merely
+# unobserved: whatever the engine does, this call is killed at the bound and
+# reports that it could not cancel (see `_download_cancel_sync`) instead of
+# holding the MCP request open for the transfer's remaining duration.
+_DOWNLOAD_CANCEL_TIMEOUT = 30.0
+
 # CEILING for the LEGACY foreground `model download` — the whole multi-GB
 # transfer happens inside that one call, hence the generous bound. It is a cap,
 # NOT the flat bound: a waiting caller is held only for what is left of their own
@@ -1401,6 +1412,36 @@ def _run_comfy_impl(
     return _unwrap_envelope(real_envelope, args, returncode, stderr, stdout=stdout)
 
 
+def _run_comfy_with_changed(
+    *args: str, timeout: float | None = None
+) -> tuple[Any, bool | None]:
+    """:func:`_run_comfy`, plus the envelope's top-level ``changed`` flag.
+
+    ``changed`` is an envelope field, not a ``data`` field (``envelope.json``:
+    *"present on mutating commands; true iff state changed"*), so
+    :func:`_run_comfy` — which unwraps straight down to ``data`` — drops it. For
+    most verbs that is the right trade. For a MUTATING one whose ``data`` looks
+    identical whether or not anything happened, it is the whole answer: `model
+    download-cancel` returns the download's status row either way, and only
+    ``changed`` says whether this call is what stopped the transfer (see
+    :func:`_with_cancel_verdict`).
+
+    Same envelope contract as ``_run_comfy`` — the `_real_envelope` filter and
+    the raising `_unwrap_envelope` — following :func:`server_info`, the other
+    caller that needs the envelope itself rather than its payload. A missing or
+    non-boolean ``changed`` is reported as ``None`` (unknown), never coerced to
+    ``False``: an older comfy-cli that omits the flag has not told us the call
+    changed nothing.
+    """
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    envelope = _real_envelope(envelope)
+    # Raises when `envelope` is None, exactly as `_run_comfy` does, so it is
+    # non-None on the line below.
+    data = _unwrap_envelope(envelope, args, returncode, stderr, stdout=stdout)
+    changed = envelope.get("changed")
+    return data, changed if isinstance(changed, bool) else None
+
+
 # git's own wording, and the state it describes. Matched on BOTH streams because
 # comfy-cli splits diagnostics unpredictably — the traceback lands on stderr
 # while a status line can land on stdout.
@@ -2046,6 +2087,13 @@ class _StreamProgress:
     def __init__(self) -> None:
         self.total: float | None = None  # node count (from the queued manifest)
         self.done = 0  # nodes fully executed or served from cache
+        # The run's handle, latched off the stream (see `report`). None until
+        # comfy-cli reports it — i.e. until something was actually submitted.
+        self.prompt_id: str | None = None
+        # True once the run reported an `execution_error`. The handle stays
+        # useful (the job exists and is inspectable) but it is no longer a
+        # RUNNING job, so a timeout must not describe it as one — see `report`.
+        self.errored = False
         self._last = -1.0  # last value reported (kept non-decreasing)
 
     def snapshot(self) -> dict:
@@ -2068,8 +2116,33 @@ class _StreamProgress:
         :meth:`snapshot`; the MCP notification is the only ctx-gated part, and it
         is best-effort — a send that fails is dropped rather than propagated, so
         it can never abort the run it is only describing.
+
+        The first ``prompt_id`` any event carries is latched before the type
+        dispatch, so events that are NOT progress ticks (``output``,
+        ``execution_error``) still yield the handle. comfy-cli stamps it on every
+        local run event and emits ``queued`` only once the job's state file is on
+        disk, so from that line on the id is pollable — which is what lets a wait
+        that expires hand back a live job instead of orphaning it.
+
+        The latched value is put through the same :func:`argv._guard_prompt_id`
+        the ``job`` verbs run on a caller-supplied id, and a value that fails it
+        is DROPPED rather than latched. Two reasons, and the first is contract
+        rather than hardening: handing back an id those verbs would refuse makes
+        the payload's "poll this" a promise the server has already broken. The
+        second is that ``_readline_unbounded`` deliberately has no line ceiling,
+        so a malformed event could otherwise inflate both the returned payload
+        and the raised message without bound.
         """
+        if self.prompt_id is None:
+            reported = event.get("prompt_id")
+            if isinstance(reported, str) and reported:
+                try:
+                    self.prompt_id = argv._guard_prompt_id(reported)
+                except ComfyCliError:
+                    pass  # unusable as a handle; keep looking
         etype = event.get("type")
+        if etype == "execution_error":
+            self.errored = True
         if etype == "queued":
             nodes = event.get("nodes")
             if isinstance(nodes, list) and nodes:
@@ -2328,11 +2401,99 @@ async def _run_comfy_async_impl(
         await _reap_async(proc)
 
 
+def _live_job_note(prompt_id: str) -> str:
+    """What to do with the handle of a run that outlived this call's wait.
+
+    Killing the comfy-cli child at our deadline stops the WATCHER, never the
+    job: ComfyUI executes a prompt it has already accepted regardless of who is
+    listening, which is exactly how a timed-out ``wait=True`` call used to leave
+    a generation running with no handle to poll, collect or cancel it. One
+    string, shared by the payload the timeout can RETURN and the message it can
+    RAISE, so the two cannot drift.
+    """
+    return (
+        f"The run was already submitted as prompt_id {prompt_id!r} and was NOT "
+        'cancelled — poll it with `job(action="status")` (or '
+        '`job(action="wait")` / `job(action="watch")`), collect its files with '
+        '`fetch_outputs`, and stop it with `job(action="cancel")`.'
+    )
+
+
+def _live_handle(tracker: "_StreamProgress", *, stream_ended: bool) -> str | None:
+    """The run's handle, but only while "still running" is actually true.
+
+    :func:`_live_job_note` and the payload built on it both assert a job that is
+    RUNNING and uncancelled. Three things have to hold for that, and having an id
+    is only the first:
+
+    * a ``prompt_id`` was latched at all — no submit, no job (ComfyUI down, a
+      stalled template fetch), and inventing one the caller could never find is
+      worse than the error it replaces;
+    * the stream had NOT already reached EOF — comfy-cli dying without an
+      envelope leaves the reap running on the same deadline, so an expiry there
+      is a dead child, not an outlived run, and the returncode/stderr the raising
+      branch collects are the answer rather than noise;
+    * no ``execution_error`` was reported — the job exists and is inspectable,
+      but it FAILED, so "still running" would be a lie.
+
+    Returns None in each of those cases, routing the caller to the raising branch
+    (which still names the handle in prose — see the ``fate`` block).
+    """
+    if stream_ended or tracker.errored:
+        return None
+    return tracker.prompt_id
+
+
+def _live_job_payload(handle: str, tracker: "_StreamProgress") -> dict:
+    """The "your job outlived this wait" result, built in one place.
+
+    Shared by the two deadlines that can strand a submitted run — this server's
+    own ``asyncio.wait_for`` and comfy-cli's per-event ``--timeout`` (its
+    ``ws_timeout`` envelope) — so the two cannot drift into different shapes for
+    what is, to the caller, the same event.
+    """
+    return {
+        "timed_out": True,
+        "prompt_id": handle,
+        "status": tracker.snapshot(),
+        "note": _live_job_note(handle),
+    }
+
+
+# comfy-cli's error code for its OWN per-event deadline expiring
+# (`comfy_cli/command/run/__init__.py`, `WebSocketTimeoutException` ->
+# `renderer.error(code="ws_timeout", ...)`). That envelope is the exact sibling
+# of our parent `asyncio.wait_for` expiry — the WATCHER gave up while ComfyUI
+# kept executing a prompt it had already accepted — and comfy-cli says so in its
+# own handler: it cancels nothing and deliberately leaves the submit-time job
+# record NON-TERMINAL, because "the job may genuinely still be running
+# server-side". That is what makes answering it with "still running" a report
+# rather than a guess. Unwrapping it raises, so the handle was lost here. Since
+# `_run_template_argv` LOWERS `--timeout` to the caller's budget, the engine's
+# deadline is the one that fires first on any gap between events longer than the
+# budget (a cold multi-GB checkpoint load — precisely the slow-hardware case the
+# handle exists for), which makes this the COMMON expiry, not the exotic one.
+#
+# The handle handed back is the LATCHED one, never the envelope's. comfy-cli
+# does put a `prompt_id` in this error's `details`, but only from #605
+# (2026-07-27) — well after the 1.14.0 floor this server supports — so reading
+# it there would work on some supported installs and silently not on others.
+# The id latched off the stream is present on every version that emits events
+# at all, and is the same id.
+#
+# Deliberately just this one code. `ws_disconnected` is the neighbouring case and
+# is NOT included: "lost connection to ComfyUI" cannot distinguish a dropped
+# socket from a server that died taking the queue with it, so answering it with
+# "still running, poll it" would be a guess. It keeps raising.
+_ENGINE_WATCHER_TIMEOUT_CODE = "ws_timeout"
+
+
 async def _run_comfy_streaming_impl(
     *args: str,
     ctx: Context | None = None,
     timeout: float | None = None,  # noqa: ASYNC109 - see the note above _reap_async
     raise_on_timeout: bool = True,
+    timeout_returns_handle: bool = False,
 ) -> Any:
     """Run ``comfy --json-stream --where local <args>`` and stream progress.
 
@@ -2348,6 +2509,23 @@ async def _run_comfy_streaming_impl(
     ``raise_on_timeout=False`` for a bounded *tail* that should instead return a
     ``{"timed_out": True, "status": <progress snapshot>}`` payload (mirroring
     ``job(action="wait")``) rather than surface the deadline as an error.
+
+    ``timeout_returns_handle=True`` is the narrower version of that for a verb
+    that SUBMITS a job: an expiry that happens after comfy-cli reported a
+    ``prompt_id`` returns ``{"timed_out": True, "prompt_id": ..., "status": ...,
+    "note": ...}`` instead, because the job is still running and the caller needs
+    the handle to poll, collect or cancel it (see :func:`_live_job_note`).
+
+    TWO deadlines can strand such a run, and it covers both, because a caller
+    cannot tell them apart and neither can the job: this function's own
+    ``asyncio.wait_for``, and comfy-cli's per-event ``--timeout``, which arrives
+    as a ``ws_timeout`` error envelope and is in fact the one that usually fires
+    first (:data:`_ENGINE_WATCHER_TIMEOUT_CODE` says why). Both are gated on
+    :func:`_live_handle` — a deadline reached BEFORE the submit (ComfyUI not
+    running, a stalled template fetch) has no job to hand back and stays the
+    error it always was, as does one reached after the stream already ended or
+    the run reported an execution error. Whichever branch runs, the ``finally``
+    below still kills the child.
     """
     _require_comfy_bin()
     # `_check_comfy_version` runs a synchronous `comfy --version` on the first
@@ -2438,15 +2616,23 @@ async def _run_comfy_streaming_impl(
         else None
     )
 
+    # Set once `_pump` hits stdout EOF, i.e. comfy-cli died without an envelope.
+    # The reap that follows is bounded by the SAME deadline, so a deadline can
+    # expire with the child already dead — which is not "the run outlived our
+    # wait" and must not be answered with the still-running handle payload.
+    stream_ended = False
+
     async def _read() -> tuple[bool, Any]:
         # Read up to the terminal envelope, then — on the EOF path only — reap
         # the child and its stderr. Both are bounded by the caller's `timeout`
         # (a child that closes stdout without exiting can't wedge the unbounded
         # proc.wait/stderr read). On the envelope path the reap is deliberately
         # left to the caller so it runs OFF the client budget.
+        nonlocal stream_ended
         got_envelope = await _pump()
         if got_envelope:
             return True, None
+        stream_ended = True
         # EOF: the child has closed stdout, so a plain wait is safe and its
         # stderr is collectible for the error message.
         returncode = await proc.wait()
@@ -2487,6 +2673,18 @@ async def _run_comfy_streaming_impl(
             if not got_envelope:
                 return eof_result
         except (asyncio.TimeoutError, TimeoutError) as exc:
+            # Latched off the stream, so it is set exactly when a job exists to
+            # hand back — see `_StreamProgress.report`.
+            handle = tracker.prompt_id
+            live = _live_handle(tracker, stream_ended=stream_ended)
+            if timeout_returns_handle and live is not None:
+                # A submitted run that outlived the wait is not a failure: the
+                # deadline is ours, the job is the server's, and returning the
+                # handle is what keeps it pollable instead of orphaned. Checked
+                # before `raise_on_timeout` so the handle wins if a caller ever
+                # asks for both (`job(action="watch")`, the only tail today,
+                # sets neither and is unaffected).
+                return _live_job_payload(live, tracker)
             if not raise_on_timeout:
                 # Bounded tail: report how far the run got instead of erroring
                 # (the finally below still kills the child).
@@ -2518,12 +2716,30 @@ async def _run_comfy_streaming_impl(
             # Slice to the last lines before joining so a chatty child's full
             # stdout history isn't copied just to keep the 500-char tail.
             timeout_stdout = "".join(lines[-500:])
+            # Name the handle when the stream gave us one: the deadline killed
+            # the watcher, not the job, so an error that omits it is what
+            # orphans a live run. Raising callers get it in prose because a
+            # ComfyCliError reaches the client as text; the tools that need it
+            # as DATA pass `timeout_returns_handle` above.
+            if live is not None:
+                fate = _live_job_note(live)
+            elif handle:
+                # A handle we have but cannot call live: the stream had already
+                # ended, or the run reported an execution error. Still name it —
+                # it is what makes the failure inspectable — but do not repeat
+                # the payload's "still running, was NOT cancelled" claim.
+                fate = (
+                    f"The run was submitted as prompt_id {handle!r}; its stream "
+                    'ended before this deadline, so check `job(action="status")` '
+                    "for what became of it."
+                )
+            else:
+                fate = 'The run may still be going — check `job(action="status")`.'
             message = (
                 f"comfy-cli timed out after {timeout}s: {_cmd_for_message(cmd)}. "
-                f"Progress so far: {tracker.snapshot()}. The run may still be "
-                'going — check `job(action="status")`, or for long generations '
-                'submit with `wait=False` and poll `job(action="wait")` / '
-                '`job(action="watch")`. '
+                f"Progress so far: {tracker.snapshot()}. {fate} For long "
+                "generations submit with `wait=False` and poll "
+                '`job(action="wait")` / `job(action="watch")`. '
                 # Scrubbed, not raw: comfy-cli echoes the URL it is fetching to
                 # stderr, and this sentence goes straight to the MCP client. See
                 # `_timeout_failure`, whose two fragments this mirrors.
@@ -2571,14 +2787,35 @@ async def _run_comfy_streaming_impl(
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 stderr = ""
-        return _unwrap_envelope(
-            envelope,
-            args,
-            proc.returncode,
-            stderr,
-            stdout=stdout_text,
-            streaming=True,
-        )
+        try:
+            return _unwrap_envelope(
+                envelope,
+                args,
+                proc.returncode,
+                stderr,
+                stdout=stdout_text,
+                streaming=True,
+            )
+        except ComfyCliError as exc:
+            # The engine's own per-event deadline, not ours: same event as the
+            # `asyncio.TimeoutError` above (the watcher gave up on a run ComfyUI
+            # is still executing) reaching us as an envelope instead of an
+            # expiry. Answer it with the same payload, built from the same
+            # latched handle rather than the one this envelope carries only on
+            # post-floor comfy-cli builds, so a caller whose
+            # contract is "never return without the handle" holds on BOTH
+            # deadlines. See `_ENGINE_WATCHER_TIMEOUT_CODE` for why it is exactly
+            # one code, and `_live_handle` for the three conditions the claim
+            # rests on. Any other error — the graph failed, the prompt was
+            # rejected, ComfyUI was never up — still raises unchanged.
+            live = _live_handle(tracker, stream_ended=stream_ended)
+            if (
+                timeout_returns_handle
+                and live is not None
+                and exc.code == _ENGINE_WATCHER_TIMEOUT_CODE
+            ):
+                return _live_job_payload(live, tracker)
+            raise
     finally:
         # Never leave a stray child or a dangling stderr reader on any exit path
         # (timeout, cancellation, or normal completion — a failed progress
@@ -2592,8 +2829,17 @@ async def _run_comfy_streaming_impl(
         # Cancelling an asyncio stream read takes effect immediately, so unlike
         # the thread-pool reader this replaced there is nothing left parked on
         # the pipe once the task is cancelled — no join is needed.
-        if stderr_future is not None and not stderr_future.done():
-            stderr_future.cancel()
+        if stderr_future is not None:
+            if not stderr_future.done():
+                stderr_future.cancel()
+            elif not stderr_future.cancelled():
+                # Finished on its own — retrieve its outcome so a drain that died
+                # (a stream read raising, e.g. a reset pipe) does not leave asyncio
+                # logging "Task exception was never retrieved" at GC. Every early
+                # return above skips the `await`, so this is the one place that can
+                # cover them all; the exception is discarded because it describes
+                # the diagnostics channel, never the run's own result.
+                stderr_future.exception()
 
 
 def _build_comfy_cli_client() -> subprocess_client.SubprocessComfyCliClient:
@@ -2650,6 +2896,7 @@ async def _run_comfy_streaming(
     ctx: Context | None = None,
     timeout: float | None = None,  # noqa: ASYNC109 - engine deadline, not cancellation
     raise_on_timeout: bool = True,
+    timeout_returns_handle: bool = False,
 ) -> Any:
     """Compatibility entry point routed through the outbound client port."""
 
@@ -2658,6 +2905,7 @@ async def _run_comfy_streaming(
         ctx=ctx,
         timeout=timeout,
         raise_on_timeout=raise_on_timeout,
+        timeout_returns_handle=timeout_returns_handle,
     )
 
 
@@ -2928,6 +3176,196 @@ def auth_status() -> Any:
     if isinstance(data, dict):
         return {**data, "registration_env_key_present": present}
     return {"whoami": data, "registration_env_key_present": present}
+
+
+# `comfy cloud status` fans out to FIVE cloud endpoints — billing status,
+# balance, features, workspace and plans — each under comfy-cli's own 30s
+# per-request timeout, and only the first is fatal (the other four degrade one
+# row each rather than failing the command). So the worst case a slow-but-alive
+# cloud can produce is ~5x30s, and this cap is derived from that rather than
+# copied from `auth_status`' single-call 30.0: a 30s budget here would kill the
+# child mid-fan-out and report a spawn timeout for what is really one slow
+# OPTIONAL endpoint, throwing away the balance and tier we already had. Nothing
+# has to be enforced here beyond outliving that sum — comfy-cli polices each
+# request itself.
+_BILLING_STATUS_TIMEOUT = 180.0
+
+# `_run_comfy_async` keeps only the trailing `_STDERR_MAX_CHARS` (64 KiB) of
+# stdout by default, which is the one place its contract is narrower than
+# `_run_comfy`'s unbounded `communicate()`. That bound exists for a multi-GB
+# download's progress spew, not for an envelope — and an envelope clipped from
+# the FRONT loses its opening brace and surfaces as "returned no JSON" rather
+# than as the payload. `cloud status` reads `additionalProperties: true` and
+# already grows rows (`seats`, `blocked_upgrades`, `upgrade_suggestion`), so
+# its size is the engine's to decide, not ours. Widen the way `upload_file`
+# does (`_UPLOAD_STDOUT_MAX_CHARS`): 1 MiB is orders of magnitude above any
+# plausible billing snapshot, so moving to the async runner costs no payload
+# this tool could previously return, while still bounding the allocation.
+_BILLING_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
+
+
+@mcp.tool()
+async def billing_status() -> Any:
+    """Comfy Cloud credit balance, plan tier and job concurrency — READ-ONLY, spends nothing.
+
+    Wraps ``comfy cloud status``. The tool for "how many credits do I have",
+    "what plan am I on", "when does it renew" and "how many jobs can I run at
+    once". It only READS billing state, so it raises no spend confirmation.
+
+    Returns comfy-cli's payload as-is: ``cloud_workspace``
+    {id,name,type,role}, ``credit_balance_usd``/``credit_balance_credits``/
+    ``effective_balance_micros``, ``currency``, ``balance_confirmed``,
+    ``subscription`` {tier,status,is_active,plan_slug,renewal_date,cancel_at},
+    ``max_concurrent_jobs``, ``upgrade_suggestion``, ``manage_url`` and
+    ``message``.
+
+    ``balance_confirmed: false`` means the balance fields are ``null`` because
+    none could be ESTABLISHED — never render that as $0. Relay ``message``
+    verbatim when present; it is comfy-cli's own neutral copy for that case,
+    not something to re-derive from the numbers.
+
+    Signed out raises comfy-cli's own error — get the user signed in with
+    ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
+    degrades to ``{"error", "unsupported": True}`` carrying
+    ``balance_confirmed: False`` and the balance fields ``null``, so the rule
+    above holds there too.
+    """
+    # The success path is a straight RELAY of comfy-cli's envelope `data`: the
+    # field list in the docstring describes what the ENGINE returns, and a
+    # payload disagreeing with comfy-cli's own `cloud_status.json` (a non-dict
+    # `data`, a missing `balance_confirmed`) is handed back as it came rather
+    # than reshaped here. Deciding the engine's payload is invalid, or
+    # substituting a shape of our own, is the guardrail breach `AGENTS.md`
+    # names; `auth_status` sets the near precedent — it WRAPS a non-dict whoami
+    # payload rather than rejecting it, and only because it has a flag of its
+    # own to keep top-level. There is nothing to add here, so there is nothing
+    # to wrap.
+    # `_run_comfy_async`, NOT the thread-pool path, for the same reason
+    # `workflow_deps` gives: this is a `_BILLING_STATUS_TIMEOUT`-long child, and
+    # `asyncio.to_thread(_run_comfy, …)`'s cancellation never reaches the
+    # thread. A client that disconnects or gives up mid-fan-out would otherwise
+    # leave both the pool worker and the `comfy` child alive for the whole 180s
+    # budget, waiting on a cloud that is slow rather than dead. The async
+    # runner's `finally` reaps the process tree on every exit path,
+    # cancellation included, and its result contract is `_run_comfy`'s own —
+    # the same envelope unwrap and the same `ComfyCliError` shapes the degrade
+    # below reads.
+    try:
+        return await _run_comfy_async(
+            "cloud",
+            "status",
+            timeout=_BILLING_STATUS_TIMEOUT,
+            stdout_cap=_BILLING_STATUS_STDOUT_MAX_CHARS,
+        )
+    except ComfyCliError as exc:
+        # Same degrade shape and same strictness as `_freshness_report` /
+        # `list_workflow_notes`: `clitext._is_missing_verb_error` requires the
+        # no-envelope + Click-usage-exit pair, so a verb comfy-cli DID dispatch
+        # and then failed — no credential (`cloud_not_configured`), a rejected
+        # one (`cloud_unauthorized`), an unreachable billing endpoint
+        # (`cloud_billing_unavailable`) — keeps its own error, hint and details
+        # instead of being relabelled a version gap. Those are the failures a
+        # user can actually act on, and burying them under "your CLI is old"
+        # would send them to the wrong fix.
+        #
+        # Unlike those two this is NOT an edge path: `cloud status` landed in
+        # comfy-cli AFTER its newest release, so today every install answers
+        # this verb with Click's usage dump and this branch is the common one.
+        # It is expected to become the rare case once the verb ships, which is
+        # why the message names no version floor to go stale — the installed
+        # comfy-cli either has the verb or does not.
+        #
+        # No `clitext._phrase_is_only_the_caller_s` subtraction here (which
+        # `list_workflow_notes` needs): this tool takes no arguments, so nothing
+        # caller-supplied reaches argv and there is no path by which a caller
+        # could plant the phrase Click is being read for.
+        #
+        # EITHER verb name degrades, because this version gap has two shapes.
+        # A comfy-cli that has the `cloud` group but not this leaf fails with
+        # Click's `No such command 'status'`; one predating the whole group —
+        # reachable because the `_MIN_COMFY_CLI` floor guard fails OPEN for a
+        # source build whose `--version` cannot be parsed — fails identically
+        # (exit 2, no envelope) while naming `cloud` instead. Reading only the
+        # leaf would hand that second caller the raw usage dump this branch
+        # exists to hide, and the fix it needs is the same upgrade either way.
+        missing = next(
+            (
+                verb
+                for verb in ("status", "cloud")
+                if clitext._is_missing_verb_error(exc, verb)
+            ),
+            None,
+        )
+        if missing is None:
+            raise
+        # Names what still works rather than dead-ending — but the balance
+        # itself genuinely has no second source to point at: `comfy cloud
+        # status` is the only comfy-cli verb that reads it, and this server has
+        # no HTTP client of its own (AGENTS.md), so the upgrade IS the fix.
+        return {
+            "error": (
+                "billing status unavailable: the installed comfy-cli does not "
+                "support 'comfy cloud status' (the verb ships in a comfy-cli "
+                "newer than the one installed here). Nothing was broken by "
+                # Deliberately about STATE, not about capability: on the
+                # whole-group-missing branch below, sign-in is not available
+                # either, so a blanket "sign-in is unchanged" would contradict
+                # the pointer that closes this message.
+                "this call — no local state changed, no run or job was "
+                "touched, and no credits were spent. Upgrade comfy-cli — "
+                "`comfy update cli` in a terminal — and call this again. "
+                # The terminal command leads and the MCP tool is qualified,
+                # rather than the other way round: `update_comfyui` prompts
+                # only for `target="all"`, so `target="cli"` would pip-upgrade
+                # the user's Python environment straight off the back of a
+                # READ-ONLY balance query. Naming it still (dead-ending helps
+                # nobody) but flagging whose decision it is keeps that call
+                # with the user.
+                '(`update_comfyui(target="cli")` does the same from here, but '
+                'unlike `target="all"` it raises no confirmation prompt, so it '
+                "would pip-upgrade the user's Python environment off the back "
+                "of a read-only balance query — ask them first.) Until then "
+                "there is no balance figure to be had here: comfy-cli exposes "
+                "it through this verb only. "
+                # Which fallback is honest depends on WHICH name was missing.
+                # A CLI that has `comfy cloud` but not its `status` leaf still
+                # answers `cloud whoami`, so `auth_status` works and its
+                # `base_url` gets the user to a billing page in a browser. One
+                # missing the whole group answers neither — pointing at
+                # `auth_status` there would send them to a second usage dump.
+                + (
+                    "`auth_status` still reports which account is signed in "
+                    "and its `base_url`, whose billing page shows the balance "
+                    "in a browser."
+                    if missing == "status"
+                    else "This comfy-cli has no `comfy cloud` group at all, so "
+                    "`auth_status` and `auth_login` are unavailable on it too "
+                    "— the upgrade is the only route to any cloud state from "
+                    "here."
+                )
+            ),
+            "unsupported": True,
+            # The promised verdict key travels with the degrade, the way
+            # `_download_verb_unsupported` carries `download-cancel`'s whole
+            # verdict. The docstring tells consumers to read
+            # `balance_confirmed` before rendering any figure, so omitting it
+            # here would hand a caller that believed it a `KeyError` — or, on
+            # the `.get(..., 0)` spelling, the rendered $0 the field exists to
+            # prevent. `False` is the only honest value: no balance was
+            # established, because no balance call was made.
+            "balance_confirmed": False,
+            # ...and the fields that verdict is ABOUT come with it, for the
+            # same reason one step further out. The docstring's invariant is
+            # "`balance_confirmed: false` means the balance fields are
+            # `null`", so a consumer implementing it by subscript
+            # (`result["credit_balance_usd"] is None`) must not hit a
+            # `KeyError` on the one shape where the verdict is always false.
+            # `None` invents nothing — it is precisely "no figure", the same
+            # value comfy-cli itself emits when it could not confirm one.
+            "credit_balance_usd": None,
+            "credit_balance_credits": None,
+            "effective_balance_micros": None,
+        }
 
 
 # --------------------------------------------------------------------------
@@ -3617,6 +4055,31 @@ def _t2i_missing_template_hint(
     )
 
 
+# Default wall clock for `generate_image(wait=True)`, deliberately far under
+# `run_template`'s 600s. An MCP client enforces its OWN transport cap on a tool
+# call; this server can neither see nor raise it, and when that cap fires first
+# the call returns NOTHING — not even the `prompt_id` — while the generation
+# keeps running on the user's GPU. So the wait has to expire on THIS side first,
+# where the handle can still be handed back.
+#
+# 60s, not the 90s that would land the whole call on exactly the 120s low end of
+# the 120-300s caps seen in the field. Matching that number is a TIE, not a win,
+# and this call loses a tie twice over: the server's clock starts inside
+# `_run_comfy_streaming`, AFTER a `_check_comfy_version` that is documented at up
+# to 30s on its first call, while the client's cap covers the whole call
+# including that probe. 60s plus `_RUN_TEMPLATE_TIMEOUT_GRACE` is 90s, leaving
+# real headroom under the lowest cap rather than racing it — and under
+# `run_workflow`'s 110s, which is that tool's WHOLE wait (it adds no grace on
+# top), so 90s+30s was never the same ceiling as its default despite running the
+# same kind of job.
+#
+# Short is cheap precisely because expiry is no longer a dead end: it returns the
+# `prompt_id` to poll (see `generate_image`), on the engine's deadline as well as
+# ours. Callers who genuinely want to block longer pass a bigger
+# `timeout_seconds` — up to their client's cap.
+_T2I_DEFAULT_TIMEOUT = 60.0
+
+
 def _t2i_config() -> tuple[str, str, str]:
     """Resolve ``generate_image``'s (template, prompt slot, checkpoint slot).
 
@@ -3642,25 +4105,32 @@ async def generate_image(
     prompt: str,
     checkpoint: str | None = None,
     wait: bool = True,
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float = _T2I_DEFAULT_TIMEOUT,
     ctx: Context | None = None,
 ) -> Any:
     """Generate an image from a text prompt — the fast on-ramp.
 
-    Runs ComfyUI's default SD1.5 template via ``comfy run-template`` (override
-    with ``COMFY_T2I_TEMPLATE`` + matching slot envs) — same run path/target
+    Runs the built-in text-to-image template via ``comfy run-template``
+    (override with ``COMFY_T2I_TEMPLATE`` + matching slot envs) — same path/target
     as ``run_workflow``: this machine unless ``COMFYUI_URL``/``COMFYUI_HOST``
     says otherwise; never Cloud.
 
     Args:
         checkpoint: swaps the checkpoint model; must already be installed on
             the machine that RUNS the job. Omit for the template's default.
-        wait: True (default) blocks/streams progress; False submits and
-            returns a ``prompt_id`` to poll via ``job(action="status")``.
-        timeout_seconds: used only when ``wait=True``; ignored (fixed short
-            submit timeout) when ``wait=False``.
+        wait: True (default) blocks up to ``timeout_seconds``, streaming
+            progress; False submits and returns a ``prompt_id`` at once —
+            prefer False on slow hardware.
+        timeout_seconds: bounds this wait when ``wait=True``. Default 60s:
+            your client's own transport cap (seen in the wild at 120-300s) is
+            invisible here and the shorter wins, so it is the real ceiling.
 
-    Returns: same envelope shape as ``run_workflow`` (``prompt_id`` + outputs).
+    Returns: ``run_workflow``'s shape (``prompt_id`` + outputs) when the run
+    finishes in time. An expired wait is NOT a failure: it returns
+    ``{"timed_out": True, "prompt_id", "status", "note"}`` for a job still
+    RUNNING — poll ``job(action="status")``, collect ``fetch_outputs``, cancel
+    ``job(action="cancel")``. That holds for the engine's own per-event deadline
+    as much as this wait's, so no expiry drops the handle.
 
     Gotchas:
     - Always FREE, a local OSS graph — use ``partner_generate`` for paid
@@ -3742,8 +4212,17 @@ async def generate_image(
     try:
         # Submit-vs-stream and the parent's grace over the engine deadline are
         # `_run_template_exec`'s, shared with `run_template` — this tool runs the
-        # same verb, so it spends the budget the same way.
-        return await _run_template_exec(args, budget, wait=wait, ctx=ctx)
+        # same verb, so it spends the budget the same way. It differs in ONE
+        # thing: an expired wait here returns the `prompt_id` rather than raising
+        # (`timeout_returns_handle`). This is the flagship one-call on-ramp, so
+        # its wait is the one most likely to be outlived by a real generation on
+        # real local hardware — and a first-time caller who gets an error with no
+        # handle has a job running on their GPU they cannot poll, collect or
+        # cancel. `run_template` keeps raising: its docstring documents that, and
+        # its callers reach for `wait=False` deliberately.
+        return await _run_template_exec(
+            args, budget, wait=wait, ctx=ctx, timeout_returns_handle=True
+        )
     except ComfyCliError as exc:
         missing = _t2i_missing_template_hint(exc, template)
         if missing is not None:
@@ -4174,6 +4653,29 @@ def _modern_approval_answer(
     return did_approve
 
 
+# Appended to every "declined" refusal, because a bare `action == "decline"` does
+# NOT prove a person saw anything. The MCP spec separates "decline" (the user
+# said no) from "cancel" (dismissed without a decision), but a client is free to
+# answer either way, and at least one shipping agent client returns "decline"
+# for conditions with no human in them at all: no approval surface registered
+# for the session, a dispatch exception, a CLI prompt that raised, a session
+# lookup that failed. Every OTHER auto-answer
+# already raises honestly rather than reporting a decision (see
+# `_elicit_approval`); this is the one shape that still arrives wearing a
+# person's clothes, and the server cannot tell it apart. So the copy stops
+# asserting the person and names both possibilities.
+#
+# It deliberately does NOT name a way to bypass the gate. On a genuine decline
+# that would hand the agent a route around a refusal it was just given, which is
+# the failure the caller comments elsewhere in this file warn about; the
+# `escape_hatch` on the RAISE paths already covers the client that cannot prompt.
+_DECLINE_MAY_BE_AUTOMATIC = (
+    ' Some clients answer "decline" on their own when they cannot display a '
+    "prompt, so if no prompt appeared, the client refused by itself and nobody "
+    "was asked."
+)
+
+
 _SPEND_APPROVAL_WORDING = _ApprovalWording(
     subject="spend",
     what="the credit spend",
@@ -4276,8 +4778,10 @@ async def _elicit_approval(
     Three outcomes, not two — the distinction the QA pass found missing:
 
     * True — a person saw the prompt and approved.
-    * False — a person saw the prompt and DECLINED (``action == "decline"``).
-      Only here may a caller say "the user declined".
+    * False — the client answered ``"decline"``. USUALLY a person saying no,
+      but not provably one: a client may auto-decline a prompt it cannot show
+      (see :data:`_DECLINE_MAY_BE_AUTOMATIC`), and that is indistinguishable
+      here. A caller may report a refusal, but must not assert WHO made it.
     * raises — the client never got a decision to us (``"cancel"``, a missing
       action, an auto-answer). Failing closed is the same; claiming a human
       refused is not, so that wording is not available to the caller at all.
@@ -4319,9 +4823,13 @@ async def _elicit_approval(
     # uncaught crash instead of the refusal this contract promises.
     action = getattr(result, "action", None)
     if action != "accept":
-        # "DECLINE" is a person saying no. Anything else — "cancel", a missing
+        # "DECLINE" is an ANSWER to the request — usually a person saying no,
+        # but not provably one: a client may auto-decline a prompt it could not
+        # show (see `_DECLINE_MAY_BE_AUTOMATIC`), so callers report the refusal
+        # without naming who made it. Anything else — "cancel", a missing
         # action, a client that resolves the request without ever rendering it —
-        # is NOT a decision, and reporting it as one is a lie about a human.
+        # is not even an answer, and reporting it as a decision is a lie about a
+        # human.
         #
         # This is the bug behind "the user declined ..." appearing in sessions
         # where no prompt was ever displayed, across four different gates: every
@@ -4404,8 +4912,10 @@ async def _resolve_spend_consent(
         if await _elicit_spend_consent(ctx, model):
             return True
         raise ComfyCliError(
-            f"spend not confirmed: the user declined to spend Comfy credits on "
-            f"`{model}`. Nothing was spent and no generation was started."
+            f"spend not confirmed: the prompt to spend Comfy credits on "
+            f"`{_display_model(model)}` was declined. Nothing was spent and no "
+            f"generation was "
+            f"started.{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     return confirm_spend
 
@@ -5070,7 +5580,7 @@ async def _resolve_optin_spend_consent(
     ``declined`` are this level's ``_ApprovalWording``.
 
     Returns True to append ``--allow-spend``. Raises :class:`ComfyCliError` —
-    before any child is spawned — when the user actively declined.
+    before any child is spawned — when the prompt was declined.
     """
     if not confirm_spend:
         return False
@@ -5106,10 +5616,13 @@ async def _resolve_template_spend_consent(
             "this one, or the remote a COMFYUI_URL/COMFYUI_HOST names."
         ),
         declined=(
-            f"spend not confirmed: the user declined to let the template "
-            f"{name!r} spend Comfy credits. Nothing was spent and no run was "
-            "started. (A template with no partner-API nodes runs for free — "
-            "call again with confirm_spend=False to run it without spending.)"
+            f"spend not confirmed: the prompt to let the template "
+            f"'{_display_model(name)}' spend Comfy credits was declined. Nothing "
+            "was spent and "
+            "no run was started. (A template with no partner-API nodes runs "
+            "for free — call again with confirm_spend=False to run it without "
+            "spending.)"
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
         ),
     )
 
@@ -5182,12 +5695,14 @@ async def _resolve_workflow_spend_consent(
             "COMFYUI_URL/COMFYUI_HOST names."
         ),
         declined=(
-            f"spend not confirmed: the user declined to let the workflow "
-            f"'{path_display}' spend Comfy credits. Nothing was spent and no "
-            "run was started. Do NOT retry this graph with confirm_spend=False "
+            f"spend not confirmed: the prompt to let the workflow "
+            f"'{path_display}' spend Comfy credits was declined. Nothing was "
+            "spent and no run was started."
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
+            " Do NOT retry this graph with confirm_spend=False "
             "to get past this: unlike run_template, `comfy run`'s spend gate is "
             "not in a comfy-cli release yet, so on the installed engine that "
-            "would run the workflow and spend the credits the user just "
+            "would run the workflow and spend the credits that were just "
             "refused."
         ),
     )
@@ -5221,7 +5736,12 @@ def _run_template_argv(
 
 
 async def _run_template_exec(
-    args: list[str], budget: float, *, wait: bool, ctx: Context | None
+    args: list[str],
+    budget: float,
+    *,
+    wait: bool,
+    ctx: Context | None,
+    timeout_returns_handle: bool = False,
 ) -> Any:
     """Run a built ``run-template`` argv on the branch ``wait`` selects.
 
@@ -5248,11 +5768,21 @@ async def _run_template_exec(
     ``server_not_running`` result, replacing an actionable error with a generic
     parent kill (and orphaning an already-enqueued run). The engine must be the
     side that gives up.
+
+    ``timeout_returns_handle`` is forwarded to :func:`_run_comfy_streaming` for a
+    caller whose contract is "never return without the ``prompt_id``" — see
+    :func:`generate_image`. Off by default so ``run_template``'s wait keeps
+    raising on expiry, as its docstring documents.
     """
     timeout = budget + _RUN_TEMPLATE_TIMEOUT_GRACE
     if not wait:
         return await _in_generate_pool(_run_comfy, *args, "--async", timeout=timeout)
-    return await _run_comfy_streaming(*args, ctx=ctx, timeout=timeout)
+    return await _run_comfy_streaming(
+        *args,
+        ctx=ctx,
+        timeout=timeout,
+        timeout_returns_handle=timeout_returns_handle,
+    )
 
 
 # Unlike `partner_generate`, this does NOT probe for the spend interlock
@@ -6597,9 +7127,10 @@ async def _resolve_network_exposure_consent(
         ):
             return
         raise ComfyCliError(
-            f"network exposure not confirmed: the user declined to {action} the "
-            f"local ComfyUI with {summary}. "
+            f"network exposure not confirmed: the prompt to {action} the "
+            f"local ComfyUI with {summary} was declined. "
             f"{_NETWORK_APPROVAL_WORDING.nothing_done}"
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_network_exposure` is the documented
     # fallback, and its `False` default is why a bare call from such a client
@@ -7330,7 +7861,8 @@ async def _resolve_kill_untracked_consent(
             return _KillDecision(True, "")
         return _KillDecision(
             False,
-            f"You declined to stop pid {listener.pid}, so it is still running.",
+            f"The prompt to stop pid {listener.pid} was declined, so it is "
+            f"still running.{_DECLINE_MAY_BE_AUTOMATIC}",
         )
     # Client cannot be prompted: `confirm_kill_untracked` is the documented
     # fallback, and its `False` default is why a bare call from such a client
@@ -7722,9 +8254,9 @@ async def _resolve_update_all_consent(
         if await _elicit_update_all_consent(ctx):
             return
         raise ComfyCliError(
-            "node pack update not confirmed: the user declined to update the "
-            "installed custom node packs. Nothing was updated and no pack code "
-            "was run."
+            "node pack update not confirmed: the prompt to update the installed "
+            "custom node packs was declined. Nothing was updated and no pack "
+            f"code was run.{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_update_all` is the documented fallback,
     # and its `False` default is why a bare `target="all"` from such a client runs
@@ -7909,8 +8441,9 @@ async def _resolve_switch_consent(
         if await _elicit_version_switch_consent(ctx, version):
             return
         raise ComfyCliError(
-            f"version switch not confirmed: the user declined to switch the "
-            f"local ComfyUI to {version!r}. Nothing was changed."
+            f"version switch not confirmed: the prompt to switch the "
+            f"local ComfyUI to {version!r} was declined. Nothing was changed."
+            f"{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_switch` is the documented fallback, and
     # its `False` default is why a bare call from such a client destroys nothing.
@@ -8277,8 +8810,9 @@ async def _resolve_install_consent(
         if await _elicit_node_install_consent(ctx, names_display):
             return
         raise ComfyCliError(
-            "node install not confirmed: the user declined to install "
-            f"{names_display}. {_INSTALL_APPROVAL_WORDING.nothing_done}"
+            "node install not confirmed: the prompt to install "
+            f"{names_display} was declined. "
+            f"{_INSTALL_APPROVAL_WORDING.nothing_done}{_DECLINE_MAY_BE_AUTOMATIC}"
         )
     # Client cannot be prompted: `confirm_install` is the documented fallback, and
     # its `False` default is why a bare call from such a client installs nothing.
@@ -9776,11 +10310,134 @@ def _nodes_downstream_sync(name: str, limit: int | None) -> Any:
     return _run_comfy(*args, timeout=60.0)
 
 
+# The marker key that tells this server WHICH `nodes path` contract the
+# installed comfy-cli speaks. comfy-cli added `mode` to the `nodes path`
+# payload in the same commit that made its `--exact` walker type-constrained
+# (comfy-cli #695, released in 1.16.0), so its presence is the engine's own
+# statement that its default mode is sound. Nothing else in the payload
+# distinguishes the two: every field the OLD one emitted, the new one still
+# emits, with the same names and the same meanings.
+_PATH_TYPED_EXACT_MARKER = "mode"
+
+
+# The `nodes path` pair's SHARED wall-clock budget, and the floor the `--loose`
+# re-ask is never squeezed below. Every other `nodes` verb is one 60s call, and
+# so is this one wherever the fallback does not fire; what the fallback must not
+# do is spend 60s TWICE. ~120s is the whole request budget a typical MCP client
+# allows — the ceiling `download_model`'s 110s default is sized to sit under —
+# and `nodes` is a SYNC tool on the shared thread pool, where a client's
+# cancellation never reaches the worker, so a second child would be spawned, and
+# run to term, after the caller had already given up. The re-ask therefore gets
+# what is LEFT of the 60s rather than a fresh 60s of its own.
+#
+# Floored rather than allowed to reach zero because the re-ask is the call whose
+# answer is actually returned: a first call that ate the budget producing a
+# payload this server is about to discard must not reduce the sound query to an
+# instant synthetic timeout. So the worst case is 60 + 15, not 60 + 60, and it
+# is still comfortably inside the client's budget.
+_NODES_PATH_TIMEOUT = 60.0
+_NODES_PATH_RETRY_MIN_TIMEOUT = 15.0
+
+
+def _nodes_path_is_type_constrained(data: Any) -> bool:
+    """Does this engine's ``nodes path`` default mode route on socket TYPE?
+
+    Reads the answer out of comfy-cli's own payload rather than off a version
+    number this repo would then have to keep in sync. ``True`` only for a
+    payload carrying :data:`_PATH_TYPED_EXACT_MARKER`; anything else — a
+    pre-fix payload, or a shape this server cannot read at all — is treated as
+    the old contract, which costs one extra ``--loose`` call and never a wrong
+    answer.
+    """
+    return isinstance(data, dict) and _PATH_TYPED_EXACT_MARKER in data
+
+
 def _nodes_path_sync(
     from_type: str, to_type: str, max_depth: int, max_paths: int
 ) -> Any:
-    """``nodes(action="path")``'s body — the exact ``nodes_path`` this replaced."""
-    return _run_comfy(
+    """``nodes(action="path")``'s body — ``nodes_path`` plus a mode fallback.
+
+    Two passthroughs, and the ONLY thing decided here is which of comfy-cli's
+    two traversal modes the installed engine can be trusted to answer in. Both
+    are the engine's own walk over the live ``object_info`` graph and the
+    payload is relayed verbatim either way, so this stays inside the
+    thin-wrapper rule: no graph is parsed here and no verdict is derived here.
+
+    **Why a fallback at all.** comfy-cli's ``--exact`` default was not always
+    type-constrained. Before comfy-cli #695 (released in 1.16.0) its
+    ``exact_paths`` walked EVERY node and admitted any whose *required link
+    inputs* were already satisfied — vacuously true of a node with no link
+    inputs at all. So it answered with widget-only loaders and generators that
+    never consume ``from_type``, reported their step's ``from_type`` as the
+    empty string (it had no consumed type to name), and burned ``max_paths`` on
+    them before a real route was reached. This server's floor is comfy-cli
+    1.14.0, so that engine is inside the supported range, and the payload it
+    produces is the right shape and the wrong answer — indistinguishable from a
+    correct one to a caller that cannot re-derive it. Measured against
+    comfy-cli's own ``nodes_path_object_info`` fixture on the pre-fix engine:
+    ``MODEL`` -> ``IMAGE`` returns ``ByteDanceImageNode`` (which takes no MODEL
+    link) and omits ``KSampler -> VAEDecode`` entirely, and the routeless
+    ``IMAGE`` -> ``MODEL`` comes back as a bare ``CheckpointLoaderSimple``
+    instead of as no answer.
+
+    ``--loose`` on that same engine is sound: it walks the consumers index,
+    which is keyed on socket type and built from link inputs only (an
+    enum/COMBO widget is not a link), so every step genuinely accepts the type
+    the step before it produced, every step names that type, and an unroutable
+    pair comes back as no paths. On the fixture it gives
+    ``KSampler -> VAEDecode`` and nothing for ``IMAGE`` -> ``MODEL``.
+
+    **Why not just pin ``--loose``.** On a post-fix engine ``--exact`` is
+    type-constrained too — it is loose PLUS a satisfiability filter — and it
+    answers strictly better: it reports each path's other required inputs under
+    ``support`` (the ``VAE`` for ``VAEDecode``, and which node can supply it),
+    and it is the only mode that can claim ``exact: true``, which on an empty
+    result is a PROOF that no route exists rather than merely no route found.
+    Pinning ``--loose`` unconditionally would take both away from every
+    up-to-date install to fix an engine most of them are not running, and would
+    reinstate a milder version of the same complaint — routes whose steps
+    cannot actually be wired.
+
+    So: ask in the default mode, and re-ask in ``--loose`` only when the answer
+    comes back in the pre-fix contract
+    (:func:`_nodes_path_is_type_constrained`). An up-to-date engine pays
+    exactly one call and behaves as it does today; a pre-fix engine pays a
+    second call and gets a sound answer instead of a plausible-looking wrong
+    one. The verdict is re-read per call rather than latched, matching this
+    module's "never memoize the negative" policy — an engine upgraded under a
+    running server is picked up on the next call, not on the next restart.
+
+    The flag itself needs no capability probe, unlike ``run_workflow``'s
+    ``--allow-spend``: ``nodes path``, ``--exact/--loose`` and the ``envelope/1``
+    contract ``_run_comfy`` itself requires all landed in the SAME comfy-cli
+    commit, so no engine this server can talk to has the verb without the flag.
+    A source build or a fork could still carry the verb without the option, and
+    that one shape degrades the way every other option-shaped gap in this module
+    does (``--registry``, ``--background``, ``--host``/``--port``): Click's
+    ``No such option: --loose`` is caught and the FIRST payload is returned
+    instead. That is not a retreat from the fix — on an engine with no
+    ``--loose`` there is no sounder answer to be had, so the choice is between
+    this file's behavior before this change and no answer at all, and the
+    degrade is narrow enough (:func:`clitext._is_missing_option_error`, minus a
+    phrase :func:`clitext._phrase_is_only_the_caller_s` shows the caller merely
+    echoed through ``from_type``/``to_type``) that it cannot swallow the errors
+    that MUST propagate. A timeout on the re-ask, or ComfyUI going away between
+    the two spawns, is re-raised: there the engine HAS a sound mode and simply
+    did not answer, and relaying the discarded payload would hand back the
+    plausible-looking wrong route this function exists to withhold, with nothing
+    in it to say so.
+
+    Neither mode is exposed as a caller-facing toggle. ``--exact`` is what a
+    caller gets wherever it is trustworthy, and offering the pre-fix engine's
+    version of it would hand an agent a mode whose wrong answers it has no way
+    to spot. Nor is a "the fallback fired" flag synthesized into the reply —
+    that would be this repo deriving a field comfy-cli did not emit, and the
+    marker already IS the signal in both directions: a payload with ``mode`` was
+    answered in the engine's own default, one without it was answered by the
+    ``--loose`` re-ask (and correspondingly carries no ``support`` and no
+    ``exact: true``).
+    """
+    args = (
         "nodes",
         "path",
         from_type,
@@ -9789,8 +10446,42 @@ def _nodes_path_sync(
         str(max_depth),
         "--max-paths",
         str(max_paths),
-        timeout=60.0,
     )
+    started = time.monotonic()
+    data = _run_comfy(*args, timeout=_NODES_PATH_TIMEOUT)
+    if _nodes_path_is_type_constrained(data):
+        return data
+    retry_timeout = max(
+        _NODES_PATH_RETRY_MIN_TIMEOUT,
+        _NODES_PATH_TIMEOUT - (time.monotonic() - started),
+    )
+    try:
+        return _run_comfy(*args, "--loose", timeout=retry_timeout)
+    except ComfyCliError as exc:
+        # The one failure that is better answered than raised: an engine whose
+        # `nodes path` has no `--loose` at all. Narrow on purpose, exactly as at
+        # `node_dependencies`' `--registry` — `_is_missing_option_error` matches
+        # Click's parser error and nothing else, and
+        # `_phrase_is_only_the_caller_s` subtracts the phrase when a caller put
+        # it there themselves through `from_type`/`to_type` (the bounds are
+        # stringified ints, but they are passed for the same reason the other
+        # sites pass every caller value: the set is what the argv carries, not
+        # what looks plausible today). Every OTHER failure — the re-ask timing
+        # out, ComfyUI going away between the two spawns — propagates, because
+        # relaying `data` there would silently hand back the pre-fix engine's
+        # wrong-but-well-shaped route that this function exists to withhold.
+        if not clitext._is_missing_option_error(
+            exc, "--loose"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--loose")),
+            from_type,
+            to_type,
+            str(max_depth),
+            str(max_paths),
+        ):
+            raise
+        return data
 
 
 def _nodes_types_sync() -> Any:
@@ -9873,7 +10564,8 @@ def nodes(
     - "upstream"/"downstream" -> `nodes upstream|downstream <name>
       [--limit N]`: what feeds INTO / is fed FROM `name`.
     - "path" -> `nodes path <from_type> <to_type> --max-depth N
-      --max-paths N`: chains between two types; depth/paths default 6/10.
+      --max-paths N`: chains between two types, every step a real
+      socket link; depth/paths 6/10. No route -> no paths.
     - "types" -> `nodes types`: connection types by connectivity.
     - "categories" -> `nodes categories`: the category tree.
 
@@ -10558,6 +11250,14 @@ _DOWNLOAD_TERMINAL_STATUSES = frozenset(
 # this work?".
 _DOWNLOAD_FAILURE_STATUSES = frozenset({"failed", "cancelled", "canceled"})
 
+# The subset that means a transfer was STOPPED, as opposed to having failed on
+# its own. Split out from `_DOWNLOAD_FAILURE_STATUSES` because `cancel` asks a
+# third question the other two sets do not answer — "is this download cancelled
+# *now*?" — and answering it off the failure set would read a `failed` transfer
+# as a successful cancel. Carries the US spelling for the same reason the
+# terminal set does.
+_DOWNLOAD_CANCELLED_STATUSES = frozenset({"cancelled", "canceled"})
+
 
 def _download_status_of(payload: Any) -> str | None:
     """The lower-cased ``status`` of a ``download-status`` payload, if it has one."""
@@ -10576,6 +11276,131 @@ def _is_download_terminal(payload: Any) -> bool:
 def _download_failed(payload: Any) -> bool:
     """True if a terminal ``download-status`` payload means the file did not land."""
     return _download_status_of(payload) in _DOWNLOAD_FAILURE_STATUSES
+
+
+def _download_cancel_note(
+    status: str | None, cancelled: bool, changed: bool | None
+) -> str:
+    """One line saying what the cancel actually did, and what is left to do.
+
+    The prose half of :func:`_with_cancel_verdict`; the booleans beside it are
+    what an agent branches on. Every branch is phrased from comfy-cli's own two
+    answers — the resulting ``status`` and the envelope's ``changed`` — and the
+    NOT-cancelled ones name the way forward rather than dead-ending, because on
+    every one of them the caller still has a decision to make (a file that
+    landed anyway, a transfer that may still be running).
+
+    ``changed`` is REPORTED here, never interpreted. The engine's flag says only
+    THAT state moved on this call, not WHAT moved, so a note that named the
+    file's disposition from it — "comfy-cli kept the completed file at `dest`",
+    "comfy-cli reclaimed its partial file" — would be this wrapper guessing, and
+    guessing the same flag two contradictory ways on two adjacent branches.
+    Worse, it is the guess whose cost is asymmetric: comfy-cli downloads to the
+    final ``dest`` and a state-changing cancel may unlink it, so telling the
+    caller the file is there to delete can be exactly backwards. The three
+    values are kept distinct on the cancelled branch for the same reason
+    ``_run_comfy_with_changed`` refuses to coerce a missing flag to ``False``:
+    ``None`` is "the engine did not say", which cannot carry the ``True``
+    branch's claim that THIS call is what stopped the transfer.
+    """
+    if cancelled:
+        if changed is False:
+            return (
+                "no-op: this download was ALREADY cancelled before this call, so "
+                "nothing was stopped now."
+            )
+        if changed is None:
+            return (
+                "cancelled: comfy-cli reports this download cancelled, but "
+                "emitted no `changed` flag — so whether THIS call stopped it or "
+                "it was already cancelled is unknown."
+            )
+        return "cancelled: comfy-cli stopped the transfer's worker."
+    moved = (
+        " comfy-cli reports this call changed state, but not what it changed."
+        if changed
+        else ""
+    )
+    if status == "completed":
+        return (
+            "NOT cancelled: the transfer had already finished, so there was no "
+            f"running transfer to stop.{moved} Nothing was aborted; check `dest` "
+            "and delete the file yourself if the download was a mistake."
+        )
+    if status in _DOWNLOAD_TERMINAL_STATUSES:
+        return (
+            f"NOT cancelled: this download was ALREADY {status} before this "
+            f"call, so there was no running transfer to stop.{moved}"
+        )
+    # SCRUBBED and capped like every other engine-derived string this server
+    # renders (`_unwrap_envelope`, `errors._render_error_details`): `status` is
+    # comfy-cli's, and a version-skewed engine or a tampered state file could
+    # put a credential-bearing URL or a blob where a one-word status belongs.
+    # The terminal branch above needs no such treatment — it only ever
+    # interpolates a member of `_DOWNLOAD_TERMINAL_STATUSES`.
+    where = (
+        f"status {failure_log._scrub_text(status)[: errors._MAX_ERROR_FIELD_CHARS]!r}"
+        if status
+        else "no status"
+    )
+    return (
+        f"NOT cancelled: comfy-cli returned {where}, so this transfer may still "
+        f'be running.{moved} Re-check it with `download(action="status")` and '
+        "re-issue the cancel if it is."
+    )
+
+
+def _with_cancel_verdict(payload: Any, changed: bool | None) -> Any:
+    """Add the branchable cancel verdict to a ``model download-cancel`` payload.
+
+    comfy-cli answers a cancel with the download's ``download-status`` row —
+    which on its own is indistinguishable from the row a transfer nobody touched
+    would produce. A cancel that arrived too late comes back ``status:
+    "completed"``, ``percent: 100.0``, ``error: null``: a success payload for a
+    cancel that stopped nothing, with no field an agent could branch on to
+    discover that. Hence three fields, in the same shape ``job(action="cancel")``
+    already uses — independent facts reported separately rather than one
+    overloaded verdict:
+
+    - ``cancelled`` — comfy-cli's resulting ``status`` reads cancelled. This is
+      the field to branch on, NOT ``status``/``error``.
+    - ``changed`` — comfy-cli's OWN envelope flag for this call: did it change
+      any state (kill a worker, reclaim a partial file)? It is what separates a
+      cancel that did something from a no-op against an id that was already
+      terminal, including the already-``cancelled`` id whose ``status`` alone
+      would read as a fresh success. ``None`` when the engine emitted no flag,
+      which is honestly "unknown", not "no".
+    - ``note`` — :func:`_download_cancel_note`.
+
+    Nothing here is derived beyond reading those two engine answers: the verdict
+    is comfy-cli's, which is what keeps this inside the thin-wrapper rule. The
+    MCP surface being served is the same one ``_with_download_id`` serves — an
+    agent has one round trip and no terminal to read the CLI's printed
+    "already completed; nothing to cancel" line from.
+    """
+    status = _download_status_of(payload)
+    cancelled = status in _DOWNLOAD_CANCELLED_STATUSES
+    verdict = {
+        "cancelled": cancelled,
+        "changed": changed,
+        "note": _download_cancel_note(status, cancelled, changed),
+    }
+    if not isinstance(payload, dict):
+        # comfy-cli always emits a status row here, so a non-dict is a broken
+        # engine contract — but handing it back bare is the very failure this
+        # function exists to close (a reply with nothing to branch on). Report
+        # the verdict anyway and keep the engine's own reply under `data`; the
+        # note's last branch already says the status is missing.
+        return {**verdict, "data": payload}
+    # The verdict wins a name clash deliberately, unlike `_with_download_id`,
+    # which keeps comfy-cli's `id` beside the spelling it adds. The asymmetry is
+    # the source: `id` and `download_id` are two spellings of a value the ENGINE
+    # owns, so dropping one would drop an engine answer, while `cancelled` /
+    # `changed` / `note` name no field of comfy-cli's `download-status` row —
+    # `changed` in particular is an ENVELOPE field, so the one here is already
+    # the engine's own, read one level up. A row that grew a `changed` of its
+    # own would therefore be shadowed by the same flag, not by an inference.
+    return {**payload, **verdict}
 
 
 def _with_download_id(payload: Any, download_id: str) -> Any:
@@ -10914,6 +11739,28 @@ def _download_verb_unsupported(
             f"{'check on' if verb == 'download-status' else 'cancel'}."
         ),
         "unsupported": True,
+        # The cancel half carries the WHOLE verdict, set to the only honest
+        # values: this comfy-cli has no abort verb, so no cancel was attempted
+        # and nothing changed. All three keys, not just `cancelled` — the tool
+        # docstring promises callers that "`changed` and `note` say what
+        # happened instead", so shipping the degrade with `cancelled` alone
+        # would hand an agent that believed it a `KeyError`, which is the same
+        # read-the-absence failure the field exists to prevent. `download-status`
+        # gets no such key: it is not a cancel and has no verdict to report.
+        **(
+            {
+                "cancelled": False,
+                "changed": False,
+                "note": (
+                    "NOT cancelled: this comfy-cli has no `model "
+                    "download-cancel`, so no cancel was attempted and nothing "
+                    "changed. There is no background transfer to stop here — "
+                    "`download_model` runs the download inline on this install."
+                ),
+            }
+            if verb == "download-cancel"
+            else {}
+        ),
     }
 
 
@@ -11189,10 +12036,42 @@ def _download_wait_sync(download_id: str, timeout_seconds: float) -> Any:
 
 
 def _download_cancel_sync(download_id: str) -> Any:
-    """``download(action="cancel")``'s body — the exact ``cancel_download`` this replaced."""
-    return _with_download_id(
-        _run_comfy("model", "download-cancel", download_id, timeout=60.0), download_id
-    )
+    """``download(action="cancel")``'s body — one bounded ``model download-cancel``.
+
+    comfy-cli owns the abort itself and it is a real one: `download-cancel`
+    writes a cancel sentinel, then `killpg`s the detached worker's process group
+    (SIGTERM, then SIGKILL), then reclaims the partial file. This call never
+    waits on the transfer — it waits on that, under
+    :data:`_DOWNLOAD_CANCEL_TIMEOUT`.
+
+    Two things are added on the way out, and neither is a verdict of this
+    server's own. :func:`_with_cancel_verdict` surfaces comfy-cli's answers —
+    the resulting ``status`` and the envelope's ``changed`` — as fields an agent
+    can branch on, because the raw status row cannot tell an effective cancel
+    from a no-op. And the bound expiring is re-raised saying exactly that much:
+    the child's process group was killed at the deadline, so what happened to
+    the download is UNKNOWN from here — the one thing that must not be reported
+    is a cancel that may not have happened.
+    """
+    try:
+        payload, changed = _run_comfy_with_changed(
+            "model", "download-cancel", download_id, timeout=_DOWNLOAD_CANCEL_TIMEOUT
+        )
+    except ComfyCliError as exc:
+        if not exc.timed_out:
+            raise
+        raise ComfyCliError(
+            f"{exc} — nothing here claims the transfer stopped: comfy-cli did "
+            "not answer within the bound, so the download may still be running. "
+            f"Re-check it with `download(action='status', "
+            f"download_id={download_id!r})` and re-issue the cancel.",
+            code=exc.code,
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+            timed_out=exc.timed_out,
+            data=exc.data,
+        ) from exc
+    return _with_download_id(_with_cancel_verdict(payload, changed), download_id)
 
 
 # The three actions `download` dispatches, in the order their old standalone
@@ -11236,6 +12115,8 @@ def download(
       the final payload, or `{"timed_out": True, "download_id": ...,
       "status": <last>}` on expiry -- a TIMEOUT, not a failure.
     - "cancel" -> stop a running transfer and its partial file.
+      `cancelled` (NOT `status`) says whether it did; `changed` and
+      `note` say what happened instead.
 
     `download_id` required for every action; `timeout_seconds` only for
     "wait" -- rejected elsewhere. Payloads key the handle `download_id`;
@@ -11930,6 +12811,84 @@ def _apply_startup_instructions() -> None:
     mcp.instructions = f"{instructions.INSTRUCTIONS}\n{block}\n"
 
 
+def _warm_template_gallery() -> None:
+    """Best-effort: pull comfy-cli's template gallery index into cache at startup.
+
+    comfy-cli caches the gallery index (``~/.cache/comfy-cli/gallery/index.json``,
+    24h TTL) and refreshes a merely STALE cache in a detached background
+    process — but an ABSENT or corrupt cache is fetched SYNCHRONOUSLY inside
+    the command, on a network timeout of its own. So on a fresh machine the
+    first :func:`search_templates` pays a cold comfy-cli start PLUS that fetch
+    inside its own request window, and a QA pass under parallel load watched
+    cold first calls like this one stack up into client-side transport
+    timeouts. This moves that cost off the request path, the same way
+    :func:`_apply_startup_instructions`' probe already pre-pays the
+    ``comfy --version`` gate and the interpreter/page cache — leaving the
+    gallery the one cold component still billed to a caller.
+
+    ``templates ls``, NOT ``templates refresh``: ``ls`` is a no-op fetch-wise
+    when the cache is present and fresh (it fetches only when the cache is
+    absent or corrupt, and stale-refreshes detached), while ``refresh`` forces
+    a network fetch on EVERY startup — which is the opposite trade for a
+    machine that is already warm.
+
+    Best-effort in every direction. The result is discarded; every failure this
+    tolerates (the same set :func:`_machine_snapshot_block` tolerates) returns
+    silently, because a warm that fails costs nothing but the cold first call
+    the caller would have paid anyway. SILENTLY includes the failure log: the
+    whole body runs inside :func:`failure_log._unattributed_calls`, because that
+    log exists to explain a call the user actually made and nothing about this
+    one is ever surfaced to anybody. (The snapshot probe above is unprompted
+    too, but its result rides the handshake, so a record explaining why it came
+    back degraded is worth its line; it keeps writing them.) Suppressing only
+    ``binary_missing`` (which the ``shutil.which`` short-circuit below happens
+    to do) would leave ``timeout`` / ``spawn_failed`` / ``no_json`` /
+    ``error_envelope`` writing a record at EVERY startup on an offline or slow
+    host, spending the log's fixed rotation budget evicting real diagnostics.
+    The ``which`` check stays because it is also a cheap skip — no error path,
+    no macOS TCC stat walk — on the machine that has no comfy-cli at all.
+
+    Same 60s cap ``search_templates`` gives the identical command
+    (:data:`_run_comfy`'s house timeout for a metadata call), and deliberately
+    NOT a shorter one: the warm exists precisely for the cold-cache case, so it
+    is the invocation MOST likely to need the fetch's full budget, and a warm
+    that expires is worse than a slow one — ``_run_comfy_raw`` SIGKILLs the
+    process group on expiry, which can land mid-write of comfy-cli's
+    ``index.json`` and leave behind exactly the corrupt cache named at the top
+    of this docstring, making the NEXT ``search_templates`` slower rather than
+    faster.
+    It is a SUBPROCESS cap either way, never a startup stall: ``main()`` starts
+    this on a daemon thread and nothing ever joins it, so this function cannot
+    delay the initialize response however long it takes.
+
+    Not joining has a shutdown consequence worth stating: when ``mcp.run()``
+    returns because the client closed stdin, the interpreter finalizes while
+    this thread may still be parked in ``communicate()``, so its own
+    timeout/kill path never runs and the ``comfy templates ls`` child — spawned
+    ``start_new_session=True`` — is orphaned in its own process group. That is
+    tolerated rather than reaped: this is comfy-cli's most read-only verb, it
+    mutates nothing but its own cache, and it exits on its own, so the orphan
+    just finishes the warm we wanted. It is also not new — the snapshot probe
+    above already outlives its bounded join the same way. What would NOT be
+    tolerable here is a mutating verb (the reason :func:`_kill_proc_tree`
+    exists for ``update`` / ``model download``); keep this thread on verbs of
+    this kind.
+    """
+    with failure_log._unattributed_calls():
+        try:
+            # Inside the `try` (and the suppression), not above it: this
+            # resolution walks whatever `PATH` holds, and anything it can raise
+            # on a hostile entry would otherwise reach `threading.excepthook`
+            # and print a raw traceback into the client's server-log channel —
+            # the one thing a warm documented as silent must not do. Nothing is
+            # left outside the handler for a nonzero cost.
+            if shutil.which(COMFY_BIN) is None:
+                return
+            _run_comfy("templates", "ls", timeout=60.0)
+        except (ComfyCliError, OSError, UnicodeDecodeError):
+            return
+
+
 def main(args: list[str] | None = None) -> None:
     """Entry point for legacy stdio or long-running Streamable HTTP.
 
@@ -11972,6 +12931,38 @@ def main(args: list[str] | None = None) -> None:
         # OSError subclass) and falls open, so nothing here can keep the
         # server from starting.
         _apply_startup_instructions()
+        # Then warm comfy-cli's template gallery cache off the request path.
+        # Started and never joined: unlike the snapshot probe above there is no
+        # result to collect, so there is nothing to wait for and this can never
+        # delay the initialize response.
+        #
+        # It therefore runs CONCURRENTLY with two things. With the snapshot
+        # probe, whenever that probe outlived its bounded join: both funnel
+        # through `_check_comfy_version`, and its shared `_version_checked`
+        # flag is read and written without a lock, so a race there can latch
+        # the fail-open verdict early — which is the same outcome that guard
+        # already documents for a hung or unreadable `--version`, and it is
+        # fail-OPEN by design in all four of its other branches too. And with
+        # the REQUEST path: a client that calls `search_templates` immediately
+        # after `initialize` gets a second comfy-cli that also sees an absent
+        # cache and fetches, so both write comfy-cli's `index.json`. Nothing
+        # here coordinates that, deliberately — the cache and the atomicity of
+        # its write belong to comfy-cli (AGENTS.md: no product behavior in this
+        # repo), and the caller's worst case is what it already pays today, one
+        # synchronous fetch, plus a redundant background one.
+        try:
+            threading.Thread(
+                target=_warm_template_gallery,
+                name="comfy-mcp-gallery-warm",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            # "can't start new thread" under thread/resource exhaustion. A warm
+            # that is best-effort in every other direction must not be the one
+            # thing that aborts startup: skipping it costs only the cold first
+            # `search_templates` the caller would have paid anyway. Narrow on
+            # purpose — anything else here is a real bug, not a warm we can drop.
+            pass
         if remote_config is None:
             # Name the transport rather than inheriting the SDK's default: in
             # stdio stdout is the JSON-RPC channel and must never carry logs.

@@ -16,6 +16,16 @@ tools (no mocks):
    template's SD1.5 checkpoint (``v1-5-pruned-emaonly-fp16.safetensors``)
    installed locally; without it the run fails with comfy-cli's own missing-model
    error rather than skipping.
+3. ``nodes(action="path", from_type="MODEL", to_type="IMAGE")`` against the live
+   catalog. Also a REGRESSION GUARD, and for the same reason as case 2: the tool
+   used to relay whatever comfy-cli's default traversal mode returned, and on a
+   pre-1.16.0 engine that was nodes which never accept a MODEL socket, wrapped in
+   a perfectly valid-looking payload. No mocked test can catch that — a canned
+   envelope asserts whatever it was handed — so the only real defense is asking a
+   real ``object_info``. Whether the answer arrives in the engine's own default
+   mode or in the ``--loose`` re-ask is invisible here BY DESIGN: this asserts the
+   semantics a caller is owed, which both modes must satisfy on a healthy install.
+   Needs no checkpoint, only the core node set.
 
 **Gated.** They require BOTH a live same-machine ComfyUI answering on
 ``COMFY_LOCAL_URL`` (or ``http://127.0.0.1:8188``) AND the ``comfy`` binary on
@@ -200,3 +210,65 @@ def test_generate_image_round_trip(tmp_path):
         if p.is_file() and p.read_bytes()[:8] == _PNG_MAGIC
     ]
     assert pngs, f"generate_image produced no valid PNG in {out_dir}"
+
+
+def test_nodes_path_model_to_image_is_semantically_sound():
+    """`nodes(action="path")` MODEL -> IMAGE routes through real socket links.
+
+    The one assertion in this repo that a mocked test structurally cannot make.
+    `nodes path`'s failure mode was SILENT: the payload kept its shape while the
+    routes stopped meaning anything — widget-only loaders returned as if they
+    accepted MODEL, every step's `from_type` blank, every path one hop long, the
+    canonical route missing. A canned envelope proves the argv and the relay; only
+    a live catalog proves the answer, so this pins the semantics against whatever
+    `object_info` the machine actually has — on whichever comfy-cli is installed,
+    which is exactly the axis the fix is about.
+
+    Deliberately install-agnostic. It asserts the PROPERTIES the ticket's
+    acceptance is written in — every step names the socket type it traversed, and
+    `KSampler -> VAEDecode` is reachable — not a fixed node list, because a custom
+    node pack legitimately adds routes and a hardcoded expectation would go red on
+    a perfectly healthy install. `KSampler` and `VAEDecode` are ComfyUI core, like
+    the `EmptyImage`/`SaveImage` pair the round-trip above leans on, so their
+    absence is a broken install rather than a taste difference.
+
+    `max_paths` is raised well above the tool's default of 10 ON PURPOSE, and it
+    is not padding a flaky assertion. The engine's traversal is breadth-first, so
+    it emits ALL one-hop routes before any two-hop one and stops the moment the
+    budget is full; `KSampler -> VAEDecode` is two hops, so an install carrying
+    ten or more node classes that take a MODEL link and emit IMAGE in a single
+    hop would push it past the default budget. Every route returned in that case
+    is still a genuine socket-linked path — that is ORDERING, the thing this
+    ticket put out of scope, not the silent wrongness it is about — but this test
+    is checking reachability, so it must ask for enough of the set to see it.
+    """
+    data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE", max_paths=50)
+
+    assert isinstance(data, dict), f"nodes path returned {data!r}"
+    paths = data.get("paths")
+    assert isinstance(paths, list) and paths, f"no MODEL -> IMAGE paths in {data!r}"
+
+    for path in paths:
+        steps = path.get("steps") or []
+        assert steps, f"path with no steps: {path!r}"
+        # Blank `from_type` was symptom #1: it means the step consumed nothing,
+        # i.e. the node is in the answer without accepting the type traversed.
+        for step in steps:
+            assert step.get("from_type"), f"step does not name its input type: {step!r}"
+            assert step.get("to_type"), f"step does not name its output type: {step!r}"
+        # Each hop must hand its output to the next hop's input; a chain that
+        # does not chain is the same silent wrongness in a different dress.
+        for earlier, later in zip(steps, steps[1:]):
+            assert earlier["to_type"] == later["from_type"], (
+                f"broken link {earlier!r} -> {later!r}"
+            )
+        assert steps[0]["from_type"] == "MODEL", (
+            f"path does not start at MODEL: {path!r}"
+        )
+        assert steps[-1]["to_type"] == "IMAGE", f"path does not end at IMAGE: {path!r}"
+
+    # The canonical route — the ticket's headline symptom was its absence.
+    chains = [tuple(s["node"] for s in (p.get("steps") or [])) for p in paths]
+    assert ("KSampler", "VAEDecode") in chains, (
+        f"canonical KSampler -> VAEDecode route missing from {chains!r}"
+    )

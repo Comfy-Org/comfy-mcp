@@ -15,12 +15,17 @@
 #    fully local OSS graph.
 # 4. That ``COMFY_T2I_TEMPLATE`` (and its slot-key companions) actually retarget
 #    the call.
+# 5. That a ``wait=True`` call which outlives its bound returns the ``prompt_id``
+#    of the still-running job instead of erroring with no handle, and that the
+#    default bound is short enough to expire here rather than at the client's
+#    own (invisible) transport cap.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx
+from conftest import _OK_STREAM, _RecordingCtx, stream_reader
 
 from comfy_mcp.server import _internal as server
 
@@ -40,12 +45,13 @@ def test_generate_image_streams_and_maps_command(patched_stream):
     assert cmd[1:4] == ["--json-stream", "--where", "local"]  # global flags first
     # No checkpoint given -> no ckpt_name param. The prompt rides inside a single
     # `--param=KEY=VALUE` token (JSON-encoded value), and the engine gets its
-    # per-event deadline — capped at comfy-cli's own 120s default, never raised.
+    # per-event deadline — capped at comfy-cli's own 120s default, never raised,
+    # and LOWERED here to the 60s default budget (`_T2I_DEFAULT_TIMEOUT`).
     assert cmd[4:] == [
         "run-template",
         "image_z_image_turbo",
         '--param=57.text="a red fox in snow"',
-        "--timeout=120",
+        "--timeout=60",
     ]
     # Nothing spend-related: the default template is a free local OSS graph.
     assert "--allow-spend" not in cmd
@@ -72,7 +78,7 @@ def test_generate_image_forwards_checkpoint_when_streaming(patched_stream, monke
         "image_z_image_turbo",
         '--param=57.text="a cat"',
         '--param=ckpt_name="sd_xl.safetensors"',
-        "--timeout=120",
+        "--timeout=60",
     ]
 
 
@@ -86,7 +92,7 @@ def test_generate_image_leading_dash_prompt_is_not_parsed_as_flag(patched_stream
         "run-template",
         "image_z_image_turbo",
         '--param=57.text="--not-a-flag, just text"',
-        "--timeout=120",
+        "--timeout=60",
     ]
     # The whole prompt is one argv token, so comfy-cli's parser never sees a
     # bare `--not-a-flag`.
@@ -174,7 +180,7 @@ def test_generate_image_env_overrides_template_and_slots(patched_stream, monkeyp
         "image_flux2",
         '--param=44.text="a cat"',
         '--param=unet_name="flux2.safetensors"',
-        "--timeout=120",
+        "--timeout=60",
     ]
 
 
@@ -300,7 +306,7 @@ def test_generate_image_colliding_slots_are_fine_without_a_checkpoint(
         "run-template",
         "image_z_image_turbo",
         '--param=6.text="a cat"',
-        "--timeout=120",
+        "--timeout=60",
     ]
 
 
@@ -396,3 +402,150 @@ def test_generate_image_missing_template_error_is_actionable(monkeypatch):
     assert "not in the gallery" in message
     assert "image_flux2_text_to_image" in message
     assert "COMFY_T2I_TEMPLATE" in message
+
+
+# --- The wait that expires: a handle, never an orphan -----------------------
+#
+# `generate_image` is the flagship one-call on-ramp, so its `wait=True` is the
+# wait most likely to be outlived by a real generation on real local hardware.
+# Expiring must therefore hand back the `prompt_id`: killing our comfy-cli child
+# stops the WATCHER, never the job ComfyUI already accepted, so a timeout that
+# returns no handle leaves a generation running that nobody can poll, collect or
+# cancel.
+
+
+class _BlockingProc:
+    """A child fake that emits ``first_lines`` and then never yields an envelope.
+
+    Local rather than in ``conftest`` for the reason AGENTS.md allows: this is the
+    one case where the call genuinely differs — the shared ``patched_stream`` fake
+    drains its canned stream to EOF instantly and reports itself already exited,
+    so it can never hold the read past a deadline, which is the whole state these
+    tests are about. Mirrors the same fake in ``test_run_template.py``.
+
+    ``returncode`` starts None so the timeout handler's kill fires; no ``pid``, so
+    that kill takes ``server._kill_proc_tree_async``'s ``proc.kill()`` fallback
+    instead of signalling a made-up process group.
+    """
+
+    def __init__(self, cmd, first_lines):
+        self.cmd = cmd
+        self._lines = [line.encode("utf-8") for line in first_lines]
+        self.stdout = self  # the reader protocol lives on the proc itself
+        self.stderr = stream_reader("")
+        self.returncode = None
+        self.killed = False
+
+    async def readuntil(self, separator=b"\n"):
+        if self._lines:
+            return self._lines.pop(0)
+        # Outlives the test's tiny deadline; no envelope ever comes.
+        await asyncio.sleep(1.0)
+        raise asyncio.IncompleteReadError(b"", None)
+
+    async def wait(self):
+        self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+def _blocking_stream(monkeypatch, first_lines):
+    """Spawn fake whose child emits ``first_lines`` and then blocks forever."""
+    procs: list[_BlockingProc] = []
+
+    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+        proc = _BlockingProc(cmd, first_lines)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    # Zeroed purely so the deadline is reachable inside a test; the real grace is
+    # 30s of deliberate slack past the caller's budget.
+    monkeypatch.setattr(server, "_RUN_TEMPLATE_TIMEOUT_GRACE", 0.0)
+    return procs
+
+
+def test_generate_image_expired_wait_returns_the_prompt_id(monkeypatch):
+    """An expired wait returns the handle payload instead of raising."""
+    queued = json.dumps(
+        {
+            "schema": "event/1",
+            "type": "queued",
+            "prompt_id": "11111111-2222-3333-4444-555555555555",
+            "nodes": [{"node_id": "1"}, {"node_id": "2"}],
+        }
+    )
+    procs = _blocking_stream(monkeypatch, [queued + "\n"])
+
+    result = asyncio.run(server.generate_image("a cat", timeout_seconds=0.25))
+
+    # Not an error: the job is alive and this is its handle.
+    assert result["timed_out"] is True
+    assert result["prompt_id"] == "11111111-2222-3333-4444-555555555555"
+    assert result["status"]["total"] == 2.0  # the queued manifest was seen
+    # The payload names the tools that poll, collect and cancel it, so the caller
+    # never has to go hunting through `job(action="queue")` for the id.
+    assert 'job(action="status")' in result["note"]
+    assert "fetch_outputs" in result["note"]
+    assert 'job(action="cancel")' in result["note"]
+    assert "NOT" in result["note"]  # ... and that it was not cancelled
+    assert procs[0].killed  # our child is still cleaned up
+
+
+def test_generate_image_expired_wait_before_submit_still_raises(monkeypatch):
+    """No `prompt_id` reported means nothing was submitted — that stays an error.
+
+    The handle payload is not a blanket "timeouts are fine" switch: a deadline
+    reached before the engine ever queued anything (ComfyUI down, a stalled
+    template fetch) has no job to hand back, and reporting it as a successful
+    `timed_out` would invent a job the caller could never poll.
+    """
+    # A well-formed run event that carries no `prompt_id` — the pre-submit state.
+    preflight = json.dumps({"schema": "event/1", "type": "converted", "node_count": 2})
+    procs = _blocking_stream(monkeypatch, [preflight + "\n"])
+
+    with pytest.raises(server.ComfyCliError) as exc:
+        asyncio.run(server.generate_image("a cat", timeout_seconds=0.25))
+
+    message = str(exc.value)
+    assert "comfy-cli timed out after" in message
+    assert "already submitted as prompt_id" not in message
+    assert procs[0].killed
+
+
+def test_generate_image_default_wait_fits_a_conservative_client_cap(monkeypatch):
+    """The default call cannot outlive a conservative MCP transport cap.
+
+    The client's cap is invisible to this server and fires first when it is
+    shorter, returning nothing at all — so the DEFAULT has to expire on this side,
+    where the handle can still be returned.
+    """
+    seen: dict = {}
+
+    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
+        seen["timeout"] = timeout
+        seen["kwargs"] = kwargs
+        return {"outputs": []}
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+
+    asyncio.run(server.generate_image("a cat"))
+
+    # Whole-call wall clock = the caller's budget + the engine grace.
+    assert seen["timeout"] == pytest.approx(
+        server._T2I_DEFAULT_TIMEOUT + server._RUN_TEMPLATE_TIMEOUT_GRACE
+    )
+    # 300s is the cap observed in the field; 120s is the low end of that range.
+    # STRICTLY under, not `<=`: landing on the cap exactly is a tie, and this
+    # call loses a tie — the server's clock starts inside `_run_comfy_streaming`,
+    # after a `_check_comfy_version` documented at up to 30s on its first call,
+    # while the client's cap covers the whole call including that probe. Pinned
+    # against 110s (`run_workflow`'s whole wait, which adds no grace on top) so
+    # there is real headroom rather than a photo finish.
+    assert seen["timeout"] < 120.0
+    assert seen["timeout"] <= 110.0
+    # And the expiry hands back the handle rather than raising.
+    assert seen["kwargs"]["timeout_returns_handle"] is True

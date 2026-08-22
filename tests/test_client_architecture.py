@@ -36,13 +36,26 @@ def test_subprocess_client_preserves_each_runner_contract():
         "async": True
     }
     assert asyncio.run(
-        client.run_streaming("run", timeout=4, raise_on_timeout=False)
+        client.run_streaming(
+            "run",
+            timeout=4,
+            raise_on_timeout=False,
+            timeout_returns_handle=True,
+        )
     ) == {"stream": True}
     assert calls == [
         ("raw", ("env",), {"timeout": 1}),
         ("run", ("stop",), {"timeout": 2, "plain_ok": True}),
         ("async", ("upload",), {"timeout": 3, "stdout_cap": 4096}),
-        ("stream", ("run",), {"timeout": 4, "raise_on_timeout": False}),
+        (
+            "stream",
+            ("run",),
+            {
+                "timeout": 4,
+                "raise_on_timeout": False,
+                "timeout_returns_handle": True,
+            },
+        ),
     ]
 
 
@@ -58,9 +71,18 @@ def test_request_binding_routes_legacy_server_entry_points_through_client():
             return {"args": args, "stdout_cap": stdout_cap}
 
         async def run_streaming(
-            self, *args, ctx=None, timeout=None, raise_on_timeout=True
+            self,
+            *args,
+            ctx=None,
+            timeout=None,
+            raise_on_timeout=True,
+            timeout_returns_handle=False,
         ):
-            return {"args": args, "raise_on_timeout": raise_on_timeout}
+            return {
+                "args": args,
+                "raise_on_timeout": raise_on_timeout,
+                "timeout_returns_handle": timeout_returns_handle,
+            }
 
     original = client_context.get_client()
     fake = FakeClient()
