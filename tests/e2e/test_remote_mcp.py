@@ -30,9 +30,11 @@ import uuid
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx2
 import pytest
+from conftest import EXPECTED_TOOL_NAMES
 from fastmcp import Client
+
+httpx2 = pytest.importorskip("httpx2")
 
 _ENDPOINT_ENV = "COMFY_MCP_TEST_URL"
 _WORKFLOW_ENV = "COMFY_MCP_TEST_WORKFLOW"
@@ -88,7 +90,7 @@ def test_remote_mcp_negotiates_and_discovers_shared_application(mode):
         async with Client(endpoint, mode=mode) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
             assert client.protocol_version is not None
-            assert len(tools) == 40
+            assert set(tools) == EXPECTED_TOOL_NAMES
             assert tools["upload_file"].input_schema["required"] == [
                 "file_path",
                 "client_os",

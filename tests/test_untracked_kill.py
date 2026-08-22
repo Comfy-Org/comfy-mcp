@@ -130,55 +130,6 @@ def _local_session(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-@pytest.fixture
-def clash(monkeypatch):
-    """Wire the untracked signature and answer each `_run_comfy` from a list.
-
-    ``setup(replies, relaunch=…) -> state`` puts the restart in the exact state
-    this gate reacts to: the stop half reports nothing recorded, the FIRST launch
-    loses the port. ``state["runs"]`` records the argv of every `_run_comfy` the
-    branch makes and ``state["launches"]`` every launch attempt, which is how a
-    test asserts that nothing was probed, killed, or relaunched.
-
-    The conftest fakes hand back ONE canned reply per fixture, and this path can
-    make two different calls (the dry run, then the kill) — the multi-call case
-    AGENTS.md leaves to a local stub. An exhausted list fails loudly, so a test
-    that expects no probe simply passes ``[]``.
-    """
-
-    def setup(replies: list, *, relaunch=None) -> dict:
-        state: dict = {"runs": [], "launches": []}
-        pending = iter(replies)
-
-        def fake_stop():
-            raise server.ComfyCliError(_NOTHING_TO_STOP)
-
-        def fake_launch(extra_args=None):
-            state["launches"].append(list(extra_args or []))
-            if len(state["launches"]) == 1:
-                raise server.ComfyCliError(_PORT_TAKEN)
-            if isinstance(relaunch, BaseException):
-                raise relaunch
-            return relaunch if relaunch is not None else {"pid": 99, "port": 8188}
-
-        def fake_run(*args, **kwargs):
-            state["runs"].append(args)
-            try:
-                reply = next(pending)
-            except StopIteration:
-                raise AssertionError(f"unexpected comfy-cli call: {args}") from None
-            if isinstance(reply, BaseException):
-                raise reply
-            return reply
-
-        monkeypatch.setattr(server, "stop_comfyui", fake_stop)
-        monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
-        monkeypatch.setattr(server, "_run_comfy", fake_run)
-        return state
-
-    return setup
-
-
 # --- the happy path: identify, ask, recycle ---------------------------------
 
 

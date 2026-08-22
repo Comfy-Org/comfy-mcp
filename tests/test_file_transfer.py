@@ -18,13 +18,22 @@ from comfy_mcp.server import _internal as server
 
 
 def _request(token: str, body: bytes) -> Request:
-    sent = False
+    return _chunked_request(token, body)
+
+
+def _chunked_request(token: str, *chunks: bytes) -> Request:
+    index = 0
 
     async def receive():
-        nonlocal sent
-        if not sent:
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
+        nonlocal index
+        if index < len(chunks):
+            body = chunks[index]
+            index += 1
+            return {
+                "type": "http.request",
+                "body": body,
+                "more_body": index < len(chunks),
+            }
         return {"type": "http.disconnect"}
 
     return Request(
@@ -126,6 +135,43 @@ def test_upload_capability_puts_exact_bytes_through_cli_and_is_single_use():
     assert isinstance(observed["path"], pathlib.Path)
     assert not observed["path"].exists()
     assert repeated.status_code == 404
+
+
+def test_upload_capability_streams_request_chunks_to_scratch(monkeypatch):
+    token = _token(_mint())
+    write_sizes: list[int] = []
+    open_owner_only = file_transfer._open_owner_only
+
+    class RecordingFile:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def write(self, data: bytes):
+            write_sizes.append(len(data))
+            return self._handle.write(data)
+
+        def close(self):
+            return self._handle.close()
+
+    def open_recording_file(path: str):
+        return RecordingFile(open_owner_only(path))
+
+    monkeypatch.setattr(file_transfer, "_open_owner_only", open_recording_file)
+
+    async def uploader(path: str):
+        uploaded = await asyncio.to_thread(pathlib.Path(path).read_bytes)
+        assert uploaded == b"remote-image"
+        return {"uploads": [{"cloud_name": "task_04.webp"}]}
+
+    response = asyncio.run(
+        file_transfer.receive_upload(
+            _chunked_request(token, b"remote-", b"image"),
+            uploader,
+        )
+    )
+
+    assert response.status_code == 200
+    assert write_sizes == [7, 5]
 
 
 def test_upload_capability_size_failure_consumes_url(monkeypatch):

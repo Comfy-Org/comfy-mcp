@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
+from conftest import EXPECTED_TOOL_NAMES
 from fastmcp import Client, Context, FastMCP
 from fastmcp.client.elicitation import ElicitResult
 from mcp_types.version import (
@@ -20,57 +20,7 @@ from comfy_mcp.client import context as client_context
 from comfy_mcp.server import _internal as server
 
 
-class _FlowClient:
-    """A typed engine fake that stands in for comfy-cli, not for MCP."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, ...]] = []
-
-    def run_raw(self, *args: str, timeout=None):
-        self.calls.append(args)
-        data = {
-            "server": {"running": True, "url": "http://127.0.0.1:8188"},
-            "hardware": {"ram_total": 32_000_000_000, "gpus": []},
-        }
-        body = {
-            "type": "envelope",
-            "schema": "envelope/1",
-            "ok": True,
-            "data": data,
-        }
-        return body, json.dumps(body), args, 0, ""
-
-    def run(self, *args: str, timeout=None, plain_ok=False):
-        self.calls.append(args)
-        if args == ("outdated",):
-            return {"core": {"outdated": False}, "packs": []}
-        if args[:1] == ("run",):
-            return {"prompt_id": "prompt-1"}
-        if args[:2] == ("jobs", "status"):
-            return {"prompt_id": args[2], "status": "completed"}
-        if args[:1] == ("download",):
-            return {"files": [{"path": "/tmp/result.png"}]}
-        raise AssertionError(f"unexpected comfy-cli call: {args!r}")
-
-    async def run_async(
-        self, *args: str, timeout=None, plain_ok=False, stdout_cap=None
-    ):
-        self.calls.append(args)
-        return {"ok": True}
-
-    async def run_streaming(
-        self,
-        *args: str,
-        ctx=None,
-        timeout=None,
-        raise_on_timeout=True,
-        timeout_returns_handle=False,
-    ):
-        self.calls.append(args)
-        return {"prompt_id": "prompt-1", "status": "completed"}
-
-
-async def _main_application_flow(engine: _FlowClient):
+async def _main_application_flow(engine):
     with client_context.bind_client(engine):
         async with Client(server.mcp, mode="legacy") as client:
             tools = await client.list_tools()
@@ -94,15 +44,16 @@ async def _main_application_flow(engine: _FlowClient):
 
 def test_stdio_application_surface_runs_the_complete_submit_poll_fetch_flow(
     monkeypatch,
+    fake_comfy_client,
 ):
-    engine = _FlowClient()
+    engine = fake_comfy_client
     monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.14.0")
 
     tools, info, submitted, status, outputs = asyncio.run(
         _main_application_flow(engine)
     )
 
-    assert len(tools) == 40
+    assert {tool.name for tool in tools} == EXPECTED_TOOL_NAMES
     assert info.data["server"]["running"] is True
     assert submitted.data["prompt_id"] == "prompt-1"
     assert status.data["status"] == "completed"
@@ -115,7 +66,7 @@ async def _accept_approval(message, response_type, params, ctx):
     return ElicitResult(action="accept", content=response_type(approve=True))
 
 
-async def _shared_paid_workflow(mode: str, engine: _FlowClient):
+async def _shared_paid_workflow(mode: str, engine):
     with client_context.bind_client(engine):
         async with Client(
             server.mcp,
@@ -134,8 +85,11 @@ async def _shared_paid_workflow(mode: str, engine: _FlowClient):
         return protocol, result
 
 
-def test_shared_application_paid_workflow_uses_modern_guard_round_trip(monkeypatch):
-    engine = _FlowClient()
+def test_shared_application_paid_workflow_uses_modern_guard_round_trip(
+    monkeypatch,
+    fake_comfy_client,
+):
+    engine = fake_comfy_client
     monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: True)
 
     protocol, result = asyncio.run(_shared_paid_workflow("auto", engine))
@@ -152,8 +106,9 @@ def test_shared_application_paid_workflow_uses_modern_guard_round_trip(monkeypat
 
 def test_shared_application_paid_workflow_keeps_legacy_elicitation_compatible(
     monkeypatch,
+    fake_comfy_client,
 ):
-    engine = _FlowClient()
+    engine = fake_comfy_client
     monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: True)
 
     protocol, result = asyncio.run(_shared_paid_workflow("legacy", engine))

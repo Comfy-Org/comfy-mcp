@@ -499,9 +499,9 @@ def test_upload_file_forwards_host_port(patched_async_run, monkeypatch):
 
     While ``upload`` was off the allowlist, a session with a remote configured
     staged images into the LOCAL install's ``input`` dir and the remote run then
-    failed on a filename it could not see. The flags go AFTER the positionals —
-    Click parses options wherever they appear, and a dash-leading path is refused
-    up front, so the variadic file list cannot swallow them.
+    failed on a filename it could not see. The flags go AFTER the positional —
+    Click parses options wherever they appear, and the single guarded
+    ``file_path`` cannot swallow them.
     """
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "9001")

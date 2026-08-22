@@ -21,7 +21,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 from urllib.parse import quote, urlencode
 
 from starlette.requests import Request
@@ -57,13 +57,12 @@ def _posix_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def _write_owner_only(path: str, data: bytes) -> None:
+def _open_owner_only(path: str) -> BinaryIO:
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
+    return os.fdopen(fd, "wb")
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,22 +228,24 @@ async def receive_upload(
             status_code=404,
             headers={"Cache-Control": "no-store"},
         )
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > _MAX_UPLOAD_BYTES:
-            return JSONResponse(
-                {"error": "file exceeds the 50 MiB upload limit"},
-                status_code=413,
-                headers={"Cache-Control": "no-store"},
-            )
-        chunks.append(chunk)
-
     directory = tempfile.TemporaryDirectory(prefix="comfy-mcp-upload-")
     path = os.path.join(directory.name, entry.filename)
     try:
-        await asyncio.to_thread(_write_owner_only, path, b"".join(chunks))
+        handle = await asyncio.to_thread(_open_owner_only, path)
+        total = 0
+        try:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > _MAX_UPLOAD_BYTES:
+                    return JSONResponse(
+                        {"error": "file exceeds the 50 MiB upload limit"},
+                        status_code=413,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                if chunk:
+                    await asyncio.to_thread(handle.write, chunk)
+        finally:
+            await asyncio.to_thread(handle.close)
         data = await uploader(path)
         return JSONResponse(
             {"name": uploaded_name(data), "subfolder": "", "type": "input"},

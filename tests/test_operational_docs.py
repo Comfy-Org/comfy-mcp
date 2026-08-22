@@ -30,12 +30,15 @@ def test_failure_log_docs_cover_stdio_http_and_server_side_ownership():
 
 def test_smoke_docs_require_transport_business_flow_and_live_engine_stages():
     section = _readme_section("## Smoke test", "## Contributing")
+    normalized = " ".join(section.split())
 
-    assert "tests/test_stdio_business_flow.py" in section
+    assert "tests/e2e/test_smoke.py" in section
     assert "tests/test_remote_http.py" in section
     assert "tests/test_fastmcp_app.py" in section
     assert "tests/test_file_transfer.py" in section
     assert "real loopback Streamable HTTP/ASGI server" in section
+    assert "shared comfy-cli fixtures" in section
+    assert "real stdio MCP subprocess" in normalized
     assert "`server_info` → workflow submission → job status" in section
     assert "same 40-tool application" in section
     assert "temporary signed URL from the same listener" in section

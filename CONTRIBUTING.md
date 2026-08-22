@@ -103,7 +103,6 @@ business flow must also run this focused smoke set:
 
 ```bash
 pytest -q \
-  tests/test_stdio_business_flow.py \
   tests/test_remote_http.py \
   tests/test_remote_transport.py \
   tests/test_fastmcp_app.py \
@@ -111,12 +110,13 @@ pytest -q \
   tests/test_failure_log.py
 ```
 
-This uses real stdio and loopback Streamable HTTP MCP transports with a
-deterministic fake engine. It is distinct from the opt-in live-engine smoke
-test (`./scripts/smoke.sh`), which drives the real `comfy` binary against a
-running same-machine ComfyUI selected with `COMFY_LOCAL_URL`. The live suite
-skips when ComfyUI or the binary is absent; its `generate_image` case also
-requires the documented SD1.5 checkpoint.
+This uses the in-process application and a real loopback Streamable HTTP MCP
+transport with the shared comfy-cli fixtures in `tests/conftest.py`; default
+tests must not create a fake `comfy` executable. The opt-in live-engine smoke
+(`./scripts/smoke.sh`) launches the real stdio MCP subprocess and drives the
+real `comfy` binary against a running same-machine ComfyUI selected with
+`COMFY_LOCAL_URL`. The live suite skips when ComfyUI or the binary is absent;
+its `generate_image` case also requires the documented SD1.5 checkpoint.
 
 For a deployed Streamable HTTP server, run the client-side live smoke through
 its reachable endpoint (an SSH local-forward is supported):

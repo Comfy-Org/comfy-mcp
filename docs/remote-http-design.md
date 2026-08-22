@@ -215,20 +215,19 @@ The affected test layers are:
    exact-instance ASGI adaptation, listener validation, and interrupt cleanup.
 2. `test_fastmcp_app.py`: one in-process application, full business flow, and
    modern/legacy consent.
-3. `test_stdio_business_flow.py`: real stdio child plus fake executable,
-   covering `server_info -> run_workflow -> job -> fetch_outputs`.
-4. `test_remote_http.py`: real loopback HTTP over the same 40 tools and the
+3. `test_remote_http.py`: real loopback HTTP over the same 40 tools and the
    same complete upload/submit/poll/signed-fetch business flow, plus failure
    observation, negotiation, concurrency, stale requests, and lifecycle.
-5. `test_file_transfer.py`: Cloud-compatible schema/commands, single-use upload
+4. `test_file_transfer.py`: Cloud-compatible schema/commands, single-use upload
    limits and exact bytes, path containment, scratch cleanup, signed downloads,
    and failure-log non-disclosure.
-6. `test_failure_log.py`: opt-in behavior, immutable event delivery, observer
+5. `test_failure_log.py`: opt-in behavior, immutable event delivery, observer
    isolation, scrubbing, permissions, rotation, and concurrency.
-7. `tests/e2e/test_smoke.py`: separately marked same-machine ComfyUI smoke. A
-   missing real `comfy` binary must be reported as a skip, never described as a
-   live pass.
-8. `tests/e2e/test_remote_mcp.py`: opt-in deployed Streamable HTTP smoke through
+6. `tests/e2e/test_smoke.py`: separately marked same-machine ComfyUI smoke,
+   including the real stdio subprocess discovery/submit/poll/fetch flow. It uses
+   the real `comfy` binary rather than a generated stub; a missing binary must be
+   reported as a skip, never described as a live pass.
+7. `tests/e2e/test_remote_mcp.py`: opt-in deployed Streamable HTTP smoke through
    `COMFY_MCP_TEST_URL`; it is a client only and proves real single-use upload,
    checkpoint-free submit/poll, and signed download behavior.
 

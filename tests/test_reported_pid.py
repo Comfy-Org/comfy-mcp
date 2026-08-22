@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import _FakeRunProc, _raises_at_spawn, envelope
+from conftest import envelope
 
 from comfy_mcp.server import _internal as server
 
@@ -90,53 +90,21 @@ def _line(payload) -> str:
 
 
 @pytest.fixture
-def sequenced(monkeypatch):
+def sequenced(monkeypatch, patched_run_sequence):
     """Answer each spawn from a queue of ``(returncode, stdout, stderr)`` replies.
 
     The reconciliation makes a SECOND comfy-cli call after the one the tool
     itself made, so these paths shell out more than once and the shared
-    single-reply fakes cannot express them — the sequenced-replies carve-out
-    AGENTS.md allows for a local stub. It still mirrors the shared fake's spawn
-    signature and reuses its :class:`_FakeRunProc`, so a change to how ``server``
-    shells out breaks here loudly rather than drifting. A queue that runs out
-    fails the test, which is how "no extra subprocess" is asserted.
+    single-reply fakes cannot express them. The ordered process implementation
+    comes from the shared conftest fixture; this local fixture only configures
+    the version/freshness probes that are outside these pid assertions.
     """
-
-    def setup(replies: list) -> list[dict]:
-        calls: list[dict] = []
-
-        def fake(
-            cmd, stdout, stderr, stdin, text, encoding, env, start_new_session, cwd
-        ):
-            record = {"cmd": cmd, "timeout": None, "cwd": cwd}
-            calls.append(record)
-            try:
-                reply = replies[len(calls) - 1]
-            except IndexError:
-                raise AssertionError(f"unexpected comfy-cli call: {cmd}") from None
-            failed = isinstance(reply, BaseException)
-            if failed and _raises_at_spawn(reply):
-                raise reply
-            returncode, out, err = (None, None, None) if failed else reply
-            return _FakeRunProc(
-                cmd,
-                record,
-                stdout=out,
-                stderr=err,
-                returncode=returncode,
-                raises=reply if failed else None,
-            )
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "Popen", fake)
-        monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.15.0")
-        monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
-        # `server_info` also probes `comfy outdated`; these tests are about the
-        # pid, so keep that off the queue and out of the call assertions.
-        monkeypatch.setattr(server, "_freshness_report", lambda: {})
-        return calls
-
-    return setup
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.15.0")
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
+    # `server_info` also probes `comfy outdated`; these tests are about the pid,
+    # so keep that off the queue and out of the call assertions.
+    monkeypatch.setattr(server, "_freshness_report", lambda: {})
+    return patched_run_sequence
 
 
 # --- server_info: the recorded pid is reconciled before it is reported -------

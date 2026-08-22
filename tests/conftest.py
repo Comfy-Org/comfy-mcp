@@ -14,6 +14,8 @@ This module also holds the shared test helpers for both comfy-cli spawn paths,
 so a change to how ``server`` shells out lands in ONE fake rather than in a
 copy per test file:
 
+* the ``ComfyCliClient`` port used by in-process application tests —
+  ``fake_comfy_client``;
 * the plain ``--json`` path (``subprocess.Popen`` + a bounded
   ``communicate``) — ``envelope`` + ``patched_run`` / ``patched_plain_run``;
 * the streaming ``--json-stream`` path
@@ -48,11 +50,268 @@ import asyncio
 import json
 import logging
 import os
+import threading
 
 import pytest
 
 from comfy_mcp import failure_log, file_transfer, target
 from comfy_mcp.server import _internal as server
+from comfy_mcp.server import tools as server_tools
+
+EXPECTED_TOOL_NAMES = frozenset(server_tools.__all__)
+
+
+class _FakeComfyCliClient:
+    """Shared ``ComfyCliClient`` port double for in-process application tests.
+
+    This sits above the subprocess fixtures: tests of FastMCP composition and
+    request-local client binding need a typed engine port, while runner tests
+    continue to exercise the real concrete client against ``patched_run``,
+    ``patched_stream``, and ``patched_async_run``. Keeping the port fake here
+    prevents individual test modules from inventing divergent comfy-cli
+    contracts.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.invocations: list[dict] = []
+
+    def _record(self, method: str, args: tuple[str, ...], **kwargs) -> None:
+        self.calls.append(args)
+        self.invocations.append({"method": method, "args": args, **kwargs})
+
+    def run_raw(self, *args: str, timeout=None):
+        self._record("run_raw", args, timeout=timeout)
+        data = {
+            "server": {"running": True, "url": "http://127.0.0.1:8188"},
+            "hardware": {"ram_total": 32_000_000_000, "gpus": []},
+        }
+        body = {
+            "type": "envelope",
+            "schema": "envelope/1",
+            "ok": True,
+            "data": data,
+        }
+        return body, json.dumps(body), args, 0, ""
+
+    def run(self, *args: str, timeout=None, plain_ok=False):
+        self._record("run", args, timeout=timeout, plain_ok=plain_ok)
+        if args == ("outdated",):
+            return {"core": {"outdated": False}, "packs": []}
+        if args[:1] == ("run",):
+            return {"prompt_id": "prompt-1"}
+        if args[:2] == ("jobs", "status"):
+            return {"prompt_id": args[2], "status": "completed"}
+        if args[:1] == ("download",):
+            return {"files": [{"path": "/tmp/result.png"}]}
+        raise AssertionError(f"unexpected comfy-cli call: {args!r}")
+
+    async def run_async(
+        self, *args: str, timeout=None, plain_ok=False, stdout_cap=None
+    ):
+        self._record(
+            "run_async",
+            args,
+            timeout=timeout,
+            plain_ok=plain_ok,
+            stdout_cap=stdout_cap,
+        )
+        return {"ok": True}
+
+    async def run_streaming(
+        self,
+        *args: str,
+        ctx=None,
+        timeout=None,
+        raise_on_timeout=True,
+        timeout_returns_handle=False,
+    ):
+        self._record(
+            "run_streaming",
+            args,
+            ctx=ctx,
+            timeout=timeout,
+            raise_on_timeout=raise_on_timeout,
+            timeout_returns_handle=timeout_returns_handle,
+        )
+        return {"prompt_id": "prompt-1", "status": "completed"}
+
+
+@pytest.fixture
+def fake_comfy_client():
+    """Return a fresh shared port double satisfying ``ComfyCliClient``."""
+    return _FakeComfyCliClient()
+
+
+@pytest.fixture
+def patched_comfy_run_sequence(monkeypatch):
+    """Patch ``_run_comfy`` with an ordered response script.
+
+    ``setup(replies) -> calls`` records each argv/kwargs pair, returns ordinary
+    replies, and raises exception replies. Exhaustion fails at the unexpected
+    call. This is the shared multi-call counterpart to the spawn-level fixtures
+    below; no test module should define its own sequenced comfy-cli double.
+    """
+
+    def setup(replies: list) -> list[dict]:
+        calls: list[dict] = []
+        pending = iter(replies)
+
+        def fake_run(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            try:
+                reply = next(pending)
+            except StopIteration:
+                raise AssertionError(
+                    f"unexpected extra comfy-cli call: {args}"
+                ) from None
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(server, "_run_comfy", fake_run)
+        return calls
+
+    return setup
+
+
+@pytest.fixture
+def clash(monkeypatch):
+    """Model restart's untracked-port signature with sequenced CLI replies."""
+
+    nothing_to_stop = "No ComfyUI is running in the background."
+    port_taken = "The 8188 port is already in use."
+
+    def setup(replies: list, *, relaunch=None) -> dict:
+        state: dict = {"runs": [], "launches": []}
+        pending = iter(replies)
+
+        def fake_stop():
+            raise server.ComfyCliError(nothing_to_stop)
+
+        def fake_launch(extra_args=None):
+            state["launches"].append(list(extra_args or []))
+            if len(state["launches"]) == 1:
+                raise server.ComfyCliError(port_taken)
+            if isinstance(relaunch, BaseException):
+                raise relaunch
+            return relaunch if relaunch is not None else {"pid": 99, "port": 8188}
+
+        def fake_run(*args, **kwargs):
+            state["runs"].append(args)
+            try:
+                reply = next(pending)
+            except StopIteration:
+                raise AssertionError(
+                    f"unexpected extra comfy-cli call: {args}"
+                ) from None
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(server, "stop_comfyui", fake_stop)
+        monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
+        monkeypatch.setattr(server, "_run_comfy", fake_run)
+        return state
+
+    return setup
+
+
+@pytest.fixture
+def blocked_comfy_run(monkeypatch):
+    """Patch ``_run_comfy`` with a logged call blocked until test release."""
+
+    def setup(*, error, failure_kind=None, failure_message=None) -> dict:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_run(*args, **kwargs):
+            if failure_kind is not None:
+                failure_log._log_failure(
+                    failure_kind,
+                    args,
+                    message=failure_message or str(error),
+                )
+            entered.set()
+            release.wait(10)
+            raise error
+
+        monkeypatch.setattr(server, "_run_comfy", fake_run)
+        return {"entered": entered, "release": release}
+
+    return setup
+
+
+@pytest.fixture
+def fail_thread_start_for_name(monkeypatch):
+    """Make only a specifically named ``threading.Thread`` fail to start."""
+
+    def setup(name: str) -> None:
+        real_thread = threading.Thread
+
+        class _StartFailingThread(real_thread):
+            def start(self):
+                if self.name == name:
+                    raise RuntimeError("can't start new thread")
+                return super().start()
+
+        monkeypatch.setattr(server.threading, "Thread", _StartFailingThread)
+
+    return setup
+
+
+@pytest.fixture
+def patched_streaming_result(monkeypatch):
+    """Patch ``_run_comfy_streaming`` with one result and call recording."""
+
+    def setup(result) -> list[dict]:
+        calls: list[dict] = []
+
+        async def fake_stream(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+        return calls
+
+    return setup
+
+
+@pytest.fixture
+def recording_mcp_run(monkeypatch):
+    """Patch the shared application's ``run`` method and record its kwargs."""
+
+    def setup(*, order: list[str] | None = None) -> list[dict]:
+        calls: list[dict] = []
+
+        def fake_run(**kwargs):
+            calls.append(kwargs)
+            if order is not None:
+                order.append(f"run:{kwargs.get('transport')}")
+
+        monkeypatch.setattr(server.mcp, "run", fake_run)
+        return calls
+
+    return setup
+
+
+@pytest.fixture
+def patched_http_app(monkeypatch):
+    """Patch the shared FastMCP application's ASGI adapter."""
+
+    def setup(result) -> list[dict]:
+        calls: list[dict] = []
+
+        def fake_http_app(**kwargs):
+            calls.append(kwargs)
+            return result
+
+        monkeypatch.setattr(server.mcp, "http_app", fake_http_app)
+        return calls
+
+    return setup
 
 
 @pytest.fixture(autouse=True)
@@ -487,6 +746,67 @@ def patched_run(monkeypatch):
 
 
 @pytest.fixture
+def patched_run_sequence(monkeypatch):
+    """Patch the plain spawn path with ordered process results.
+
+    ``setup(replies) -> calls`` accepts ``(returncode, stdout, stderr)`` tuples
+    or exceptions. It preserves the same spawn signature, recording, encoding
+    checks, and wait-vs-spawn exception placement as :func:`patched_run`, while
+    failing loudly if the code makes an unscripted extra call.
+    """
+
+    def setup(replies: list) -> list[dict]:
+        calls: list[dict] = []
+
+        def fake(
+            cmd,
+            stdout,
+            stderr,
+            stdin,
+            text,
+            encoding,
+            env,
+            start_new_session,
+            cwd,
+        ):
+            record = {
+                "cmd": cmd,
+                "env": env,
+                "timeout": None,
+                "encoding": encoding,
+                "stdin": stdin,
+                "start_new_session": start_new_session,
+                "cwd": cwd,
+            }
+            calls.append(record)
+            try:
+                reply = replies[len(calls) - 1]
+            except IndexError:
+                raise AssertionError(
+                    f"unexpected extra comfy-cli call: {cmd}"
+                ) from None
+            failed = isinstance(reply, BaseException)
+            if failed and _raises_at_spawn(reply):
+                raise reply
+            _encode_argv_like_posix(cmd)
+            returncode, out, err = (None, None, None) if failed else reply
+            return _FakeRunProc(
+                cmd,
+                record,
+                stdout=out,
+                stderr=err,
+                returncode=returncode,
+                raises=reply if failed else None,
+            )
+
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.subprocess, "Popen", fake)
+        return calls
+
+    return setup
+
+
+@pytest.fixture
 def no_spawn(monkeypatch):
     """Assert no comfy-cli child is spawned — an input guard must refuse first.
 
@@ -546,6 +866,53 @@ def stream_reader(
     if eof:
         reader.feed_eof()
     return reader
+
+
+class _StderrBlockingProc:
+    """Streaming child whose stdout EOFs while its stderr read stays blocked."""
+
+    def __init__(self, cmd, stdout_lines):
+        self.cmd = cmd
+        self._lines = [line.encode("utf-8") for line in stdout_lines]
+        self.stdout = self
+        self.stderr = self
+        self.returncode = None
+        self.killed = False
+
+    async def readuntil(self, separator=b"\n"):
+        if self._lines:
+            return self._lines.pop(0)
+        raise asyncio.IncompleteReadError(b"", None)
+
+    async def read(self, size=-1):
+        await asyncio.sleep(1.0)
+        return b""
+
+    async def wait(self):
+        self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.fixture
+def stderr_blocking_stream(monkeypatch):
+    """Spawn a streaming child with fast stdout EOF and blocked stderr."""
+
+    def setup(stdout_lines) -> list[_StderrBlockingProc]:
+        procs: list[_StderrBlockingProc] = []
+
+        async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
+            proc = _StderrBlockingProc(cmd, stdout_lines)
+            procs.append(proc)
+            return proc
+
+        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+        return procs
+
+    return setup
 
 
 class _FakeProc:

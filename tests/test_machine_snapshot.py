@@ -242,20 +242,16 @@ def test_snapshot_dump_is_credential_scrubbed(patched_run):
     assert "example.com" in tail  # the URL survives, only the secret is masked
 
 
-def test_main_applies_the_snapshot_before_serving(monkeypatch):
+def test_main_applies_the_snapshot_before_serving(monkeypatch, recording_mcp_run):
     """``main()`` enriches the handshake and only then hands off to ``mcp.run``."""
     order: list[str] = []
     monkeypatch.setattr(
         server, "_machine_snapshot_block", lambda: order.append("probe") or "SNAP"
     )
-
-    def fake_run(*, transport, show_banner):
-        order.append(f"run:{transport}")
-        assert show_banner is False
-
-    monkeypatch.setattr(server.mcp, "run", fake_run)
+    calls = recording_mcp_run(order=order)
 
     server.main()
 
     assert order == ["probe", "run:stdio"]
+    assert calls == [{"transport": "stdio", "show_banner": False}]
     assert server.mcp.instructions == f"{server.instructions.INSTRUCTIONS}\nSNAP\n"

@@ -59,46 +59,34 @@ def test_subprocess_client_preserves_each_runner_contract():
     ]
 
 
-def test_request_binding_routes_legacy_server_entry_points_through_client():
-    class FakeClient:
-        def run_raw(self, *args, timeout=None):
-            return None, "", args, 0, ""
-
-        def run(self, *args, timeout=None, plain_ok=False):
-            return {"args": args, "timeout": timeout, "plain_ok": plain_ok}
-
-        async def run_async(self, *args, timeout=None, plain_ok=False, stdout_cap=None):
-            return {"args": args, "stdout_cap": stdout_cap}
-
-        async def run_streaming(
-            self,
-            *args,
-            ctx=None,
-            timeout=None,
-            raise_on_timeout=True,
-            timeout_returns_handle=False,
-        ):
-            return {
-                "args": args,
-                "raise_on_timeout": raise_on_timeout,
-                "timeout_returns_handle": timeout_returns_handle,
-            }
-
+def test_request_binding_routes_legacy_server_entry_points_through_client(
+    fake_comfy_client,
+):
     original = client_context.get_client()
-    fake = FakeClient()
+    fake = fake_comfy_client
     with client_context.bind_client(fake):
         assert server._run_comfy("jobs", "status", "p1", timeout=5) == {
-            "args": ("jobs", "status", "p1"),
-            "timeout": 5,
-            "plain_ok": False,
+            "prompt_id": "p1",
+            "status": "completed",
         }
-        assert (
-            asyncio.run(
-                server._run_comfy_streaming(
-                    "jobs", "watch", "p1", raise_on_timeout=False
-                )
-            )["raise_on_timeout"]
-            is False
+        asyncio.run(
+            server._run_comfy_streaming("jobs", "watch", "p1", raise_on_timeout=False)
         )
 
     assert client_context.get_client() is original
+    assert fake.invocations == [
+        {
+            "method": "run",
+            "args": ("jobs", "status", "p1"),
+            "timeout": 5,
+            "plain_ok": False,
+        },
+        {
+            "method": "run_streaming",
+            "args": ("jobs", "watch", "p1"),
+            "ctx": None,
+            "timeout": None,
+            "raise_on_timeout": False,
+            "timeout_returns_handle": False,
+        },
+    ]

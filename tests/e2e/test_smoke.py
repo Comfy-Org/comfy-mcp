@@ -3,10 +3,14 @@
 This is the manual validation ritual turned into a command. It drives the actual
 tools (no mocks):
 
-1. ``server_info`` -> ``run_workflow`` on a checkpoint-free ``EmptyImage`` ->
+1. A real stdio MCP subprocess performs discovery, ``server_info``,
+   ``run_workflow`` on a checkpoint-free ``EmptyImage`` -> ``SaveImage`` graph,
+   job polling, and ``fetch_outputs``. This transport test uses the real
+   ``comfy`` binary; it never writes a fake executable.
+2. ``server_info`` -> ``run_workflow`` on a checkpoint-free ``EmptyImage`` ->
    ``SaveImage`` graph (both ComfyUI core nodes) -> ``fetch_outputs``, then
    asserts a real PNG landed in a temp out_dir.
-2. ``generate_image(prompt=…, wait=True)`` — the text-prompt on-ramp — end to
+3. ``generate_image(prompt=…, wait=True)`` — the text-prompt on-ramp — end to
    end, likewise down to a real PNG. This one is a REGRESSION GUARD: the tool
    used to wrap ``comfy generate``, a partner/cloud-only verb with no local mode
    and no ``--prompt`` flag, so every call died in comfy-cli's argument parser
@@ -14,10 +18,10 @@ tools (no mocks):
    test could catch that — mocks happily accept an argv the real CLI rejects —
    so the only real defense is running it. Unlike case 1 it needs the default
    template's SD1.5 checkpoint (``v1-5-pruned-emaonly-fp16.safetensors``)
-   installed locally; without it the run fails with comfy-cli's own missing-model
-   error rather than skipping.
-3. ``nodes(action="path", from_type="MODEL", to_type="IMAGE")`` against the live
-   catalog. Also a REGRESSION GUARD, and for the same reason as case 2: the tool
+   installed locally; unlike cases 1 and 2, without it the run fails with
+   comfy-cli's own missing-model error rather than skipping.
+4. ``nodes(action="path", from_type="MODEL", to_type="IMAGE")`` against the live
+   catalog. Also a REGRESSION GUARD, and for the same reason as case 3: the tool
    used to relay whatever comfy-cli's default traversal mode returned, and on a
    pre-1.16.0 engine that was nodes which never accept a MODEL socket, wrapped in
    a perfectly valid-looking payload. No mocked test can catch that — a canned
@@ -43,11 +47,16 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
+from conftest import EXPECTED_TOOL_NAMES
+from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
 
 from comfy_mcp.server import _internal as server
 
@@ -56,6 +65,16 @@ from comfy_mcp.server import _internal as server
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 _WORKFLOW = Path(__file__).parent / "workflow_smoke.json"
+
+_TERMINAL_JOB_STATUSES = {
+    "completed",
+    "success",
+    "succeeded",
+    "failed",
+    "error",
+    "cancelled",
+    "canceled",
+}
 
 
 _DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
@@ -160,6 +179,59 @@ def test_no_model_round_trip(tmp_path):
         if p.is_file() and p.read_bytes()[:8] == _PNG_MAGIC
     ]
     assert pngs, f"no valid PNG downloaded into {out_dir}"
+
+
+def test_stdio_mcp_process_completes_submit_poll_fetch(tmp_path):
+    """A real stdio server and real comfy-cli complete the business flow."""
+
+    async def exercise() -> None:
+        transport = StdioTransport(
+            command=sys.executable,
+            args=["-c", "from comfy_mcp.server import main; main()"],
+            env=os.environ.copy(),
+        )
+        async with Client(transport, mode="legacy") as client:
+            tools = await client.list_tools()
+            assert {tool.name for tool in tools} == EXPECTED_TOOL_NAMES
+
+            info = await client.call_tool("server_info", {})
+            assert info.data, f"server_info returned {info.data!r}"
+
+            submitted = await client.call_tool(
+                "run_workflow",
+                {"workflow_path": str(_WORKFLOW.resolve()), "wait": False},
+            )
+            prompt_id = _extract_prompt_id(submitted.data)
+            assert prompt_id, f"no prompt_id in run_workflow result: {submitted.data!r}"
+
+            deadline = time.monotonic() + 180
+            final: dict[str, object] | None = None
+            while time.monotonic() < deadline:
+                status = await client.call_tool(
+                    "job", {"action": "status", "prompt_id": prompt_id}
+                )
+                assert isinstance(status.data, dict), status.data
+                final = status.data
+                if final.get("status") in _TERMINAL_JOB_STATUSES:
+                    break
+                await asyncio.sleep(1)
+            assert final is not None
+            assert final.get("status") == "completed", final
+
+            out_dir = tmp_path / "stdio_out"
+            await client.call_tool(
+                "fetch_outputs",
+                {"prompt_id": prompt_id, "out_dir": str(out_dir)},
+            )
+
+        pngs = [
+            path
+            for path in out_dir.rglob("*")
+            if path.is_file() and path.read_bytes()[:8] == _PNG_MAGIC
+        ]
+        assert pngs, f"stdio MCP flow downloaded no valid PNG into {out_dir}"
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=240))
 
 
 def test_system_stats_reports_devices():

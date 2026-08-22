@@ -4766,52 +4766,11 @@ def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(blocking_stream, id
     assert len(msg) < id_len or id_len < 1_000
 
 
-class _StderrBlockingProc:
-    """stdout hits EOF fast; ``stderr.read()`` blocks past the timeout.
-
-    Reproduces the cancellation path: ``_drain`` finishes ``_pump`` + ``wait``
-    and then suspends at ``await stderr_future``, so the outer ``wait_for``
-    timeout cancels the future. Awaiting it in the handler re-raises
-    ``CancelledError`` (a ``BaseException``) — which must NOT escape and mask the
-    intended ``ComfyCliError``.
-    """
-
-    def __init__(self, cmd, stdout_lines):
-        self.cmd = cmd
-        self._lines = [line.encode("utf-8") for line in stdout_lines]
-        self.stdout = self  # the reader protocol lives on the proc
-        self.stderr = self  # read lives on the proc
-        self.returncode = None
-        self.killed = False
-
-    async def readuntil(self, separator=b"\n"):
-        if self._lines:
-            return self._lines.pop(0)
-        raise asyncio.IncompleteReadError(b"", None)  # EOF -> _pump breaks
-
-    async def read(self, size=-1):
-        # Outlives the tiny timeout; suspends `_read` at `await stderr_future`.
-        await asyncio.sleep(1.0)
-        return b""
-
-    async def wait(self):
-        self.returncode = 0
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-        self._alive = False
-
-
-def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
+def test_streaming_timeout_stderr_cancel_still_raises(stderr_blocking_stream):
     """A timeout that cancels the stderr read must still raise ComfyCliError, not CancelledError."""
     queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
 
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        return _StderrBlockingProc(cmd, [queued + "\n"])
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    stderr_blocking_stream([queued + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -4829,7 +4788,9 @@ def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
     )  # tail gathering was cancelled -> empty, best-effort
 
 
-def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(monkeypatch):
+def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(
+    stderr_blocking_stream,
+):
     """A deadline that lands on the post-EOF reap is a dead child, not a live run.
 
     `_read` bounds the EOF-path `proc.wait()` + stderr drain with the SAME
@@ -4843,11 +4804,7 @@ def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(monkeypatch):
         {"schema": "event/1", "type": "queued", "prompt_id": _HANDLE, "nodes": [{}]}
     )
 
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        return _StderrBlockingProc(cmd, [queued + "\n"])
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    stderr_blocking_stream([queued + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(

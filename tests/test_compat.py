@@ -19,7 +19,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import _FakeRunProc, _raises_at_spawn
 
 from comfy_mcp.server import _internal as server
 
@@ -327,7 +326,7 @@ _OUTDATED_DATA = {
 
 
 @pytest.fixture
-def patched_env_then_outdated(monkeypatch):
+def patched_env_then_outdated(monkeypatch, patched_run_sequence):
     """Patch comfy-cli so ``server_info``'s two runs each see their own reply.
 
     ``server_info`` shells out twice — ``comfy env`` then ``comfy outdated`` —
@@ -335,41 +334,13 @@ def patched_env_then_outdated(monkeypatch):
     per call: each entry is a result-shaping tuple ``(returncode, stdout,
     stderr)`` or an exception instance to raise.
 
-    Sequenced replies are the carve-out AGENTS.md allows for a local stub, but
-    it still mirrors the shared fake's spawn signature and reuses its
-    :class:`_FakeRunProc`, so a change to how ``server`` shells out breaks here
-    loudly rather than drifting.
+    The ordered subprocess implementation comes from the shared conftest
+    fixture; this local fixture only configures the compatibility-specific
+    version and floor state.
     """
-
-    def setup(replies: list) -> list[dict]:
-        calls: list[dict] = []
-
-        def fake(
-            cmd, stdout, stderr, stdin, text, encoding, env, start_new_session, cwd
-        ):
-            record = {"cmd": cmd, "timeout": None, "cwd": cwd}
-            calls.append(record)
-            reply = replies[len(calls) - 1]
-            failed = isinstance(reply, BaseException)
-            if failed and _raises_at_spawn(reply):
-                raise reply
-            returncode, out, err = (None, None, None) if failed else reply
-            return _FakeRunProc(
-                cmd,
-                record,
-                stdout=out,
-                stderr=err,
-                returncode=returncode,
-                raises=reply if failed else None,
-            )
-
-        monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-        monkeypatch.setattr(server.subprocess, "Popen", fake)
-        monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
-        monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
-        return calls
-
-    return setup
+    monkeypatch.setattr(server, "_detect_comfy_cli_version", lambda: "1.13.0")
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", None)
+    return patched_run_sequence
 
 
 def test_server_info_attaches_freshness_block(patched_env_then_outdated):

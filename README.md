@@ -1359,17 +1359,16 @@ bounded output, but the temporary file itself is removed before the route return
 
 ## Smoke test
 
-Validation has two complementary stages. Run both when changing the MCP
+Validation has three complementary stages. Run all three when changing the MCP
 transport, shared client boundary, runner, or workflow/job behavior.
 
 **1. Automated MCP transport and business-flow smoke (no live ComfyUI).** This
-starts a real stdio child and a real loopback Streamable HTTP/ASGI server, uses
-FastMCP clients for negotiation and discovery, and exercises the shared
-comfy-cli path with a deterministic fake engine:
+starts a real loopback Streamable HTTP/ASGI server, uses FastMCP clients for
+negotiation and discovery, and exercises the in-process and HTTP business flows
+with the shared comfy-cli fixtures from `tests/conftest.py`:
 
 ```bash
 pytest -q \
-  tests/test_stdio_business_flow.py \
   tests/test_remote_transport.py \
   tests/test_remote_http.py \
   tests/test_fastmcp_app.py \
@@ -1377,20 +1376,21 @@ pytest -q \
   tests/test_failure_log.py
 ```
 
-Both transports cover input staging → `server_info` → workflow submission → job status
+The in-process and HTTP flows cover input staging → `server_info` → workflow submission → job status
 → `fetch_outputs` against the same 40-tool application. The HTTP flow downloads the returned
 temporary signed URL from the same listener, rejects a modified signature, and proves the upload URL is single-use;
-the stdio flow proves that direct local paths and output writes stay compatible. The tests use a deterministic
-fake engine (including a real temporary executable on the stdio path). HTTP coverage also checks
+the local-path behavior is covered through the shared subprocess fixtures rather than a
+hand-written executable stub. HTTP coverage also checks
 concurrent clients, legacy and modern protocol negotiation, native tool-error
 behavior, opt-in failure observation (including upload-byte non-disclosure), scratch cleanup, and clean
 ASGI/uvicorn shutdown.
 
-**2. Live ComfyUI smoke.** This drives the actual tools through the actual
-`comfy` binary into a running local ComfyUI:
+**2. Live ComfyUI and stdio-process smoke.** This drives the actual tools through
+the actual `comfy` binary into a running local ComfyUI. The real stdio MCP
+subprocess also covers discovery → `server_info` → submit → poll → fetch:
 
 ```bash
-./scripts/smoke.sh            # or: python -m pytest tests/e2e -m e2e
+./scripts/smoke.sh            # or: python -m pytest tests/e2e/test_smoke.py -m e2e
 ```
 
 It needs a running same-machine ComfyUI (`COMFY_LOCAL_URL`, default

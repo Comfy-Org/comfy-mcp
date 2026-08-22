@@ -17,13 +17,13 @@ import time
 import httpx2
 import pytest
 import uvicorn
-from conftest import envelope
+from conftest import EXPECTED_TOOL_NAMES, envelope
 from fastmcp import Client
 from fastmcp.client.elicitation import ElicitResult
 from fastmcp.client.transports import StreamableHttpTransport
 from starlette.requests import Request
 
-from comfy_mcp import failure_log, file_transfer
+from comfy_mcp import failure_log
 from comfy_mcp.server import _internal as server
 from comfy_mcp.server import remote
 from comfy_mcp.server.config import RemoteServerConfig
@@ -90,7 +90,7 @@ async def _discover_and_call(
     return discovered, result
 
 
-def test_http_exposes_the_same_40_tools_and_complete_business_flow(
+def test_http_exposes_the_same_tools_and_complete_business_flow(
     remote_http_server, patched_run, patched_async_run, monkeypatch
 ):
     """HTTP carries input bytes in and signed output bytes back on one app."""
@@ -238,7 +238,7 @@ def test_http_exposes_the_same_40_tools_and_complete_business_flow(
     ) = asyncio.run(run_flow())
 
     names = {tool.name for tool in discovered}
-    assert len(names) == 40
+    assert names == EXPECTED_TOOL_NAMES
     assert {
         "server_info",
         "upload_file",
@@ -290,8 +290,6 @@ def test_http_exposes_the_same_40_tools_and_complete_business_flow(
         download_scratch[0],
     ]
     assert pathlib.Path(download_scratch[0]).exists()
-    file_transfer._DOWNLOAD_STORE.close()
-    assert not pathlib.Path(download_scratch[0]).exists()
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
@@ -468,7 +466,6 @@ def test_http_transfer_reports_preserve_forwarded_scheme_host_and_port(
     assert outputs.data["files"][0]["url"].startswith(
         "https://mcp.example.test:8443/downloads/"
     )
-    file_transfer._DOWNLOAD_STORE.close()
 
 
 async def _accept_approval(message, response_type, params, ctx):
@@ -632,7 +629,7 @@ def test_http_auto_mode_negotiates_the_modern_sessionless_protocol(
         )
     )
 
-    assert len({tool.name for tool in discovered}) == 40
+    assert {tool.name for tool in discovered} == EXPECTED_TOOL_NAMES
     assert result.data["running"] is True
 
 
@@ -765,7 +762,7 @@ def test_installed_http_process_shuts_down_cleanly(
             async with Client(f"http://127.0.0.1:{port}/mcp") as client:
                 return await client.list_tools()
 
-        assert len(asyncio.run(discover())) == 40
+        assert {tool.name for tool in asyncio.run(discover())} == EXPECTED_TOOL_NAMES
         proc.send_signal(shutdown_signal)
         stdout, stderr = proc.communicate(timeout=15)
     finally:
@@ -773,8 +770,8 @@ def test_installed_http_process_shuts_down_cleanly(
             proc.kill()
             proc.communicate()
 
-    # Uvicorn 0.52 completes the ASGI lifespan, restores the process's prior
-    # signal handler, then replays the signal. Python's SIGINT handler becomes
+    # Uvicorn completes the ASGI lifespan, restores the process's prior signal
+    # handler, then replays the signal. Python's SIGINT handler becomes
     # KeyboardInterrupt (normalized by ``serve``); SIGTERM keeps native Unix
     # signal-exit semantics. Both paths must finish application shutdown first.
     assert proc.returncode == expected_returncode

@@ -48,16 +48,10 @@ def test_remote_adapter_contains_no_second_fastmcp_constructor():
     assert not hasattr(remote, "create_server")
 
 
-def test_http_app_is_built_from_the_exact_shared_application(monkeypatch):
+def test_http_app_is_built_from_the_exact_shared_application(patched_http_app):
     settings = config.RemoteServerConfig()
-    calls = []
     sentinel = object()
-
-    def fake_http_app(**kwargs):
-        calls.append(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(server.mcp, "http_app", fake_http_app)
+    calls = patched_http_app(sentinel)
 
     assert remote.create_http_app(settings, server.mcp) is sentinel
     assert calls == [

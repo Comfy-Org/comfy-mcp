@@ -238,10 +238,11 @@ and the parser are exercised directly (`test_wrapper.py`, `test_parser.py`); eac
 has its own file. Add a tool's test with it.
 
 Remote configuration and same-instance adapter tests live in `test_remote_transport.py`;
-in-process FastMCP business flows live in `test_fastmcp_app.py`; the real stdio process flow
-lives in `test_stdio_business_flow.py`; real-loopback Streamable HTTP integration lives in
-`test_remote_http.py`; transfer edge cases live in `test_file_transfer.py`. Both transport
-flows cover the full upload/submit/poll/fetch path and the
+in-process FastMCP business flows live in `test_fastmcp_app.py`; real-loopback Streamable HTTP
+integration lives in `test_remote_http.py`; transfer edge cases live in `test_file_transfer.py`.
+The real stdio process flow belongs to the opt-in `e2e/test_smoke.py` suite and uses the real
+comfy-cli plus a live local ComfyUI, never a generated fake executable. The default in-process
+and HTTP flows cover the full upload/submit/poll/fetch path and the
 same 40-tool discovery result. Also cover modern+legacy negotiation, pre-initialize/stale
 requests, concurrency, native tool errors, signed-link tampering/expiry, scratch containment
 and cleanup, failure observation/non-disclosure, and clean lifecycle. Never
@@ -257,11 +258,17 @@ server filesystem path.
 **Mock comfy-cli via the shared fixtures in `tests/conftest.py`, never a hand-rolled stub.**
 They mirror how `server._internal` spawns the CLI: a spawn-signature change is one edit, not a sweep:
 
+- `fake_comfy_client` — the shared `ComfyCliClient` port double for in-process
+  application and request-binding tests; never define a second client fake in a test module.
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
+- `patched_comfy_run_sequence(replies) -> calls` — ordered responses at the
+  guarded runner boundary for multi-call composition tests.
 - `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) -> calls` — the plain
   `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/`encoding` per
   call for exact-argv checks; `on_spawn(cmd)` fires at spawn so the one verb whose answer is
   a FILE writes its `--output`.
+- `patched_run_sequence(replies) -> calls` — the same plain spawn model with one
+  ordered process result per call; an exhausted script fails immediately.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for verbs that print
   human text with no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
@@ -270,6 +277,8 @@ They mirror how `server._internal` spawns the CLI: a spawn-signature change is o
   buffer limits stay exercised.
 - `blocking_stream(first_lines, stderr_text=…) -> procs` — its TIMEOUT counterpart: a child
   that BLOCKS with both pipes open, `wait()` parked until `kill()` — or a 30s net — EOFs them.
+- `stderr_blocking_stream(first_lines) -> procs` — stdout EOFs while stderr
+  remains blocked, for the post-EOF cancellation edge.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) -> procs` — the
   plain-JSON *async* path (`_run_comfy_async`): same spawn and real `StreamReader` pipes as
   `patched_stream`, but parses the capture once at the end, not line-by-line. `hang=True`
@@ -287,9 +296,9 @@ worker, so a client giving up left the child running; it carries the longest-liv
 `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 
-A local stub is justified only where the call genuinely differs — the `comfy --version` probe
-(its own kwargs), multi-call sequenced replies, and `test_wrapper.py`'s `_StderrBlockingProc`
-(stdout EOFs fast while `stderr.read()` blocks, which neither streaming fixture models).
+A genuinely different call shape is not an exception to fixture sharing. Extend
+`tests/conftest.py` with the required sequence, blocking, port, or client behavior and consume
+that fixture from the test module; never define a local comfy-cli test double.
 
 ## Destined-public hygiene
 

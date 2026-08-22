@@ -2275,8 +2275,8 @@ async def _run_comfy_async_impl(
     the LAST JSON object it prints and :func:`clitext._synthesize_plain_result` already
     reports only the tail of the printed text. That holds only while the
     envelope itself FITS the tail, so ``stdout_cap`` widens the stdout bound for
-    a caller whose envelope scales with its input — ``upload_file``'s echoes
-    every staged path back (see :data:`_UPLOAD_STDOUT_MAX_CHARS`). ``None``
+    a caller whose envelope scales with its input — ``upload_file``'s envelope
+    echoes its staged ``file_path`` back (see :data:`_UPLOAD_STDOUT_MAX_CHARS`). ``None``
     (the default) reads :data:`_STDERR_MAX_CHARS` at call time, so a test
     patching the module constant is still honored.
 
