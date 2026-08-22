@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 from fastmcp import Client, Context, FastMCP
 from fastmcp.client.elicitation import ElicitResult
+from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
 from comfy_mcp.client import context as client_context
 from comfy_mcp.server import _internal as server
@@ -132,7 +134,7 @@ def test_shared_application_paid_workflow_uses_modern_guard_round_trip(monkeypat
 
     protocol, result = asyncio.run(_shared_paid_workflow("auto", engine))
 
-    assert str(protocol) == "2026-07-28"
+    assert protocol == LATEST_MODERN_VERSION
     assert result.data["prompt_id"] == "prompt-1"
     assert (
         "run",
@@ -150,8 +152,30 @@ def test_shared_application_paid_workflow_keeps_legacy_elicitation_compatible(
 
     protocol, result = asyncio.run(_shared_paid_workflow("legacy", engine))
 
-    assert str(protocol) != "2026-07-28"
+    assert protocol == LATEST_HANDSHAKE_VERSION
     assert result.data["prompt_id"] == "prompt-1"
+
+
+def test_protocol_classifier_accepts_only_sdk_modern_versions():
+    def context(version: str):
+        return SimpleNamespace(
+            request_context=SimpleNamespace(protocol_version=version)
+        )
+
+    assert server._is_modern_protocol(context(LATEST_MODERN_VERSION)) is True
+    assert server._is_modern_protocol(context(LATEST_HANDSHAKE_VERSION)) is False
+    assert server._is_modern_protocol(context("draft")) is False
+
+
+def test_spend_gates_have_distinct_round_keys_but_no_env_consent_tokens():
+    generate_key = server._approval_key(server._SPEND_APPROVAL_WORDING)
+    optin_key = server._approval_key(server._OPTIN_SPEND_APPROVAL_WORDING)
+
+    assert generate_key == "comfy_mcp_spend_generate"
+    assert optin_key == "comfy_mcp_spend_optin"
+    assert generate_key != optin_key
+    assert server._SPEND_APPROVAL_WORDING.consent_token == ""
+    assert server._OPTIN_SPEND_APPROVAL_WORDING.consent_token == ""
 
 
 def test_modern_guard_carries_only_prior_gate_approval_between_rounds():

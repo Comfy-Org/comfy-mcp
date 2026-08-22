@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 
+import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
@@ -101,6 +102,7 @@ async def _run_stdio_flow(fake_comfy: str, input_path: str):
     return tools, info, uploaded, submitted, status, outputs
 
 
+@pytest.mark.skipif(os.name != "posix", reason="the fake comfy binary uses a shebang")
 def test_real_stdio_process_completes_submit_poll_fetch(tmp_path):
     fake = tmp_path / "fake-comfy"
     fake.write_text(_FAKE_COMFY.format(python=sys.executable), encoding="utf-8")
@@ -109,7 +111,10 @@ def test_real_stdio_process_completes_submit_poll_fetch(tmp_path):
     input_path.write_bytes(b"stdio-input")
 
     tools, info, uploaded, submitted, status, outputs = asyncio.run(
-        _run_stdio_flow(str(fake), str(input_path))
+        asyncio.wait_for(
+            _run_stdio_flow(str(fake), str(input_path)),
+            timeout=120,
+        )
     )
 
     assert len(tools) == 40

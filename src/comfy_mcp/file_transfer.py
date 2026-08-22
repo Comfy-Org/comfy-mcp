@@ -24,9 +24,9 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import quote, urlencode
 
-from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.types import Receive, Scope, Send
 
 from . import argv
 from .errors import ComfyCliError
@@ -137,7 +137,7 @@ class _UploadStore:
                 request.mime_type,
                 now + self._ttl_seconds,
             )
-        url = f"{base_url.rstrip('/')}/api/uploads/{token}"
+        url = f"{base_url.rstrip('/')}{_UPLOAD_ROUTE.format(token=token)}"
         if request.client_os == "windows":
             command = " ".join(
                 (
@@ -379,7 +379,11 @@ class _SignedDownloadStore:
                 token = secrets.token_urlsafe(32)
                 signature = self._signature(token, filename, expires)
                 query = urlencode({"expires": expires, "signature": signature})
-                url = f"{base_url.rstrip('/')}/downloads/{token}/{quote(filename)}?{query}"
+                route = _DOWNLOAD_ROUTE.format(
+                    token=token,
+                    filename=quote(filename),
+                )
+                url = f"{base_url.rstrip('/')}{route}?{query}"
                 client_path = self._client_path(client_out_dir, filename)
                 row["path"] = client_path
                 row["url"] = url
@@ -478,6 +482,36 @@ class _SignedDownloadStore:
 _DOWNLOAD_STORE = _SignedDownloadStore()
 
 
+class _LeasedFileResponse(FileResponse):
+    """Release one download lease whenever the ASGI response exits."""
+
+    def __init__(
+        self,
+        lease: _DownloadLease,
+        store: _SignedDownloadStore,
+    ) -> None:
+        self._lease = lease
+        self._store = store
+        super().__init__(
+            lease.entry.path,
+            filename=lease.entry.filename,
+            headers={
+                "Cache-Control": "private, no-store",
+                "Content-Security-Policy": "default-src 'none'",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette background tasks run only after the response body finishes.
+            # A send error or task cancellation can exit earlier, so the lease
+            # belongs in a real finally block rather than a BackgroundTask.
+            self._store.release(self._lease)
+
+
 def publish_downloads(
     directory: tempfile.TemporaryDirectory,
     data: Any,
@@ -528,13 +562,4 @@ async def serve_signed_download(request: Request) -> Response:
             status_code=404,
             headers={"Cache-Control": "no-store"},
         )
-    return FileResponse(
-        lease.entry.path,
-        filename=lease.entry.filename,
-        headers={
-            "Cache-Control": "private, no-store",
-            "Content-Security-Policy": "default-src 'none'",
-            "X-Content-Type-Options": "nosniff",
-        },
-        background=BackgroundTask(_DOWNLOAD_STORE.release, lease),
-    )
+    return _LeasedFileResponse(lease, _DOWNLOAD_STORE)

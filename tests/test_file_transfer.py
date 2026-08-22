@@ -210,6 +210,57 @@ def test_signed_download_rejects_expired_url_and_removes_scratch(monkeypatch, tm
     assert not scratch.exists()
 
 
+def test_signed_download_releases_lease_when_client_send_fails(monkeypatch, tmp_path):
+    directory = tempfile.TemporaryDirectory(dir=tmp_path)
+    scratch = pathlib.Path(directory.name)
+    (scratch / "result.png").write_bytes(b"png")
+    store = file_transfer._SignedDownloadStore(ttl_seconds=30)
+    monkeypatch.setattr(file_transfer, "_DOWNLOAD_STORE", store)
+
+    try:
+        result = store.publish(
+            directory,
+            {"files": [{"path": "result.png"}]},
+            base_url="http://127.0.0.1:9000",
+            client_out_dir="/client/results",
+            client_os="linux",
+        )
+        parsed = urlparse(result["files"][0]["url"])
+        token, filename = parsed.path.rstrip("/").rsplit("/", 2)[-2:]
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": parsed.path,
+                "query_string": parsed.query.encode(),
+                "headers": [],
+                "path_params": {
+                    "token": token,
+                    "filename": unquote(filename),
+                },
+            }
+        )
+        response = asyncio.run(file_transfer.serve_signed_download(request))
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        with pytest.raises(OSError, match="client disconnected"):
+            asyncio.run(response(request.scope, receive, send))
+
+        # Expiry/close may now remove the directory because the response's
+        # finally block returned the active lease even though body delivery failed.
+        store.close()
+        assert not scratch.exists()
+    finally:
+        store.close()
+        directory.cleanup()
+
+
 def test_signed_download_refuses_engine_path_outside_scratch(tmp_path):
     directory = tempfile.TemporaryDirectory(dir=tmp_path)
     scratch = pathlib.Path(directory.name)

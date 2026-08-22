@@ -11,7 +11,8 @@ standalone [MCP](https://modelcontextprotocol.io) server that lets an agent driv
 Every tool is a passthrough to the `comfy` binary. Application/tool code reaches it only
 through the `ComfyCliClient` port under `src/comfy_mcp/client/`; the concrete client is
 composed with the guarded `_run_comfy*_impl` runners in `server/_internal.py`. Those runners shell out
-to `comfy --json[--stream] --where local <args>` (global flags **before** the subcommand),
+to `comfy --json --where local <args>` or `comfy --json-stream --where local <args>`
+(global flags **before** the subcommand),
 parse comfy-cli's versioned `envelope/1`, and return its data. Do not bypass the client port
 or the runners.
 

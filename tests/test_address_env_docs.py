@@ -82,7 +82,7 @@ def test_server_reads_the_comfyui_vars_and_not_comfy_local_url():
     argument for leaving the name alone would go with it.
     """
     sources = {
-        str(path.relative_to(_PACKAGE_ROOT)): path.read_text(encoding="utf-8")
+        path.relative_to(_PACKAGE_ROOT).as_posix(): path.read_text(encoding="utf-8")
         for path in _PACKAGE_SOURCES
     }
     assert "server/_internal.py" in sources, (

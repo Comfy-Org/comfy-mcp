@@ -77,7 +77,7 @@ flowchart LR
     H --> U["uvicorn.Server"]
     M --> C["ComfyCliClient"]
     C --> R["guarded runners"]
-    R --> CLI["comfy --json[--stream] --where local"]
+    R --> CLI["comfy --json / --json-stream --where local"]
     CLI --> UI["ComfyUI"]
 ```
 

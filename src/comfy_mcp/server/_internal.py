@@ -89,6 +89,7 @@ from fastmcp.server.dependencies import get_http_request
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import Image
 from mcp import types
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import BaseModel, Field
 
 from .. import (
@@ -4416,7 +4417,7 @@ def _is_modern_protocol(ctx: object | None) -> bool:
         version = getattr(request_context, "protocol_version")
     except (AttributeError, RuntimeError, ValueError):
         return False
-    return str(version) >= str(types.LATEST_PROTOCOL_VERSION)
+    return str(version) in MODERN_PROTOCOL_VERSIONS
 
 
 def _approval_state_from_context(ctx: object | None) -> frozenset[str]:
@@ -4574,6 +4575,10 @@ class _ApprovalWording(NamedTuple):
     error text drifting from the other's semantics.
     """
 
+    #: Stable identity for this gate across modern approval rounds. This is
+    #: deliberately separate from ``consent_token``: the latter controls an
+    #: operator's out-of-band pre-authorization, not which prompt was answered.
+    gate_id: str
     #: Names the gate in the timeout message: ``"<subject> not confirmed: …"``.
     subject: str
     #: Names it in the client-error message: ``"could not confirm <what> …"``.
@@ -4592,7 +4597,7 @@ class _ApprovalWording(NamedTuple):
 def _approval_key(wording: _ApprovalWording) -> str:
     """Stable key shared by every round of one approval gate."""
 
-    return f"comfy_mcp_{wording.consent_token or 'spend'}"
+    return f"comfy_mcp_{wording.gate_id}"
 
 
 def _modern_approval_request(
@@ -4677,6 +4682,7 @@ _DECLINE_MAY_BE_AUTOMATIC = (
 
 
 _SPEND_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="spend_generate",
     subject="spend",
     what="the credit spend",
     nothing_done="Nothing was spent.",
@@ -4701,6 +4707,7 @@ _SPEND_APPROVAL_WORDING = _ApprovalWording(
 # the retry. There is no durable consent for these verbs to point at, and
 # offering a remedy that provably does nothing is worse than offering none.
 _OPTIN_SPEND_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="spend_optin",
     subject="spend",
     what="the credit spend",
     nothing_done="Nothing was spent.",
@@ -7046,6 +7053,7 @@ class NetworkExposureApproval(BaseModel):
 
 
 _NETWORK_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="network_exposure",
     subject="network exposure",
     what="exposing the local ComfyUI to the network",
     nothing_done="The local ComfyUI was left as it was.",
@@ -7758,6 +7766,7 @@ class KillUntrackedApproval(BaseModel):
 
 
 _KILL_UNTRACKED_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="kill_untracked",
     subject="stopping the untracked server",
     what="stopping the server holding the port",
     # The reassurance this gate needs is unusually specific, because the prompt
@@ -8177,6 +8186,7 @@ class UpdateAllApproval(BaseModel):
 
 
 _UPDATE_ALL_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="update_all",
     subject="node pack update",
     what="updating the installed custom node packs",
     nothing_done="Nothing was updated.",
@@ -8375,6 +8385,7 @@ class VersionSwitchApproval(BaseModel):
 
 
 _SWITCH_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="version_switch",
     subject="version switch",
     what="the ComfyUI version switch",
     nothing_done="Nothing was changed.",
@@ -8733,6 +8744,7 @@ class NodeInstallApproval(BaseModel):
 
 
 _INSTALL_APPROVAL_WORDING = _ApprovalWording(
+    gate_id="install_node",
     subject="node install",
     what="the custom node install",
     nothing_done="Nothing was installed.",

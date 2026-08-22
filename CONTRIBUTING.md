@@ -22,7 +22,8 @@ Before you write any code, read [`AGENTS.md`](AGENTS.md). The core rule:
 resolve a `ComfyCliClient` from `src/comfy_mcp/client/`; its concrete
 implementation delegates to the established guarded runners in
 `src/comfy_mcp/server/_internal.py`. Those runners are the only code that may spawn
-`comfy --json[--stream] --where local <args>`, parse comfy-cli's versioned
+`comfy --json --where local <args>` or
+`comfy --json-stream --where local <args>`, parse comfy-cli's versioned
 `envelope/1` result, and return its data. Do not bypass this boundary.
 
 This means:
