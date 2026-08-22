@@ -10062,10 +10062,10 @@ def _nodes_path_sync(
         # `node_dependencies`' `--registry` — `_is_missing_option_error` matches
         # Click's parser error and nothing else, and
         # `_phrase_is_only_the_caller_s` subtracts the phrase when a caller put
-        # it there themselves through `from_type`/`to_type` (the bounds are
-        # stringified ints, but they are passed for the same reason the other
-        # sites pass every caller value: the set is what the argv carries, not
-        # what looks plausible today). Every OTHER failure — the re-ask timing
+        # it there themselves through `from_type`/`to_type`/`object_info_path`
+        # (the bounds are stringified ints, but they are passed for the same
+        # reason the other sites pass every caller value: the set is what the
+        # argv carries, not what looks plausible today). Every OTHER failure — the re-ask timing
         # out, ComfyUI going away between the two spawns — propagates, because
         # relaying `data` there would silently hand back the pre-fix engine's
         # wrong-but-well-shaped route that this function exists to withhold.
@@ -10078,6 +10078,7 @@ def _nodes_path_sync(
             to_type,
             str(max_depth),
             str(max_paths),
+            object_info_path,
         ):
             raise
         return data

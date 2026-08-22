@@ -545,6 +545,23 @@ def test_nodes_path_degrade_ignores_a_phrase_the_caller_supplied(monkeypatch):
         )
 
 
+def test_nodes_path_degrade_subtracts_object_info_path(monkeypatch):
+    """A catalog path cannot forge the missing-``--loose`` fallback."""
+    catalog = "catalog No such option: --loose.json"
+    echoed = server.ComfyCliError(
+        f"invalid value for --input: {catalog}", no_envelope=True, returncode=2
+    )
+    _sequenced_run(monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, echoed])
+
+    with pytest.raises(server.ComfyCliError, match="invalid value for --input"):
+        server.nodes(
+            action="path",
+            from_type="MODEL",
+            to_type="IMAGE",
+            object_info_path=catalog,
+        )
+
+
 def test_nodes_path_unreadable_payload_falls_back_rather_than_trusting_it(
     patched_run,
 ):
