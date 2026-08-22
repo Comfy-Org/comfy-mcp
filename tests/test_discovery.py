@@ -181,7 +181,7 @@ def test_nodes_downstream_with_limit(patched_run):
 
 
 def test_nodes_path_defaults(patched_run):
-    calls = patched_run(envelope(data=[]))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
     # concrete int defaults are always passed, so the argv is deterministic
     assert calls[0]["cmd"][4:] == [
@@ -197,7 +197,7 @@ def test_nodes_path_defaults(patched_run):
 
 
 def test_nodes_path_overrides(patched_run):
-    calls = patched_run(envelope(data=[]))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     server.nodes(
         action="path", from_type="LATENT", to_type="IMAGE", max_depth=3, max_paths=2
     )
@@ -211,6 +211,355 @@ def test_nodes_path_overrides(patched_run):
         "--max-paths",
         "2",
     ]
+
+
+# The canonical MODEL -> IMAGE answer as a POST-fix comfy-cli (>= 1.16.0)
+# returns it: `KSampler -> VAEDecode`, every step naming the socket type it
+# traversed. `mode` is the marker `_nodes_path_is_type_constrained` reads —
+# comfy-cli added it in the same commit that made its `--exact` walker
+# type-constrained, so its presence is what says the default answer is sound.
+_TYPED_MODEL_TO_IMAGE = {
+    "from": "MODEL",
+    "to": "IMAGE",
+    "mode": "exact",
+    "exact": True,
+    "truncated": False,
+    "truncated_by": None,
+    "depth_limited": False,
+    "collapsed": False,
+    "not_searched": False,
+    "not_searched_reason": None,
+    "max_depth": 6,
+    "max_paths": 10,
+    "count": 1,
+    "paths": [
+        {
+            "from": "MODEL",
+            "to": "IMAGE",
+            "steps": [
+                {"node": "KSampler", "from_type": "MODEL", "to_type": "LATENT"},
+                {"node": "VAEDecode", "from_type": "LATENT", "to_type": "IMAGE"},
+            ],
+            "support": [{"type": "VAE", "node": "CheckpointLoaderSimple"}],
+        }
+    ],
+}
+
+# The SAME query on a PRE-fix comfy-cli (1.13.x-1.15.x, all inside this
+# server's supported floor), reproduced from comfy-cli's own
+# `nodes_path_object_info` fixture run against its pre-#695 walker. Every
+# symptom the ticket reports is here and none of them is visible in the
+# payload's SHAPE: a node that takes no MODEL link, a blank `from_type`, and
+# no `KSampler -> VAEDecode`. No `mode` key — that is the only tell.
+_PRE_FIX_MODEL_TO_IMAGE = {
+    "from": "MODEL",
+    "to": "IMAGE",
+    "exact": True,
+    "max_depth": 6,
+    "max_paths": 10,
+    "count": 1,
+    "paths": [
+        {
+            "from": "MODEL",
+            "to": "IMAGE",
+            "steps": [
+                {"node": "ByteDanceImageNode", "from_type": "", "to_type": "IMAGE"}
+            ],
+        }
+    ],
+}
+
+
+def test_nodes_path_asks_the_engines_default_mode_first(patched_run):
+    """A type-constrained engine is asked ONCE, in its own `--exact` default.
+
+    The fallback is for the engines that need it, not a tax on the ones that
+    do not: `--exact` on comfy-cli >= 1.16.0 is `--loose` PLUS a satisfiability
+    filter, and it is the only mode that reports `support` and can claim
+    `exact: true`. Re-asking in `--loose` there would drop both.
+    """
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
+    data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert len(calls) == 1, [c["cmd"] for c in calls]
+    assert "--loose" not in calls[0]["cmd"]
+    assert "--exact" not in calls[0]["cmd"]
+    assert data == _TYPED_MODEL_TO_IMAGE
+
+
+def test_nodes_path_refuses_a_pre_fix_engines_default_answer(patched_run):
+    """A pre-1.16.0 payload is re-asked in `--loose` and never relayed.
+
+    The regression this ticket is about. comfy-cli's pre-#695 `exact_paths`
+    admitted any node whose REQUIRED link inputs were satisfied — vacuously
+    true of a node with no link inputs — so it answered MODEL -> IMAGE with
+    widget-only generators that never consume MODEL, blanked their step's
+    `from_type`, and burned `max_paths` on them before the real route was
+    reached. Structurally valid, semantically wrong, and unspottable by the
+    caller, which is why the wrapper has to catch it rather than pass it on.
+    """
+    calls = patched_run(envelope(data=_PRE_FIX_MODEL_TO_IMAGE))
+    server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert len(calls) == 2, [c["cmd"] for c in calls]
+    assert "--loose" not in calls[0]["cmd"]
+    assert calls[1]["cmd"][4:] == [
+        "nodes",
+        "path",
+        "MODEL",
+        "IMAGE",
+        "--max-depth",
+        "6",
+        "--max-paths",
+        "10",
+        "--loose",
+    ]
+
+
+def _sequenced_run(monkeypatch, replies: list) -> list:
+    """Answer successive `_run_comfy` calls from `replies`; record argv + kwargs.
+
+    The conftest fakes hand back ONE canned reply per fixture, and the mode
+    fallback needs a different answer per call — the multi-call case AGENTS.md
+    leaves to a local stub. A reply that is an exception is RAISED rather than
+    returned, which is how the re-ask's failure paths are driven. `kwargs` is
+    recorded alongside the argv because the pair's shared deadline lives in the
+    second call's `timeout`, not in its argv. An exhausted iterator fails loudly.
+    """
+    calls: list[dict] = []
+    pending = iter(replies)
+
+    def fake_run(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        try:
+            reply = next(pending)
+        except StopIteration:
+            raise AssertionError(f"unexpected extra comfy-cli call: {args}") from None
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(server, "_run_comfy", fake_run)
+    return calls
+
+
+def _fake_monotonic(monkeypatch, *ticks: float) -> None:
+    """Pin `time.monotonic` to `ticks`, holding the last one once exhausted.
+
+    Only the elapsed-time arithmetic between the two `nodes path` spawns is
+    under test, and both spawns are stubbed, so a fake clock is exact where a
+    real `sleep` would be slow and flaky. The last tick REPEATS rather than
+    raising: nothing else in this call path is supposed to read the clock, but a
+    test that pins behavior should not also break if something starts to.
+    """
+    remaining = list(ticks)
+
+    def fake() -> float:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    monkeypatch.setattr(server.time, "monotonic", fake)
+
+
+def _no_such_loose_option() -> Exception:
+    """Click's `NoSuchOption` for `--loose`, in the shape `_run_comfy` raises it.
+
+    `_is_missing_option_error` requires more than the phrase: `no_envelope`
+    (nothing was dispatched, so no `envelope/1` was printed) and Click's exit 2.
+    Building the real thing keeps these tests honest about what the degrade
+    actually keys on.
+    """
+    return server.ComfyCliError(
+        "comfy-cli returned no JSON (exit 2). stderr: "
+        "Usage: comfy nodes path [OPTIONS] FROM_TYPE TO_TYPE\n"
+        "Error: No such option: --loose | stdout: <empty>",
+        no_envelope=True,
+        returncode=2,
+    )
+
+
+def test_nodes_path_fallback_relays_the_canonical_model_to_image_route(monkeypatch):
+    """The route an agent reads back after the fallback fires.
+
+    Pins the ticket's acceptance on the wrapper half: `KSampler -> VAEDecode`
+    is present, every step names the socket type it traversed rather than an
+    empty string, and the path is longer than one hop. WHICH nodes the engine
+    picks is the ENGINE's answer — proven live against a real catalog by the
+    gated e2e pin in `tests/e2e/test_smoke.py`, and against comfy-cli's own
+    `nodes_path_object_info` fixture in comfy-cli's suite; a mocked test cannot
+    and must not assert it.
+    """
+    loose = {
+        "from": "MODEL",
+        "to": "IMAGE",
+        "exact": False,
+        "max_depth": 6,
+        "max_paths": 10,
+        "count": 1,
+        "paths": [
+            {
+                "from": "MODEL",
+                "to": "IMAGE",
+                "steps": [
+                    {"node": "KSampler", "from_type": "MODEL", "to_type": "LATENT"},
+                    {"node": "VAEDecode", "from_type": "LATENT", "to_type": "IMAGE"},
+                ],
+            }
+        ],
+    }
+    calls = _sequenced_run(monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, loose])
+    data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert [c["args"][-1] for c in calls] == ["10", "--loose"]
+    assert data == loose
+    steps = data["paths"][0]["steps"]
+    assert [s["node"] for s in steps] == ["KSampler", "VAEDecode"]
+    assert all(s["from_type"] for s in steps), steps
+    assert len(steps) > 1
+
+
+def test_nodes_path_relays_an_empty_result_rather_than_inventing_one(patched_run):
+    """No route -> the engine's own empty answer, not a consolation payload.
+
+    On a pre-fix engine the routeless IMAGE -> MODEL came back as a bare
+    `CheckpointLoaderSimple` — a node that consumes nothing, dressed as a
+    one-step path. The `--loose` re-ask returns `count: 0` and no paths, and
+    the wrapper hands that straight back: an explicit "no such route" is the
+    answer, and synthesizing anything friendlier here would be the
+    derive-it-locally breach the architecture rule forbids.
+
+    The pre-fix half, so the re-ask is asserted rather than assumed: `empty`
+    carries no `mode`, `patched_run` replays one canned envelope for every call,
+    and without the call-count assertion the equality below would hold whichever
+    call answered. The modern-engine half is the test underneath.
+    """
+    empty = {"from": "IMAGE", "to": "MODEL", "count": 0, "paths": []}
+    calls = patched_run(envelope(data=empty))
+    assert server.nodes(action="path", from_type="IMAGE", to_type="MODEL") == empty
+    assert len(calls) == 2, [c["cmd"] for c in calls]
+    assert "--loose" in calls[1]["cmd"]
+
+
+def test_nodes_path_trusts_a_modern_engines_no_route_answer(patched_run):
+    """A type-constrained engine's empty answer is FINAL — no second opinion.
+
+    `exact: true` on an empty result is the one thing `--loose` cannot say: it
+    is a proof that no route exists, not merely that none was found. Re-asking
+    would spend a second full `object_info` traversal to replace that proof with
+    a weaker claim. The marker (`mode`) is what separates this from the pre-fix
+    empty payload above, which is byte-for-byte plausible and is not trusted.
+    """
+    empty = {
+        "from": "IMAGE",
+        "to": "MODEL",
+        "mode": "exact",
+        "exact": True,
+        "count": 0,
+        "paths": [],
+    }
+    calls = patched_run(envelope(data=empty))
+    assert server.nodes(action="path", from_type="IMAGE", to_type="MODEL") == empty
+    assert len(calls) == 1, [c["cmd"] for c in calls]
+    assert "--loose" not in calls[0]["cmd"]
+
+
+def test_nodes_path_retry_gets_what_is_left_of_the_shared_budget(monkeypatch):
+    """The pair shares one 60s budget; the re-ask does not get a fresh one.
+
+    Two 60s calls would put the worst case at ~120s — the whole request budget a
+    typical MCP client allows — and `nodes` is sync on the shared thread pool,
+    where the client's cancellation never reaches the worker, so the second
+    child would keep running after the caller gave up.
+    """
+    _fake_monotonic(monkeypatch, 1000.0, 1041.0)
+    calls = _sequenced_run(
+        monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _PRE_FIX_MODEL_TO_IMAGE]
+    )
+    server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert calls[0]["kwargs"]["timeout"] == pytest.approx(60.0)
+    assert calls[1]["kwargs"]["timeout"] == pytest.approx(19.0)
+
+
+def test_nodes_path_retry_budget_never_falls_below_its_floor(monkeypatch):
+    """A first call that ate the budget still leaves the re-ask a real attempt.
+
+    The re-ask is the call whose answer is returned; letting the remainder reach
+    zero would turn the sound query into an instant synthetic timeout on behalf
+    of a payload the wrapper is about to throw away.
+    """
+    _fake_monotonic(monkeypatch, 1000.0, 1059.5)
+    calls = _sequenced_run(
+        monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _PRE_FIX_MODEL_TO_IMAGE]
+    )
+    server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert calls[1]["kwargs"]["timeout"] == pytest.approx(15.0)
+
+
+def test_nodes_path_degrades_when_the_engine_has_no_loose_flag(monkeypatch):
+    """An engine with the verb and no `--loose` gets its own answer back.
+
+    No RELEASE produces this shape — the verb, the mode flags and `envelope/1`
+    are one comfy-cli commit — but a source build or a fork can, and the module
+    covers the option-shaped half of a gap alongside the verb-shaped half
+    everywhere else (`--registry`, `--background`, `--host`/`--port`). There is
+    no sounder answer to be had on such an engine, so the choice is this file's
+    pre-change behavior or no answer at all.
+    """
+    calls = _sequenced_run(
+        monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _no_such_loose_option()]
+    )
+    data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+    assert data == _PRE_FIX_MODEL_TO_IMAGE
+    assert [c["args"][-1] for c in calls] == ["10", "--loose"]
+
+
+def test_nodes_path_reraises_a_retry_failure_that_is_not_a_missing_flag(monkeypatch):
+    """A timeout on the re-ask propagates — the discarded payload stays discarded.
+
+    The engine HAS a sound mode here and simply did not answer. Relaying the
+    first payload would hand back the pre-fix engine's plausible-looking wrong
+    route with nothing in it to say so, which is the exact failure this fallback
+    exists to prevent; an honest error is the better answer.
+    """
+    _sequenced_run(
+        monkeypatch,
+        [
+            _PRE_FIX_MODEL_TO_IMAGE,
+            server.ComfyCliError(
+                "`comfy nodes path` timed out after 19s", no_envelope=True
+            ),
+        ],
+    )
+    with pytest.raises(server.ComfyCliError, match="timed out"):
+        server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+
+
+def test_nodes_path_degrade_ignores_a_phrase_the_caller_supplied(monkeypatch):
+    """A caller who types the parser's wording gets the raw error, not a degrade.
+
+    `_phrase_is_only_the_caller_s`, the same guard `node_dependencies` puts on
+    `--registry`: with the phrase subtracted nothing of comfy-cli's own is left
+    saying the option is missing, so the engine never said it and the first
+    payload must not be substituted for the failure.
+    """
+    _sequenced_run(monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _no_such_loose_option()])
+    with pytest.raises(server.ComfyCliError, match="No such option"):
+        server.nodes(
+            action="path", from_type="MODEL", to_type="No such option: --loose"
+        )
+
+
+def test_nodes_path_unreadable_payload_falls_back_rather_than_trusting_it(
+    patched_run,
+):
+    """A shape this server cannot read is treated as the OLD contract.
+
+    The marker is read out of a dict; a list, a scalar or a null is neither a
+    post-fix payload nor something to relay on faith, so it takes the same
+    `--loose` re-ask. Fail toward the mode that is sound on every supported
+    engine — the cost of guessing wrong that way is one extra call.
+    """
+    for data in ([], None, "nope", 3):
+        calls = patched_run(envelope(data=data))
+        server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
+        assert len(calls) == 2, (data, [c["cmd"] for c in calls])
+        assert "--loose" in calls[1]["cmd"]
 
 
 def test_nodes_types_argv(patched_run):
@@ -273,6 +622,13 @@ def test_every_nodes_action_forwards_object_info_path(patched_run, kwargs, expec
     server.nodes(**kwargs, object_info_path="catalog.json")
 
     assert calls[0]["cmd"][4:] == [*expected, "--input", "catalog.json"]
+    if kwargs["action"] == "path":
+        assert calls[1]["cmd"][4:] == [
+            *expected,
+            "--input",
+            "catalog.json",
+            "--loose",
+        ]
 
 
 @pytest.mark.parametrize(
@@ -1057,7 +1413,7 @@ def test_nodes_path_still_passes_negative_bounds_through(patched_run):
     those verbatim), so even a negative bound is comfy-cli's to reject, not the
     wrapper's to refuse for looking dash-leading.
     """
-    calls = patched_run(envelope(data=[]))
+    calls = patched_run(envelope(data=_TYPED_MODEL_TO_IMAGE))
     server.nodes(
         action="path", from_type="MODEL", to_type="IMAGE", max_depth=-1, max_paths=-2
     )
@@ -1112,7 +1468,17 @@ def test_nodes_reject_embedded_nul(monkeypatch):
 # this bullet list is trimmed; never bump without saying why in the same PR.
 # The whole-server ceiling in `test_payload_budget.py` is the other half of
 # this guard and was NOT raised.
-_NODES_DOC_BUDGET_TOKENS = 500
+#
+# Raised 500 -> 508 for the "path" bullet's two added clauses — every step is a
+# real socket link, and no route means no paths. Stated plainly because the
+# previous bump's own note applies again: the tree was ALREADY at ~493 of 500,
+# so the slack that ceiling was set with had been spent by intervening growth,
+# not by this edit, which costs ~12. Not decoration either: `path` shipped
+# answers that were structurally valid and semantically wrong, and an agent not
+# told the steps are type-checked links has no way to tell this tool's output
+# from that one. Measured ~505. The whole-server ceiling in
+# `test_payload_budget.py` was again NOT raised.
+_NODES_DOC_BUDGET_TOKENS = 508
 
 
 def test_nodes_tool_docstring_within_its_own_token_budget():
