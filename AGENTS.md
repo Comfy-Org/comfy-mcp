@@ -94,8 +94,8 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-The local differentiator: discovery (`nodes`, `search_models`) reads the **live install** —
-custom nodes included — not a static catalog.
+Local differentiators: discovery (`nodes`, `search_models`) reads the **live install**, custom
+nodes included, while `preview_media` returns comfy-cli's rendered PNG as MCP image content.
 
 ## Module layout
 

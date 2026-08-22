@@ -6329,20 +6329,14 @@ def fetch_outputs(
     """Download a completed job's output files into ``out_dir``.
 
     Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
-    ``url_only=True`` adds ``--url-only`` — emits URLs without downloading.
+    ``url_only=True`` emits URLs without downloading.
 
-    Works for a job that ran on a configured REMOTE too, even though this verb
-    forwards no ``--host``/``--port`` (not in ``_TARGET_AWARE_SUBCOMMANDS``):
-    the run that submitted the job wrote a state file on THIS machine keyed by
-    ``prompt_id``, and against a remote that file records each output as an
-    absolute URL comfy-cli streams from there. Only a ``prompt_id`` this
-    machine never submitted has no such state file (``download_job_not_found``).
+    Remote jobs work although ``download`` is not in
+    ``_TARGET_AWARE_SUBCOMMANDS``: the submitting run's local state file maps
+    ``prompt_id`` to output URLs. An unknown local id has no record.
 
-    ``inline_images=True`` ALSO returns copied images as inline MCP content
-    (base64); the on-disk copy is unchanged either way. Returns a list:
-    comfy-cli's metadata first, then the image files (capped at
-    ``_INLINE_IMAGE_MAX_COUNT`` files / ``_INLINE_IMAGE_MAX_BYTES`` aggregate;
-    on-disk copies are never capped).
+    ``inline_images=True`` appends bounded MCP images to the metadata. Disk
+    copies remain uncapped.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
@@ -6366,6 +6360,54 @@ def fetch_outputs(
     paths = _select_inline_images(_collect_output_images(data, out_dir))
     images = [Image(path=path) for path in paths]
     return [data, *images]
+
+
+def _preview_image_path(data: Any) -> str | None:
+    """Resolve comfy-cli's generated preview path against its spawn directory."""
+    if not isinstance(data, dict):
+        return None
+    preview = data.get("preview")
+    if not isinstance(preview, str) or not preview.lower().endswith(".png"):
+        return None
+    if not os.path.isabs(preview):
+        preview = os.path.join(_project_root() or os.getcwd(), preview)
+    resolved = os.path.realpath(preview)
+    return resolved if os.path.isfile(resolved) else None
+
+
+@mcp.tool()
+def preview_media(
+    media_path: str,
+    out_path: str = "",
+    grid: str = "4x3",
+    width: int = 480,
+    inline_image: bool = True,
+) -> Any:
+    """Render local media as a PNG through ``comfy preview``.
+
+    comfy-cli owns classification and creates a thumbnail, video contact sheet,
+    or audio waveform. ``inline_image=True`` appends the bounded PNG to its
+    metadata; false returns metadata only. Relative paths follow
+    ``COMFY_PROJECT``.
+    """
+    argv._guard_arg_len("media_path", media_path)
+    media_path = argv._reject_option_like("media_path", media_path)
+    media_path = argv._reject_nul("media_path", media_path)
+    grid = argv._reject_nul("grid", grid)
+
+    args = ["preview", media_path]
+    if out_path:
+        argv._guard_arg_len("out_path", out_path)
+        out_path = argv._reject_nul("out_path", out_path)
+        args.extend(["--out", out_path])
+    args.extend(["--grid", grid, "--width", str(width)])
+
+    data = _run_comfy(*args, timeout=180.0)
+    if not inline_image:
+        return data
+    path = _preview_image_path(data)
+    paths = _select_inline_images([path]) if path is not None else []
+    return [data, *(Image(path=path) for path in paths)]
 
 
 # ComfyUI's two network-EXPOSING flags. Both are declared `nargs="?"` in
