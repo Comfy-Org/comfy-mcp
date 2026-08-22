@@ -32,7 +32,6 @@ comfy-cli is mocked throughout: no real ComfyUI is ever launched.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 
 import pytest
 from conftest import envelope
@@ -759,18 +758,17 @@ def test_the_generate_refusal_as_delivered_names_no_bypass(monkeypatch):
 # environment variable, which is what keeps this from becoming self-consent.
 
 
-def test_preauthorized_gate_skips_the_prompt(monkeypatch):
+def test_preauthorized_gate_skips_the_prompt(monkeypatch, patched_run):
     """A named gate proceeds without contacting the client at all."""
     monkeypatch.setenv("COMFY_MCP_ASSUME_CONSENT", "network_exposure")
     ctx = _FakeCtx(action="cancel")  # would fail closed if it were asked
+    calls = patched_run(envelope(data={"pid": 42}))
 
-    # Whether the launch itself then succeeds is not what this asserts (no CLI is
-    # mocked here); the property is that the GATE let it through without ever
-    # contacting the client.
-    with contextlib.suppress(server.ComfyCliError):
-        _launch(extra_args=["--listen"], ctx=ctx)
+    result = _launch(extra_args=["--listen"], ctx=ctx)
 
     assert ctx.elicitations == []
+    assert result == {"pid": 42}
+    assert calls[0]["cmd"][4:] == ["launch", "--background", "--", "--listen"]
 
 
 def test_unnamed_gate_still_asks(monkeypatch):
