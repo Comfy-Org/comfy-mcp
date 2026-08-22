@@ -240,7 +240,7 @@ has its own file. Add a tool's test with it.
 Remote configuration and same-instance adapter tests live in `test_remote_transport.py`;
 in-process FastMCP business flows live in `test_fastmcp_app.py`; real-loopback Streamable HTTP
 integration lives in `test_remote_http.py`; transfer edge cases live in `test_file_transfer.py`.
-The real stdio process flow belongs to the opt-in `e2e/test_smoke.py` suite and uses the real
+The real stdio process flow belongs to the opt-in `tests/e2e/test_smoke.py` suite and uses the real
 comfy-cli plus a live local ComfyUI, never a generated fake executable. The default in-process
 and HTTP flows cover the full upload/submit/poll/fetch path and the
 same 40-tool discovery result. Also cover modern+legacy negotiation, pre-initialize/stale
