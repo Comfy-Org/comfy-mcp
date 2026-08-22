@@ -6,9 +6,15 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastmcp import Client, Context, FastMCP
 from fastmcp.client.elicitation import ElicitResult
-from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
+from mcp_types.version import (
+    HANDSHAKE_PROTOCOL_VERSIONS,
+    LATEST_HANDSHAKE_VERSION,
+    LATEST_MODERN_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
+)
 
 from comfy_mcp.client import context as client_context
 from comfy_mcp.server import _internal as server
@@ -156,15 +162,43 @@ def test_shared_application_paid_workflow_keeps_legacy_elicitation_compatible(
     assert result.data["prompt_id"] == "prompt-1"
 
 
-def test_protocol_classifier_accepts_only_sdk_modern_versions():
-    def context(version: str):
+def test_protocol_classifier_accepts_only_sdk_registered_generations():
+    def context(version):
         return SimpleNamespace(
             request_context=SimpleNamespace(protocol_version=version)
         )
 
-    assert server._is_modern_protocol(context(LATEST_MODERN_VERSION)) is True
-    assert server._is_modern_protocol(context(LATEST_HANDSHAKE_VERSION)) is False
+    for version in MODERN_PROTOCOL_VERSIONS:
+        assert server._protocol_info(context(version)) == (version, "modern")
+        assert server._is_modern_protocol(context(version)) is True
+    for version in HANDSHAKE_PROTOCOL_VERSIONS:
+        assert server._protocol_info(context(version)) == (version, "handshake")
+        assert server._is_modern_protocol(context(version)) is False
+
+    assert server._protocol_info(context("draft")) == ("draft", "unknown")
     assert server._is_modern_protocol(context("draft")) is False
+    assert server._protocol_info(context(20260728)) == (None, "unknown")
+    assert server._protocol_info(None) == (None, "absent")
+
+
+def test_unknown_protocol_cannot_fall_back_to_legacy_confirmation():
+    ctx = SimpleNamespace(
+        request_context=SimpleNamespace(protocol_version="draft"),
+    )
+
+    assert server._client_elicitation_support(ctx) is None
+    with pytest.raises(
+        server.ComfyCliError,
+        match="unsupported MCP protocol version 'draft'",
+    ):
+        asyncio.run(
+            server._elicit_approval(
+                ctx,
+                "Approve spending?",
+                server.SpendApproval,
+                server._SPEND_APPROVAL_WORDING,
+            )
+        )
 
 
 def test_spend_gates_have_distinct_round_keys_but_no_env_consent_tokens():

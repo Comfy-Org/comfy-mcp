@@ -89,7 +89,10 @@ from fastmcp.server.dependencies import get_http_request
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import Image
 from mcp import types
-from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+from mcp_types.version import (
+    HANDSHAKE_PROTOCOL_VERSIONS,
+    MODERN_PROTOCOL_VERSIONS,
+)
 from pydantic import BaseModel, Field
 
 from .. import (
@@ -4407,17 +4410,42 @@ class SpendApproval(BaseModel):
 _APPROVAL_STATE_PREFIX = "comfy-mcp-approvals/1:"
 
 
-def _is_modern_protocol(ctx: object | None) -> bool:
-    """Whether FastMCP negotiated the sessionless 2026 protocol era."""
+class _ProtocolInfo(NamedTuple):
+    """The negotiated MCP revision and the interaction model it selects."""
+
+    version: str | None
+    generation: Literal["absent", "handshake", "modern", "unknown"]
+
+
+def _protocol_info(ctx: object | None) -> _ProtocolInfo:
+    """Classify only revisions explicitly registered by the protocol SDK.
+
+    ``absent`` preserves direct-call and test-double behavior where there is no
+    live negotiated request.  ``unknown`` is deliberately distinct from
+    ``handshake``: an unrecognized future or malformed revision must not be
+    silently routed through the legacy ``ctx.elicit`` interaction model.
+    """
 
     if ctx is None:
-        return False
+        return _ProtocolInfo(None, "absent")
     try:
         request_context = getattr(ctx, "request_context")
         version = getattr(request_context, "protocol_version")
     except (AttributeError, RuntimeError, ValueError):
-        return False
-    return str(version) in MODERN_PROTOCOL_VERSIONS
+        return _ProtocolInfo(None, "absent")
+    if not isinstance(version, str):
+        return _ProtocolInfo(None, "unknown")
+    if version in MODERN_PROTOCOL_VERSIONS:
+        return _ProtocolInfo(version, "modern")
+    if version in HANDSHAKE_PROTOCOL_VERSIONS:
+        return _ProtocolInfo(version, "handshake")
+    return _ProtocolInfo(version, "unknown")
+
+
+def _is_modern_protocol(ctx: object | None) -> bool:
+    """Whether FastMCP negotiated a known sessionless protocol revision."""
+
+    return _protocol_info(ctx).generation == "modern"
 
 
 def _approval_state_from_context(ctx: object | None) -> frozenset[str]:
@@ -4459,12 +4487,18 @@ def _client_elicitation_support(ctx: Context | None) -> bool | None:
       no human prompt — the one outcome this tool exists to prevent. The caller
       treats ``None`` as "ask anyway" (see :func:`_resolve_spend_consent`).
     """
-    if _is_modern_protocol(ctx):
+    protocol = _protocol_info(ctx)
+    if protocol.generation == "modern":
         # Modern clients answer an InputRequiredResult on a subsequent call;
         # there is no session back-channel capability to probe. Treat this as
         # interactive so an agent-supplied confirm_* flag cannot bypass the
         # human gate.
         return True
+    if protocol.generation == "unknown":
+        # UNKNOWN is not legacy.  Returning the tri-state's conservative value
+        # makes callers enter `_elicit_approval`, which reports the unsupported
+        # revision and fails closed instead of accepting a confirm_* fallback.
+        return None
     if ctx is None or not callable(getattr(ctx, "elicit", None)):
         return False
     try:
@@ -4804,8 +4838,18 @@ async def _elicit_approval(
             _ASSUME_CONSENT_ENV,
         )
         return True
-    if _is_modern_protocol(ctx):
+    protocol = _protocol_info(ctx)
+    if protocol.generation == "modern":
         return _modern_approval_answer(ctx, message, schema, wording)
+    if protocol.generation == "unknown":
+        version = (
+            repr(protocol.version) if protocol.version is not None else "<invalid>"
+        )
+        raise ComfyCliError(
+            f"{wording.subject} not confirmed: unsupported MCP protocol version "
+            f"{version}; refusing to guess its confirmation model. "
+            f"{wording.nothing_done}"
+        )
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message, schema),

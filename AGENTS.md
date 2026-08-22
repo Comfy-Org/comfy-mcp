@@ -182,7 +182,9 @@ or patch SDK sessions to carry files.
 
 FastMCP 4 serves both modern sessionless and legacy handshake protocols. Legacy consent uses
 `ctx.elicit`; modern consent returns `InputRequiredResult` and resumes from FastMCP-sealed
-request state. Every gate remains fail-closed and request-local. Do not treat a caller's
+request state. Classify the negotiated revision only through `mcp_types.version`'s explicit
+modern and handshake registries; an unknown revision fails closed rather than falling back to
+the legacy interaction model. Every gate remains fail-closed and request-local. Do not treat a caller's
 `confirm_*` argument as human consent when either interactive route is available.
 
 The MCP listener (`COMFY_MCP_HOST`/`PORT`/`PATH`) and the ComfyUI target
