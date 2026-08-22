@@ -3,8 +3,8 @@
 Every consent and progress test in this suite drives a hand-rolled fake rather
 than a live MCP session, so those fakes ARE the contract those tests check
 against. That makes them a blind spot precisely where it costs the most: the
-production call sites pass by keyword (``ctx.elicit(message=..., schema=...)``)
-inside broad ``except`` handlers, so an SDK signature change lands as a
+production call sites pass FastMCP's required message/response type pair inside
+broad ``except`` handlers, so a framework signature change lands as a
 ``TypeError`` that surfaces as "could not confirm the credit spend with the
 user" on every paid call — or, on the progress path, as silently dropped
 notifications — while the fakes keep the suite green.
@@ -36,7 +36,7 @@ import test_run_workflow_spend
 import test_switch_version
 import test_untracked_kill
 import test_update_consent
-from mcp.server.mcpserver import Context
+from fastmcp import Context
 from mcp.server.session import ServerSession
 
 _TESTS_DIR = pathlib.Path(__file__).parent
@@ -169,8 +169,14 @@ def _discover_fakes(method: str) -> set[str]:
 
 @pytest.mark.parametrize("fake", _ELICIT_FAKES, ids=_label)
 def test_fake_elicit_matches_the_real_context_signature(fake):
-    """A renamed ``elicit`` keyword must fail HERE, not as a spend-path TypeError."""
-    assert _params(fake.elicit) == _params(Context.elicit), _label(fake)
+    """Every fake accepts FastMCP 4's required message/response-type pair."""
+    assert _params(fake.elicit) == [
+        ("message", False),
+        ("response_type", False),
+    ], _label(fake)
+    inspect.signature(Context.elicit).bind(
+        object(), message="ask", response_type=type("S", (), {})
+    )
     assert inspect.iscoroutinefunction(fake.elicit) == inspect.iscoroutinefunction(
         Context.elicit
     ), _label(fake)
@@ -220,15 +226,15 @@ def test_every_module_level_fake_is_registered(method):
     assert _discover_fakes(method) == set(labels), registry_name
 
 
-def test_the_spend_prompt_keywords_bind_to_the_real_elicit():
-    """`_elicit_approval` passes `message=`/`schema=` — they must still bind.
+def test_the_spend_prompt_arguments_bind_to_the_real_elicit():
+    """The positional message/response type sent by the consent gate must bind.
 
     The fakes above are checked against the real signature, but this asserts the
-    other direction directly on the SDK: the exact keywords server.py sends are
+    other direction directly on the SDK: the exact keywords `_internal.py` sends are
     accepted by `Context.elicit` as installed.
     """
     signature = inspect.signature(Context.elicit)
-    signature.bind(object(), message="ask", schema=type("S", (), {}))
+    signature.bind(object(), "ask", type("S", (), {}))
 
 
 def test_the_progress_keywords_bind_to_the_real_report_progress():

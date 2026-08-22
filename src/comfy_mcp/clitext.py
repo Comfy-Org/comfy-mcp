@@ -919,7 +919,7 @@ def _phrase_is_only_the_caller_s(
       every PATH-shaped value carries only the far more generous argv-safety
       ceiling ``_MAX_PATH_ARG_LEN`` — ``workflow_path``, ``download_model``'s
       ``relative_path`` and ``filename``, the three ``out_path`` values, the two
-      ``out_dir`` values, each entry of ``upload_file``'s ``paths`` and
+      ``out_dir`` values, ``upload_file``'s ``file_path`` and
       ``search_models``' ``folder`` — as ``download_model``'s ``url`` carries
       ``_MAX_URL_LEN``. (That list and the one at :data:`argv._MAX_PATH_ARG_LEN` are
       the same set, and are meant to stay in sync.) Both ceilings sit

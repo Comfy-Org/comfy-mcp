@@ -70,10 +70,11 @@ those same hosted models, while [`COMFYUI_URL`](#driving-a-remote-comfyui) point
 at a ComfyUI on another machine you control.
 
 **This server vs. [Comfy Cloud MCP](#comfy-cloud-mcp).** Two different servers, and running both is
-normal. This one is **stdio**: your client launches it as a subprocess on **your own machine**, and
-it drives the ComfyUI installed there (or one on another machine you control). Comfy Cloud MCP is a
-**remote HTTP** server at `https://cloud.comfy.org/mcp` that your client connects to over the
-network, and it executes workflows on **Comfy Cloud GPUs** — no local GPU, no ComfyUI install. Both
+normal. This one runs on **a machine you control**, either as a client-launched stdio subprocess or
+as your own [long-running Remote HTTP server](#remote-streamable-http); it drives that machine's
+comfy-cli and ComfyUI install (or a separately configured ComfyUI you control). Comfy Cloud MCP is
+a managed HTTP server at `https://cloud.comfy.org/mcp` that executes workflows on **Comfy Cloud
+GPUs** — no local GPU or ComfyUI install. Both
 authenticate: this one signs in to Comfy through comfy-cli ([`auth_login`](#partner-api-nodes) or
 `COMFY_API_KEY`), the cloud one through OAuth in your browser or a Comfy Cloud API key. Both can
 spend credits on **partner** models, so partner generation is not the dividing line — what this
@@ -81,8 +82,8 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 40 tools; core loop validated end-to-end against a live local ComfyUI
-> (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
+> **Status:** beta. stdio and Streamable HTTP serve the same 40-tool FastMCP application. The core loop is validated against a live local ComfyUI
+> (`server_info → run_workflow → fetch_outputs` → PNG on disk); automated transport tests also cover command-based HTTP upload and signed output delivery. CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
 ## Quickstart
@@ -108,9 +109,9 @@ Four steps take you from a fresh install to your first generated image.
    `pip install comfy-mcp` puts a `comfy-mcp` console script on your `PATH`; that command is what
    you point your AI client at in step 3. (A dedicated venv is fine — MCP clients may not see that
    venv's `PATH`, which is exactly what `COMFY_BIN` is for; see [Prerequisites](#prerequisites).)
-   `comfy-mcp --version` confirms it landed — but don't run `comfy-mcp` itself to test it: it
-   is a **stdio** server that talks MCP over stdin/stdout, so in a terminal it just waits and
-   exits without printing anything. `comfy-mcp --help` says the same thing in one screen.
+   `comfy-mcp --version` confirms it landed — but a bare `comfy-mcp` is the **stdio** mode, so in a
+   terminal it waits for MCP on stdin and exits without printing anything. Use `comfy-mcp serve`
+   for a persistent HTTP listener; `comfy-mcp --help` shows both modes.
 
    To install from a checkout of this repo instead, run `pip install .` there (`pip install -e .`
    for a working copy) — the comfy-cli half is the same either way.
@@ -126,8 +127,8 @@ Four steps take you from a fresh install to your first generated image.
    ```
 
 3. **Add the server to your client** using the snippet for your client in
-   [Configure your AI client](#configure-your-ai-client) just below, then restart / reload it so
-   the tools appear.
+   [Configure your AI client](#configure-your-ai-client), then restart / reload it so the tools
+   appear.
 
 4. **Ask your agent to run a workflow.** For example:
 
@@ -142,10 +143,11 @@ Four steps take you from a fresh install to your first generated image.
    template](#templates-your-install-cant-run) yet.
 
 **Where the images land.** ComfyUI writes generated files into your ComfyUI **workspace's
-`output/` directory** (part of the workspace `comfy install` created). On top of that,
-`fetch_outputs(prompt_id, out_dir)` **copies** a finished job's outputs into any directory you
-name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
-the originals stay in the ComfyUI workspace.
+`output/` directory** (part of the workspace `comfy install` created). Over stdio,
+`fetch_outputs(prompt_id, out_dir)` **copies** a finished job's outputs into any directory visible
+to that same machine. Over Streamable HTTP, the MCP server cannot write into the remote client's
+filesystem: it returns a temporary signed download URL and ready `curl` / `curl.exe` commands for
+each output instead. The originals stay in the ComfyUI workspace in both cases.
 
 ## Upgrading from `comfy-local-mcp`
 
@@ -195,10 +197,163 @@ the rename is **not** something `pip install .` finishes on its own, because `co
    The glob carries the two rotations (`failures.jsonl.1`, `failures.jsonl.2`) along with the
    live file, and `mkdir -p` first means this is also safe once the new directory exists.
 
+## Remote Streamable HTTP
+
+Run a long-lived MCP server independently of any client's stdin lifecycle:
+
+```bash
+COMFY_BIN=/path/to/venv/bin/comfy \
+COMFY_API_KEY=YOUR_COMFY_API_KEY \
+COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+comfy-mcp serve \
+  --transport streamable-http \
+  --host 127.0.0.1 \
+  --port 9000 \
+  --log-level INFO
+```
+
+The endpoint is `http://127.0.0.1:9000/mcp`. The application is pinned to
+FastMCP 4.0.0b3 and MCP SDK 2.0.0. One minimal builder owns its name, version,
+and base instructions and creates **one FastMCP application**. Every tool is
+registered on that instance once. The process then selects one adapter:
+`mcp.run(transport="stdio")` or `mcp.http_app(...)` handed to uvicorn.
+
+Consequently both transports expose the same 40 tools, parameters, results,
+confirmations, machine snapshot, and `ComfyCliClient` path. HTTP is not a
+second product API and has no DTO/VO translation layer. Filesystem arguments
+still resolve on the machine running `comfy-mcp`, except for the explicit
+command-based upload and signed-output boundary below.
+
+### Uploads and downloads over HTTP
+
+`upload_file` uses the same command-oriented schema as ComfyCloud. Pass one absolute path on the
+**MCP client** and the client's operating system:
+
+```json
+{
+  "file_path": "/Users/me/task_04.webp",
+  "client_os": "darwin"
+}
+```
+
+Over stdio the server can read that path and immediately runs `comfy upload`. Over HTTP it does not
+pretend the path exists on the server and does not embed base64 into JSON-RPC. It returns a
+credential-free `curl`/`curl.exe` PUT command with a single-use URL on the same MCP listener. Run
+the command verbatim; success prints `{"name":"...","subfolder":"","type":"input"}`. The route
+accepts JPG/JPEG/PNG/WebP/GIF up to 50 MiB, expires after five minutes, is consumed by the first
+attempt, writes owner-only scratch, calls the same `ComfyCliClient → comfy upload` path, and removes
+scratch on every exit.
+
+For `fetch_outputs`, HTTP mode treats `out_dir` as the desired path on the **client**. The server
+first runs `comfy download` into an owner-only temporary directory, then returns each file with a
+**temporary signed download URL (valid for five minutes)** on the same MCP listener port and one ready
+command selected by `client_os`. The URL is a bearer capability: do not share or log it. It expires
+automatically, cannot be edited, and the temporary bytes are removed with it. A reverse proxy must
+forward `/mcp`, `/api/uploads/`, and `/downloads/`, plus the client-facing scheme, Host, and port via
+`Forwarded` or `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Port`. Transfer commands and
+signed links use that upstream origin, including a non-default external port; no second file server
+or port is started. If the proxy does not preserve those fields, set the complete origin explicitly,
+for example `COMFY_MCP_PUBLIC_URL=https://mcp.example.test:8443` (no path or credentials). This follows the
+[Comfy MCP upload/download contract](https://docs.comfy.org/agent-tools/mcp#uploads-and-downloads):
+the server returns a download link because it cannot write directly into a remote client's
+filesystem.
+
+The Python module boundary follows the same rule. `comfy_mcp.server` is a
+small public package that exports only `mcp`, `main`, and the 40 registered tool
+callables. Guarded runners, locks, parsers, consent state, and startup helpers
+remain private in `comfy_mcp.server._internal`; importing the public package
+does not make those implementation details part of the supported API.
+
+FastMCP owns JSON-RPC, modern/legacy protocol negotiation, validation,
+Streamable HTTP, and the ASGI lifespan. Stateless JSON responses prevent a
+stale session ID from selecting half-initialized server state. This project
+does not implement parallel JSON-RPC, legacy SSE, reconnect logic, or a private
+session patch. Application/server logs go to stderr; child stdout is parsed
+only as comfy-cli `envelope/1` data.
+
+A minimal FastMCP 4 client (auto-negotiates the modern protocol and falls back
+to a legacy handshake when required):
+
+```python
+import asyncio
+
+from fastmcp import Client
+
+
+async def main() -> None:
+    async with Client("http://127.0.0.1:9000/mcp") as client:
+        tools = await client.list_tools()
+        print([tool.name for tool in tools])
+
+        info = await client.call_tool("server_info")
+        print(info.data)
+
+
+asyncio.run(main())
+```
+
+The listener address is separate from the ComfyUI target:
+
+| Concern | CLI / environment | Example |
+| --- | --- | --- |
+| MCP listener | `--host` / `COMFY_MCP_HOST`, `--port` / `COMFY_MCP_PORT`, `--path` / `COMFY_MCP_PATH` | `127.0.0.1:9000/mcp` |
+| Same-machine ComfyUI | `COMFY_LOCAL_URL` (optional at the default address) | `http://127.0.0.1:8188` |
+| Different-machine ComfyUI | `COMFYUI_URL`, or `COMFYUI_HOST` + `COMFYUI_PORT` | `http://gpu-box:8188` |
+
+`COMFY_MCP_TRANSPORT`, `COMFY_MCP_LOG_LEVEL`, and comma-separated
+`COMFY_MCP_ALLOWED_HOSTS` provide the other `serve` defaults. CLI flags override
+their matching environment values.
+
+The default loopback bind is intentional. To bind a non-loopback interface you
+must explicitly allow the Host header patterns accepted by the SDK's
+DNS-rebinding protection, for example:
+
+```bash
+comfy-mcp serve \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --allowed-host 'mcp.example.test:*'
+```
+
+That check is not authentication. This release does not add an account system,
+OAuth implementation, or TLS termination; for access beyond a trusted private
+network, put the listener behind an authenticated TLS reverse proxy and allow
+only that proxy's public Host value. HTTP exposes the complete tool surface,
+including lifecycle, installation, and update tools; the same MCP elicitation,
+comfy-cli consent, argument guards, and local-state protections apply in both
+transports, but they are not a substitute for authenticating an untrusted
+network deployment.
+
 ## Configure your AI client
 
-All three clients speak the same MCP stdio contract: run the `comfy-mcp` command as a
-server. Pick your client.
+Choose one connection mode, then use the matching client configuration below:
+
+| Mode | Who starts `comfy-mcp` | Client points to | Tool surface |
+| --- | --- | --- | --- |
+| stdio | The AI client, as a subprocess | the `comfy-mcp` command | all 40 tools |
+| Streamable HTTP | You or a service manager, before the client connects | `http://127.0.0.1:9000/mcp` by default | the same 40 tools |
+
+For HTTP, first start the independently managed listener as described in
+[Remote Streamable HTTP](#remote-streamable-http), then register its URL with the client. Do not
+register both examples under different names unless you intentionally want two separately running
+server processes that expose the same application contract.
+
+HTTP mode still needs the same comfy-cli environment. It creates a **second listener**, not a
+replacement for ComfyUI: ComfyUI continues on its own port (normally `8188`), while MCP listens on
+another port (here `9000`). Start ComfyUI first, then start the MCP listener:
+
+```bash
+# COMFY_API_KEY is optional unless you use partner-API nodes.
+# COMFY_LOCAL_URL is optional when ComfyUI already uses 127.0.0.1:8188.
+COMFY_BIN=/path/to/venv/bin/comfy \
+COMFY_API_KEY=YOUR_COMFY_API_KEY \
+COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+comfy-mcp serve --host 127.0.0.1 --port 9000
+```
+
+The AI client connects to `http://127.0.0.1:9000/mcp`; `comfy-mcp` reaches ComfyUI through
+comfy-cli at `http://127.0.0.1:8188`. When a service manager starts `comfy-mcp serve`, put these
+environment variables in that service definition.
 
 > The **server key** (`comfy-mcp` in every snippet below) is just the label your client files
 > these tools under — it is yours to choose, and the `"command"` (`comfy-mcp`) is the only part
@@ -207,11 +362,11 @@ server. Pick your client.
 > pasting a second one** — two keys pointing at the same command register the server twice and
 > your client shows every tool twice. Keeping the old key is equally fine; nothing reads it.
 
-> The `COMFY_BIN` env entry is shown in every example. Drop it if `comfy` is already on the
-> environment your client launches the server with; keep it (pointing at the absolute path) if
-> it isn't. `COMFY_API_KEY` is also shown, commented as optional — keep it only if you use
-> [partner-API nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …); drop it
-> otherwise.
+> `COMFY_BIN` is needed whenever `comfy` is not already on the server process's `PATH`: in stdio
+> that process is launched by the AI client, while in HTTP it is the independently started
+> `comfy-mcp serve`. `COMFY_API_KEY` is optional — keep it only if you use [partner-API
+> nodes](#partner-api-nodes) (Seedream / Veo / Kling / Gemini / …). In HTTP mode these variables
+> belong to the `comfy-mcp serve` process, not to the client's URL-only configuration.
 
 > **On macOS, keep ComfyUI out of `~/Documents`, `~/Desktop` and `~/Downloads`** — or grant your
 > client Full Disk Access. macOS blocks apps (and everything they launch) from reading those
@@ -220,18 +375,50 @@ server. Pick your client.
 
 ### Claude Code
 
-One command registers the server:
+Claude Code supports both transports. For HTTP, start `comfy-mcp serve` first, then register its
+URL:
+
+```bash
+claude mcp add --transport http comfy-mcp http://127.0.0.1:9000/mcp
+```
+
+To check that HTTP registration into the project, add `--scope project` before the server name:
+
+```bash
+claude mcp add --transport http --scope project \
+  comfy-mcp http://127.0.0.1:9000/mcp
+```
+
+The resulting `.mcp.json` may also be written directly. Environment expansion lets each developer
+override the listener URL without editing the checked-in file:
+
+```json
+{
+  "mcpServers": {
+    "comfy-mcp": {
+      "type": "http",
+      "url": "${COMFY_MCP_URL:-http://127.0.0.1:9000/mcp}"
+    }
+  }
+}
+```
+
+For client-launched local stdio, use:
 
 ```bash
 # COMFY_API_KEY is optional — add it only if you use partner-API nodes
 # (see the Partner-API nodes section).
-claude mcp add comfy-mcp \
-  -e COMFY_BIN=/path/to/venv/bin/comfy \
-  -e COMFY_API_KEY=<your-comfy-api-key> \
+claude mcp add --transport stdio comfy-mcp \
+  --env COMFY_BIN=/path/to/venv/bin/comfy \
+  --env COMFY_API_KEY=YOUR_COMFY_API_KEY \
   -- comfy-mcp
 ```
 
-Or, to check it into a project, add a `.mcp.json` at the repo root:
+Keep the server name before the first `--env`: Claude Code's `--env <env...>` option accepts
+multiple values, so putting it first can consume the name and produce a misleading
+`missing required argument 'commandOrUrl'` error.
+
+Or check the stdio form into a project with this `.mcp.json`:
 
 ```json
 {
@@ -249,9 +436,16 @@ Or, to check it into a project, add a `.mcp.json` at the repo root:
 
 ### Claude Desktop
 
-Edit `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS it lives at
-`~/Library/Application Support/Claude/claude_desktop_config.json`) and add the server, then
-restart Claude Desktop:
+For a remotely reachable HTTP deployment, open **Settings → Connectors → Add custom connector**
+and enter its HTTPS `/mcp` URL. Claude Desktop does not load remote servers from
+`claude_desktop_config.json`; that file is only for locally spawned integrations. A loopback
+`http://127.0.0.1:9000/mcp` listener is not a remotely reachable connector, so use stdio for a
+same-Mac ComfyUI unless you have deliberately published the HTTP service behind an authenticated
+TLS reverse proxy.
+
+For local stdio, edit `claude_desktop_config.json` (Settings → Developer → Edit Config; on macOS
+it lives at `~/Library/Application Support/Claude/claude_desktop_config.json`) and add the server,
+then restart Claude Desktop:
 
 ```json
 {
@@ -269,7 +463,20 @@ restart Claude Desktop:
 
 ### Cursor
 
-Add the server to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a project:
+Cursor accepts a Streamable HTTP URL directly. After starting `comfy-mcp serve`, add this to
+`~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in a project:
+
+```json
+{
+  "mcpServers": {
+    "comfy-mcp": {
+      "url": "http://127.0.0.1:9000/mcp"
+    }
+  }
+}
+```
+
+For client-launched local stdio, use the command form instead:
 
 ```json
 {
@@ -388,6 +595,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 
 - [Quickstart](#quickstart)
 - [Upgrading from `comfy-local-mcp`](#upgrading-from-comfy-local-mcp)
+- [Remote Streamable HTTP](#remote-streamable-http)
 - [Configure your AI client](#configure-your-ai-client)
 - [Comfy Cloud MCP](#comfy-cloud-mcp)
 - [Prerequisites](#prerequisites)
@@ -765,8 +973,10 @@ That set is deliberately closed under submit-then-poll: a `prompt_id` only means
 server that issued it, so a tool that submits and a tool that polls must never resolve to different
 machines. `upload_file` is in it for the same reason one step earlier: an input file is only useful
 on the machine that runs the workflow reading it, so staging it here while submitting there would
-fail the run on a filename the remote cannot see. Its `paths` still name files on **this** machine —
-they are read here and their bytes sent to the target. Remote upload needs comfy-cli **≥ 1.14.0**
+fail the run on a filename the remote cannot see. `upload_file(file_path, client_os)` names one
+absolute client path. stdio passes it straight through; HTTP returns a single-use PUT command, then
+stages the received bytes briefly on the MCP server and follows the identical `comfy upload` path.
+Remote upload needs comfy-cli **≥ 1.14.0**
 (this server's floor); an older one rejects the forwarded `--host` and `upload_file` raises with the
 upgrade step rather than silently staging into the local `input` dir.
 
@@ -796,8 +1006,10 @@ upgrade step rather than silently staging into the local `input` dir.
   `prompt_id`, and for a non-loopback target that file records each output as an absolute
   `http://<remote>:<port>/view?…` URL, which `comfy download` then streams from the remote. It falls
   back to querying the local default server only when no such state file exists (an id this machine
-  never submitted). `run_workflow(wait=True)` / `job(action="status")` return those same URLs if you
-  would rather hand them off than copy bytes.
+  never submitted). Over stdio it copies directly into `out_dir`; over HTTP it downloads into a
+  temporary server directory and returns five-minute signed URLs on the MCP listener, because
+  `out_dir` belongs to the client machine. `run_workflow(wait=True)` / `job(action="status")`
+  return the engine's source URLs, but `fetch_outputs` is the client-delivery step.
 - **Discovery / validation** (`nodes`, `validate_workflow`, and the
   `local_check` block on `fetch_template` / `get_template`) — their comfy-cli verbs *do* accept
   `--host`/`--port`, but this version forwards only to the submit/poll tools, so they still
@@ -972,7 +1184,7 @@ handle is `prompt_id`.
 | `emit_partner_workflow(model, out_path, params=None)` | `comfy generate <model> [--param=value…] --emit-workflow=<path>` | Write a runnable workflow JSON that drives the partner model's **API node** instead of calling the proxy, so **your own ComfyUI executes the partner model** (the other way there is an existing `API`-tagged gallery template via `search_templates` / `run_template`; this is the path from a model *alias*). Chain it: `emit_partner_workflow` → `run_workflow` → `fetch_outputs` (the three stay separate so the graph can be inspected, edited with `set_workflow_slot`, re-run, or embedded in a bigger pipeline). Calls no partner API, needs no API key, and **spends nothing**, so unlike `partner_generate` it has no `confirm_spend` argument and raises no confirmation prompt — *running* the emitted graph is what bills the partner node, so that `run_workflow` step is the one that needs `confirm_spend=True`. **Coverage is narrow:** comfy-cli maps only `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana` and `seedance` to a node class, a small subset of `list_partner_models()`; every other model reaches its partner through the proxy only, so send those to `partner_generate`. An unsupported model raises with comfy-cli's own `emit_workflow_failed` message, which names the supported set for the comfy-cli you actually have installed. Returns comfy-cli's envelope data — `{"out", "model", "nodes"}`. |
 | `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=True` (the default) streams the run's live progress as MCP progress notifications, the same way `run_workflow` / `job(action="watch")` do, so a long template run is not a silent block; `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job(action="status", prompt_id="", timeout_seconds=None)` | `comfy jobs status/watch/cancel/ls <prompt_id>` | One grouped tool over the six former `job_status`/`wait_for_job`/`watch_job`/`get_execution_error`/`cancel_job`/`get_queue` tools — pick a behavior with `action`. `"status"` (default) polls status + outputs. `"error"` returns a compact failure verdict — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; `error: None` on a healthy prompt. Failures comfy-cli diagnosed itself rather than ComfyUI (a `server_died` crash mid-run) carry no node-level fields, so the verdict also reports `error_code` — comfy-cli's own code, `None` on an ordinary node failure — with its message backfilling `exception_message`. `"wait"` polls (bounded, default 25.0s) until a job reaches a terminal status, returning a `{"timed_out": True, …}` payload on expiry — chain several rather than one long call. `"watch"` streams live progress (bounded, default 600.0s) as MCP progress notifications, same `timed_out` shape except `status` is a live `{progress, total, nodes_done}` snapshot. `"cancel"` stops a queued/running job. `"queue"` lists known jobs (Comfy Cloud-tracked rows filtered out, since this server never drives them; follows a configured remote like the other job actions). `prompt_id` is required for every action but `"queue"`; `timeout_seconds` only for `"wait"`/`"watch"` — passing either where the action does not use it is rejected rather than silently ignored. |
-| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False, client_os="darwin")` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Deliver a finished job's outputs — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)). stdio writes directly into `out_dir`; Streamable HTTP cannot write on the client, so it returns temporary signed URLs on the MCP listener (five-minute lifetime) plus one ready command selected by `client_os`. In HTTP mode `url_only` and `inline_images` do not bypass that transfer boundary. In stdio, `url_only=True` emits the engine URLs without copying bytes and `inline_images=True` also returns bounded MCP image content. |
 
 ### Resource management
 
@@ -1028,7 +1240,7 @@ handle is `prompt_id`.
 | `update_comfyui(target="comfy", confirm_update_all=False)` | `comfy update <all\|comfy\|cli>` | Update the local install: `"comfy"` = ComfyUI core, `"all"` = the installed custom node packs, `"cli"` = comfy-cli itself. This is what `server_info`'s `freshness` block points at when it reports a stale install. Slow (a core update re-installs requirements; 30-minute timeout) and the updated code only takes effect after a `restart_comfyui`. **`target="all"` asks the USER first — and only that target.** It `git pull`s and `pip install`s **every** third-party custom node pack into ComfyUI's Python environment, so it runs code those packs' authors have published since you installed them, and it can move a pack (or a shared dependency) to a version other packs and your saved workflows don't work with. comfy-cli does not gate that, so on a client that supports MCP elicitation a prompt naming exactly that is raised and a decline runs nothing; on a client that cannot show prompts the call errors unless `confirm_update_all=True`, which an agent may pass **only** when the user has actually agreed. That prompt is raised even when `confirm_update_all=True` is passed, so a host's "always allow this tool" toggle is not standing authority to run third-party code. `target="comfy"` and `target="cli"` update first-party code from known repositories and are never prompted. Any other `target` is rejected before comfy-cli is invoked (and before anyone is asked), and a second update requested while one is still running is refused rather than run in parallel (concurrent `git`/`pip` against one workspace can leave it half-installed) — that refusal comes before the prompt too, so nobody approves a call that was never going to run. |
 | `switch_comfyui_version(version, confirm_switch=False)` | `comfy update comfy --version <version>` | Move the local ComfyUI install to a **specific** version — `"nightly"`, `"latest"`, or a release like `"0.24.0"` / `"v0.24.0"` — so you can roll **back** to reproduce or rule out a regression (`update_comfyui` only ever moves forward to the latest). **Destructive:** the engine stashes any uncommitted changes in the ComfyUI checkout, moves it to that version, and reinstalls that version's Python dependencies (minutes, not seconds; 15-minute timeout). **The USER is asked to confirm every call** — on a client that supports MCP elicitation a prompt naming exactly that is raised, and a decline cancels with nothing changed; on a client that cannot show prompts the call errors unless `confirm_switch=True`, which an agent may pass **only** when the user has actually agreed. That prompt is raised even when `confirm_switch=True` is passed, so a host's "always allow this tool" toggle is not standing authority over the install. It **refuses while a local ComfyUI is running** (reinstalling under a live process can leave it serving half-replaced code) — checked both before the prompt and again immediately before the switch, since the prompt may sit unanswered for minutes, and fail-closed, so a `comfy env` this server cannot read is refused rather than read as "stopped" — and it does **not** restart anything — the flow is `stop_comfyui` → `switch_comfyui_version` → `launch_comfyui` → `server_info` to confirm what came up. Returns `{switched_to, result, restart_required: true}`. A malformed version is rejected before comfy-cli is invoked; a comfy-cli whose `comfy update` predates `--version` surfaces as an "upgrade comfy-cli" error rather than a raw usage dump; and it shares `update_comfyui`'s one-at-a-time lock. |
 | `install_node(names, confirm_install=False)` | `comfy node install <name...> --exit-on-fail` | Install custom node packs into the local ComfyUI — the acquisition half of the missing-node story, after `validate_workflow` / `run_workflow` names a node class this install lacks and `node_dependencies(registry_id=…)` pre-checks the pack's requirements. `names` are **registry pack ids** (slugs like `"comfyui-impact-pack"`), not node class names: a git URL, a filesystem path, or `"all"` is refused before comfy-cli is invoked — the URL case deliberately, because the confirmation prompt promises the user a *named pack from the registry*, so nothing else may ride through it. (To update the packs you already have, use `update_comfyui(target="all")`; to install from a URL, run `comfy node install` in a terminal.) **Installing a pack runs third-party code** — a `pip install` of its dependencies into the ComfyUI environment plus the pack's own install script — so **the USER is asked to confirm every call**, and that prompt is raised even when `confirm_install=True`, since a host's "always allow this tool" toggle is not standing authority to execute third-party code and the pack names are frequently a model's guess. On a client that cannot show prompts the call errors unless `confirm_install=True`, which an agent may pass **only** once the user has actually agreed. It does **not** restart anything — new nodes are invisible until ComfyUI restarts, so the flow is `install_node` → `restart_comfyui` → `nodes(action="search")` — and it shares `update_comfyui`'s one-at-a-time lock (same venv, same `pip`). `--exit-on-fail` is always forwarded, because without it comfy-cli reports a failed install as success — but it is not sufficient on its own: ComfyUI-Manager prints a pack's failure *before* consulting the flag, so `comfy node install` can report a pack as failed and still exit 0. The verdict is therefore read out of the engine's own output rather than off the exit status. 30-minute timeout. Returns `{installed, result, restart_required}` — **`installed` lists only the packs the engine did not report as failed, not an echo of `names`** — plus `{failed, error}` when any pack failed, where each `failed` entry carries the engine's own message and a `code` of `pack_not_found` (the id is not in this install's registry channel, so retrying it will not help) or `install_failed`. `restart_required` is `false` when nothing was installed, because there is then nothing for a restart to pick up. |
-| `upload_file(paths, overwrite=False)` | `comfy upload <files...> --overwrite/--no-overwrite` | Stage source images/masks into the target ComfyUI's `input` dir (unlocks img2img / inpaint). Goes to whichever ComfyUI the server targets — the local install by default, or the remote a configured `COMFYUI_URL`/`COMFYUI_HOST` names, the same one `run_workflow` submits to ([Driving a remote ComfyUI](#driving-a-remote-comfyui)); remote upload needs comfy-cli ≥ 1.14.0, and an older one raises with the upgrade step instead of staging locally where the remote run cannot see the files. Entries must already exist on **this** filesystem (they are read here and sent to the target) and **should be absolute** — comfy-cli runs with the ComfyUI workspace as its working directory, so a relative path resolves against the workspace, not the agent's cwd. **For an image the user attached in chat:** an MCP server never receives attachment *bytes* (the protocol has no client-to-server path for them), but several clients save the attachment and put its absolute path in the agent's context — Claude Code injects an `[Image: source: <absolute path>]` line — and that path is an ordinary local file you can pass straight to `paths`. If your client gives no path, ask the user to save the file and supply it; that is the portable flow. |
+| `upload_file(file_path, client_os)` | `comfy upload <file> --no-overwrite` | Stage one JPG/JPEG/PNG/WebP/GIF into the target ComfyUI's `input` dir (unlocks img2img / inpaint), using the same public schema and remote command report as ComfyCloud. `file_path` is absolute on the MCP client and `client_os` is `darwin`, `linux`, or `windows`. stdio runs the command directly. HTTP returns a credential-free, five-minute, single-use PUT command on the MCP listener; the route accepts at most 50 MiB, responds with `{"name":"...","subfolder":"","type":"input"}`, and passes owner-only scratch through the same `ComfyCliClient`. Goes to whichever ComfyUI the server targets — local by default or the remote configured by `COMFYUI_URL`/`COMFYUI_HOST`; remote upload needs comfy-cli ≥ 1.14.0; base64/data-inline upload is unsupported. |
 | `download_model(url, relative_path=None, filename=None, wait=True, timeout_seconds=110.0)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>] --background` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. Local-only and **enforced**: `comfy model download` has no `--host`/`--port`, so with a remote configured (`COMFYUI_URL`/`COMFYUI_HOST`) this refuses instead of writing the checkpoint to a disk the remote cannot see — install the model on the remote host itself, or set `COMFY_MCP_REMOTE_SHARED_MODELS=1` if this machine's models dir *is* the remote's (shared NFS / tailnet mount). See [Driving a remote ComfyUI](#driving-a-remote-comfyui). The transfer is **submitted** to comfy-cli's background worker and returns a `download_id`, so a multi-GB checkpoint no longer holds the MCP request open past the client's deadline: `wait=True` (default) polls that id for you within a bounded budget and returns `{"timed_out": True, "download_id": …}` — not an error — if the transfer is still running, while a `failed` / `cancelled` download raises with comfy-cli's own error. On that path `timeout_seconds` is the **end-to-end** budget for the whole call, submit included, so the submit and the poll cannot add up past the client deadline the 110s default is chosen to sit under. `wait=False` returns the submit payload immediately and keeps the submit's own fixed budget. Every payload from that background path keys the handle `download_id`, matching the argument name every download tool takes, so an id read out of one result goes straight back into the next call — the legacy foreground fallback below is the exception, since no id is ever minted on it. The file is written straight to its final path as it transfers, so a filesystem / `search_models` check mid-flight sees a present-but-incomplete file — `download(action="status")` is the source of truth. `relative_path` resolves from the workspace root and must be the models dir or a subfolder of it — `models`, `models/loras` (a bare `loras` is rejected, not assumed); sibling dirs like `custom_nodes/…`, `input`, `output` are refused. Use `/` as the separator on every host, Windows included. Against a comfy-cli too old to know `--background` (anything below 1.14.0, which only reaches here past the fail-open version guard) it falls back to the previous foreground download — which has no id to detach or poll, so it blocks even on `wait=False`, and every payload it returns is marked `background_unsupported: true` to say so. On that fallback `wait=True` is bounded by what is left of your `timeout_seconds` (capped at 1800s) rather than by a silent half hour: when the bound expires the transfer is killed and the error names where an incomplete file may remain, since there is no `download_id` to check it with. Cancelling the tool call kills the transfer the same way instead of orphaning it. |
 | `download(action="status", download_id="", timeout_seconds=None)` | `comfy model download-status/download-cancel <download_id>` | One grouped tool over the three former `download_status`/`wait_for_download`/`cancel_download` tools — pick a behavior with `action`. Does **not** start a transfer — that's `download_model`, whose `download_id` this tool consumes. `"status"` (default) returns `status`, `completed_bytes` / `total_bytes` / `percent`, `elapsed_seconds`, `dest`, and `error` — the only proof a model is complete and loadable. `"wait"` polls (bounded, default 25.0s, ceiling 3600s) until a download reaches a terminal state (completed / failed / cancelled), returning a `{"timed_out": True, …}` payload on expiry — chain several rather than one long call, the `job(action="wait")` shape, for transfers. `"cancel"` stops a running download and removes its partial file. `download_id` is required for every action; `timeout_seconds` only for `"wait"` — passing it elsewhere is rejected rather than silently ignored. Every payload keys the handle `download_id` on the way back out too, including the status nested inside a `"wait"` timeout, so a handle read out of one result passes straight into the next call without renaming; comfy-cli spells the same field `id`, and that spelling is kept alongside rather than replaced. On a comfy-cli without the verb, returns `{"error": …, "unsupported": true}` instead of a raw usage dump — that shape carries no handle at all, since a CLI that old can never have minted one. |
 
@@ -1097,20 +1309,46 @@ Default paths — the same per-OS local-state convention comfy-cli itself uses:
 | Linux / other | `~/.config/comfy-mcp/failures.jsonl` |
 
 Each line records the failure `kind` (`error_envelope`, `no_json`, `timeout`, `binary_missing`,
-`schema_mismatch`), a UTC `ts`, the comfy-cli `args`, its `exit_code` and the envelope's
+`spawn_failed`, `schema_mismatch`), a UTC `ts`, the comfy-cli `args`, its `exit_code` and the envelope's
 `error_code`, the message you saw in your client, and up to 4,000 characters of `stdout_tail` /
 `stderr_tail` — deliberately more output than an error message can carry:
 
 ```console
-$ COMFY_MCP_DEBUG_LOG=1 …            # in your MCP client config's env block
 $ jq -r 'select(.kind == "timeout") | .ts + "  " + (.args | join(" "))' \
     ~/Library/Application\ Support/comfy-mcp/failures.jsonl
 ```
+
+The setting is read when the **MCP server process starts**:
+
+- **stdio:** put `COMFY_MCP_DEBUG_LOG=1` in the same MCP client `env` block as
+  `COMFY_BIN` / `COMFY_API_KEY`, then fully restart that client-launched server.
+- **Streamable HTTP:** set it on the machine and service that run
+  `comfy-mcp serve`, not in the remote client's URL-only configuration, then
+  restart that HTTP process. For example:
+
+  ```bash
+  COMFY_MCP_DEBUG_LOG=1 \
+  COMFY_BIN=/path/to/venv/bin/comfy \
+  COMFY_API_KEY=YOUR_COMFY_API_KEY \
+  COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+  comfy-mcp serve --host 127.0.0.1 --port 9000
+  ```
+
+In both modes the runner publishes the same immutable failure event. A single
+JSONL writer observes those events and returns immediately while the setting is
+off; when enabled it writes on the **MCP server host**. This deliberately small
+observer design keeps subprocess code independent of storage without adding a
+general event bus. Both adapters therefore produce the same failure kinds,
+redaction, rotation, and owner-only permissions.
 
 The file rotates itself: 1 MiB per file with two older generations kept (`failures.jsonl.1`,
 `failures.jsonl.2`), so it stops growing at roughly 3 MiB no matter how long you leave it on.
 Successful calls are never recorded, and nothing is ever transmitted anywhere — the log is local,
 full stop.
+
+HTTP upload request bytes are never passed as comfy-cli arguments and never enter the failure event
+or JSONL file. A failed capability upload can record its generated temporary path and comfy-cli's
+bounded output, but the temporary file itself is removed before the route returns.
 
 > **Privacy — review before sharing.** The log contains local file paths and comfy-cli's own
 > command output, which can include the workflow or prompt text comfy-cli echoed back. Credentials
@@ -1121,27 +1359,74 @@ full stop.
 
 ## Smoke test
 
-Turn the manual validation ritual into one command. The e2e smoke test drives the
-real tools end-to-end (no mocks): `server_info` → `run_workflow` on a checkpoint-free
-`EmptyImage` → `SaveImage` graph → `fetch_outputs`, and asserts a valid PNG lands in
-a temp out_dir.
+Validation has three complementary stages. Run all three when changing the MCP
+transport, shared client boundary, runner, or workflow/job behavior.
+
+**1. Automated MCP transport and business-flow smoke (no live ComfyUI).** This
+starts a real loopback Streamable HTTP/ASGI server, uses FastMCP clients for
+negotiation and discovery, and exercises the in-process and HTTP business flows
+with the shared comfy-cli fixtures from `tests/conftest.py`:
 
 ```bash
-./scripts/smoke.sh            # or: python -m pytest tests/e2e -m e2e
+pytest -q \
+  tests/test_remote_transport.py \
+  tests/test_remote_http.py \
+  tests/test_fastmcp_app.py \
+  tests/test_file_transfer.py \
+  tests/test_failure_log.py
 ```
 
-It needs a running local ComfyUI (`COMFYUI_URL`, default `http://127.0.0.1:8188`)
-**and** the `comfy` binary on `PATH` (or `COMFY_BIN`). Without both it **skips**
-rather than fails. The e2e tests are deselected by default from plain `pytest`
-runs, so it's safe to run anywhere — and the `pytest` gate stays green on CI
-runners that have neither.
+The in-process and HTTP flows cover input staging → `server_info` → workflow submission → job status
+→ `fetch_outputs` against the same 40-tool application. The HTTP flow downloads the returned
+temporary signed URL from the same listener, rejects a modified signature, and proves the upload URL is single-use;
+the local-path behavior is covered through the shared subprocess fixtures rather than a
+hand-written executable stub. HTTP coverage also checks
+concurrent clients, legacy and modern protocol negotiation, native tool-error
+behavior, opt-in failure observation (including upload-byte non-disclosure), scratch cleanup, and clean
+ASGI/uvicorn shutdown.
+
+**2. Live ComfyUI and stdio-process smoke.** This drives the actual tools through
+the actual `comfy` binary into a running local ComfyUI. The real stdio MCP
+subprocess also covers discovery → `server_info` → submit → poll → fetch:
+
+```bash
+./scripts/smoke.sh            # or: python -m pytest tests/e2e/test_smoke.py -m e2e
+```
+
+It needs a running same-machine ComfyUI (`COMFY_LOCAL_URL`, default
+`http://127.0.0.1:8188`) and the `comfy` binary on `PATH` (or `COMFY_BIN`). Keep
+`COMFY_API_KEY` set when that local ComfyUI requires it. If the binary or
+ComfyUI is absent, the tests **skip** rather than fail. The checkpoint-free
+`EmptyImage` → `SaveImage` round trip and `system_stats` need no model; the
+additional `generate_image` regression test requires the documented SD1.5
+checkpoint and fails with comfy-cli's own missing-model error when it is not
+installed. These e2e tests are deselected from plain `pytest` and CI by default.
+
+**3. Live remote Streamable HTTP MCP smoke.** When the MCP server and ComfyUI
+run on another machine, point the opt-in client test at a reachable endpoint
+(an SSH local-forward is fine) and name the checkpoint-free workflow on the
+**server** filesystem:
+
+```bash
+COMFY_MCP_TEST_URL=http://127.0.0.1:9000/mcp \
+COMFY_MCP_TEST_WORKFLOW=/absolute/server/path/tests/e2e/workflow_smoke.json \
+  pytest -q tests/e2e/test_remote_mcp.py -m e2e
+```
+
+This test never imports the server application locally. It negotiates both
+modern and legacy protocols, discovers the 40-tool shared application, uploads
+a generated client-local PNG through the single-use PUT URL, runs the no-model
+workflow, polls it, and downloads the result through the five-minute signed
+URL. It consumes no cloud credits, but it deliberately leaves one tiny input
+image and one smoke output in the configured ComfyUI.
 
 ## Contributing
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
-setup (`pip install -e '.[dev]'`, `pytest`, `ruff`) and the thin-wrapper
-architecture rule, and [`AGENTS.md`](AGENTS.md) for the full guidelines. This
-project follows a [Code of Conduct](CODE_OF_CONDUCT.md). To report a
+setup, the thin-wrapper/shared-client architecture, FastMCP 4 transport
+guardrails, failure-log requirements, and the mandatory targeted + full test
+gates. [`AGENTS.md`](AGENTS.md) contains the complete implementation rules.
+This project follows a [Code of Conduct](CODE_OF_CONDUCT.md). To report a
 vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## License

@@ -1,11 +1,7 @@
-"""The `initialize` handshake must report this server's version, not `""`.
+"""The `initialize` handshake reports the installed comfy-mcp version.
 
-The SDK does not infer a version: `MCPServer(...)` defaults `version` to the
-empty string and `Server.server_info` hands that straight to the client, so
-forgetting the argument is silent — every tool still works, and the only symptom
-is `"serverInfo": {"name": "comfy-mcp", "version": ""}` in a client's logs, with
-nothing to display and nothing to correlate a bug report against. Nothing else
-in the suite touches the handshake identity, so this file is the whole guard.
+FastMCP defaults its version to ``None``; this application passes the installed
+distribution version explicitly so clients can correlate reports with a release.
 
 It has three layers on purpose:
 
@@ -14,8 +10,7 @@ It has three layers on purpose:
   constructor;
 * the SOURCE check — where that string comes from, including the fallback the
   wire check (which always runs installed) can never exercise;
-* the SDK check — that the constructor keyword is still spelled `version`, since
-  a rename would quietly restore the empty default.
+* the framework check — that the constructor keyword remains ``version``.
 """
 
 from __future__ import annotations
@@ -28,10 +23,10 @@ import subprocess
 import sys
 
 import pytest
-from mcp.server.mcpserver import MCPServer
+from fastmcp import FastMCP
 
 import comfy_mcp
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 # Bounds the stdio handshake below. Generous because it covers interpreter
 # startup plus importing the SDK, not the handshake itself (milliseconds); a
@@ -165,9 +160,6 @@ def test_sdk_still_spells_the_handshake_version_argument_version():
     this fix exists to displace, so an SDK that starts deriving a version does
     not leave the argument sitting here unexamined.
     """
-    parameter = inspect.signature(MCPServer.__init__).parameters.get("version")
-    assert parameter is not None, "MCPServer no longer takes a `version` argument"
-    assert parameter.default == "", (
-        "MCPServer.version no longer defaults to the empty string — re-check "
-        "whether passing it explicitly is still what reaches serverInfo."
-    )
+    parameter = inspect.signature(FastMCP.__init__).parameters.get("version")
+    assert parameter is not None, "FastMCP no longer takes a `version` argument"
+    assert parameter.default is None

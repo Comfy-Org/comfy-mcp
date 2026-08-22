@@ -8,15 +8,18 @@ standalone [MCP](https://modelcontextprotocol.io) server that lets an agent driv
 
 ## The architecture rule — thin wrapper only (read this first)
 
-Every tool is a passthrough to the `comfy` binary — the only way to reach comfy-cli is the
-`_run_comfy(*args)` helper in `src/comfy_mcp/server.py`, which shells out to `comfy --json
---where local <args>` (global flags **before** the subcommand), parses comfy-cli's versioned
-`envelope/1` result, and returns its `data`. Do not bypass it.
+Every tool is a passthrough to the `comfy` binary. Application/tool code reaches it only
+through the `ComfyCliClient` port under `src/comfy_mcp/client/`; the concrete client is
+composed with the guarded `_run_comfy*_impl` runners in `server/_internal.py`. Those runners shell out
+to `comfy --json --where local <args>` or `comfy --json-stream --where local <args>`
+(global flags **before** the subcommand),
+parse comfy-cli's versioned `envelope/1`, and return its data. Do not bypass the client port
+or the runners.
 
 Hard guardrails — a PR breaking any of these should be rejected:
 
 - **Every tool is a `comfy --json --where local` passthrough.** New functionality belongs in
-  comfy-cli, exposed here as a thin `_run_comfy` call. A feature that can't be a `comfy`
+  comfy-cli, exposed here as a thin `ComfyCliClient.run*` call. A feature that can't be a `comfy`
   subcommand needs a comfy-cli change, not a workaround here.
 - **No HTTP client.** This server never talks to ComfyUI (or anything else) over HTTP
   directly — no `httpx`/`requests`/`aiohttp`/`urllib` calls to a server. comfy-cli owns all
@@ -24,8 +27,9 @@ Hard guardrails — a PR breaking any of these should be rejected:
   a socket).
 - **No code from the cloud MCP.** Do not copy code, patterns, or dependencies from
   `Comfy-Org/comfy-cloud-mcp-server` — a multi-tenant HTTP service with per-session state,
-  signed URLs, analytics, and a cloud API client, none of which apply here. This repo is
-  local-only, single-process, with no filesystem/multi-tenancy concerns to design around.
+  storage, analytics, and a cloud API client, none of which apply here. This repo's narrow
+  same-listener signed download capability is locally implemented and process-scoped; it is
+  not permission to import the cloud server's session/filesystem architecture.
 
 A tool may COMPOSE more than one passthrough when the value is in the sequence, not new
 logic — `fetch_template` runs `templates fetch` then `validate`, telling the caller whether
@@ -74,6 +78,22 @@ The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
 handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
 
+The third is the remote MCP **filesystem boundary** (`file_transfer.py`). Its public schema follows
+ComfyCloud's command-oriented contract: `upload_file(file_path, client_os)` treats `file_path` as
+client-local. stdio passes that path directly to `comfy upload`; HTTP mints a five-minute,
+single-use, credential-free PUT command on the SAME FastMCP listener. That route stages at most
+50 MiB owner-only, calls the same guarded `ComfyCliClient` upload runner, returns
+`{name, subfolder, type}`, and always removes scratch. In the other direction, HTTP
+`fetch_outputs` first calls `comfy download` into owner-only scratch, then publishes only contained
+regular files through a five-minute HMAC-signed URL and one `client_os`-selected command. stdio keeps
+direct output paths. Behind a reverse proxy, both directions derive the complete client-facing
+scheme/Host/port per request from `Forwarded` or `X-Forwarded-*`; never mint an internal or
+port-stripped capability URL. If the proxy strips those fields, its launcher may map the
+authoritative upstream origin to `COMFY_MCP_PUBLIC_URL`; validate it as a credential-free HTTP(S)
+origin and keep platform-specific environment names outside this package. This is MCP protocol adaptation, not an alternate ComfyUI client: bytes still
+enter/leave ComfyUI only through comfy-cli; never add a second server, storage API, per-session
+filesystem, base64-in-tool fallback, or direct ComfyUI HTTP call.
+
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` — differ where
 the engine's own shape differs, and those differences are load-bearing: `comfy generate`
 always spends, so it always prompts and honors `spend.auto_confirm`, while `comfy
@@ -99,36 +119,106 @@ custom nodes included — not a static catalog.
 
 ## Module layout
 
-`server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the `--json-stream`
-machinery, the spend-consent plumbing) and every `@mcp.tool()`. Ten **leaf** modules sit
-under it — none imports `server`, so the dependency edges only ever point one way:
+`server/` is the application package. Its public package API is deliberately small:
+`server/__init__.py` exports only `mcp`, `main`, and the 40 tool callables;
+`server/tools.py` holds the explicit tool export list without wrapping or duplicating the
+callables. The tightly coupled runner state, envelope parser, `--json-stream`
+machinery, consent plumbing, tool implementations, and startup logic remain private in
+`server/_internal.py`. Tests that exercise private behavior import that owning module
+explicitly; do not re-export private helpers from `server/__init__.py`.
+
+`McpApplicationBuilder` creates the one FastMCP instance in the private composition root;
+stdio and HTTP are transport adapters selected after registration. Leaf business/client
+modules do not import the server package, so dependency edges only point inward from the
+composition root. User-entry and application-composition modules live with that root under
+`server/`; public model/exception types and reusable leaf support stay at package level.
+`server/remote.py` receives the already-built application and never constructs a server or
+registers a tool; the private runtime imports it only inside the explicit `serve` branch,
+after initialization.
 
 | Module | Owns |
 |---|---|
+| `server/__init__.py` | stable public Python API: `mcp`, `main`, and the 40 registered tool callables; no private runtime names |
+| `server/tools.py` | explicit public tool export list; the objects are the exact callables registered by the private runtime |
+| `server/cli.py` | the console script's human argv surface — `--help`, `--version`, and validated `serve` options — plus the installed-metadata version lookup (`_version`) |
+| `server/config.py` | immutable Remote MCP listener configuration (`COMFY_MCP_*`), including the non-loopback Host-header policy. It never owns or reads the `COMFYUI_*` target |
+| `server/instructions.py` | the `INSTRUCTIONS` constant handed to `FastMCP(..., instructions=...)` — client-handshake text |
+| `server/mcp_app.py` | the minimal `McpApplicationBuilder`; owns name/version/base instructions and performs the repository's only `FastMCP(...)` construction |
+| `server/remote.py` | transport-only adapter: calls `http_app()` on the supplied shared FastMCP instance and composes it with uvicorn; owns no tools, models, client, or application factory |
+| `server/_internal.py` | private composition root, guarded runners, envelope/stream machinery, consent state, tool implementations, and startup logic |
+| `file_transfer.py` | remote MCP filesystem adapter: Cloud-compatible single-use upload commands/routes plus same-listener signed output tokens, containment, expiry, and cleanup; no ComfyUI I/O |
 | `textutil.py` | pure text helpers: `_tail` / `_stream_tail` (bounded stream tails) and `_redact_url` (userinfo masking) |
 | `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
-| `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` failure log (its config, its module state, and `_log_failure`) **and the URL scrubbers** — `_scrub_text` / `_scrubbed_stream_tail` also mask credentials on the way to the MCP CLIENT, not just to disk |
-| `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — client-handshake text |
+| `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` observer: `_log_failure` publishes immutable `_FailureEvent`s and the JSONL observer owns config, rotation, permissions and lazy file state. Its URL scrubbers also mask credentials on the way to the MCP CLIENT and disk |
 | `errors.py` | `ComfyCliError`; the "nothing recorded to stop" detector; the `error.details` renderer + per-field char cap |
 | `clitext.py` | comfy-cli **human-output** parsing for verbs with no envelope — `Saved:`-block/install-failure extraction, `plain_ok` synthesis, missing-verb/-option probes, `install_node`'s per-pack verdict, echoed-argv forgery guards. Its extractors are the documented cm-cli contract (see architecture rule above) — move or edit byte-for-byte |
-| `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload paths) |
+| `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload path) |
 | `target.py` | remote-target resolution/redaction/provenance for run/job tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, and divergence notes on `system_stats`/`free_memory` so an agent doesn't gate a remote run on local numbers |
 | `params.py` | param/slot marshaling into comfy-cli argv for `generate`/`run-template`/`set-slot`/`vary`, incl. the structured slot machinery — `SlotOverride`/`SlotVariants` are this module's public TYPES (carve-out below) |
-| `cli.py` | the console script's own argv surface — the `--help` / `--version` text a HUMAN who types `comfy-mcp` in a terminal gets, plus the installed-metadata version lookup (`_version`) behind it. That lookup is the SINGLE answer to "which release is this?": `server._server_version` delegates to it for the handshake's `serverInfo.version`, so the string a client displays is the string the terminal prints |
+| `client/protocols.py` | `ComfyCliClient`, the outbound engine port used by all application/tool code |
+| `client/subprocess_client.py` | the concrete client delegating to the guarded sync/raw/async/streaming subprocess runners; imports no MCP server |
+| `client/context.py` | lazy default composition and request-safe `ContextVar` injection; concurrent requests never share a mutable current-client field |
 
-`server` reaches them **module-qualified** (e.g. `failure_log._log_failure(...)`) and
-re-exports no BEHAVIOR: patching a moved name on `server` would silently patch nothing.
-**Patch the owning module** (`monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", …)`),
-not `server` — the wrong one now raises `AttributeError`. Carve-out: public exception/model
-TYPES (`ComfyCliError`, `SlotOverride`, `SlotVariants`) ARE name-imported — they ride many
+## Transport modes and logging
+
+No arguments serves the shared 40-tool FastMCP application over stdio. `comfy-mcp serve`
+passes that exact instance to FastMCP 4's
+`http_app(json_response=True, stateless_http=True)` and hands the SDK-owned ASGI app to an
+explicit `uvicorn.Server`. Do not create a second FastMCP instance or transport-specific
+tool registry. Do not call
+`MCPServer.run(transport="streamable-http")`, copy legacy SSE, or patch a private session
+method. Never implement JSON-RPC, sessions, SSE, WebSockets, or reconnect here. Both modes
+therefore share tool names, schemas, returns, instructions/version, consent, and
+`ComfyCliClient`; the Remote layer must never shell out independently.
+
+The two non-MCP routes are registered with FastMCP's public `custom_route` on that shared
+application: `/api/uploads/{token}` consumes one short-lived PUT and forwards owner-only scratch
+through the guarded upload runner; `/downloads/{token}/{filename}` serves only HMAC-signed,
+unexpired files that `comfy download` placed inside its owner-only scratch directory. They use the
+same ASGI app and port. Reverse proxies must forward `/api/uploads/` and `/downloads/` with the
+configured MCP path, plus the client-facing scheme, Host, and port via `Forwarded` or
+`X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Port`. Do not build a second file listener
+or patch SDK sessions to carry files.
+
+FastMCP 4 serves both modern sessionless and legacy handshake protocols. Legacy consent uses
+`ctx.elicit`; modern consent returns `InputRequiredResult` and resumes from FastMCP-sealed
+request state. Classify the negotiated revision only through `mcp_types.version`'s explicit
+modern and handshake registries; an unknown revision fails closed rather than falling back to
+the legacy interaction model. Every gate remains fail-closed and request-local. Do not treat a caller's
+`confirm_*` argument as human consent when either interactive route is available.
+
+The MCP listener (`COMFY_MCP_HOST`/`PORT`/`PATH`) and the ComfyUI target
+(`COMFYUI_URL` or `COMFYUI_HOST`/`PORT`) are different address spaces. Default the listener
+to loopback. A non-loopback bind requires explicit allowed Host-header patterns and still is
+not authentication; deployment beyond a trusted network belongs behind an authenticated TLS
+reverse proxy.
+
+Keep console logs on stderr in both modes. Under stdio, stdout is the JSON-RPC channel; under
+HTTP it is technically free but deliberately stays unused so behavior is predictable across
+launch modes. Child stdout remains captured data for `envelope/1` parsing only. The opt-in
+failure publisher has one JSONL observer. While disabled it returns before any filesystem
+effect; while enabled it remains non-propagating and file-only. Upload request bytes are never
+failure-event fields. Keep this diagnostic-only—do
+not introduce a general event bus.
+
+The private runtime reaches leaf modules **module-qualified** (for example,
+`failure_log._log_failure(...)`). Patch the owning module
+(`monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", …)`), not the private runtime — the
+wrong one raises `AttributeError`. Tests for runner/tool internals import
+`comfy_mcp.server._internal` explicitly and patch it because that module genuinely owns the
+tightly coupled runtime state. Public API tests import `comfy_mcp.server` and must assert
+that private names stay absent. Carve-out: exception/model TYPES (`ComfyCliError`,
+`SlotOverride`, `SlotVariants`) are name-imported inside `_internal` because they ride many
 `except`/`isinstance`/tool-signature sites and hold no mutable state a test could patch the
-wrong copy of, so that risk doesn't apply.
+wrong copy of.
 
 ## Toolchain
 
 Python ≥ 3.10; pip + setuptools (no `uv.lock` here — comfy-cli bundles `uv` and may write a
 stray one into the working directory; gitignored). **comfy-cli is deliberately NOT a declared
 dependency** — don't "fix" that by adding one; `pyproject.toml`'s comment says why.
+FastMCP is deliberately exact-pinned to `4.0.0b3` and the protocol engine to `mcp==2.0.0`
+while FastMCP 4 is beta; upgrade the pair in a dedicated, fully tested change.
 
 ```bash
 pip install -e '.[dev]'   # install with dev extras (pytest, ruff)
@@ -147,14 +237,38 @@ Tests live in `tests/` and mock comfy-cli — no real ComfyUI, no `comfy` binary
 and the parser are exercised directly (`test_wrapper.py`, `test_parser.py`); each tool group
 has its own file. Add a tool's test with it.
 
-**Mock comfy-cli via the shared fixtures in `tests/conftest.py`, never a hand-rolled stub.**
-They mirror how `server` spawns the CLI: a spawn-signature change is one edit, not a sweep:
+Remote configuration and same-instance adapter tests live in `test_remote_transport.py`;
+in-process FastMCP business flows live in `test_fastmcp_app.py`; real-loopback Streamable HTTP
+integration lives in `test_remote_http.py`; transfer edge cases live in `test_file_transfer.py`.
+The real stdio process flow belongs to the opt-in `tests/e2e/test_smoke.py` suite and uses the real
+comfy-cli plus a live local ComfyUI, never a generated fake executable. The default in-process
+and HTTP flows cover the full upload/submit/poll/fetch path and the
+same 40-tool discovery result. Also cover modern+legacy negotiation, pre-initialize/stale
+requests, concurrency, native tool errors, signed-link tampering/expiry, scratch containment
+and cleanup, failure observation/non-disclosure, and clean lifecycle. Never
+label fake-engine coverage a real ComfyUI end-to-end test.
 
+`tests/e2e/test_remote_mcp.py` is the separately opt-in deployed-HTTP check. It
+requires `COMFY_MCP_TEST_URL` plus a server-side
+`COMFY_MCP_TEST_WORKFLOW`, behaves only as an MCP client, and covers real
+upload → submit → poll → signed fetch through a reachable endpoint. Keep it
+environment-driven: never hardcode a deployment hostname, port, credential, or
+server filesystem path.
+
+**Mock comfy-cli via the shared fixtures in `tests/conftest.py`, never a hand-rolled stub.**
+They mirror how `server._internal` spawns the CLI: a spawn-signature change is one edit, not a sweep:
+
+- `fake_comfy_client` — the shared `ComfyCliClient` port double for in-process
+  application and request-binding tests; never define a second client fake in a test module.
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
+- `patched_comfy_run_sequence(replies) -> calls` — ordered responses at the
+  guarded runner boundary for multi-call composition tests.
 - `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) -> calls` — the plain
   `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/`encoding` per
   call for exact-argv checks; `on_spawn(cmd)` fires at spawn so the one verb whose answer is
   a FILE writes its `--output`.
+- `patched_run_sequence(replies) -> calls` — the same plain spawn model with one
+  ordered process result per call; an exhausted script fails immediately.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for verbs that print
   human text with no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
@@ -163,6 +277,8 @@ They mirror how `server` spawns the CLI: a spawn-signature change is one edit, n
   buffer limits stay exercised.
 - `blocking_stream(first_lines, stderr_text=…) -> procs` — its TIMEOUT counterpart: a child
   that BLOCKS with both pipes open, `wait()` parked until `kill()` — or a 30s net — EOFs them.
+- `stderr_blocking_stream(first_lines) -> procs` — stdout EOFs while stderr
+  remains blocked, for the post-EOF cancellation edge.
 - `patched_async_run(stdout=…, returncode=…, stderr=…, hang=…, on_spawn=…) -> procs` — the
   plain-JSON *async* path (`_run_comfy_async`): same spawn and real `StreamReader` pipes as
   `patched_stream`, but parses the capture once at the end, not line-by-line. `hang=True`
@@ -180,9 +296,9 @@ worker, so a client giving up left the child running; it carries the longest-liv
 `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 
-A local stub is justified only where the call genuinely differs — the `comfy --version` probe
-(its own kwargs), multi-call sequenced replies, and `test_wrapper.py`'s `_StderrBlockingProc`
-(stdout EOFs fast while `stderr.read()` blocks, which neither streaming fixture models).
+A genuinely different call shape is not an exception to fixture sharing. Extend
+`tests/conftest.py` with the required sequence, blocking, port, or client behavior and consume
+that fixture from the test module; never define a local comfy-cli test double.
 
 ## Destined-public hygiene
 

@@ -20,7 +20,7 @@ import re
 
 import pytest
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 _SECTION = "## Which address variable do I want?"
 # Anchored at both ends so the slice cannot start at a DEMOTED (`### …`) copy of
@@ -28,9 +28,12 @@ _SECTION = "## Which address variable do I want?"
 _SECTION_START = f"\n{_SECTION}\n"
 _SECTION_END = "\n## "
 
-# The package's own sources — every module `server` reaches, since a read of
-# comfy-cli's variable would breach the ownership split from any of them.
-_PACKAGE_SOURCES = sorted(pathlib.Path(server.__file__).resolve().parent.glob("*.py"))
+# The package's own sources — every module the private server implementation
+# reaches, since a read of comfy-cli's variable would breach the ownership split
+# from any of them. The implementation now lives one directory below the package
+# root, so keep relative paths to distinguish repeated names such as __init__.py.
+_PACKAGE_ROOT = pathlib.Path(server.__file__).resolve().parents[1]
+_PACKAGE_SOURCES = sorted(_PACKAGE_ROOT.rglob("*.py"))
 
 
 def _reads_env(source: str, name: str) -> bool:
@@ -78,10 +81,16 @@ def test_server_reads_the_comfyui_vars_and_not_comfy_local_url():
     documented "comfy-cli's, not ours" split would become a lie — and the whole
     argument for leaving the name alone would go with it.
     """
-    sources = {path.name: path.read_text(encoding="utf-8") for path in _PACKAGE_SOURCES}
-    assert "server.py" in sources, "the package layout moved out from under this test"
+    sources = {
+        path.relative_to(_PACKAGE_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in _PACKAGE_SOURCES
+    }
+    assert "server/_internal.py" in sources, (
+        "the private server implementation moved out from under this test"
+    )
 
-    # Any module in the package, not specifically server.py: `_comfy_target` (the
+    # Any module in the package, not specifically server/_internal.py:
+    # `_comfy_target` (the
     # actual reader of these three) lives in target.py post-extraction, and the
     # ownership claim this guards is about the PACKAGE, not one file within it —
     # the same reasoning the COMFY_LOCAL_URL check below already applies.

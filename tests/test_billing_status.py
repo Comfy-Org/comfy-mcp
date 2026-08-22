@@ -31,7 +31,7 @@ import inspect
 import pytest
 from conftest import envelope
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 
 def _billing_status():
