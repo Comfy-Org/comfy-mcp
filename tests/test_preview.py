@@ -100,6 +100,18 @@ def test_preview_media_does_not_inline_a_non_png_engine_path(patched_run, tmp_pa
     assert server.preview_media("clip.mp4") == [metadata]
 
 
+def test_preview_media_does_not_inline_an_oversized_preview(
+    patched_run, tmp_path, monkeypatch
+):
+    rendered = tmp_path / "clip.preview.png"
+    rendered.write_bytes(b"x" * 11)
+    metadata = {"kind": "video", "preview": str(rendered)}
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 10)
+    patched_run(envelope(data=metadata))
+
+    assert server.preview_media("clip.mp4") == [metadata]
+
+
 @pytest.mark.parametrize(
     "media_path",
     ["--help", "clip\x00.mp4", "x" * (argv._MAX_PATH_ARG_LEN + 1)],

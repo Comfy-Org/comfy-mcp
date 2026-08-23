@@ -6306,7 +6306,7 @@ def _select_inline_images(paths: list[str]) -> list[str]:
             size = os.path.getsize(path)
         except OSError:
             continue
-        if selected and total + size > _INLINE_IMAGE_MAX_BYTES:
+        if total + size > _INLINE_IMAGE_MAX_BYTES:
             break
         selected.append(path)
         total += size
