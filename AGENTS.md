@@ -152,7 +152,8 @@ They mirror how `server` spawns the CLI: a spawn-signature change is one edit, n
 
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
 - `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…, replies=…) -> calls` — the plain
-  `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/`encoding` per
+  `--json` path (`subprocess.Popen` + bounded `communicate`); `calls` records
+  `cmd`/`env`/`timeout`/`encoding` per
   call for exact-argv checks; `on_spawn(cmd)` fires at spawn so the one verb whose answer is
   a FILE writes its `--output`.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for verbs that print
