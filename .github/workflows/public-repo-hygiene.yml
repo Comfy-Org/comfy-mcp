@@ -22,8 +22,15 @@ jobs:
   hygiene:
     permissions:
       contents: read
-    uses: Comfy-Org/github-workflows/.github/workflows/public-repo-hygiene.yml@4df9bf684ee45d5baf2a49d2068685ce780a8609 # github-workflows main (4df9bf6)
+    uses: Comfy-Org/github-workflows/.github/workflows/public-repo-hygiene.yml@a02bb3e4803556eebb945b62a8b00bbc06294798 # github-workflows main (a02bb3e)
     with:
       # REQUIRED, and must equal the `uses:` SHA above — the reusable asserts
       # they match, which is what pins the checker to the reviewed commit.
-      workflows_ref: 4df9bf684ee45d5baf2a49d2068685ce780a8609
+      workflows_ref: a02bb3e4803556eebb945b62a8b00bbc06294798
+      # `ECMA-48` is the ANSI escape-sequence standard that clitext.py and
+      # test_compat.py cite when parsing CSI parameter bytes. It has the
+      # LETTERS-DIGITS shape the checker reads as an internal ticket id, and the
+      # built-in allowlist covers RFC/ISO/PEP/CVE prefixes but not ECMA, so
+      # every scan here reported it. This input is additive: the built-in list
+      # still applies, and a caller can only widen it, never shrink it.
+      ticket_allowlist: ECMA-48
