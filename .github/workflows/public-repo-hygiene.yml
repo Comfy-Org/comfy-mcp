@@ -4,10 +4,18 @@
 #
 # Why the checker is not in this repo any more: the old job ran
 # the checker straight out of the PR's own checkout, so a PR could widen the
-# allowlist — or disable the scan — and go green. The reusable loads the
-# checker from the pinned `workflows_ref` commit instead, so a PR here cannot
-# reach it through this workflow's inputs. The allowlist is deliberately NOT
-# an input, for the same reason.
+# known-public repo allowlist — or disable the scan — and go green. The
+# reusable loads the checker from the pinned `workflows_ref` commit instead,
+# so a PR here cannot reach it through this workflow's inputs. The known-public
+# repo/team allowlist is deliberately NOT an input, for the same reason.
+#
+# One allowlist IS an input: `ticket_allowlist` in the `with:` block below. It
+# reaches only the generic ticket-shape check (LETTERS-DIGITS tokens), never
+# the repo allowlist; it is additive (the checker unions it with its built-in
+# entries, so a caller can add a token but never drop one); and every entry
+# sits in this file's diff. That diff is the control, so review this block the
+# way the reusable's own header asks: a PR that introduces a ticket-shaped
+# token AND its allowlist entry in the same change is the bypass to look for.
 #
 # The pin is kept fresh by bump-public-repo-hygiene-callers.yml once this repo
 # is enrolled in the PUBLIC_REPO_HYGIENE_CALLERS roster.
@@ -29,8 +37,11 @@ jobs:
       workflows_ref: a02bb3e4803556eebb945b62a8b00bbc06294798
       # `ECMA-48` is the ANSI escape-sequence standard that clitext.py and
       # test_compat.py cite when parsing CSI parameter bytes. It has the
-      # LETTERS-DIGITS shape the checker reads as an internal ticket id, and the
-      # built-in allowlist covers RFC/ISO/PEP/CVE prefixes but not ECMA, so
-      # every scan here reported it. This input is additive: the built-in list
-      # still applies, and a caller can only widen it, never shrink it.
+      # LETTERS-DIGITS shape the checker reads as an internal ticket id, and
+      # the checker's built-in prefix carve-outs (CVE/CWE/PEP/RFC/ISO/UTF) do
+      # not include ECMA, so every scan here reported it. Entries here are
+      # matched as EXACT tokens, case-insensitively, and only the built-in
+      # prefixes clear by prefix — a bare `ECMA` entry suppresses nothing
+      # (checked against the checker at the pinned SHA), so a citation of a
+      # different ECMA standard would need its own entry.
       ticket_allowlist: ECMA-48
