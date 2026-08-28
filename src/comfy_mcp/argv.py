@@ -164,8 +164,9 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
 # ``run_workflow`` / ``validate_workflow`` / the four other ``workflow_path``
 # tools, ``download_model``'s ``relative_path`` and ``filename``,
 # ``fetch_template``'s / ``emit_partner_workflow``'s / ``partner_generate``'s
-# ``out_path``, ``fetch_outputs``'s and ``vary_workflow``'s ``out_dir``, each
-# entry of ``upload_file``'s ``paths``, and ``search_models``' ``folder``.
+# ``out_path``, ``preview_media``'s ``media_path`` / ``out_path``,
+# ``fetch_outputs``'s and ``vary_workflow``'s ``out_dir``, each entry of
+# ``upload_file``'s ``paths``, and ``search_models``' ``folder``.
 # ``download_model``'s ``url`` is the one path-adjacent value with a ceiling of
 # its own (:data:`_MAX_URL_LEN`), passed to the same helper as an explicit
 # ``limit``. Keep this list in sync — the SCOPE note at :data:`_MAX_URL_LEN`

@@ -53,7 +53,8 @@ here; it breaks the next release's registry publish.
 **What it does:**
 
 - 🖼️ **Generate** — run a workflow JSON (API-format or UI export), or go text-prompt → image in one call.
-- ⏱️ **Monitor jobs** — submit async, then wait / watch / cancel, read the failure verdict, and collect the output PNGs.
+- ⏱️ **Monitor jobs** — submit async, then wait / watch / cancel, read the failure verdict, and collect the output files.
+- 🎞️ **Preview media** — turn video into a contact sheet and audio into a waveform the agent can inspect.
 - 🔍 **Introspect your live install** — search the nodes, models, and templates your ComfyUI *actually* has (custom nodes included), not a static catalog.
 - 🧩 **Build workflows** — validate a graph, edit a template's slots, and fan one workflow into variants.
 - ♻️ **Manage ComfyUI** — launch / stop / restart the server, tail its logs, and stage input assets.
@@ -81,7 +82,7 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 40 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 41 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -146,6 +147,10 @@ Four steps take you from a fresh install to your first generated image.
 `fetch_outputs(prompt_id, out_dir)` **copies** a finished job's outputs into any directory you
 name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
 the originals stay in the ComfyUI workspace.
+
+For video or audio output, pass the downloaded file to `preview_media`. It asks comfy-cli to
+render a PNG contact sheet or waveform and returns that image inline, so the agent can inspect
+the result without trying to embed the original media file in the MCP response.
 
 ## Upgrading from `comfy-local-mcp`
 
@@ -954,13 +959,13 @@ Set it in the client registration `env` block, same as `COMFY_BIN`:
 
 ## Tools
 
-40 tools, grouped below by what they do. Every tool runs `comfy` with the global
+41 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
 instructions say the same thing): an input workflow file is always `workflow_path`, an output
-file is `out_path`, an output directory is `out_dir`, a registry lookup key is `name`, and a job
-handle is `prompt_id`.
+file is `out_path`, an input media file is `media_path`, an output directory is `out_dir`, a
+registry lookup key is `name`, and a job handle is `prompt_id`.
 
 ### Run and monitor
 
@@ -973,6 +978,7 @@ handle is `prompt_id`.
 | `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=True` (the default) streams the run's live progress as MCP progress notifications, the same way `run_workflow` / `job(action="watch")` do, so a long template run is not a silent block; `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job(action="status", prompt_id="", timeout_seconds=None)` | `comfy jobs status/watch/cancel/ls <prompt_id>` | One grouped tool over the six former `job_status`/`wait_for_job`/`watch_job`/`get_execution_error`/`cancel_job`/`get_queue` tools — pick a behavior with `action`. `"status"` (default) polls status + outputs. `"error"` returns a compact failure verdict — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; `error: None` on a healthy prompt. Failures comfy-cli diagnosed itself rather than ComfyUI (a `server_died` crash mid-run) carry no node-level fields, so the verdict also reports `error_code` — comfy-cli's own code, `None` on an ordinary node failure — with its message backfilling `exception_message`. `"wait"` polls (bounded, default 25.0s) until a job reaches a terminal status, returning a `{"timed_out": True, …}` payload on expiry — chain several rather than one long call. `"watch"` streams live progress (bounded, default 600.0s) as MCP progress notifications, same `timed_out` shape except `status` is a live `{progress, total, nodes_done}` snapshot. `"cancel"` stops a queued/running job. `"queue"` lists known jobs (Comfy Cloud-tracked rows filtered out, since this server never drives them; follows a configured remote like the other job actions). `prompt_id` is required for every action but `"queue"`; `timeout_seconds` only for `"wait"`/`"watch"` — passing either where the action does not use it is rejected rather than silently ignored. |
 | `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+| `preview_media(media_path, out_path="", grid="4x3", width=480, inline_image=True)` | `comfy preview <media_path> [--out <out_path>] --grid <COLSxROWS> --width <pixels>` | Render a local image thumbnail, video contact sheet, or audio waveform as PNG. comfy-cli owns media classification and rendering; this server does not parse media or call ffmpeg. By default the result contains comfy-cli's metadata followed by the generated PNG as inline MCP image content; `inline_image=False` returns metadata only. `grid` controls video frame sampling, and `out_path` is optional because comfy-cli otherwise writes `<media>.preview.png`. The input must exist on the MCP host, so for a remote job call `fetch_outputs` first and pass one of its downloaded paths here. Relative paths follow `COMFY_PROJECT`. |
 
 ### Resource management
 
