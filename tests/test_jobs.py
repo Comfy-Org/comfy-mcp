@@ -34,9 +34,15 @@ from pathlib import Path
 import pytest
 from conftest import _OK_STREAM, _RecordingCtx, envelope
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
-_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
+_SERVER_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "comfy_mcp"
+    / "server"
+    / "_internal.py"
+)
 
 
 # --- R2: the off-load proof ---------------------------------------------------
@@ -1170,4 +1176,4 @@ def test_job_tool_docstring_within_its_own_token_budget():
             # LOCAL there would be simply wrong (test_address_env_docs.py).
             assert not doc.strip().splitlines()[0].startswith("LOCAL")
             return
-    pytest.fail("job() tool not found in server.py")
+    pytest.fail("job() tool not found in server/_internal.py")
