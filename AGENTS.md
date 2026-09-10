@@ -94,8 +94,8 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-The local differentiator: discovery (`nodes`, `search_models`) reads the **live install** —
-custom nodes included — not a static catalog.
+The local differentiator: discovery (`nodes`, `search_models`) reads the **live install** by
+default, custom nodes included; `nodes` can instead read a saved `object_info` snapshot.
 
 ## Module layout
 
@@ -151,8 +151,9 @@ has its own file. Add a tool's test with it.
 They mirror how `server` spawns the CLI: a spawn-signature change is one edit, not a sweep:
 
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
-- `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) -> calls` — the plain
-  `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/`encoding` per
+- `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…, replies=…) -> calls` — the plain
+  `--json` path (`subprocess.Popen` + bounded `communicate`); `calls` records
+  `cmd`/`env`/`timeout`/`encoding` per
   call for exact-argv checks; `on_spawn(cmd)` fires at spawn so the one verb whose answer is
   a FILE writes its `--output`.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for verbs that print
@@ -181,7 +182,7 @@ worker, so a client giving up left the child running; it carries the longest-liv
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 
 A local stub is justified only where the call genuinely differs — the `comfy --version` probe
-(its own kwargs), multi-call sequenced replies, and `test_wrapper.py`'s `_StderrBlockingProc`
+(its own kwargs) and `test_wrapper.py`'s `_StderrBlockingProc`
 (stdout EOFs fast while `stderr.read()` blocks, which neither streaming fixture models).
 
 ## Destined-public hygiene

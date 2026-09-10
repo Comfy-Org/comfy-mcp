@@ -2273,6 +2273,25 @@ def test_validate_workflow_returns_results_for_valid(patched_run):
     assert calls[0]["cmd"][4:] == ["validate", "--workflow", "wf.json"]
 
 
+def test_validate_workflow_forwards_object_info_path(patched_run):
+    """A saved catalog reaches comfy-cli through its existing `--input` option."""
+    calls = patched_run(
+        {"type": "envelope", "ok": True, "data": {"valid": True, "nodes": 7}}
+    )
+
+    assert server.validate_workflow("wf.json", "catalog.json") == {
+        "valid": True,
+        "nodes": 7,
+    }
+    assert calls[0]["cmd"][4:] == [
+        "validate",
+        "--workflow",
+        "wf.json",
+        "--input",
+        "catalog.json",
+    ]
+
+
 def test_validate_workflow_raises_with_error_code(patched_run):
     """A failure with NO report payload keeps raising comfy-cli's error code.
 
@@ -2973,9 +2992,12 @@ def test_tool_arguments_follow_the_naming_convention():
     outlier this test was written alongside). Clients introspect these schemas
     fresh each session, so the schema IS the contract.
     """
+    tool_parameters = {
+        tool.name: tool.parameters for tool in server.mcp._tool_manager.list_tools()
+    }
     schemas = {
-        tool.name: tool.parameters.get("properties", {})
-        for tool in server.mcp._tool_manager.list_tools()
+        name: parameters.get("properties", {})
+        for name, parameters in tool_parameters.items()
     }
 
     # Every tool that consumes a workflow FILE names it `workflow_path`.
@@ -2987,6 +3009,12 @@ def test_tool_arguments_follow_the_naming_convention():
         "vary_workflow",
     ):
         assert "workflow_path" in schemas[name]
+
+    # A saved node catalog has one spelling across both tools that consume it.
+    for name in ("nodes", "validate_workflow"):
+        assert "object_info_path" in schemas[name]
+        assert schemas[name]["object_info_path"].get("default") == ""
+        assert "object_info_path" not in tool_parameters[name].get("required", [])
 
     # Output file -> `out_path`; output directory -> `out_dir`.
     for name in ("fetch_template", "partner_generate"):
@@ -6697,6 +6725,27 @@ def test_validate_workflow_rejects_option_like_path(monkeypatch):
 
     with pytest.raises(server.ComfyCliError, match=r"leading '-'.*\./"):
         server.validate_workflow("--help")
+
+
+@pytest.mark.parametrize(
+    ("object_info_path", "match"),
+    [
+        ("--catalog.json", r"object_info_path.*leading '-'"),
+        ("catalog\0.json", r"object_info_path.*embedded NUL"),
+        ("c" * (argv._MAX_PATH_ARG_LEN + 1), r"object_info_path.*exceeds"),
+        ("/tmp/\ud800.json", r"object_info_path.*cannot be encoded"),
+    ],
+    ids=("option-like", "nul", "oversized", "unencodable"),
+)
+def test_validate_workflow_rejects_invalid_object_info_path_before_spawn(
+    patched_run, object_info_path, match
+):
+    calls = patched_run(envelope(data={"valid": True}))
+
+    with pytest.raises(server.ComfyCliError, match=match):
+        server.validate_workflow("wf.json", object_info_path)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("wait", [True, False])
