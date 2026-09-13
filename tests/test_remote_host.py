@@ -32,7 +32,8 @@ import subprocess
 import pytest
 from conftest import _OK_STREAM, envelope
 
-from comfy_mcp import server, target
+from comfy_mcp import target
+from comfy_mcp.server import _internal as server
 
 # --- _comfy_target env parsing ---------------------------------------------
 
@@ -498,23 +499,22 @@ def test_upload_file_forwards_host_port(patched_async_run, monkeypatch):
 
     While ``upload`` was off the allowlist, a session with a remote configured
     staged images into the LOCAL install's ``input`` dir and the remote run then
-    failed on a filename it could not see. The flags go AFTER the positionals —
-    Click parses options wherever they appear, and a dash-leading path is refused
-    up front, so the variadic file list cannot swallow them.
+    failed on a filename it could not see. The flags go AFTER the positional —
+    Click parses options wherever they appear, and the single guarded
+    ``file_path`` cannot swallow them.
     """
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     monkeypatch.setenv("COMFYUI_PORT", "9001")
-    procs = patched_async_run(envelope(data={"uploaded": 2}))
+    procs = patched_async_run(envelope(data={"uploaded": 1}))
 
-    assert _upload_file(["a.png", "b.png"], overwrite=True) == {"uploaded": 2}
+    assert _upload_file("/client/a.png", "linux") == {"uploaded": 1}
 
     cmd = procs[0].cmd
     assert cmd[1:4] == ["--json", "--where", "local"]  # global prefix unchanged
     assert cmd[4:] == [
         "upload",
-        "a.png",
-        "b.png",
-        "--overwrite",
+        "/client/a.png",
+        "--no-overwrite",
         "--host",
         "gpu.example",
         "--port",
@@ -522,13 +522,37 @@ def test_upload_file_forwards_host_port(patched_async_run, monkeypatch):
     ]
 
 
+def test_upload_file_keeps_remote_target_forwarding(
+    patched_async_run, monkeypatch, tmp_path
+):
+    """The shared upload runner forwards the target in stdio as well as HTTP."""
+
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    source = tmp_path / "input.png"
+    source.write_bytes(b"remote-input")
+    procs = patched_async_run(envelope(data={"uploads": []}))
+
+    _upload_file(str(source), "darwin")
+
+    assert procs[0].cmd[4:] == [
+        "upload",
+        str(source),
+        "--no-overwrite",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+    assert source.read_bytes() == b"remote-input"
+
+
 def test_upload_file_local_default_is_byte_identical(patched_async_run):
     """Adding `upload` to the allowlist changes NOTHING with no remote set."""
     procs = patched_async_run(envelope(data={"uploaded": 1}))
 
-    _upload_file(["only.png"])
+    _upload_file("/client/only.png", "linux")
 
-    assert procs[0].cmd[4:] == ["upload", "only.png", "--no-overwrite"]
+    assert procs[0].cmd[4:] == ["upload", "/client/only.png", "--no-overwrite"]
 
 
 def test_upload_file_old_comfy_cli_gets_an_upgrade_instruction(
@@ -563,7 +587,7 @@ def test_upload_file_old_comfy_cli_gets_an_upgrade_instruction(
     )
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        _upload_file(["a.png"])
+        _upload_file("/client/a.png", "linux")
 
     message = str(excinfo.value)
     assert "1.14.0" in message
@@ -585,7 +609,7 @@ def test_upload_file_real_failure_keeps_its_own_message(patched_async_run, monke
     )
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        _upload_file(["a.png"])
+        _upload_file("/client/a.png", "linux")
 
     message = str(excinfo.value)
     assert "no server" in message
@@ -605,7 +629,7 @@ def test_upload_file_malformed_target_raises_and_never_spawns(
     procs = patched_async_run(envelope(data={"uploaded": 1}))
 
     with pytest.raises(server.ComfyCliError, match="scheme"):
-        _upload_file(["a.png"])
+        _upload_file("/client/a.png", "linux")
 
     assert procs == []  # never spawned comfy-cli
 

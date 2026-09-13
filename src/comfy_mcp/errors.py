@@ -55,7 +55,8 @@ class ComfyCliError(RuntimeError):
     running out of patience: the child's whole process group was killed at the
     ``timeout=`` we handed ``communicate``. A caller that *chose* that budget
     can then tell its own deadline firing from a genuine comfy-cli error without
-    matching on the message — ``job(action="wait")`` (:func:`server._job_wait_sync`),
+    matching on the message — ``job(action="wait")``
+    (``server._internal._job_wait_sync``),
     which caps each poll to the time left on the caller's bound, is exactly that
     caller.
 

@@ -31,13 +31,13 @@ import json
 
 import pytest
 from conftest import _OK_STREAM, _RecordingCtx, envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 
 def _run_template(*args, **kwargs):
@@ -61,7 +61,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     Deliberately a local copy of ``test_partner_generate``'s fake rather than a
     shared one: the two tools' consent paths are asserted independently, so a
@@ -84,10 +84,10 @@ class _FakeCtx:
     async def report_progress(self, progress, total=None, message=None):
         self.progress.append({"progress": progress, "total": total, "message": message})
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()

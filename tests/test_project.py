@@ -32,9 +32,15 @@ from pathlib import Path
 import pytest
 from conftest import _OK_STREAM, envelope
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
-_SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "server.py"
+_SERVER_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "comfy_mcp"
+    / "server"
+    / "_internal.py"
+)
 
 
 def _boom(*args, **kwargs):
@@ -305,4 +311,4 @@ def test_project_tool_docstring_within_its_own_token_budget():
             est_tokens = len(doc) // 4
             assert est_tokens <= 150, f"project() docstring ~{est_tokens} est. tokens"
             return
-    pytest.fail("project() tool not found in server.py")
+    pytest.fail("project() tool not found in server/_internal.py")

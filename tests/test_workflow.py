@@ -30,7 +30,8 @@ import pytest
 from conftest import envelope
 from pydantic import ValidationError
 
-from comfy_mcp import argv, errors, params, server
+from comfy_mcp import argv, errors, params
+from comfy_mcp.server import _internal as server
 
 
 def test_list_workflow_slots_argv(patched_run):
@@ -1188,31 +1189,31 @@ def test_structured_slot_item_requires_both_fields(no_spawn):
 def test_slot_tools_advertise_the_union_item_type():
     """The MCP schema offers BOTH forms per item, so a client can send either.
 
-    `anyOf: [string, $ref]` is what makes the structured form discoverable at
-    all — a client reads the schema, not the docstring, to decide what to send.
+    FastMCP 4 dereferences the model into ``anyOf`` by default. The structured
+    object shape is what makes that form discoverable to a client.
     """
     tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
 
-    for name, param, model, value_field in (
-        ("set_workflow_slot", "overrides", "SlotOverride", "value"),
-        ("vary_workflow", "slots", "SlotVariants", "values"),
+    for name, param, value_field in (
+        ("set_workflow_slot", "overrides", "value"),
+        ("vary_workflow", "slots", "values"),
     ):
-        schema = tools[name].input_schema
+        schema = tools[name].parameters
         item = schema["properties"][param]["items"]
         assert {"type": "string"} in item["anyOf"]
-        assert {"$ref": f"#/$defs/{model}"} in item["anyOf"]
-
-        model_schema = schema["$defs"][model]
-        assert model_schema["properties"]["address"]["type"] == "string"
-        assert sorted(model_schema["required"]) == sorted(["address", value_field])
+        structured = next(
+            option for option in item["anyOf"] if option.get("type") == "object"
+        )
+        assert structured["properties"]["address"]["type"] == "string"
+        assert set(structured["required"]) == {"address", value_field}
 
     # No existing parameter was renamed or dropped.
-    assert set(tools["set_workflow_slot"].input_schema["properties"]) == {
+    assert set(tools["set_workflow_slot"].parameters["properties"]) == {
         "workflow_path",
         "overrides",
         "stdout",
     }
-    assert set(tools["vary_workflow"].input_schema["properties"]) == {
+    assert set(tools["vary_workflow"].parameters["properties"]) == {
         "workflow_path",
         "slots",
         "out_dir",
@@ -1220,10 +1221,10 @@ def test_slot_tools_advertise_the_union_item_type():
 
 
 def test_structured_slot_items_deserialize_through_the_mcp_boundary(patched_run):
-    """End-to-end through MCPServer: a JSON dict lands as the model, not a stray dict.
+    """End-to-end through FastMCP: a JSON dict lands as the model, not a stray dict.
 
     The direct-call tests above go through the same coercion helper but not
-    through MCPServer's own argument validation, which is what a real client
+    through FastMCP's own argument validation, which is what a real client
     actually exercises — and it is the union that has to hold there.
     """
     calls = patched_run(envelope(data={"modified": True}))

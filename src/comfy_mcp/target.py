@@ -351,10 +351,8 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     byte-identical to today.
 
     They go at the END of the subcommand args, past any positionals — Click
-    parses options wherever they appear, and ``upload``'s variadic file list
-    does not swallow them because they are dash-leading (a dash-leading PATH is
-    refused up front by :func:`argv._validate_upload_paths`, which is the same
-    property read from the other side).
+    parses options wherever they appear, including after ``upload``'s one
+    guarded file-path positional.
     """
     # Check the verb FIRST, then resolve the target. A malformed
     # COMFYUI_URL/PORT must not brick local-only verbs (server_info's `env`,

@@ -47,7 +47,7 @@ from pathlib import Path
 import pytest
 
 import comfy_mcp
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PYPROJECT = _ROOT / "pyproject.toml"
@@ -164,7 +164,15 @@ def test_runtime_dependencies_parse_as_expected():
     vacuously — the one failure mode a "this name is absent" test has.
     """
     names = {_requirement_name(req) for req in _runtime_dependencies()}
-    assert {"mcp", "pydantic", "anyio"} <= names, names
+    assert {"fastmcp", "mcp", "pydantic", "anyio", "uvicorn"} <= names, names
+
+
+def test_fastmcp_beta_and_protocol_engine_are_exact_pins():
+    """A beta framework/protocol pair must not drift under an unrelated install."""
+
+    dependencies = _runtime_dependencies()
+    assert "fastmcp==4.0.0b3" in dependencies
+    assert "mcp==2.0.0" in dependencies
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="no tomllib to compare against")
@@ -236,7 +244,7 @@ def test_readme_quickstart_installs_the_engine_alongside():
 
     Keyed on the exact command a user copies, with the floor read from
     `_MIN_COMFY_CLI_STR` rather than hardcoded — so raising the floor in
-    `server.py` fails here until the README says the new number, the same way
+    `server/_internal.py` fails here until the README says the new number, the same way
     the runtime error message does.
     """
     readme = _README.read_text(encoding="utf-8")
@@ -262,11 +270,11 @@ def test_no_document_pins_a_stale_comfy_cli_floor():
 
     The quickstart is keyed to `_MIN_COMFY_CLI_STR`, but the same pin is
     written out again in the README prerequisites and in `pyproject.toml`'s
-    rationale. Without this, raising the floor in `server.py` fails on the one
+    rationale. Without this, raising the floor in `server/_internal.py` fails on the one
     copy the test above reads and leaves the rest silently stale — telling a
     user to install a comfy-cli the runtime gate will then reject.
 
-    Scoped to the DOCS. `server.py`'s own prose is left out on purpose: a
+    Scoped to the DOCS. `server/_internal.py`'s own prose is left out on purpose: a
     per-tool minimum there may legitimately sit above the global floor.
     """
     floor = server._MIN_COMFY_CLI_STR

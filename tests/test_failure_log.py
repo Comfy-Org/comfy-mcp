@@ -29,7 +29,8 @@ import threading
 import pytest
 from conftest import _FakeProc
 
-from comfy_mcp import errors, failure_log, server, tcc, textutil
+from comfy_mcp import errors, failure_log, tcc, textutil
+from comfy_mcp.server import _internal as server
 
 # A failing envelope/1 result, the most common recorded failure.
 _ERROR_ENVELOPE = json.dumps(
@@ -100,6 +101,50 @@ def test_env_var_any_other_value_is_the_log_path(tmp_path):
     target = str(tmp_path / "x.jsonl")
 
     assert failure_log._resolve_failure_log_path(target) == target
+
+
+def test_failure_publisher_delivers_one_immutable_event(monkeypatch):
+    """Runners publish context; observers decide how to persist or inspect it."""
+
+    observed = []
+    monkeypatch.setattr(failure_log, "_FAILURE_OBSERVERS", (observed.append,))
+
+    failure_log._log_failure(
+        "error_envelope",
+        ["run", "workflow.json"],
+        exit_code=2,
+        error_code="boom",
+        message="failed",
+    )
+
+    assert len(observed) == 1
+    event = observed[0]
+    assert event.kind == "error_envelope"
+    assert event.args == ("run", "workflow.json")
+    assert event.exit_code == 2
+    assert event.error_code == "boom"
+    with pytest.raises((AttributeError, TypeError)):
+        event.kind = "changed"
+
+
+def test_one_broken_failure_observer_does_not_block_the_next(monkeypatch):
+    """Diagnostics are independent and can never replace the runner failure."""
+
+    observed = []
+
+    def broken(event):
+        raise OSError(f"cannot observe {event.kind}")
+
+    monkeypatch.setattr(
+        failure_log,
+        "_FAILURE_OBSERVERS",
+        (broken, observed.append),
+    )
+
+    failure_log._log_failure("timeout", ("run",), message="timed out")
+
+    assert len(observed) == 1
+    assert observed[0].kind == "timeout"
 
 
 @pytest.mark.parametrize(

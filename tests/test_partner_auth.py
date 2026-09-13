@@ -18,7 +18,8 @@ import asyncio
 
 import pytest
 
-from comfy_mcp import errors, server
+from comfy_mcp import errors
+from comfy_mcp.server import _internal as server
 
 
 def _partner_error_envelope() -> dict:

@@ -34,13 +34,13 @@ import asyncio
 
 import pytest
 from conftest import envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 
 def _restart(*args, **kwargs):
@@ -59,7 +59,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     A local copy of the other gates' fake rather than a shared one, following the
     convention those files set: this gate's prompt must be assertable on its own,
@@ -72,10 +72,10 @@ class _FakeCtx:
         self._approve = approve
         self.elicitations: list[str] = []
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
@@ -128,55 +128,6 @@ def _local_session(monkeypatch):
     """
     for var in ("COMFYUI_URL", "COMFYUI_HOST", "COMFYUI_PORT"):
         monkeypatch.delenv(var, raising=False)
-
-
-@pytest.fixture
-def clash(monkeypatch):
-    """Wire the untracked signature and answer each `_run_comfy` from a list.
-
-    ``setup(replies, relaunch=…) -> state`` puts the restart in the exact state
-    this gate reacts to: the stop half reports nothing recorded, the FIRST launch
-    loses the port. ``state["runs"]`` records the argv of every `_run_comfy` the
-    branch makes and ``state["launches"]`` every launch attempt, which is how a
-    test asserts that nothing was probed, killed, or relaunched.
-
-    The conftest fakes hand back ONE canned reply per fixture, and this path can
-    make two different calls (the dry run, then the kill) — the multi-call case
-    AGENTS.md leaves to a local stub. An exhausted list fails loudly, so a test
-    that expects no probe simply passes ``[]``.
-    """
-
-    def setup(replies: list, *, relaunch=None) -> dict:
-        state: dict = {"runs": [], "launches": []}
-        pending = iter(replies)
-
-        def fake_stop():
-            raise server.ComfyCliError(_NOTHING_TO_STOP)
-
-        def fake_launch(extra_args=None):
-            state["launches"].append(list(extra_args or []))
-            if len(state["launches"]) == 1:
-                raise server.ComfyCliError(_PORT_TAKEN)
-            if isinstance(relaunch, BaseException):
-                raise relaunch
-            return relaunch if relaunch is not None else {"pid": 99, "port": 8188}
-
-        def fake_run(*args, **kwargs):
-            state["runs"].append(args)
-            try:
-                reply = next(pending)
-            except StopIteration:
-                raise AssertionError(f"unexpected comfy-cli call: {args}") from None
-            if isinstance(reply, BaseException):
-                raise reply
-            return reply
-
-        monkeypatch.setattr(server, "stop_comfyui", fake_stop)
-        monkeypatch.setattr(server, "_launch_comfyui_sync", fake_launch)
-        monkeypatch.setattr(server, "_run_comfy", fake_run)
-        return state
-
-    return setup
 
 
 # --- the happy path: identify, ask, recycle ---------------------------------
@@ -312,7 +263,7 @@ def test_an_unanswered_prompt_lapses_into_a_refusal(clash, monkeypatch):
     state = clash([_dry_run()])
 
     class _SilentCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             self.elicitations.append(message)
             await asyncio.sleep(3600)
 
@@ -332,7 +283,7 @@ def test_a_client_that_errors_on_the_prompt_is_a_refusal(clash):
     state = clash([_dry_run()])
 
     class _BoomCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             raise RuntimeError("no prompt surface")
 
     with pytest.raises(server.ComfyCliError) as excinfo:

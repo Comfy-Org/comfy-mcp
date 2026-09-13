@@ -51,13 +51,15 @@ from unittest import mock
 
 import pytest
 from conftest import envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import argv, clitext, instructions, server
+from comfy_mcp import argv, clitext
+from comfy_mcp.server import _internal as server
+from comfy_mcp.server import instructions
 
 # Captured before any test patches it, so the one test that wants the REAL
 # `comfy env` pre-flight can put it back and drive the probe end to end through
@@ -107,7 +109,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     A local copy of the switch/spend tests' fake rather than a shared one,
     following the convention those files set: this gate's prompt must be
@@ -121,10 +123,10 @@ class _FakeCtx:
         self._approve = approve
         self.elicitations: list[str] = []
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
@@ -863,7 +865,7 @@ def test_an_unanswered_prompt_is_a_refusal(patched_plain_run, monkeypatch):
     monkeypatch.setattr(server, "_ELICIT_TIMEOUT", 0.05)
 
     class _HangingCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             self.elicitations.append(message)
             await asyncio.sleep(10)
 
@@ -880,7 +882,7 @@ def test_a_client_that_errors_on_the_prompt_is_a_refusal(patched_plain_run):
     calls = patched_plain_run(0, stderr="done")
 
     class _ExplodingCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             raise RuntimeError("client went away")
 
     with pytest.raises(server.ComfyCliError) as excinfo:
@@ -1409,7 +1411,7 @@ def test_the_handshake_instructions_teach_the_install_flow():
 
 
 def test_the_module_docstring_lists_the_tool():
-    """The inventory at the top of `server.py` is the other place a reader looks."""
+    """The inventory in the private implementation is another place a reader looks."""
     assert "install_node" in server.__doc__
 
 

@@ -24,7 +24,8 @@ import time
 import pytest
 from conftest import envelope
 
-from comfy_mcp import failure_log, server
+from comfy_mcp import failure_log
+from comfy_mcp.server import _internal as server
 
 # Captured at import, BEFORE conftest's autouse ``_skip_template_gallery_warm``
 # replaces the module attribute — the same re-enable pattern the snapshot tests
@@ -69,7 +70,7 @@ def test_search_templates_and_the_warm_share_one_timeout(patched_run):
     assert warm_calls[0]["timeout"] == search_calls[0]["timeout"] == 60.0
 
 
-def test_warm_without_a_binary_never_spawns_or_logs(monkeypatch, tmp_path):
+def test_warm_without_a_binary_never_spawns_or_logs(monkeypatch, tmp_path, no_spawn):
     """No comfy-cli means no spawn AND no ``binary_missing`` record.
 
     ``_require_comfy_bin`` inside ``_run_comfy`` would write a failure-log entry
@@ -80,14 +81,9 @@ def test_warm_without_a_binary_never_spawns_or_logs(monkeypatch, tmp_path):
     path = tmp_path / "state" / "failures.jsonl"
     monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(path))
     monkeypatch.setattr(server.shutil, "which", lambda _: None)
-    calls: list[tuple] = []
-    monkeypatch.setattr(
-        server, "_run_comfy", lambda *args, **kwargs: calls.append(args)
-    )
 
     assert server._warm_template_gallery() is None
 
-    assert calls == []
     assert not path.exists(), [
         json.loads(line) for line in path.read_text().splitlines() if line.strip()
     ]
@@ -102,18 +98,16 @@ def test_warm_without_a_binary_never_spawns_or_logs(monkeypatch, tmp_path):
     ],
     ids=["comfy-cli-error", "os-error", "undecodable-output"],
 )
-def test_warm_swallows_every_tolerated_failure(monkeypatch, failure):
+def test_warm_swallows_every_tolerated_failure(
+    patched_comfy_run_sequence,
+    failure,
+):
     """A failed warm propagates nothing — the caller just pays what it pays today.
 
     Same tolerated set as ``_machine_snapshot_block``. Anything raised out of
     here would land on ``main()``'s startup thread with nobody to catch it.
     """
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-
-    def boom(*args, **kwargs):
-        raise failure
-
-    monkeypatch.setattr(server, "_run_comfy", boom)
+    patched_comfy_run_sequence([failure])
 
     assert server._warm_template_gallery() is None
 
@@ -139,7 +133,9 @@ def test_main_starts_the_warm_on_a_daemon_thread_it_never_joins(monkeypatch):
 
     monkeypatch.setattr(server, "_warm_template_gallery", blocking_warm)
     monkeypatch.setattr(
-        server.mcp, "run", lambda *, transport: order.append(f"run:{transport}")
+        server.mcp,
+        "run",
+        lambda *, transport, show_banner: order.append(f"run:{transport}"),
     )
 
     began = time.monotonic()
@@ -159,7 +155,11 @@ def test_main_starts_the_warm_on_a_daemon_thread_it_never_joins(monkeypatch):
         release.set()
 
 
-def test_warm_writes_no_failure_log_record_for_any_failure(monkeypatch, tmp_path):
+def test_warm_writes_no_failure_log_record_for_any_failure(
+    monkeypatch,
+    tmp_path,
+    blocked_comfy_run,
+):
     """EVERY failure mode of the warm is silent in the log, not just no-binary.
 
     The `shutil.which` short-circuit only ever suppressed ``binary_missing``;
@@ -172,12 +172,12 @@ def test_warm_writes_no_failure_log_record_for_any_failure(monkeypatch, tmp_path
     path = tmp_path / "state" / "failures.jsonl"
     monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(path))
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-
-    def timing_out(*args, **kwargs):
-        failure_log._log_failure("timeout", args, message="comfy-cli timed out")
-        raise server.ComfyCliError("comfy-cli timed out")
-
-    monkeypatch.setattr(server, "_run_comfy", timing_out)
+    blocked = blocked_comfy_run(
+        error=server.ComfyCliError("comfy-cli timed out"),
+        failure_kind="timeout",
+        failure_message="comfy-cli timed out",
+    )
+    blocked["release"].set()
 
     assert server._warm_template_gallery() is None
 
@@ -186,7 +186,11 @@ def test_warm_writes_no_failure_log_record_for_any_failure(monkeypatch, tmp_path
     ]
 
 
-def test_suppression_is_scoped_to_the_warm_thread(monkeypatch, tmp_path):
+def test_suppression_is_scoped_to_the_warm_thread(
+    monkeypatch,
+    tmp_path,
+    blocked_comfy_run,
+):
     """A real tool call's failure is still recorded, during and after a warm.
 
     Thread-local, not a global mute: the warm must not quiet the failures
@@ -196,24 +200,19 @@ def test_suppression_is_scoped_to_the_warm_thread(monkeypatch, tmp_path):
     path = tmp_path / "state" / "failures.jsonl"
     monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", str(path))
     monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    inside = threading.Event()
-    release = threading.Event()
-
-    def parked(*args, **kwargs):
-        failure_log._log_failure("timeout", args, message="warm timed out")
-        inside.set()
-        release.wait(10)
-        raise server.ComfyCliError("warm timed out")
-
-    monkeypatch.setattr(server, "_run_comfy", parked)
+    blocked = blocked_comfy_run(
+        error=server.ComfyCliError("warm timed out"),
+        failure_kind="timeout",
+        failure_message="warm timed out",
+    )
     warm = threading.Thread(target=server._warm_template_gallery, daemon=True)
     warm.start()
     try:
-        assert inside.wait(5), "the warm never reached the suppressed call"
+        assert blocked["entered"].wait(5), "the warm never reached the suppressed call"
         # A different thread, mid-warm: this one IS a call the user made.
         failure_log._log_failure("timeout", ("jobs", "ls"), message="tool timed out")
     finally:
-        release.set()
+        blocked["release"].set()
         warm.join(10)
 
     # ...and the suppression is unwound once the warm returns.
@@ -227,7 +226,10 @@ def test_suppression_is_scoped_to_the_warm_thread(monkeypatch, tmp_path):
     assert kinds == ["tool timed out", "after the warm"]
 
 
-def test_main_survives_a_thread_start_failure(monkeypatch):
+def test_main_survives_a_thread_start_failure(
+    monkeypatch,
+    fail_thread_start_for_name,
+):
     """Thread exhaustion drops the warm; it never aborts the server.
 
     ``main()``'s only other handler translates ``PermissionError``, so an
@@ -236,24 +238,11 @@ def test_main_survives_a_thread_start_failure(monkeypatch):
     the thing that stops the server from starting at all.
     """
     order: list[str] = []
-    real_thread = threading.Thread
-
-    class _ExhaustedForTheWarm(real_thread):
-        """Real threads for everything else; only the warm's start() fails.
-
-        Scoped by name rather than blanket-patching ``threading.Thread``: the
-        snapshot probe above it builds one too, and a test that broke BOTH
-        would not show which start() ``main()`` actually tolerates.
-        """
-
-        def start(self):
-            if self.name == "comfy-mcp-gallery-warm":
-                raise RuntimeError("can't start new thread")
-            return super().start()
-
-    monkeypatch.setattr(server.threading, "Thread", _ExhaustedForTheWarm)
+    fail_thread_start_for_name("comfy-mcp-gallery-warm")
     monkeypatch.setattr(
-        server.mcp, "run", lambda *, transport: order.append(f"run:{transport}")
+        server.mcp,
+        "run",
+        lambda *, transport, show_banner: order.append(f"run:{transport}"),
     )
 
     server.main()

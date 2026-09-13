@@ -22,7 +22,8 @@ import subprocess
 import pytest
 from conftest import _FakeRunProc
 
-from comfy_mcp import server, tcc
+from comfy_mcp import tcc
+from comfy_mcp.server import _internal as server
 
 # The child's stderr when its venv sits in a TCC-protected folder.
 _DENIED_PATH = os.path.join(
@@ -432,19 +433,21 @@ def test_main_serves_stdio_explicitly(monkeypatch):
     """
     seen = {}
 
-    def record(transport):
+    def record(transport, show_banner):
         seen["transport"] = transport
+        seen["show_banner"] = show_banner
 
     monkeypatch.setattr(server.mcp, "run", record)
     server.main()
 
     assert seen["transport"] == "stdio"
+    assert seen["show_banner"] is False
 
 
 def test_main_reports_a_startup_denial_instead_of_a_traceback(
     on_macos, monkeypatch, capsys
 ):
-    def boom(transport):
+    def boom(transport, show_banner):
         raise PermissionError(1, "Operation not permitted", _DENIED_PATH)
 
     monkeypatch.setattr(server.mcp, "run", boom)
@@ -461,7 +464,7 @@ def test_main_reports_a_startup_denial_instead_of_a_traceback(
 def test_main_handles_a_bytes_filename(on_macos, monkeypatch, capsys):
     """A denial on a bytes path carries a bytes `filename` — decode, don't crash."""
 
-    def boom(transport):
+    def boom(transport, show_banner):
         raise PermissionError(1, "Operation not permitted", os.fsencode(_DENIED_PATH))
 
     monkeypatch.setattr(server.mcp, "run", boom)
@@ -475,7 +478,7 @@ def test_main_handles_a_bytes_filename(on_macos, monkeypatch, capsys):
 
 
 def test_main_propagates_an_unrelated_permission_error(on_macos, monkeypatch):
-    def boom(transport):
+    def boom(transport, show_banner):
         raise PermissionError(13, "Permission denied", "/etc/shadow")
 
     monkeypatch.setattr(server.mcp, "run", boom)
@@ -485,7 +488,7 @@ def test_main_propagates_an_unrelated_permission_error(on_macos, monkeypatch):
 
 
 def test_main_propagates_on_non_macos(on_linux, monkeypatch):
-    def boom(transport):
+    def boom(transport, show_banner):
         raise PermissionError(1, "Operation not permitted", _DENIED_PATH)
 
     monkeypatch.setattr(server.mcp, "run", boom)
