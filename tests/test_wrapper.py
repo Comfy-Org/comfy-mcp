@@ -4785,7 +4785,13 @@ def test_streaming_bounded_tail_payload_is_unchanged(blocking_stream):
 
     assert result == {
         "timed_out": True,
-        "status": {"progress": 0.0, "total": 1.0, "nodes_done": 0},
+        "events_seen": 1,
+        "status": {
+            "progress": 0.0,
+            "total": 1.0,
+            "nodes_done": 0,
+            "events_seen": 1,
+        },
     }
 
 

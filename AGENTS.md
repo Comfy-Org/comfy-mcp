@@ -171,13 +171,13 @@ They mirror how `server` spawns the CLI: a spawn-signature change is one edit, n
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool for async
-callers); anything STREAMING or long-lived spawns via `asyncio.create_subprocess_exec` —
-nothing blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two async
-runners live there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a
-plain-JSON twin of `_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread`
-worker, so a client giving up left the child running; it carries the longest-lived children
-(foreground `model download`, `workflow_deps`, `upload_file`). Each stream keeps only a
-`_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
+callers); anything STREAMING or long-lived spawns via `asyncio.create_subprocess_exec` — nothing
+blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two async runners live
+there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON twin of
+`_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread` worker, so a client
+giving up left the child running; it carries the longest-lived children (foreground `model
+download`, `workflow_deps`, `upload_file`, `job("watch")`'s status polls). Each stream keeps
+only a `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 
 A local stub is justified only where the call genuinely differs — the `comfy --version` probe
