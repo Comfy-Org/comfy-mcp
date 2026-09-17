@@ -162,7 +162,8 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
 #
 # The full set it covers, all of them through :func:`_guard_arg_len`:
 # ``run_workflow`` / ``validate_workflow`` / the four other ``workflow_path``
-# tools, ``download_model``'s ``relative_path`` and ``filename``,
+# tools, ``nodes`` / ``validate_workflow``'s ``object_info_path``,
+# ``download_model``'s ``relative_path`` and ``filename``,
 # ``fetch_template``'s / ``emit_partner_workflow``'s / ``partner_generate``'s
 # ``out_path``, ``fetch_outputs``'s and ``vary_workflow``'s ``out_dir``, each
 # entry of ``upload_file``'s ``paths``, and ``search_models``' ``folder``.
@@ -322,6 +323,24 @@ def _guard_workflow_path(workflow_path: str, *, frontend: bool = False) -> str:
     _reject_option_like("workflow_path", workflow_path, expected=expected)
     _reject_nul("workflow_path", workflow_path)
     return workflow_path
+
+
+def _guard_object_info_path(object_info_path: str) -> str:
+    """Run the shared path-shaped argv guards on an ``object_info_path``.
+
+    Both ``nodes`` and ``validate_workflow`` forward this behind comfy-cli's
+    ``--input`` option. It is input hygiene rather than injection defense, but
+    keeping the same length, encoding, leading-dash and NUL checks as every
+    other caller-supplied path gives the two tools one consistent contract.
+    """
+    _guard_arg_len("object_info_path", object_info_path)
+    _reject_option_like(
+        "object_info_path",
+        object_info_path,
+        expected="a path to an object_info JSON file (prefix a dash-leading name with './')",
+    )
+    _reject_nul("object_info_path", object_info_path)
+    return object_info_path
 
 
 # Generous ceiling on a `prompt_id`'s length. Real ids are the server's UUIDs
