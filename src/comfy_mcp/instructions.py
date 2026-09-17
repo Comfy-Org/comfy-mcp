@@ -22,7 +22,8 @@ flows:
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
   does not block; same for `generate_image` / `run_template` on slow hardware,
   where YOUR transport cap bounds a `wait=True` call too. A run that outlives
-  a wait keeps going — poll its `prompt_id`, never re-run it.
+  a wait keeps going — poll its `prompt_id`, never re-run it. For video/audio,
+  call `preview_media` on a path returned by `fetch_outputs`.
 - Large model downloads: `download_model` submits to a background worker and
   returns a `download_id`; poll `download(action="wait")` /
   `download(action="status")`, or `download(action="cancel")` to stop one.
@@ -158,8 +159,9 @@ flows:
 Argument naming is uniform across the tool surface — do not guess it: input
 workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `list_workflow_slots`, `list_workflow_notes`, `set_workflow_slot`,
-`vary_workflow`); output files use `out_path` (`fetch_template`,
-`partner_generate`, `emit_partner_workflow`); output directories use
+`vary_workflow`); input media uses `media_path` (`preview_media`); output files
+use `out_path` (`fetch_template`, `partner_generate`, `emit_partner_workflow`,
+`preview_media`); output directories use
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
 (`get_template`, `nodes`, `run_template`); job handles use `prompt_id`
 (`job`, `fetch_outputs`); and
