@@ -155,6 +155,30 @@ def _clear_comfyui_target_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_comfy_desktop_discovery(monkeypatch):
+    """Default every test to "no Comfy Desktop port-lock directory found".
+
+    ``_comfy_target`` falls back to :func:`target._discover_comfy_desktop_port`
+    when neither ``COMFYUI_URL`` nor ``COMFYUI_HOST`` is set, which in turn
+    reads :func:`target._comfy_desktop_port_locks_dir` — the REAL
+    ``%APPDATA%\\Comfy Desktop\\port-locks`` (or the macOS/Linux equivalent) —
+    whatever happens to be on the machine running the suite. Left ambient, a
+    developer's or CI runner's own Comfy Desktop install would perturb every
+    "nothing configured" assertion across the suite (starting with
+    ``test_target_none_when_unset``) exactly the way a stray ``COMFYUI_URL``
+    would, which is why that env is cleared by the fixture above.
+
+    Patched at ``_comfy_desktop_port_locks_dir`` rather than
+    ``_discover_comfy_desktop_port`` itself so that
+    ``test_comfy_desktop_discovery.py``'s own tests of the discovery function
+    — which override THIS attribute to point at a ``tmp_path`` full of lock
+    fixtures — still exercise the REAL scanning/liveness logic rather than a
+    blanket stub sitting in front of it.
+    """
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_project_env(monkeypatch):
     """Default every test to the unanchored default (no ``COMFY_PROJECT``).
 
