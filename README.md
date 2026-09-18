@@ -475,11 +475,21 @@ full cloud tool list, and the slash-command/prompt tables live.
   full precedence chain; every example in
   [Configure your AI client](#configure-your-ai-client) shows where it goes.
 - **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a ComfyUI on *another
-  machine*).** Read by **this server**. By default every tool targets `127.0.0.1:8188`. Set
+  machine*).** Read by **this server**. With neither set, the **submit / job** tools target
+  Comfy Desktop's current port when it can be discovered — read from Comfy Desktop's own
+  `port-locks` directory and matched against a live process, only when exactly one instance is
+  running — otherwise they fall back to comfy-cli's hardcoded default, `127.0.0.1:8188`. This
+  discovery is a same-machine, submit/job-only fallback: it never touches the **local-only**
+  tools (`nodes`, `validate_workflow`, `get_logs`; see [Discovery /
+  validation](#driving-a-remote-comfyui)), which keep resolving independently through comfy-cli's
+  own rules — so with Comfy Desktop on a non-default port and `COMFY_LOCAL_URL` unset, those
+  tools can still target a different (and wrong) ComfyUI than the one the submit/job tools just
+  discovered; set `COMFY_LOCAL_URL` (below) to point them at the same instance. Set
   `COMFYUI_URL` (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`,
   default `8188`) pair — to point the **submit / job** tools at a ComfyUI running elsewhere, e.g. a
-  GPU box reachable over a private network (Tailscale). See **[Driving a remote
-  ComfyUI](#driving-a-remote-comfyui)** for what is and isn't remoted. Unset ⇒ nothing changes.
+  GPU box reachable over a private network (Tailscale); either one always overrides the Desktop
+  discovery. See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)** for what is and isn't
+  remoted.
 - **`COMFY_MCP_REMOTE_SHARED_MODELS` (optional — only meaningful alongside the variables above).**
   `download_model` writes to *this* machine's models dir and has no remote mode, so with a remote
   configured it refuses rather than downloading onto the wrong disk. Set this to `1` when this
