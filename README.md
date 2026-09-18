@@ -453,6 +453,7 @@ full cloud tool list, and the slash-command/prompt tables live.
   `comfy launch` (or, from an agent, the `launch_comfyui` tool), and confirm it is up with
   `server_info`. Nothing here starts ComfyUI implicitly.
 
+<a id="optional-environment-variables"></a>
 <details>
 <summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_MCP_REMOTE_SHARED_MODELS</code>, <code>COMFY_LOCAL_URL</code>, <code>COMFY_T2I_TEMPLATE</code>; plus <code>COMFY_USER_AGENT</code>, which the server sets itself)</summary>
 
