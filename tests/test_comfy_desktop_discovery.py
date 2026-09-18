@@ -238,6 +238,20 @@ def test_discover_ignores_a_lock_missing_pid(monkeypatch, tmp_path):
     assert target._discover_comfy_desktop_port() is None
 
 
+@pytest.mark.parametrize("payload", [[1, 2, 3], "just a string", 42, None, True])
+def test_discover_skips_a_syntactically_valid_non_dict_lock_and_still_resolves_the_valid_one(
+    monkeypatch, tmp_path, payload
+):
+    """A lock file that is valid JSON but not an object -- data["pid"] would
+    raise TypeError, which must be caught individually rather than aborting
+    the whole scan (the malformed-lock contract this function documents)."""
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", lambda: tmp_path)
+    (tmp_path / "port-9999.json").write_text(json.dumps(payload), encoding="utf-8")
+    _write_lock(tmp_path, 8003, pid=os.getpid())
+
+    assert target._discover_comfy_desktop_port() == 8003
+
+
 @pytest.mark.parametrize("port", [0, -1, 65536, 999999])
 def test_discover_ignores_a_lock_naming_an_out_of_range_port(
     monkeypatch, tmp_path, port

@@ -754,8 +754,11 @@ back, and nothing is ever refused on its account. Pass `check_local=False` to sk
 
 ## Driving a remote ComfyUI
 
-By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at a ComfyUI running
-**elsewhere** — e.g. a GPU box reachable over a private network (Tailscale) — by setting one of:
+By default the server drives ComfyUI on this machine — the Comfy Desktop instance it can discover
+via its own port-lock file when exactly one live instance is found (see [Optional environment
+variables](#optional-environment-variables) above), or `127.0.0.1:8188` otherwise. Point it at a
+ComfyUI running **elsewhere** — e.g. a GPU box reachable over a private network (Tailscale) — by
+setting one of:
 
 - **`COMFYUI_URL`** — a full URL, e.g. `http://gpu-box:8188` (host-only is fine; port defaults to
   `8188`). Takes precedence over the pair below. Only the **host and port** are forwarded to
@@ -769,10 +772,12 @@ By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at 
 - **`COMFYUI_HOST`** (+ optional **`COMFYUI_PORT`**, default `8188`) — e.g. `COMFYUI_HOST=gpu-box`.
   A port without a host (setting only `COMFYUI_PORT`) is rejected — set the host too.
 
-Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set,
-behavior is unchanged (`127.0.0.1:8188` on this machine). If what you actually have is a ComfyUI on
-*this* machine on a different port, you want `COMFY_LOCAL_URL` instead — see [Which address variable
-do I want?](#which-address-variable-do-i-want).
+Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set, these
+tools target a discovered Comfy Desktop instance when exactly one live one is found, else
+`127.0.0.1:8188` — see [Optional environment variables](#optional-environment-variables) above. If
+what you actually have is a ComfyUI on *this* machine on a different port (and Desktop discovery
+doesn't apply — e.g. it wasn't launched via Comfy Desktop), you want `COMFY_LOCAL_URL` instead — see
+[Which address variable do I want?](#which-address-variable-do-i-want).
 
 When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
 accept them — `comfy run`, `comfy run-template`, `comfy jobs …` and `comfy upload` — so every tool

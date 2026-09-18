@@ -315,8 +315,17 @@ def _discover_comfy_desktop_port() -> int | None:
             continue
         try:
             data = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            # A syntactically-valid JSON value that isn't an object (a list,
+            # a bare string, a number) -- data["pid"] below would raise
+            # TypeError, which is NOT in the except clause, aborting the
+            # whole scan instead of skipping this one malformed lock.
+            continue
+        try:
             pid = data["pid"]
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        except KeyError:
             continue
         if _pid_is_alive(pid):
             live_ports.append(port)
