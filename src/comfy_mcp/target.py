@@ -212,14 +212,33 @@ def _comfy_desktop_port_locks_dir() -> Path | None:
         base = Path(appdata) / "Comfy Desktop"
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support" / "Comfy Desktop"
+    elif sys.platform == "linux":
+        # Electron's own `app.getPath("appData")` honors $XDG_CONFIG_HOME on
+        # Linux, falling back to ~/.config only when it is unset — the same
+        # rule this must mirror, or a distro/sandbox with a non-default
+        # XDG_CONFIG_HOME (a common case, e.g. NixOS, Snap's SNAP_USER_DATA
+        # convention) silently never finds a real, running Desktop install.
+        base = (
+            Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+            / "Comfy Desktop"
+        )
     else:
-        base = Path.home() / ".config" / "Comfy Desktop"
+        # An unrecognized platform gets no fallback rather than guessing at a
+        # path convention that may not even apply there.
+        return None
     d = base / "port-locks"
     return d if d.is_dir() else None
 
 
-def _pid_is_alive(pid: int) -> bool:
+def _pid_is_alive(pid: Any) -> bool:
     """Best-effort liveness check for *pid*, cross-platform, never raises.
+
+    *pid* comes from a lock file this process did not write, so it is
+    accepted as an untyped JSON value, not trusted as an ``int``: a
+    non-``int`` (a JSON string, float, bool, or a non-positive value) is
+    rejected outright rather than coerced — ``os.kill(0, 0)`` on POSIX checks
+    the CALLING process's own group and would make a lock naming pid ``0``
+    look alive regardless of whether anything real is listening.
 
     A STALE lock file (the app crashed instead of cleaning up on exit) must
     not be trusted — this is what distinguishes "the live instance" from
@@ -228,6 +247,8 @@ def _pid_is_alive(pid: int) -> bool:
     which only means the stale-lock case falls through to the existing
     zero-or-multiple-candidates "don't guess" path below, never a wrong guess.
     """
+    if type(pid) is not int or pid <= 0:
+        return False
     if sys.platform == "win32":
         import ctypes
 
@@ -290,9 +311,11 @@ def _discover_comfy_desktop_port() -> int | None:
             port = int(lock_path.stem.removeprefix("port-"))
         except ValueError:
             continue
+        if not (1 <= port <= 65535):
+            continue
         try:
             data = json.loads(lock_path.read_text(encoding="utf-8"))
-            pid = int(data["pid"])
+            pid = data["pid"]
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             continue
         if _pid_is_alive(pid):

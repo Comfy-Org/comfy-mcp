@@ -63,6 +63,10 @@ def test_locks_dir_mirrors_electron_appdata_convention(
     monkeypatch.setattr(target.sys, "platform", platform)
     monkeypatch.setattr(target.Path, "home", lambda: tmp_path)
     monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+    # The Linux branch now honors $XDG_CONFIG_HOME (see the dedicated tests
+    # below) -- clear it here so this "no override" case is not at the mercy
+    # of whatever happens to be set in the test runner's own environment.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     # Directory must actually exist for the function to return it.
     if platform == "win32":
         d = tmp_path / "AppData" / "Roaming" / "Comfy Desktop" / "port-locks"
@@ -103,6 +107,34 @@ def test_locks_dir_none_when_appdata_unset(monkeypatch):
     assert target._comfy_desktop_port_locks_dir() is None
 
 
+def test_locks_dir_honors_xdg_config_home_on_linux(monkeypatch, tmp_path):
+    """Electron's own Linux `appData` resolves $XDG_CONFIG_HOME first, not ~/.config.
+
+    A distro or sandbox with a non-default XDG_CONFIG_HOME (NixOS, Snap's
+    SNAP_USER_DATA convention, a containerized dev environment) would
+    otherwise never find a real, running Comfy Desktop instance -- silently
+    falling through to the wrong hardcoded default this whole fallback exists
+    to avoid.
+    """
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", _REAL_LOCKS_DIR)
+    monkeypatch.setattr(target.sys, "platform", "linux")
+    xdg = tmp_path / "custom-xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    d = xdg / "Comfy Desktop" / "port-locks"
+    d.mkdir(parents=True)
+
+    assert target._comfy_desktop_port_locks_dir() == d
+
+
+def test_locks_dir_none_for_an_unrecognized_platform(monkeypatch, tmp_path):
+    """A platform this fallback has no documented convention for -> None, not a guess."""
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", _REAL_LOCKS_DIR)
+    monkeypatch.setattr(target.sys, "platform", "freebsd13")
+    monkeypatch.setattr(target.Path, "home", lambda: tmp_path)
+
+    assert target._comfy_desktop_port_locks_dir() is None
+
+
 # --- _pid_is_alive -----------------------------------------------------------
 
 
@@ -114,6 +146,28 @@ def test_pid_is_alive_false_for_a_pid_that_does_not_exist():
     # PID 0 is reserved/invalid on every real OS; a value this large is not a
     # real pid on any platform this runs on either — belt and suspenders.
     assert target._pid_is_alive(2**31 - 1) is False
+
+
+@pytest.mark.parametrize(
+    "pid",
+    [
+        0,
+        -1,
+        True,  # bool IS an int subclass -- must not slip past the type check
+        False,
+        "1234",
+        12.0,
+        None,
+    ],
+)
+def test_pid_is_alive_rejects_non_positive_or_non_int_values(pid):
+    """The pid comes from a lock file this process did not write -- never trust its type.
+
+    `os.kill(0, 0)` on POSIX checks the CALLING process's own group, so an
+    un-typed `0` would make a stale lock naming pid 0 look alive regardless of
+    whether anything real is listening.
+    """
+    assert target._pid_is_alive(pid) is False
 
 
 # --- _discover_comfy_desktop_port -------------------------------------------
@@ -179,6 +233,31 @@ def test_discover_ignores_a_lock_missing_pid(monkeypatch, tmp_path):
     monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", lambda: tmp_path)
     (tmp_path / "port-9999.json").write_text(
         json.dumps({"installationName": "ComfyUI"}), encoding="utf-8"
+    )
+
+    assert target._discover_comfy_desktop_port() is None
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, 999999])
+def test_discover_ignores_a_lock_naming_an_out_of_range_port(
+    monkeypatch, tmp_path, port
+):
+    """The filename itself carries an out-of-range port -- reject before trusting it as a target."""
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", lambda: tmp_path)
+    _write_lock(tmp_path, port, pid=os.getpid())
+
+    assert target._discover_comfy_desktop_port() is None
+
+
+@pytest.mark.parametrize("pid_value", [0, -1, True, "4242", 12.0])
+def test_discover_ignores_a_lock_with_a_non_positive_or_non_int_pid(
+    monkeypatch, tmp_path, pid_value
+):
+    """A malformed/adversarial pid value in the JSON is rejected, not coerced with int()."""
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", lambda: tmp_path)
+    (tmp_path / "port-8003.json").write_text(
+        json.dumps({"pid": pid_value, "installationName": "ComfyUI", "timestamp": 0}),
+        encoding="utf-8",
     )
 
     assert target._discover_comfy_desktop_port() is None
