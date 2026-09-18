@@ -479,8 +479,10 @@ full cloud tool list, and the slash-command/prompt tables live.
   machine*).** Read by **this server**. With neither set, the **submit / job** tools target
   Comfy Desktop's current port when it can be discovered — read from Comfy Desktop's own
   `port-locks` directory and matched against a live process, only when exactly one instance is
-  running — otherwise they fall back to comfy-cli's hardcoded default, `127.0.0.1:8188`. This
-  discovery is a same-machine, submit/job-only fallback: it never touches the **local-only**
+  running — otherwise no `--host`/`--port` is forwarded and comfy-cli resolves its own local
+  target the usual way (`COMFY_LOCAL_URL`, then a comfy-cli-launched background server, then its
+  hardcoded default `127.0.0.1:8188` — see [Which address variable do I want?](#which-address-variable-do-i-want)).
+  This discovery is a same-machine, submit/job-only fallback: it never touches the **local-only**
   tools (`nodes`, `validate_workflow`, `get_logs`; see [Discovery /
   validation](#driving-a-remote-comfyui)), which keep resolving independently through comfy-cli's
   own rules — so with Comfy Desktop on a non-default port and `COMFY_LOCAL_URL` unset, those
