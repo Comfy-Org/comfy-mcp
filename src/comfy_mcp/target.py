@@ -431,6 +431,50 @@ def _reject_remote_model_download() -> None:
     )
 
 
+def _reject_remote_restart() -> None:
+    """Refuse a LOCAL restart while a REMOTE ComfyUI target is configured.
+
+    ``restart_comfyui`` composes ``comfy stop`` + ``comfy launch``, and neither
+    verb accepts a ``--host`` / ``--port``: comfy-cli only ever stops and
+    (re)starts the ComfyUI process it launched on the machine running THIS
+    server. So with ``COMFYUI_URL`` / ``COMFYUI_HOST`` pointing elsewhere, the
+    call would kill and relaunch the LOCAL server while the configured remote is
+    never touched — and, per the reported failure mode, report success for a
+    machine it did not act on. That is a destructive wrong-machine action, so it
+    is refused up front: a clear failure beats silently killing the wrong server.
+
+    There is no remote-restart mode to fall back to, and none can be added here —
+    nothing in comfy-cli's lifecycle verbs accepts a target, so restarting a
+    remote is something the caller does ON the remote host. (Remoting the
+    lifecycle tools is out of scope by design; they stay local-only.) Hence the
+    message names how to reach the remote rather than a flag that would make this
+    call do it, and there is deliberately NO shared-storage escape hatch: unlike
+    a model download onto a shared volume, a process restart on the wrong host is
+    never the right operation.
+
+    Mirrors :func:`_reject_remote_model_download`, down to failing LOUDLY on a
+    malformed value: the raise comes straight out of :func:`_comfy_target`,
+    because the caller opted into a remote and the only open question is WHICH
+    one — an unparseable answer is an error, not something to shrug off and
+    restart locally.
+    """
+    target = _comfy_target()
+    if target is None:
+        return
+    host, port, source = target
+    raise ComfyCliError(
+        "restart_comfyui is LOCAL-ONLY, but a remote ComfyUI is configured "
+        f"({source} -> {host}:{port}). It composes `comfy stop` + `comfy "
+        "launch`, which take no --host/--port and only manage the ComfyUI "
+        "process comfy-cli started on the machine running this MCP server — so "
+        "it would kill and relaunch the LOCAL server while reporting success, "
+        f"and the remote at {host}:{port} was NOT touched. To restart that "
+        "remote, do it on the remote host itself (its own comfy-cli / MCP "
+        "server, or however that ComfyUI is managed). To manage a local server "
+        "from here, unset COMFYUI_URL/COMFYUI_HOST."
+    )
+
+
 _COMFY_TARGET_NOTE_KEY = "comfy_target_note"
 
 

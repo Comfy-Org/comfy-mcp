@@ -51,7 +51,16 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # so there was no version of it that fit the slack left after the
 # `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
 # next growth is still a decision.
-_BUDGET_TOKENS = 15_650
+#
+# 15,650 -> 15,750 for `restart_comfyui`'s remote-target refusal (~70 tokens).
+# This one a caller cannot do without: `restart_comfyui` is LOCAL-ONLY, and with
+# a remote configured it would kill and relaunch the LOCAL server while
+# reporting success for a machine it never touched — so the docstring has to say
+# it refuses, exactly as `download_model`'s does for the same reason. The tree
+# was already at ~15,596, spending most of the slack the last ratchet left, so
+# there was no version of the note that fit under 15,650. Measured ~15,721 after
+# the edit (docstring trimmed against this ceiling first).
+_BUDGET_TOKENS = 15_750
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

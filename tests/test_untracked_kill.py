@@ -484,21 +484,23 @@ def test_a_probe_that_cannot_even_run_is_not_an_error_on_top_of_an_error(clash):
 
 
 @pytest.mark.parametrize(
-    ("var", "value"),
+    ("var", "value", "endpoint"),
     [
-        ("COMFYUI_URL", "http://comfy.example:8188"),
-        ("COMFYUI_HOST", "comfy.example"),
-        # Set but MALFORMED: `_comfy_target` raises, and that reads as
-        # "configured", never as "local" — an unreadable config must not unlock
-        # a kill.
-        ("COMFYUI_URL", "http://[::1"),
+        ("COMFYUI_URL", "http://comfy.example:8188", "comfy.example:8188"),
+        ("COMFYUI_HOST", "comfy.example", "comfy.example:8188"),
     ],
 )
-def test_a_remote_session_neither_probes_nor_prompts(clash, monkeypatch, var, value):
-    """The lifecycle verbs are local-only, so whose port this is stops being obvious.
+def test_a_remote_session_is_refused_before_any_lifecycle_action(
+    clash, monkeypatch, var, value, endpoint
+):
+    """A configured remote refuses the whole restart — it never reaches the kill gate.
 
-    `[]` as the reply list is the assertion: any `_run_comfy` call at all fails
-    the test.
+    The lifecycle verbs are local-only, so a restart while a remote is
+    configured would kill and relaunch the LOCAL server and report success for
+    a machine it never touched. The refusal fires at the top, before
+    the stop/launch and before the untracked-kill gate below, so nothing is
+    stopped, launched, probed, or prompted. `[]` as the reply list is the
+    assertion for the probe: any `_run_comfy` call at all fails the test.
     """
     monkeypatch.setenv(var, value)
     state = clash([])
@@ -507,9 +509,35 @@ def test_a_remote_session_neither_probes_nor_prompts(clash, monkeypatch, var, va
     with pytest.raises(server.ComfyCliError) as excinfo:
         _restart(ctx=ctx)
 
+    message = str(excinfo.value)
+    assert "LOCAL-ONLY" in message  # says it can only manage a local process
+    assert endpoint in message  # names the remote that was NOT touched
+    assert var in message  # ... and which knob selected it
+    assert "NOT touched" in message
     assert ctx.elicitations == []
     assert state["runs"] == []
-    assert "almost certainly started outside comfy-cli" in str(excinfo.value)
+    assert state["launches"] == []
+
+
+def test_a_malformed_remote_config_fails_loudly_before_any_lifecycle_action(
+    clash, monkeypatch
+):
+    """A malformed COMFYUI_URL fails LOUDLY, exactly as it does for ``download_model``.
+
+    The caller opted into a remote, so an unparseable value is an error, not
+    something to shrug off and restart locally — the raise comes straight out of
+    ``_comfy_target``. Nothing is stopped, launched, or probed.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://[::1")  # unbalanced IPv6 -> malformed
+    state = clash([])
+    ctx = _FakeCtx()
+
+    with pytest.raises(server.ComfyCliError, match="malformed"):
+        _restart(ctx=ctx)
+
+    assert ctx.elicitations == []
+    assert state["runs"] == []
+    assert state["launches"] == []
 
 
 def test_an_unreadable_port_is_never_guessed_at(clash):

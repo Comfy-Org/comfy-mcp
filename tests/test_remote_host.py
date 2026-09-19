@@ -17,10 +17,11 @@ comfy-cli verbs that accept them (``comfy run``, ``comfy run-template``, every
    same ``--host`` / ``--port``, or the ``prompt_id`` from one is meaningless
    to the other.
 6. The tools that CANNOT be diverted saying so themselves: ``download_model``
-   refusing outright, and ``system_stats`` / ``free_memory`` annotating their
-   payload with a ``comfy_target_note`` — and, since a probe that cannot reach
-   the remote usually FAILS when one is configured, appending that same
-   provenance to the error they raise.
+   and ``restart_comfyui`` (a destructive lifecycle action) refusing outright,
+   and ``system_stats`` / ``free_memory`` annotating their payload with a
+   ``comfy_target_note`` — and, since a probe that cannot reach the remote
+   usually FAILS when one is configured, appending that same provenance to the
+   error they raise.
 """
 
 from __future__ import annotations
@@ -956,6 +957,83 @@ def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
         ["model", "download-status"],
         ["model", "download-cancel"],
     ]
+
+
+# --- restart_comfyui refuses a configured remote ---------------------------
+#
+# `restart_comfyui` composes `comfy stop` + `comfy launch`, neither of which
+# takes a `--host` / `--port`: they only manage the ComfyUI process comfy-cli
+# started on THIS machine. So with a remote configured the call would kill and
+# relaunch the LOCAL server while the configured remote was left untouched, and
+# (per the reported failure) report success for the wrong machine. It is refused
+# up front instead, exactly like `download_model` — the untracked-kill gate's
+# own remote skip (test_untracked_kill.py) is never even reached.
+
+
+def _restart(**kwargs):
+    """Drive the async ``restart_comfyui`` tool from these synchronous tests."""
+    return asyncio.run(server.restart_comfyui(**kwargs))
+
+
+def test_restart_comfyui_refuses_configured_url_target(patched_run, monkeypatch):
+    """A COMFYUI_URL remote fails the call, and spawns NOTHING."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"pid": 99, "port": 9001}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart()
+
+    message = str(excinfo.value)
+    assert "LOCAL-ONLY" in message  # says it can only manage a local process
+    assert "gpu.example:9001" in message  # names the remote that was NOT touched
+    assert "COMFYUI_URL" in message  # ... and which knob selected it
+    assert "NOT touched" in message  # ... and that the remote was left alone
+    # The guard is only worth anything if it lands BEFORE any stop/launch: a
+    # killed local server is not undoable whatever the call then returns.
+    assert calls == []
+
+
+def test_restart_comfyui_refuses_configured_host_target(patched_run, monkeypatch):
+    """The COMFYUI_HOST spelling is guarded too, with its default port named."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    calls = patched_run(envelope(data={"pid": 99, "port": 8188}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart()
+
+    message = str(excinfo.value)
+    assert f"gpu.example:{target.DEFAULT_COMFYUI_PORT}" in message
+    assert "COMFYUI_HOST" in message
+    assert calls == []
+
+
+def test_restart_comfyui_raises_on_malformed_url_target(patched_run, monkeypatch):
+    """A malformed remote config fails LOUDLY here, same as ``download_model``.
+
+    The caller asked for a remote, and the whole question the guard answers is
+    *which* one — so an unparseable answer is an error, not something to shrug
+    off and restart the local server. Unlike the local-only verbs (env / stop /
+    logs), which ignore a malformed ``COMFYUI_URL`` (see
+    ``test_local_only_verb_survives_malformed_config``), this destructive tool
+    refuses rather than act on the wrong machine.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_run(envelope(data={"pid": 99, "port": 8188}))
+
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        _restart()
+
+    assert calls == []
+
+
+def test_restart_comfyui_reject_guard_is_a_no_op_when_unconfigured():
+    """No remote configured -> the guard returns without raising (byte-identical).
+
+    The full local restart path (stop + launch, and the untracked-kill gate) is
+    covered by ``test_untracked_kill.py``; here we pin only that the new guard
+    itself does nothing when no remote is set.
+    """
+    assert target._reject_remote_restart() is None
 
 
 # --- system_stats / free_memory annotate a configured remote ---------------
