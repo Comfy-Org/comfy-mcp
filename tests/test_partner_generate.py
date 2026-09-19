@@ -22,18 +22,20 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import unicodedata
 
 import pytest
 from conftest import envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import argv, clitext, server
+from comfy_mcp import argv, clitext
+from comfy_mcp.server import _internal as server
 
 
 def _generate(*args, **kwargs):
@@ -57,7 +59,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     Records every elicitation raised so a test can assert the prompt happened
     (and what it said), and can be told to have no elicitation capability at all
@@ -70,10 +72,10 @@ class _FakeCtx:
         self._approve = approve
         self.elicitations: list[str] = []
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
@@ -201,9 +203,8 @@ def test_partner_generate_schema_names_the_save_path_out_path():
     agent sees. Two visible names for one save path would enlarge exactly the
     guess space the naming convention exists to shrink — hence no alias.
     """
-    properties = server.mcp._tool_manager.get_tool("partner_generate").parameters[
-        "properties"
-    ]
+    tool = asyncio.run(server.mcp.get_tool("partner_generate"))
+    properties = tool.parameters["properties"]
 
     assert "out_path" in properties
     assert "download" not in properties
@@ -336,7 +337,7 @@ def test_partner_generate_surfaces_a_broken_elicitation_without_spending(
     calls = patched_plain_run(0, stdout="done")
 
     class _BrokenCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             raise RuntimeError("client closed the connection")
 
     with pytest.raises(
@@ -759,7 +760,7 @@ def test_client_elicitation_support_is_false_outside_a_live_request():
     """`Context.session` raises outside a request — that is "cannot ask", not a crash."""
 
     class _NoSessionCtx:
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             raise AssertionError("must never be reached")
 
         @property
@@ -820,7 +821,7 @@ def test_an_unanswered_prompt_lapses_into_a_refusal(patched_plain_run, monkeypat
     monkeypatch.setattr(server, "_ELICIT_TIMEOUT", 0.05)
 
     class _SilentCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             self.elicitations.append(message)
             await asyncio.sleep(30)  # never answers
             raise AssertionError("must never be reached")
@@ -837,7 +838,7 @@ def test_a_malformed_elicitation_result_is_a_refusal(patched_plain_run):
     calls = patched_plain_run(0, stdout="done")
 
     class _NonsenseCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             self.elicitations.append(message)
             return object()  # no `.action`, no `.data`
 
@@ -1295,14 +1296,14 @@ def test_instructions_warn_that_partner_generate_spends_credits():
 
 
 def test_partner_generate_takes_an_injected_context():
-    """MCPServer must recognise `ctx` — or the spend prompt silently never fires.
+    """FastMCP must recognise `ctx` — or the spend prompt silently never fires.
 
     The elicitation path is reachable only if the server injects the request
     context; a rename or a retype would quietly degrade every call to the
     `confirm_spend` fallback with nothing failing loudly. `ctx` also has to stay
     OUT of the tool's public input schema, so a caller can't pass one.
     """
-    tool = server.mcp._tool_manager.get_tool("partner_generate")
+    tool = asyncio.run(server.mcp.get_tool("partner_generate"))
 
-    assert tool.context_kwarg == "ctx"
+    assert "ctx" in inspect.signature(tool.fn).parameters
     assert "ctx" not in tool.parameters["properties"]

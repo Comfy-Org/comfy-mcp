@@ -1,4 +1,4 @@
-"""The console script's `--help` / `--version` surface (`comfy_mcp.cli`).
+"""The console script's `--help` / `--version` surface.
 
 A stdio server that ignores argv gives a first-time user nothing: `comfy-mcp
 --help` starts the server, blocks on stdin, and exits silently at EOF, which is
@@ -20,7 +20,8 @@ from pathlib import Path
 import pytest
 
 import comfy_mcp
-from comfy_mcp import cli, server
+from comfy_mcp.server import _internal as server
+from comfy_mcp.server import cli, remote
 
 _FLOOR = server._MIN_COMFY_CLI_STR
 _ROOT = Path(__file__).resolve().parents[1]
@@ -32,10 +33,10 @@ def test_help_prints_usage_to_stdout(capsys):
     assert handled is True
     assert out.err == ""
     assert out.out.startswith("comfy-mcp ")
-    # The three things a confused user needs: what it is, that it is not an
-    # interactive program, and the one command that registers it properly.
+    # The three things a confused user needs: both supported transports, the
+    # long-lived HTTP command, and the command that registers stdio properly.
     assert "stdio" in out.out
-    assert "Not meant to be run interactively" in out.out
+    assert "comfy-mcp serve" in out.out
     assert "claude mcp add comfy-mcp -- comfy-mcp" in out.out
 
 
@@ -212,16 +213,47 @@ def test_main_serves_when_given_no_flags(monkeypatch):
     monkeypatch.setattr(server.mcp, "run", lambda **kw: calls.append(kw))
     monkeypatch.setattr(sys, "argv", ["comfy-mcp"])
     server.main()
-    assert calls == ["i", {"transport": "stdio"}]
+    assert calls == ["i", {"transport": "stdio", "show_banner": False}]
+
+
+def test_main_serve_starts_the_remote_sdk_listener(monkeypatch):
+    """Only the explicit subcommand selects HTTP; stdin is not involved."""
+
+    calls = []
+    monkeypatch.setattr(
+        server, "_apply_startup_instructions", lambda: calls.append("instructions")
+    )
+    monkeypatch.setattr(
+        remote,
+        "serve",
+        lambda settings, app: calls.append((settings, app)),
+    )
+
+    server.main(["serve", "--host", "127.0.0.1", "--port", "9000"])
+
+    assert calls[0] == "instructions"
+    settings, app = calls[1]
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 9000
+    assert settings.transport.value == "streamable-http"
+    assert app is server.mcp
+
+
+def test_non_loopback_serve_requires_an_allowed_host(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli._serve_config(["serve", "--host", "0.0.0.0"])
+
+    assert raised.value.code == 2
+    assert "non-loopback MCP bind" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("flag", ["--help", "--version"])
 def test_entry_point_exits_zero_with_output(flag):
     """End-to-end through a real process: prints on stdout, exits 0.
 
-    `python -m comfy_mcp.server` reaches the same `main()` the `comfy-mcp`
-    console script does, so this covers the real `sys.argv` read and the exit
-    status a user sees — without needing the script on PATH.
+    Importing and calling the public `main()` reaches the same function the
+    `comfy-mcp` console script uses, so this covers the real `sys.argv` read and
+    the exit status a user sees without adding a package-level `__main__.py`.
 
     `stdin` is `DEVNULL` so a regression fails fast: if flag interception ever
     stops firing, the child becomes a stdio MCP server, and on pytest's
@@ -229,7 +261,12 @@ def test_entry_point_exits_zero_with_output(flag):
     depending on whether that handle happened to be at EOF.
     """
     proc = subprocess.run(
-        [sys.executable, "-m", "comfy_mcp.server", flag],
+        [
+            sys.executable,
+            "-c",
+            "from comfy_mcp.server import main; main()",
+            flag,
+        ],
         capture_output=True,
         text=True,
         timeout=120,

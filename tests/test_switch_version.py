@@ -28,13 +28,14 @@ from unittest import mock
 
 import pytest
 from conftest import envelope
-from mcp.server.elicitation import (
+from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 
-from comfy_mcp import instructions, server
+from comfy_mcp.server import _internal as server
+from comfy_mcp.server import instructions
 
 
 def _switch(*args, **kwargs):
@@ -58,7 +59,7 @@ class _FakeSession:
 
 
 class _FakeCtx:
-    """A fake MCPServer ``Context`` that answers the elicitation with ``action``.
+    """A fake FastMCP ``Context`` that answers the elicitation with ``action``.
 
     A local copy of the spend tests' fake rather than a shared one, following the
     convention those files set: this gate's prompt must be assertable on its own,
@@ -71,10 +72,10 @@ class _FakeCtx:
         self._approve = approve
         self.elicitations: list[str] = []
 
-    async def elicit(self, message, schema):
+    async def elicit(self, message, response_type):
         self.elicitations.append(message)
         if self._action == "accept":
-            return AcceptedElicitation(data=schema(approve=self._approve))
+            return AcceptedElicitation(data=response_type(approve=self._approve))
         if self._action == "decline":
             return DeclinedElicitation()
         return CancelledElicitation()
@@ -565,7 +566,7 @@ def test_unanswered_prompt_lapses_into_a_refusal(patched_plain_run, monkeypatch)
     calls = patched_plain_run(0, stderr="done")
 
     class _SilentCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             self.elicitations.append(message)
             await asyncio.sleep(3600)
 
@@ -580,7 +581,7 @@ def test_a_client_that_errors_on_the_prompt_names_the_manual_route(patched_plain
     calls = patched_plain_run(0, stderr="done")
 
     class _BoomCtx(_FakeCtx):
-        async def elicit(self, message, schema):
+        async def elicit(self, message, response_type):
             raise RuntimeError("no prompt surface")
 
     with pytest.raises(server.ComfyCliError) as excinfo:

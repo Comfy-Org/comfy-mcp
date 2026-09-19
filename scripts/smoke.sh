@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# One-command e2e smoke: a real no-model round-trip against a LIVE local ComfyUI.
+# One-command live-engine smoke against a LIVE same-machine ComfyUI.
 #
-#   server_info -> run_workflow (EmptyImage -> SaveImage) -> fetch_outputs -> PNG.
+# It includes the checkpoint-free workflow/output and system-stats checks plus
+# generate_image, whose default template needs the documented SD1.5 checkpoint.
 #
-# Requires a running local ComfyUI (COMFYUI_URL, default 127.0.0.1:8188) AND the
+# Requires a running local ComfyUI (COMFY_LOCAL_URL, default 127.0.0.1:8188) AND the
 # comfy binary on PATH (or COMFY_BIN). Without both, the test SKIPS rather than
-# fails — so this is safe to run anywhere; it just reports "skipped" if you're
-# not set up. Answers "does it really work on this machine?" in one shot.
+# fails. This complements, rather than replaces, the stdio/HTTP transport smoke
+# documented in README.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

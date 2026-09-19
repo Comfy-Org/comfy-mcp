@@ -1,7 +1,7 @@
-"""The client-handshake instructions text.
+"""The server application's client-handshake instructions text.
 
 Leaf module: a single constant, no imports from this package, so anything may
-depend on it. ``server`` hands this to ``MCPServer(..., instructions=...)`` so
+depend on it. ``server`` hands this to ``FastMCP(..., instructions=...)`` so
 every client sees it once, at connection time, before any tool call — the
 canonical flows an agent would otherwise have to rediscover tool-by-tool.
 """
@@ -23,6 +23,10 @@ flows:
   does not block; same for `generate_image` / `run_template` on slow hardware,
   where YOUR transport cap bounds a `wait=True` call too. A run that outlives
   a wait keeps going — poll its `prompt_id`, never re-run it.
+- Remote HTTP files: `upload_file(file_path, client_os)` returns a short-lived,
+  single-use, credential-free PUT command for the CLIENT's own shell; run it
+  verbatim. HTTP `fetch_outputs` returns five-minute signed URLs plus one command
+  selected by `client_os`; do not edit the signed query.
 - Large model downloads: `download_model` submits to a background worker and
   returns a `download_id`; poll `download(action="wait")` /
   `download(action="status")`, or `download(action="cancel")` to stop one.

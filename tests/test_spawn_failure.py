@@ -37,7 +37,8 @@ import json
 import pytest
 from conftest import _OK_STREAM, _RecordingCtx
 
-from comfy_mcp import failure_log, server
+from comfy_mcp import failure_log
+from comfy_mcp.server import _internal as server
 
 # Long enough that `_cmd_for_message`'s `_MAX_ERROR_FIELD_CHARS` head slice
 # cannot carry the whole thing into the message — which is the property the

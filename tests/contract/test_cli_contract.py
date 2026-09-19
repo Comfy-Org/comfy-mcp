@@ -13,7 +13,7 @@ import shutil
 
 import pytest
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 pytestmark = pytest.mark.cli_contract
 

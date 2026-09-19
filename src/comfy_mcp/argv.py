@@ -6,10 +6,10 @@ and OS-limit defenses (``_reject_nul``, ``_reject_option_like``,
 ``_bounded_timeout``, ``_clip_for_error``) plus every per-domain guard built on
 top of them — ``_guard_workflow_path``, ``_guard_prompt_id``,
 ``_guard_download_id``, ``_guard_extra_args``, ``_guard_version``,
-``_guard_node_names``, ``_guard_log_port`` / ``_render_bad_port``,
-``_guard_model_relative_path`` / ``_guard_model_filename``, and
-``_validate_upload_paths`` — and their supporting length/shape constants and
-regexes. The common thread across all of them: a caller-supplied string that is
+``_guard_node_names``, ``_guard_log_port`` / ``_render_bad_port``, and
+``_guard_model_relative_path`` / ``_guard_model_filename`` — plus their
+supporting length/shape constants and regexes. The common thread across all of them:
+a caller-supplied string that is
 too long, embeds a NUL, or opens with a leading dash reaches either
 ``subprocess`` (a bare, unconverted exception) or comfy-cli (misread as an
 option) instead of failing as the :class:`errors.ComfyCliError` every other bad
@@ -84,10 +84,9 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
     straight when adding a call site:
 
     - **A bare POSITIONAL is an argument-injection vector.** A leading-dash entry
-      IS read as a flag, and every later positional shifts up one slot — how
-      ``upload_file(paths=["--overwrite"])`` becomes the overwrite flag, and how a
-      dash-leading ``workflow_path`` would let the first ``set-slot`` override land
-      in the path slot. Guarding these is mandatory.
+      IS read as a flag, and every later positional shifts up one slot — a
+      dash-leading ``workflow_path`` would let the first ``set-slot`` override
+      land in the path slot. Guarding these is mandatory.
     - **An option VALUE (``--flag VALUE``) is NOT.** comfy-cli is Click-backed, and
       Click takes the token after a value-taking option verbatim — even one that is
       itself a valid option name (``--out-dir --slot`` parses as
@@ -164,17 +163,12 @@ def _reject_option_like(label: str, value: str, expected: str = "") -> str:
 # ``run_workflow`` / ``validate_workflow`` / the four other ``workflow_path``
 # tools, ``download_model``'s ``relative_path`` and ``filename``,
 # ``fetch_template``'s / ``emit_partner_workflow``'s / ``partner_generate``'s
-# ``out_path``, ``fetch_outputs``'s and ``vary_workflow``'s ``out_dir``, each
-# entry of ``upload_file``'s ``paths``, and ``search_models``' ``folder``.
+# ``out_path``, ``fetch_outputs``'s and ``vary_workflow``'s ``out_dir``,
+# ``upload_file``'s ``file_path``, and ``search_models``' ``folder``.
 # ``download_model``'s ``url`` is the one path-adjacent value with a ceiling of
 # its own (:data:`_MAX_URL_LEN`), passed to the same helper as an explicit
 # ``limit``. Keep this list in sync — the SCOPE note at :data:`_MAX_URL_LEN`
 # points here for exactly the values that are covered.
-#
-# ``upload_file``'s ``paths`` is the one entry that needs MORE than this: it is
-# splatted into many argv slots, so a per-entry ceiling leaves the sum unbounded
-# and :data:`_MAX_UPLOAD_PATHS` / :data:`_MAX_UPLOAD_PATHS_TOTAL_BYTES` bound
-# the list itself, the way :data:`_MAX_EXTRA_ARGS` does for ``extra_args``.
 #
 # It stays this GENEROUS on purpose. It is an argv-safety guard, NOT an attempt
 # to close the residual forgery window in :func:`clitext._phrase_is_only_the_caller_s` —
@@ -252,9 +246,8 @@ def _encode_argv(label: str, value: str) -> bytes:
 
     ``subprocess`` encodes POSIX argv with :func:`os.fsencode`, so this is both
     the CHECK that a value can become an argv entry and the only honest way to
-    MEASURE one in the bytes the kernel counts. :func:`upload_file` uses it for
-    the second — its aggregate is sized against ``ARG_MAX`` directly and cannot
-    afford a proxy — and :func:`_guard_arg_len` for the first.
+    MEASURE one in the bytes the kernel counts. :func:`_guard_arg_len` uses it
+    for that check.
 
     Refusing matters because the alternative is not a bad answer but an
     unconverted one: an unencodable argument raises :class:`UnicodeEncodeError`
@@ -268,8 +261,8 @@ def _encode_argv(label: str, value: str) -> bytes:
     :func:`os.fsencode` at all, and that platform's filesystem error handler is
     ``surrogatepass`` — so nothing here raises and the byte count is a UTF-8
     estimate of a limit Windows does not express in bytes. The guard is a no-op
-    there rather than wrong, and the Windows command-line limit is out of scope
-    for the same reason :data:`_MAX_UPLOAD_PATHS_TOTAL_BYTES` says it is.
+    there rather than wrong; the Windows command-line limit is outside this
+    POSIX argv guard's scope.
     """
     try:
         return os.fsencode(value)
@@ -1093,149 +1086,6 @@ def _guard_model_filename(filename: str) -> str:
     ):
         raise ComfyCliError(f"invalid filename: {filename!r} (must be a bare filename)")
     return filename
-
-
-# Ceilings on `upload_file`'s `paths` LIST, alongside the per-entry
-# `_MAX_PATH_ARG_LEN` each path carries. The per-entry cap alone does not bound
-# the argv this tool builds: `paths` is the one caller-supplied value here that
-# is splatted into MANY argv slots, so a list of individually-legal paths still
-# sums past the kernel's TOTAL `ARG_MAX` (256 KiB on macOS, typically 2 MiB on
-# Linux) and dies as the `OSError` (`E2BIG`) `_run_comfy_raw` never converts —
-# its `try` wraps `communicate()`, not the `Popen(...)` that raises. Bounding
-# both the count and the size of a splatted list is the same thing
-# `_guard_extra_args` does for `extra_args`, for the same reason.
-#
-# TWO of them, because either alone leaves the other open: the aggregate bounds
-# the path BYTES, and the count bounds the per-entry overhead the aggregate
-# cannot see, since `execve` charges a pointer and a terminator per entry (a
-# list of a million EMPTY strings sums to zero bytes and still blows the limit).
-# `_guard_extra_args` splits the same job differently — count plus PER-ENTRY
-# length, no aggregate — so the two are the same pair of concerns rather than
-# literally the same pair of caps; its own worst case is a residue of the kind
-# the last paragraph describes.
-#
-# BYTES, not characters, and this is the one place in this module where that
-# distinction bites. The per-value ceilings above count characters and say why:
-# each sits so far under the limit it is guarding that a 4x UTF-8 expansion
-# still cannot reach it. An AGGREGATE has no such headroom — it is sized against
-# `ARG_MAX` directly, so 128 KiB of CHARACTERS would be up to 512 KiB of
-# multibyte path on the wire and would sail past the very limit it exists to
-# hold. Measured with `os.fsencode`, which is what `subprocess` itself uses to
-# render argv, so the count is the kernel's rather than a near-enough proxy:
-# `surrogatepass` would charge 3 bytes for each surrogate in the
-# `surrogateescape` range that `os.fsencode` renders back as the SINGLE
-# undecodable filename byte it came from, over-counting a path with non-UTF-8
-# bytes in its name threefold and refusing a batch that fits.
-#
-# NOT a proof that the spawn fits, and the comment must not pretend otherwise.
-# `execve` charges the inherited ENVIRONMENT against the same budget and
-# `_comfy_env` forwards a copy of `os.environ`, which on a loaded shell is tens
-# of KiB on its own; Windows does not work like this at all, capping the whole
-# rendered command line at 32,767 UTF-16 code units. A ceiling that actually
-# held under all of that would have to be computed per-spawn against the live
-# environment, which is a different mechanism from a tool-argument guard. What
-# these two DO buy is what the id caps buy: a runaway list is refused as a clean
-# `ComfyCliError` naming the mistake, rather than reaching a spawn that fails
-# with an unconverted `OSError`. Converting that `OSError` at the spawn site is
-# the airtight backstop underneath them, and is tracked separately.
-#
-# The AGGREGATE is the one that binds in practice, and the count is the backstop
-# under it rather than a second ceiling a caller meets. At a typical absolute
-# path — `/home/user/Pictures/comfy-inputs/IMG_20260804_123456.png` is about 58
-# bytes — 128 KiB is reached around 2,200 files, well before the 4096-entry cap,
-# so that entry count is only reachable with short paths (a `/tmp/frames/NNNN.png`
-# sequence is ~20 bytes and does fit). Read the count cap as what stops a list of
-# a million tiny or empty strings, not as a promise that 4096 real files fit.
-# Clearing these caps is not a promise the upload COMPLETES —
-# `upload_file`'s 300s timeout is the binding constraint on a batch that large,
-# and it is comfy-cli's transfer being timed, not this guard's business. A
-# caller who does reach one is told to split the batch; the tool takes any
-# number of files across several calls, so neither cap makes an upload
-# impossible, only unbatched.
-_MAX_UPLOAD_PATHS = 4096
-_MAX_UPLOAD_PATHS_TOTAL_BYTES = 128 * 1024
-
-
-def _validate_upload_paths(paths: Any) -> None:
-    """Every list-level and per-entry guard for :func:`upload_file`.
-
-    Synchronous ON PURPOSE: the tool is async, and these guards scan up to
-    :data:`_MAX_UPLOAD_PATHS` entries of :data:`_MAX_PATH_ARG_LEN` characters
-    each (including an ``os.fsencode`` per entry) before the first await —
-    inline, that stalls every other in-flight call and progress notification on
-    the event loop. :func:`upload_file` runs this through ``asyncio.to_thread``,
-    the same offload `_parse_deps_manifest` gets for the same class of work.
-    """
-    # Each path is splatted in as a positional, so a leading-dash entry is read
-    # by comfy-cli as a flag instead — `paths=["--overwrite"]` would silently
-    # become the overwrite flag rather than a (failing) upload. NUL is orthogonal
-    # to that (it is refused wherever it rides, positional or not): `subprocess`
-    # raises a bare `ValueError` on one, which would escape as an internal error
-    # instead of the `ComfyCliError` every other bad input produces.
-    # SHAPE first, the way `_guard_extra_args` checks it: a bare `str` would pass
-    # `len()` and then be splatted one CHARACTER per argv slot (`"a.png"` ->
-    # `a`, `.`, `p`, …), and a non-string entry dies inside `subprocess` with a
-    # `TypeError` this module's error contract never promised. This is the block
-    # where list-level mistakes are named, so they are both named here.
-    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
-        raise ComfyCliError(
-            f"invalid paths: expected a list of strings, got {type(paths).__name__}."
-        )
-    # The emptiest list-level mistake, and the one every cap below waves through:
-    # `[]` builds `comfy upload` with no positionals, so the caller gets either a
-    # success-shaped result for an upload that moved nothing or comfy-cli's raw
-    # Click usage dump. Name it here like the rest.
-    if not paths:
-        raise ComfyCliError(
-            "invalid paths: empty list — pass at least one file to upload "
-            "(e.g. ['/tmp/source.png'])."
-        )
-    # COUNT next, ahead of the per-entry loop: it is the whole-list mistake, and
-    # checking it first is what keeps the loop below proportional to a plausible
-    # command line rather than to whatever the caller sent. See
-    # `_MAX_UPLOAD_PATHS`.
-    if len(paths) > _MAX_UPLOAD_PATHS:
-        raise ComfyCliError(
-            f"invalid paths: {len(paths)} entries exceeds the "
-            f"{_MAX_UPLOAD_PATHS}-entry maximum (they are forwarded to comfy-cli "
-            "as command-line arguments) — upload in batches."
-        )
-    # Every per-entry failure names the INDEX the way `_reject_non_json_array_slot`
-    # names `slots[i]`: the list is splatted, so "which of the paths" is the first
-    # thing a caller with several needs to know, and that is as true of a
-    # dash-leading or NUL-bearing entry as of an oversized one. Size runs ahead
-    # of the two value guards for the ordering reason `_guard_arg_len` gives.
-    total = 0
-    for index, p in enumerate(paths):
-        label = f"upload path paths[{index}]"
-        if not isinstance(p, str):
-            raise ComfyCliError(
-                f"invalid {label}: expected a string, got {type(p).__name__}."
-            )
-        _guard_arg_len(label, p)
-        _reject_option_like(
-            label,
-            p,
-            expected="a file path (prefix a dash-leading name with './')",
-        )
-        _reject_nul(label, p)
-        # Encoded exactly as `subprocess` will encode it, so the running total is
-        # the kernel's count rather than a proxy — see
-        # `_MAX_UPLOAD_PATHS_TOTAL_BYTES` for why this aggregate cannot afford
-        # one. The encodability REFUSAL already happened inside `_guard_arg_len`
-        # above, which runs `_encode_argv` for every path-shaped value; this is
-        # the same call for its byte count.
-        total += len(_encode_argv(label, p))
-    # AGGREGATE last, once every entry is known to be a legal path: reporting it
-    # before the per-entry checks would name the sum for a list whose real
-    # problem is one bad member. Reports the total, never the paths.
-    if total > _MAX_UPLOAD_PATHS_TOTAL_BYTES:
-        raise ComfyCliError(
-            f"invalid paths: {len(paths)} entries totalling {total} bytes exceeds "
-            f"the {_MAX_UPLOAD_PATHS_TOTAL_BYTES}-byte maximum for the whole list "
-            "(the paths are forwarded to comfy-cli as command-line arguments) — "
-            "upload in batches."
-        )
 
 
 def _clip_for_error(text: str) -> str:

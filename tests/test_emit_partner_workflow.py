@@ -31,7 +31,8 @@ import json
 import pytest
 from conftest import envelope
 
-from comfy_mcp import argv, params, server
+from comfy_mcp import argv, params
+from comfy_mcp.server import _internal as server
 
 
 def _emit(*args, **kwargs):
@@ -293,7 +294,7 @@ def test_emit_never_probes_the_spend_gate_or_asks_for_consent(patched_run, monke
 
 def test_emit_takes_no_confirm_spend_argument():
     """The tool's public schema must not offer a spend knob it does not honor."""
-    tool = server.mcp._tool_manager.get_tool("emit_partner_workflow")
+    tool = asyncio.run(server.mcp.get_tool("emit_partner_workflow"))
 
     assert "confirm_spend" not in tool.parameters["properties"]
     assert set(tool.parameters["required"]) == {"model", "out_path"}

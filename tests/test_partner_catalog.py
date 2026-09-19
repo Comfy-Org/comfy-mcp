@@ -31,7 +31,8 @@ import json
 import pytest
 from conftest import envelope
 
-from comfy_mcp import params, server
+from comfy_mcp import params
+from comfy_mcp.server import _internal as server
 
 # A representative slice of the real `comfy generate list` payload
 # (comfy_cli/schemas/generate_list.json): one record per model, `count`, and the

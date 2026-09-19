@@ -32,7 +32,8 @@ import textwrap
 
 import pytest
 
-from comfy_mcp import instructions, server
+from comfy_mcp.server import _internal as server
+from comfy_mcp.server import instructions
 
 # The node tool — one grouped `nodes(action=...)` since the tool-consolidation
 # series, all of whose actions resolve against the live local `object_info`.

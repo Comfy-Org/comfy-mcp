@@ -39,7 +39,8 @@ from conftest import (
     stream_reader,
 )
 
-from comfy_mcp import argv, clitext, errors, failure_log, server, tcc, textutil
+from comfy_mcp import argv, clitext, errors, failure_log, tcc, textutil
+from comfy_mcp.server import _internal as server
 
 
 def _launch(*args, **kwargs):
@@ -1752,7 +1753,7 @@ def test_free_memory_sends_no_unload_models_when_off(patched_run):
     """`unload_models=False` sends the paired OFF flag and drops `--free-memory`.
 
     The pair must not go out as `--no-unload-models --free-memory`: ComfyUI's
-    `POST /free` only records `unload_models` when it is TRUE (server.py's
+    `POST /free` only records `unload_models` when it is TRUE (`_internal.py`'s
     `if unload_models: set_flag(...)`), and the queue worker then resolves
     `flags.get("unload_models", free_memory)` — so a `free_memory` left on would
     supply the default and unload every model, the exact opposite of what
@@ -1888,255 +1889,54 @@ def _upload_file(*args, **kwargs):
     return asyncio.run(server.upload_file(*args, **kwargs))
 
 
-def test_upload_file_passes_paths_and_overwrite(patched_async_run):
-    """upload_file forwards every path and appends --overwrite when asked."""
-    procs = patched_async_run(envelope(data={"uploaded": 2}))
-
-    assert _upload_file(["a.png", "b.png"], overwrite=True) == {"uploaded": 2}
-
-    cmd = procs[0].cmd
-    assert cmd[1:4] == ["--json", "--where", "local"]  # global flags first
-    assert cmd[4:] == ["upload", "a.png", "b.png", "--overwrite"]
-
-
-def test_upload_file_forwards_no_overwrite_by_default(patched_async_run):
-    """overwrite=False must SAY so — comfy-cli's flag pair defaults to overwrite.
-
-    `--overwrite/--no-overwrite` is True when omitted, so leaving the flag off
-    entirely would make `overwrite=False` a silent no-op that still replaces
-    existing files; the False leg has to spell out `--no-overwrite`.
-    """
+def test_upload_file_passes_cloud_path_and_no_overwrite(patched_async_run):
+    """The stdio leg forwards the one Cloud-compatible path unchanged."""
     procs = patched_async_run(envelope(data={"uploaded": 1}))
 
-    _upload_file(["only.png"])
+    assert _upload_file("/client/a.png", "linux") == {"uploaded": 1}
 
-    assert procs[0].cmd[4:] == ["upload", "only.png", "--no-overwrite"]
-
-
-def test_upload_file_rejects_option_like_path():
-    """A leading-dash path is refused: splatted in, it would BE the flag."""
-    with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        _upload_file(["--overwrite"])
+    cmd = procs[0].cmd
+    assert cmd[1:4] == ["--json", "--where", "local"]
+    assert cmd[4:] == ["upload", "/client/a.png", "--no-overwrite"]
 
 
-def test_upload_file_rejects_option_like_path_among_valid_ones():
-    """The guard scans every path, not just the first (argument injection)."""
-    with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        _upload_file(["/tmp/a.png", "--overwrite"])
+@pytest.mark.parametrize(
+    ("path", "client_os", "match"),
+    [
+        ("relative.png", "linux", "absolute path"),
+        ("/client/input.txt", "linux", "accepts image files"),
+        (r"C:\\client\\input.png", "linux", "absolute path"),
+    ],
+)
+def test_upload_file_rejects_non_cloud_path_shapes(path, client_os, match, no_spawn):
+    with pytest.raises(server.ComfyCliError, match=match):
+        _upload_file(path, client_os)
 
 
 def test_upload_file_rejects_an_oversized_path(no_spawn):
-    """An oversized entry is refused, and the error NAMES WHICH ONE.
-
-    The list is splatted into argv, so "which of the paths" is the first thing a
-    caller with several needs to know — the label carries the index the way
-    `_reject_non_json_array_slot` names `slots[i]`. A good first entry proves
-    the guard scans past it rather than stopping at `paths[0]`.
-    """
-    oversized = "/tmp/" + "u" * argv._MAX_PATH_ARG_LEN + ".png"
+    oversized = "/client/" + "u" * argv._MAX_PATH_ARG_LEN + ".png"
 
     with pytest.raises(server.ComfyCliError, match="exceeds") as excinfo:
-        _upload_file(["/tmp/ok.png", oversized])
+        _upload_file(oversized, "linux")
 
-    message = str(excinfo.value)
-    assert "paths[1]" in message
-    # Length-not-value: the size check runs ahead of both per-entry value
-    # guards, whose echoes would name the value instead of its size.
-    assert oversized not in message
+    assert oversized not in str(excinfo.value)
 
 
-def test_upload_file_rejects_too_many_paths(no_spawn):
-    """The per-entry cap does not bound the LIST — the count cap does.
-
-    `paths` is splatted into many argv slots, so entries that are each legal
-    still sum past the kernel's total `ARG_MAX` and die as the `OSError`
-    (`E2BIG`) `_run_comfy_raw` never converts. Same pair of caps, for the same
-    reason, as `_guard_extra_args`' `_MAX_EXTRA_ARGS`.
-    """
-    paths = [f"/tmp/{index}.png" for index in range(argv._MAX_UPLOAD_PATHS + 1)]
-
-    with pytest.raises(server.ComfyCliError, match="entries exceeds") as excinfo:
-        _upload_file(paths)
-
-    assert str(argv._MAX_UPLOAD_PATHS) in str(excinfo.value)
+def test_upload_file_rejects_an_unencodable_filename(no_spawn):
+    with pytest.raises(server.ComfyCliError, match="cannot be encoded"):
+        _upload_file("/client/\ud800.png", "linux")
 
 
-def test_upload_file_rejects_paths_totalling_past_the_aggregate_cap(no_spawn):
-    """A short-enough list of individually-legal paths is still bounded.
-
-    The count cap alone leaves this open — a mere 33 entries at the per-entry
-    ceiling already pass it while summing past `ARG_MAX` — so the aggregate is
-    what actually holds the splatted command line under the kernel's limit.
-    """
-    entry = "/tmp/" + "u" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
-    count = argv._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
-    paths = [entry] * count
-    assert count <= argv._MAX_UPLOAD_PATHS, "must clear the count cap first"
-
-    with pytest.raises(server.ComfyCliError, match="totalling") as excinfo:
-        _upload_file(paths)
-
-    # Reports the total, never the paths.
-    assert entry not in str(excinfo.value)
-
-
-def test_upload_file_measures_the_aggregate_in_bytes_not_characters(no_spawn):
-    """The aggregate is sized against `ARG_MAX`, which counts BYTES.
-
-    The per-value ceilings in this module count characters and can afford to —
-    each sits far enough under the limit it guards that a 4x UTF-8 expansion
-    cannot reach it. This one has no such headroom, so a list of multibyte paths
-    whose CHARACTER count is comfortably legal is still refused when its encoded
-    size is not — otherwise the cap would sail past the very limit it holds.
-    """
-    # 3 bytes per character, so this is a third of the cap in characters and
-    # just past it in bytes.
-    entry = "/tmp/" + "中" * 1000
-    count = argv._MAX_UPLOAD_PATHS_TOTAL_BYTES // (3 * 1000) + 1
-    paths = [entry] * count
-    assert sum(len(p) for p in paths) < argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
-
-    with pytest.raises(server.ComfyCliError, match="bytes exceeds"):
-        _upload_file(paths)
-
-
-def test_upload_file_rejects_a_bare_string_for_paths(no_spawn):
-    """A bare `str` would be splatted one CHARACTER per argv slot.
-
-    `len()` accepts it and iteration yields characters, so every per-entry guard
-    passes and `comfy upload a . p n g` is what gets spawned. Same refusal
-    `_guard_extra_args` makes, for the same reason.
-    """
-    with pytest.raises(server.ComfyCliError, match="expected a list of strings"):
-        _upload_file("a.png")
-
-
-def test_upload_file_rejects_an_empty_list(no_spawn):
-    """`[]` clears every cap and builds `comfy upload` with no positionals.
-
-    The emptiest list-level mistake, so it is named here with the rest rather
-    than surfacing as a success-shaped result for an upload that moved nothing.
-    """
-    with pytest.raises(server.ComfyCliError, match="empty list"):
-        _upload_file([])
-
-
-def test_upload_file_rejects_a_non_string_entry(no_spawn):
-    """A non-string entry dies inside `subprocess` with a bare `TypeError`.
-
-    That is an internal error rather than the `ComfyCliError` every other bad
-    input produces, and the message names WHICH entry.
-    """
-    with pytest.raises(server.ComfyCliError, match=r"paths\[1\].*expected a string"):
-        _upload_file(["/tmp/ok.png", 42])
-
-
-def test_upload_file_rejects_an_unencodable_path(no_spawn):
-    """A lone surrogate cannot be rendered into argv at all.
-
-    It survives the MCP JSON wire intact, passes the length and NUL guards, and
-    then makes `Popen` raise an uncaught `UnicodeEncodeError` — the same
-    unconverted-spawn-failure class `_reject_nul` exists to close. `os.fsencode`
-    is what refuses it here, because it is also what `subprocess` would use.
-    """
-    with pytest.raises(server.ComfyCliError, match=r"paths\[1\].*cannot be encoded"):
-        _upload_file(["/tmp/ok.png", "/tmp/\ud800.png"])
-
-
-def test_upload_file_counts_undecodable_filename_bytes_as_subprocess_would(
-    patched_async_run,
-):
-    """The aggregate uses `os.fsencode`, not a near-enough proxy.
-
-    A filename byte that is not valid UTF-8 arrives as a `surrogateescape`
-    surrogate and `os.fsencode` renders it back as the SINGLE byte it came from.
-    Measuring with `surrogatepass` instead would charge 3 bytes for each of
-    those, over-counting such a path threefold and refusing a batch that fits.
-    """
-    procs = patched_async_run(envelope(data={"uploaded": 1}))
-    # One undecodable byte (0xFF) per character of name, at a size that fits
-    # under the cap when counted as `subprocess` counts it and blows past it
-    # when counted with `surrogatepass`.
-    per_entry = "/tmp/" + "\udcff" * 2000
-    count = 60
-    paths = [per_entry] * count
-    assert sum(len(os.fsencode(p)) for p in paths) < argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
-    surrogatepass_total = sum(len(p.encode("utf-8", "surrogatepass")) for p in paths)
-    assert surrogatepass_total > argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
-
-    _upload_file(paths)
-
-    assert procs[0].cmd[4:] == ["upload", *paths, "--no-overwrite"]
-
-
-def test_upload_file_reports_a_bad_entry_ahead_of_the_aggregate(no_spawn):
-    """A list that is BOTH too large and holds a bad entry names the entry.
-
-    The aggregate is a property of the whole list; a dash-leading path is a
-    property of one member, and that is the more actionable of the two — so the
-    per-entry loop runs before the sum is judged.
-    """
-    entry = "/tmp/" + "u" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
-    count = argv._MAX_UPLOAD_PATHS_TOTAL_BYTES // len(entry) + 1
-    paths = [*[entry] * count, "--overwrite"]
-
-    with pytest.raises(server.ComfyCliError, match="leading '-'"):
-        _upload_file(paths)
-
-
-def test_upload_file_allows_a_full_batch_of_real_paths(patched_async_run):
-    """Both caps are backstops: a real batch AT the count boundary rides through.
-
-    The whole point of sizing them the way `_MAX_UPLOAD_PATHS` documents is that
-    no upload a caller would actually make reaches either — a frame sequence
-    filling the count cap at realistic path lengths is still well inside the
-    aggregate, so the caps refuse runaway argv rather than bulk uploads.
-    """
-    procs = patched_async_run(envelope(data={"uploaded": argv._MAX_UPLOAD_PATHS}))
-    paths = [f"/tmp/frames/{index:04d}.png" for index in range(argv._MAX_UPLOAD_PATHS)]
-    assert sum(len(p) for p in paths) < argv._MAX_UPLOAD_PATHS_TOTAL_BYTES
-
-    _upload_file(paths)
-
-    assert procs[0].cmd[4:] == ["upload", *paths, "--no-overwrite"]
-
-
-def test_upload_file_allows_a_path_at_the_ceiling(patched_async_run):
-    """The boundary value itself rides through as a positional."""
-    procs = patched_async_run(envelope(data={"uploaded": 1}))
-    at_ceiling = "/tmp/" + "u" * (argv._MAX_PATH_ARG_LEN - len("/tmp/"))
-    assert len(at_ceiling) == argv._MAX_PATH_ARG_LEN
-
-    _upload_file(["/tmp/ok.png", at_ceiling])
-
-    assert procs[0].cmd[4:] == ["upload", "/tmp/ok.png", at_ceiling, "--no-overwrite"]
-
-
-def test_upload_file_rejects_embedded_nul_path():
-    """A NUL surfaces as ComfyCliError, not subprocess's bare ValueError."""
+def test_upload_file_rejects_embedded_nul_path(no_spawn):
     with pytest.raises(server.ComfyCliError, match="embedded NUL"):
-        _upload_file(["/tmp/a\0.png"])
-
-    with pytest.raises(server.ComfyCliError, match="embedded NUL"):
-        _upload_file(["/tmp/a.png", "/tmp/b\0.png"])
+        _upload_file("/client/a\0.png", "linux")
 
 
 def test_upload_file_cancellation_reaps_the_transfer(patched_async_run, monkeypatch):
-    """Cancelling the tool call must kill the transfer, not orphan it.
-
-    This is what the synchronous path could not do: cancellation never lands on
-    the worker pool sync tools run on, so an MCP client that cancelled (or
-    disconnected) mid-upload left the `comfy upload` child transferring with
-    nobody waiting. The kill strands at most a partial BATCH (comfy-cli stages
-    one file at a time through the server's HTTP endpoint), which re-running
-    the same call recovers — the tool's docstring owns that story.
-    """
+    """Cancelling stdio upload still kills the long-lived comfy child."""
     procs = patched_async_run(hang=True)
 
     async def drive():
-        # Wrap the fixture's fake so the cancel fires at a DETERMINISTIC point —
-        # once the child exists. Cancelling on a fixed number of loop turns
-        # would race the `to_thread` hop the version probe makes first.
         spawned = asyncio.Event()
         fake_exec = server.asyncio.create_subprocess_exec
 
@@ -2146,7 +1946,7 @@ def test_upload_file_cancellation_reaps_the_transfer(patched_async_run, monkeypa
             return proc
 
         monkeypatch.setattr(server.asyncio, "create_subprocess_exec", notifying_exec)
-        task = asyncio.ensure_future(server.upload_file(["/tmp/big.png"]))
+        task = asyncio.ensure_future(server.upload_file("/client/big.png", "linux"))
         await spawned.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2155,7 +1955,7 @@ def test_upload_file_cancellation_reaps_the_transfer(patched_async_run, monkeypa
     asyncio.run(drive())
 
     assert len(procs) == 1
-    assert procs[0].killed is True  # the `finally` fired
+    assert procs[0].killed is True
 
 
 def test_run_comfy_async_default_tail_clips_an_oversized_envelope(patched_async_run):
@@ -2187,12 +1987,10 @@ def test_run_comfy_async_stdout_cap_widens_the_bound(patched_async_run):
 
 
 def test_upload_file_parses_an_envelope_past_the_default_tail(patched_async_run):
-    """A full batch's envelope must reach the caller whole, not clipped.
+    """A verbose upload envelope must reach the caller whole, not clipped.
 
-    comfy-cli's upload envelope echoes every staged path back, so its size
-    scales with the argv the caps allow — past `_STDERR_MAX_CHARS`. The tool
-    passes `_UPLOAD_STDOUT_MAX_CHARS` so the LAST JSON object is still the
-    whole envelope and a successful upload is reported as one.
+    The tool passes `_UPLOAD_STDOUT_MAX_CHARS` so the last JSON object remains
+    complete even when comfy-cli includes verbose upload metadata.
     """
     uploads = {
         "uploads": [
@@ -2201,7 +1999,7 @@ def test_upload_file_parses_an_envelope_past_the_default_tail(patched_async_run)
     }
     patched_async_run(envelope(data=uploads))
 
-    assert _upload_file(["/tmp/a.png"]) == uploads
+    assert _upload_file("/tmp/a.png", "linux") == uploads
 
 
 @pytest.mark.parametrize(
@@ -2931,7 +2729,7 @@ def test_fetch_outputs_omits_url_only_by_default(patched_run):
 def test_server_instructions_cover_canonical_flows():
     """Instructions ride the handshake and teach submit->poll->fetch + templates."""
     instructions = server.mcp.instructions
-    assert instructions  # present on the MCPServer instance
+    assert instructions  # present on the FastMCP instance
 
     # Call-server-info-first + the async submit -> poll -> fetch generation loop.
     # "wait_for_job" -> "job": the six job tools consolidated into
@@ -2975,7 +2773,7 @@ def test_tool_arguments_follow_the_naming_convention():
     """
     schemas = {
         tool.name: tool.parameters.get("properties", {})
-        for tool in server.mcp._tool_manager.list_tools()
+        for tool in asyncio.run(server.mcp.list_tools())
     }
 
     # Every tool that consumes a workflow FILE names it `workflow_path`.
@@ -3009,7 +2807,7 @@ def test_the_readme_tool_count_matches_the_live_tool_set():
     thing a reader can check and the first thing that costs the rest of the
     document its credibility, so it gets a tripwire rather than a convention.
     """
-    count = len(server.mcp._tool_manager.list_tools())
+    count = len(asyncio.run(server.mcp.list_tools()))
     readme = (pathlib.Path(__file__).resolve().parent.parent / "README.md").read_text(
         encoding="utf-8"
     )
@@ -4968,52 +4766,11 @@ def test_latched_prompt_id_must_pass_the_job_verbs_own_guard(blocking_stream, id
     assert len(msg) < id_len or id_len < 1_000
 
 
-class _StderrBlockingProc:
-    """stdout hits EOF fast; ``stderr.read()`` blocks past the timeout.
-
-    Reproduces the cancellation path: ``_drain`` finishes ``_pump`` + ``wait``
-    and then suspends at ``await stderr_future``, so the outer ``wait_for``
-    timeout cancels the future. Awaiting it in the handler re-raises
-    ``CancelledError`` (a ``BaseException``) — which must NOT escape and mask the
-    intended ``ComfyCliError``.
-    """
-
-    def __init__(self, cmd, stdout_lines):
-        self.cmd = cmd
-        self._lines = [line.encode("utf-8") for line in stdout_lines]
-        self.stdout = self  # the reader protocol lives on the proc
-        self.stderr = self  # read lives on the proc
-        self.returncode = None
-        self.killed = False
-
-    async def readuntil(self, separator=b"\n"):
-        if self._lines:
-            return self._lines.pop(0)
-        raise asyncio.IncompleteReadError(b"", None)  # EOF -> _pump breaks
-
-    async def read(self, size=-1):
-        # Outlives the tiny timeout; suspends `_read` at `await stderr_future`.
-        await asyncio.sleep(1.0)
-        return b""
-
-    async def wait(self):
-        self.returncode = 0
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-        self._alive = False
-
-
-def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
+def test_streaming_timeout_stderr_cancel_still_raises(stderr_blocking_stream):
     """A timeout that cancels the stderr read must still raise ComfyCliError, not CancelledError."""
     queued = json.dumps({"type": "queued", "nodes": [{"node_id": "1"}]})
 
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        return _StderrBlockingProc(cmd, [queued + "\n"])
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    stderr_blocking_stream([queued + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -5031,7 +4788,9 @@ def test_streaming_timeout_stderr_cancel_still_raises(monkeypatch):
     )  # tail gathering was cancelled -> empty, best-effort
 
 
-def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(monkeypatch):
+def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(
+    stderr_blocking_stream,
+):
     """A deadline that lands on the post-EOF reap is a dead child, not a live run.
 
     `_read` bounds the EOF-path `proc.wait()` + stderr drain with the SAME
@@ -5045,11 +4804,7 @@ def test_expired_wait_after_stdout_eof_does_not_claim_a_live_job(monkeypatch):
         {"schema": "event/1", "type": "queued", "prompt_id": _HANDLE, "nodes": [{}]}
     )
 
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        return _StderrBlockingProc(cmd, [queued + "\n"])
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    stderr_blocking_stream([queued + "\n"])
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(
@@ -5605,7 +5360,7 @@ def test_restart_comfyui_returns_new_server_status(monkeypatch):
 #
 # `launch` / `stop` / `restart` all drive comfy-cli's ONE recorded pid and the one
 # ComfyUI port. Being dispatched onto a worker thread does not order them — both
-# `asyncio.to_thread` and MCPServer's sync-tool pool have many workers — so
+# `asyncio.to_thread` and FastMCP's sync-tool pool have many workers — so
 # `_LIFECYCLE_LOCK` has to, and a `stop` slipping into the gap between a restart's
 # stop and its launch is exactly the interleaving that leaves a server comfy-cli
 # can no longer stop.

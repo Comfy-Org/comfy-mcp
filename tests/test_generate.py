@@ -25,9 +25,9 @@ import asyncio
 import json
 
 import pytest
-from conftest import _OK_STREAM, _RecordingCtx, stream_reader
+from conftest import _OK_STREAM, _RecordingCtx
 
-from comfy_mcp import server
+from comfy_mcp.server import _internal as server
 
 
 def test_generate_image_streams_and_maps_command(patched_stream):
@@ -414,61 +414,10 @@ def test_generate_image_missing_template_error_is_actionable(monkeypatch):
 # cancel.
 
 
-class _BlockingProc:
-    """A child fake that emits ``first_lines`` and then never yields an envelope.
-
-    Local rather than in ``conftest`` for the reason AGENTS.md allows: this is the
-    one case where the call genuinely differs — the shared ``patched_stream`` fake
-    drains its canned stream to EOF instantly and reports itself already exited,
-    so it can never hold the read past a deadline, which is the whole state these
-    tests are about. Mirrors the same fake in ``test_run_template.py``.
-
-    ``returncode`` starts None so the timeout handler's kill fires; no ``pid``, so
-    that kill takes ``server._kill_proc_tree_async``'s ``proc.kill()`` fallback
-    instead of signalling a made-up process group.
-    """
-
-    def __init__(self, cmd, first_lines):
-        self.cmd = cmd
-        self._lines = [line.encode("utf-8") for line in first_lines]
-        self.stdout = self  # the reader protocol lives on the proc itself
-        self.stderr = stream_reader("")
-        self.returncode = None
-        self.killed = False
-
-    async def readuntil(self, separator=b"\n"):
-        if self._lines:
-            return self._lines.pop(0)
-        # Outlives the test's tiny deadline; no envelope ever comes.
-        await asyncio.sleep(1.0)
-        raise asyncio.IncompleteReadError(b"", None)
-
-    async def wait(self):
-        self.returncode = 0
-        return self.returncode
-
-    def kill(self):
-        self.killed = True
-
-
-def _blocking_stream(monkeypatch, first_lines):
-    """Spawn fake whose child emits ``first_lines`` and then blocks forever."""
-    procs: list[_BlockingProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingProc(cmd, first_lines)
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-    # Zeroed purely so the deadline is reachable inside a test; the real grace is
-    # 30s of deliberate slack past the caller's budget.
-    monkeypatch.setattr(server, "_RUN_TEMPLATE_TIMEOUT_GRACE", 0.0)
-    return procs
-
-
-def test_generate_image_expired_wait_returns_the_prompt_id(monkeypatch):
+def test_generate_image_expired_wait_returns_the_prompt_id(
+    monkeypatch,
+    blocking_stream,
+):
     """An expired wait returns the handle payload instead of raising."""
     queued = json.dumps(
         {
@@ -478,7 +427,10 @@ def test_generate_image_expired_wait_returns_the_prompt_id(monkeypatch):
             "nodes": [{"node_id": "1"}, {"node_id": "2"}],
         }
     )
-    procs = _blocking_stream(monkeypatch, [queued + "\n"])
+    procs = blocking_stream([queued + "\n"])
+    # Zeroed purely so the deadline is reachable inside a test; the real grace is
+    # 30s of deliberate slack past the caller's budget.
+    monkeypatch.setattr(server, "_RUN_TEMPLATE_TIMEOUT_GRACE", 0.0)
 
     result = asyncio.run(server.generate_image("a cat", timeout_seconds=0.25))
 
@@ -495,7 +447,10 @@ def test_generate_image_expired_wait_returns_the_prompt_id(monkeypatch):
     assert procs[0].killed  # our child is still cleaned up
 
 
-def test_generate_image_expired_wait_before_submit_still_raises(monkeypatch):
+def test_generate_image_expired_wait_before_submit_still_raises(
+    monkeypatch,
+    blocking_stream,
+):
     """No `prompt_id` reported means nothing was submitted — that stays an error.
 
     The handle payload is not a blanket "timeouts are fine" switch: a deadline
@@ -505,7 +460,8 @@ def test_generate_image_expired_wait_before_submit_still_raises(monkeypatch):
     """
     # A well-formed run event that carries no `prompt_id` — the pre-submit state.
     preflight = json.dumps({"schema": "event/1", "type": "converted", "node_count": 2})
-    procs = _blocking_stream(monkeypatch, [preflight + "\n"])
+    procs = blocking_stream([preflight + "\n"])
+    monkeypatch.setattr(server, "_RUN_TEMPLATE_TIMEOUT_GRACE", 0.0)
 
     with pytest.raises(server.ComfyCliError) as exc:
         asyncio.run(server.generate_image("a cat", timeout_seconds=0.25))
@@ -516,26 +472,21 @@ def test_generate_image_expired_wait_before_submit_still_raises(monkeypatch):
     assert procs[0].killed
 
 
-def test_generate_image_default_wait_fits_a_conservative_client_cap(monkeypatch):
+def test_generate_image_default_wait_fits_a_conservative_client_cap(
+    patched_streaming_result,
+):
     """The default call cannot outlive a conservative MCP transport cap.
 
     The client's cap is invisible to this server and fires first when it is
     shorter, returning nothing at all — so the DEFAULT has to expire on this side,
     where the handle can still be returned.
     """
-    seen: dict = {}
-
-    async def fake_stream(*args, ctx=None, timeout=None, **kwargs):
-        seen["timeout"] = timeout
-        seen["kwargs"] = kwargs
-        return {"outputs": []}
-
-    monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+    calls = patched_streaming_result({"outputs": []})
 
     asyncio.run(server.generate_image("a cat"))
 
     # Whole-call wall clock = the caller's budget + the engine grace.
-    assert seen["timeout"] == pytest.approx(
+    assert calls[0]["kwargs"]["timeout"] == pytest.approx(
         server._T2I_DEFAULT_TIMEOUT + server._RUN_TEMPLATE_TIMEOUT_GRACE
     )
     # 300s is the cap observed in the field; 120s is the low end of that range.
@@ -545,7 +496,7 @@ def test_generate_image_default_wait_fits_a_conservative_client_cap(monkeypatch)
     # while the client's cap covers the whole call including that probe. Pinned
     # against 110s (`run_workflow`'s whole wait, which adds no grace on top) so
     # there is real headroom rather than a photo finish.
-    assert seen["timeout"] < 120.0
-    assert seen["timeout"] <= 110.0
+    assert calls[0]["kwargs"]["timeout"] < 120.0
+    assert calls[0]["kwargs"]["timeout"] <= 110.0
     # And the expiry hands back the handle rather than raising.
-    assert seen["kwargs"]["timeout_returns_handle"] is True
+    assert calls[0]["kwargs"]["timeout_returns_handle"] is True

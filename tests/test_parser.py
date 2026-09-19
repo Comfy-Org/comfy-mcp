@@ -1,6 +1,6 @@
 """Unit tests for the comfy-cli envelope parser."""
 
-from comfy_mcp.server import _last_json_object
+from comfy_mcp.server._internal import _last_json_object
 
 
 def test_prefers_envelope_over_plain_json():
