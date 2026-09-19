@@ -958,6 +958,109 @@ def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
     ]
 
 
+# --- stop_comfyui refuses a configured remote ------------------------------
+#
+# `comfy stop` is LOCAL-ONLY: it takes no `--host` / `--port`, and the
+# background-process registry it consults is populated only by local
+# background-mode launches on THIS machine. A remote target can never appear
+# there, so a bare `comfy stop` against a remote-configured session returns
+# comfy-cli's "No ComfyUI is running in the background" — a FALSE NEGATIVE that
+# conflates "nothing to stop" with "this tool cannot even observe the remote".
+# It is refused up front with a structured verdict instead, so a caller can
+# branch on `stopped` and is told the remote may well be up.
+
+
+def test_stop_refuses_configured_url_target(patched_plain_run, monkeypatch):
+    """A COMFYUI_URL remote yields a structured refusal and stops NOTHING."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    # The explicit, branchable fields the ticket requires: a caller does not
+    # have to scrape prose to learn no local action ran, nor to tell this apart
+    # from a confirmed "not running".
+    assert result["ok"] is False
+    assert result["stopped"] is False
+    assert result["reason"] == "remote_target_configured"
+    assert result["remote_target"] == {
+        "host": "gpu.example",
+        "port": 9001,
+        "source": "COMFYUI_URL",
+    }
+    message = result["message"]
+    assert "gpu.example:9001" in message  # names the remote it cannot touch
+    assert "COMFYUI_URL" in message  # ... and which knob selected it
+    # The distinction the ticket is about: NOT the same as "confirmed down".
+    assert "NOT a confirmed 'not running'" in message
+    assert "No local action was taken" in message
+    # The whole point of the guard: it never shells out to `comfy stop`.
+    assert calls == []
+
+
+def test_stop_refuses_configured_host_target(patched_plain_run, monkeypatch):
+    """The COMFYUI_HOST spelling is guarded too, with its default port named."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    assert result["stopped"] is False
+    assert result["remote_target"] == {
+        "host": "gpu.example",
+        "port": target.DEFAULT_COMFYUI_PORT,
+        "source": "COMFYUI_HOST",
+    }
+    assert f"gpu.example:{target.DEFAULT_COMFYUI_PORT}" in result["message"]
+    assert calls == []
+
+
+def test_stop_raises_on_malformed_url_target(patched_plain_run, monkeypatch):
+    """A malformed remote config fails LOUDLY, never silently stopping locally.
+
+    Same posture as ``download_model`` / ``launch_comfyui``: the caller asked
+    for a remote, so an unparseable value is an error rather than something to
+    shrug off and run a LOCAL stop instead (which could mislead exactly as the
+    "not running" false negative this whole guard exists to avoid).
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        server.stop_comfyui()
+
+    assert calls == []
+
+
+def test_stop_refusal_masks_userinfo_in_host(patched_plain_run, monkeypatch):
+    """A credential written into COMFYUI_HOST is not echoed raw in the refusal."""
+    monkeypatch.setenv("COMFYUI_HOST", "<user>:<sekret>@gpu.example")
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    assert "<sekret>" not in result["message"]
+    assert "<sekret>" not in result["remote_target"]["host"]
+    assert result["remote_target"]["host"] == "***@gpu.example"
+    assert calls == []
+
+
+def test_stop_unconfigured_is_unchanged(patched_plain_run):
+    """No remote configured -> byte-identical to today (the guard is a no-op).
+
+    Distinguishes "confirmed not running" (this path — comfy-cli's own verdict)
+    from the "cannot see the remote" refusal above: with nothing configured the
+    tool really does shell out to `comfy stop` and synthesize its plain result.
+    """
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "stop"
+    assert calls[0]["cmd"][4:] == ["stop"]  # the local stop really was attempted
+
+
 # --- system_stats / free_memory annotate a configured remote ---------------
 #
 # `comfy system-stats` and `comfy free` take no `--host` / `--port` (only

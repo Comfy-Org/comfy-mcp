@@ -6879,6 +6879,57 @@ async def launch_comfyui(
     return await asyncio.to_thread(_launch_comfyui_sync, guarded)
 
 
+def _remote_stop_refusal() -> dict[str, Any] | None:
+    """A structured "cannot stop a remote" verdict, or ``None`` for local.
+
+    ``comfy stop`` is LOCAL-ONLY: like ``comfy launch`` it takes no ``--host`` /
+    ``--port``, and the background-process registry it consults is populated only
+    by local, background-mode launches on THIS machine. A remote target (or even
+    a foreground-launched LOCAL instance) can never appear in that registry, so a
+    bare ``comfy stop`` against a remote-configured session returns comfy-cli's
+    "No ComfyUI is running in the background" — a FALSE NEGATIVE that conflates
+    "nothing to stop" with "this tool has no way to observe the remote at all",
+    misleading a caller trying to reason about a remote that may well be up and
+    serving. The lifecycle tools are deliberately local-only (there is no
+    ``--host`` for these verbs), so there is no remote-stop mode to fall back to.
+
+    So when ``COMFYUI_URL`` / ``COMFYUI_HOST`` is set this returns a branchable
+    dict (``stopped: False``) — mirroring :func:`launch_comfyui`'s remote refusal
+    rather than raising — that states the limitation, distinguishes it from a
+    confirmed "not running", and names the ways around it. The host is
+    userinfo-masked (:func:`target._redact_target_host`) so a credential written
+    into ``COMFYUI_HOST`` is not echoed back.
+
+    Returns ``None`` when nothing is configured, so :func:`stop_comfyui` stays
+    byte-identical to today. A set-but-malformed value raises straight out of
+    :func:`target._comfy_target`, loudly — the same way ``download_model`` /
+    ``launch_comfyui`` treat a remote the caller asked for but mis-spelled: it
+    must never be shrugged off into a local stop.
+    """
+    resolved = target._comfy_target()
+    if resolved is None:
+        return None
+    host, port, source = resolved
+    safe_host = target._redact_target_host(host)
+    endpoint = target._format_target_endpoint(safe_host, port)
+    return {
+        "ok": False,
+        "stopped": False,
+        "reason": "remote_target_configured",
+        "remote_target": {"host": safe_host, "port": port, "source": source},
+        "message": (
+            "stop_comfyui is LOCAL-ONLY, but a remote ComfyUI is configured "
+            f"({source} -> {endpoint}). `comfy stop` takes no --host/--port and "
+            "consults only comfy-cli's local background-process registry, which a "
+            "remote server never appears in — so this tool cannot see or stop that "
+            "remote. This is NOT a confirmed 'not running': the remote may well be "
+            "up and serving. No local action was taken. To stop the remote, stop it "
+            "on the remote host itself (its own comfy-cli / MCP server); or unset "
+            "COMFYUI_URL/COMFYUI_HOST to manage a LOCAL ComfyUI here."
+        ),
+    }
+
+
 @mcp.tool()
 def stop_comfyui() -> Any:
     """Stop the LOCAL ComfyUI server that comfy-cli launched.
@@ -6892,10 +6943,16 @@ def stop_comfyui() -> Any:
     Prints text with no JSON envelope; success returns a synthesized
     ``{"ok": True, ...}``.
 
+    **LOCAL-ONLY** — a configured remote refuses, not misreporting "not
+    running" (:func:`_remote_stop_refusal`).
+
     **One lifecycle call at a time** — shares ``_LIFECYCLE_LOCK`` with
     ``launch_comfyui``/``restart_comfyui``; refused immediately if one of those
     is in flight, rather than racing comfy-cli's single recorded pid.
     """
+    refusal = _remote_stop_refusal()
+    if refusal is not None:
+        return refusal
     with _lifecycle_slot("stop"):
         return _run_comfy("stop", timeout=60.0, plain_ok=True)
 
