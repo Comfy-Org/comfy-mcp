@@ -51,7 +51,16 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # so there was no version of it that fit the slack left after the
 # `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
 # next growth is still a decision.
-_BUDGET_TOKENS = 15_650
+#
+# 15,650 -> 15,750 for `launch_comfyui`'s remote-target refusal (+~110 tokens,
+# already trimmed twice against this ceiling). Growth a caller cannot do
+# without: that `launch_comfyui` is LOCAL-ONLY and, with a remote configured,
+# spawns NOTHING and returns a structured refusal (``launched: False``) rather
+# than starting a second local ComfyUI and reporting success, is not inferable
+# from any other tool's docs — and an agent that does not know it acts on a
+# launch that never touched the remote it meant to (re)start. Measured ~15,704
+# after the edit, so the next growth is still a decision.
+_BUDGET_TOKENS = 15_750
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

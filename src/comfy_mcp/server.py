@@ -6857,7 +6857,21 @@ async def launch_comfyui(
     comfy-cli records (kept as ``recorded_pid``); ``pid_source``/``pid_note``
     say which you got. Stop the server with ``stop_comfyui``, never by killing
     a reported pid.
+
+    **LOCAL-ONLY.** With ``COMFYUI_URL``/``COMFYUI_HOST`` set this cannot touch
+    that remote, so it launches nothing and returns a refusal with ``ok`` and
+    ``launched`` both ``False`` (and ``reason: remote_target_configured``, plus
+    ``remote_target``); branch on ``launched``. A malformed value raises. Unset
+    those to launch locally.
     """
+    refusal = target._local_launch_refusal_for_remote_target()
+    if refusal is not None:
+        # Before spawning ANYTHING: a remote target means this local-only launch
+        # is the wrong tool, so refuse up front (like `download_model`) rather
+        # than starting a second local process and reporting a success that hides
+        # it. Ahead of the network-exposure consent too — there is no launch to
+        # expose, so the user must not be prompted for one.
+        return refusal
     guarded = argv._guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
         guarded,
