@@ -88,11 +88,11 @@ jobs:
       issues: write
       pull-requests: read
       actions: read
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@23c7b69392d08e57f545d393faa391e43cf4dd55 # github-workflows main (23c7b69)
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@9cbbaa9f3b99ec14f80630f0b6e8ad0e1791287e # github-workflows main (9cbbaa9)
     with:
       # Keep the assets ref (finder/verifier briefs, interval gate, dedup ledger)
       # in lock-step with the `uses:` SHA above. Bump both together.
-      workflows_ref: 23c7b69392d08e57f545d393faa391e43cf4dd55
+      workflows_ref: 9cbbaa9f3b99ec14f80630f0b6e8ad0e1791287e
       # File as cloud-code-bot so groom's issues are a distinct, queryable actor
       # rather than github-actions[bot]. Unset -> reusable falls back gracefully.
       bot_app_id: ${{ vars.APP_ID }}
