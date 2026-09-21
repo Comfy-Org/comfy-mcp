@@ -20,7 +20,10 @@ public name in this module.
 
 from __future__ import annotations
 
+import json
 import os
+import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -183,6 +186,154 @@ def _redact_config_url(url: str) -> str:
     return f"{masked[: cut + 1]}<redacted>"
 
 
+_COMFY_DESKTOP_PORT_LOCK_SOURCE = "comfy_desktop_port_lock"
+
+
+def _comfy_desktop_port_locks_dir() -> Path | None:
+    """The platform-specific ``Comfy Desktop/port-locks`` directory, or None.
+
+    Comfy Desktop (the Electron app) writes one JSON file per port it is
+    CURRENTLY bound to, named ``port-<N>.json`` with ``{"pid", "installationName",
+    "timestamp"}`` — its own dynamic-port bookkeeping, independent of anything
+    comfy-cli tracks. Locations per Electron's own ``app.getPath("appData")``
+    convention (verified against a live Windows install; macOS/Linux paths
+    follow Electron's documented convention but are unverified here — a
+    maintainer or Mac/Linux tester should confirm before this fallback is
+    trusted cross-platform). Returns None (not a raise) when the platform is
+    unrecognized or the directory does not exist, so a Comfy-Desktop-less
+    environment resolves this fallback to "no candidates" rather than erroring
+    — the same "byte-identical when nothing applies" contract every other
+    branch of `_comfy_target` keeps.
+    """
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        base = Path(appdata) / "Comfy Desktop"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Comfy Desktop"
+    elif sys.platform == "linux":
+        # Electron's own `app.getPath("appData")` honors $XDG_CONFIG_HOME on
+        # Linux, falling back to ~/.config only when it is unset — the same
+        # rule this must mirror, or a distro/sandbox with a non-default
+        # XDG_CONFIG_HOME (a common case, e.g. NixOS, Snap's SNAP_USER_DATA
+        # convention) silently never finds a real, running Desktop install.
+        base = (
+            Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+            / "Comfy Desktop"
+        )
+    else:
+        # An unrecognized platform gets no fallback rather than guessing at a
+        # path convention that may not even apply there.
+        return None
+    d = base / "port-locks"
+    return d if d.is_dir() else None
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    """Best-effort liveness check for *pid*, cross-platform, never raises.
+
+    *pid* comes from a lock file this process did not write, so it is
+    accepted as an untyped JSON value, not trusted as an ``int``: a
+    non-``int`` (a JSON string, float, bool, or a non-positive value) is
+    rejected outright rather than coerced — ``os.kill(0, 0)`` on POSIX checks
+    the CALLING process's own group and would make a lock naming pid ``0``
+    look alive regardless of whether anything real is listening.
+
+    A STALE lock file (the app crashed instead of cleaning up on exit) must
+    not be trusted — this is what distinguishes "the live instance" from
+    "whatever port some now-dead process last used". Unable to determine
+    (permission denied, an OS quirk) errs TOWARD treating the pid as alive,
+    which only means the stale-lock case falls through to the existing
+    zero-or-multiple-candidates "don't guess" path below, never a wrong guess.
+    """
+    if type(pid) is not int or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _discover_comfy_desktop_port() -> int | None:
+    """The single LIVE port Comfy Desktop is currently bound to, or None.
+
+    Comfy Desktop dynamically picks a port per launch (falling back to another
+    one when its preferred port is taken) and has no notion of a static
+    ``COMFYUI_URL`` — so a value that was correct at config time silently goes
+    stale on the app's next relaunch, with no signal that it did (a healthy
+    server, a config confidently pointed at the WRONG one — the failure mode
+    this fallback exists to close). Discovered by reading every
+    ``port-<N>.json`` lock in :func:`_comfy_desktop_port_locks_dir`, filtering
+    to ones whose recorded ``pid`` is still alive (:func:`_pid_is_alive`) — a
+    lock left behind by a crashed instance names a port nothing is listening on
+    anymore.
+
+    Deliberately conservative, matching :func:`_comfy_target`'s own "raise or
+    return None, never guess" discipline: returns the port ONLY when EXACTLY
+    ONE live lock exists. Zero live locks means Comfy Desktop is not running
+    (or was not launched through it at all) — None, same as today. More than
+    one means multiple Comfy Desktop instances are genuinely running at once
+    (a real, if unusual, configuration) and there is no principled way to pick
+    one over the other from a lock file alone — None here too, so the existing
+    local-default (or an explicit ``COMFYUI_URL``/``COMFYUI_HOST``) still
+    governs rather than this fallback silently guessing wrong.
+
+    Malformed lock files (bad JSON, a non-integer filename suffix, a missing
+    ``pid`` key) are skipped individually rather than aborting the whole scan —
+    they are Comfy Desktop's own files, not something this fallback should ever
+    raise about.
+    """
+    locks_dir = _comfy_desktop_port_locks_dir()
+    if locks_dir is None:
+        return None
+    live_ports: list[int] = []
+    try:
+        candidates = sorted(locks_dir.glob("port-*.json"))
+    except OSError:
+        return None
+    for lock_path in candidates:
+        try:
+            port = int(lock_path.stem.removeprefix("port-"))
+        except ValueError:
+            continue
+        if not (1 <= port <= 65535):
+            continue
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            # A syntactically-valid JSON value that isn't an object (a list,
+            # a bare string, a number) -- data["pid"] below would raise
+            # TypeError, which is NOT in the except clause, aborting the
+            # whole scan instead of skipping this one malformed lock.
+            continue
+        try:
+            pid = data["pid"]
+        except KeyError:
+            continue
+        if _pid_is_alive(pid):
+            live_ports.append(port)
+    if len(live_ports) == 1:
+        return live_ports[0]
+    return None
+
+
 def _comfy_target() -> tuple[str, int, str] | None:
     """Resolve the configured ComfyUI ``(host, port, source)``, or None for local.
 
@@ -265,6 +416,19 @@ def _comfy_target() -> tuple[str, int, str] | None:
                 "not select a remote. Set COMFYUI_HOST (or COMFYUI_URL) to "
                 "target a remote ComfyUI."
             )
+        # Neither COMFYUI_URL nor COMFYUI_HOST is set. Before falling back to
+        # comfy-cli's hardcoded 127.0.0.1:8188 default, check whether Comfy
+        # Desktop is running and has a SINGLE live instance recorded in its own
+        # dynamic port-lock bookkeeping (see _discover_comfy_desktop_port) —
+        # Desktop's port is not guaranteed to be 8188, or to be the same port
+        # across relaunches, so the hardcoded default is frequently wrong for
+        # anyone running ComfyUI via the desktop app rather than `comfy launch`.
+        # Silent when it finds nothing or finds more than one candidate: this
+        # is explicitly a "use it only when unambiguous" fallback, never a
+        # guess (see that function's own docstring for why).
+        desktop_port = _discover_comfy_desktop_port()
+        if desktop_port is not None:
+            return "127.0.0.1", desktop_port, _COMFY_DESKTOP_PORT_LOCK_SOURCE
         return None
     if not raw_port:
         return _strip_brackets(host), DEFAULT_COMFYUI_PORT, "COMFYUI_HOST"

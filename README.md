@@ -444,6 +444,7 @@ full cloud tool list, and the slash-command/prompt tables live.
   `comfy launch` (or, from an agent, the `launch_comfyui` tool), and confirm it is up with
   `server_info`. Nothing here starts ComfyUI implicitly.
 
+<a id="optional-environment-variables"></a>
 <details>
 <summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_MCP_REMOTE_SHARED_MODELS</code>, <code>COMFY_LOCAL_URL</code>, <code>COMFY_T2I_TEMPLATE</code>; plus <code>COMFY_USER_AGENT</code>, which the server sets itself)</summary>
 
@@ -466,11 +467,23 @@ full cloud tool list, and the slash-command/prompt tables live.
   full precedence chain; every example in
   [Configure your AI client](#configure-your-ai-client) shows where it goes.
 - **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a ComfyUI on *another
-  machine*).** Read by **this server**. By default every tool targets `127.0.0.1:8188`. Set
+  machine*).** Read by **this server**. With neither set, the **submit / job** tools target
+  Comfy Desktop's current port when it can be discovered — read from Comfy Desktop's own
+  `port-locks` directory and matched against a live process, only when exactly one instance is
+  running — otherwise no `--host`/`--port` is forwarded and comfy-cli resolves its own local
+  target the usual way (`COMFY_LOCAL_URL`, then a comfy-cli-launched background server, then its
+  hardcoded default `127.0.0.1:8188` — see [Which address variable do I want?](#which-address-variable-do-i-want)).
+  This discovery is a same-machine, submit/job-only fallback: it never touches the **local-only**
+  tools (`nodes`, `validate_workflow`, `get_logs`; see [Discovery /
+  validation](#driving-a-remote-comfyui)), which keep resolving independently through comfy-cli's
+  own rules — so with Comfy Desktop on a non-default port and `COMFY_LOCAL_URL` unset, those
+  tools can still target a different (and wrong) ComfyUI than the one the submit/job tools just
+  discovered; set `COMFY_LOCAL_URL` (below) to point them at the same instance. Set
   `COMFYUI_URL` (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`,
   default `8188`) pair — to point the **submit / job** tools at a ComfyUI running elsewhere, e.g. a
-  GPU box reachable over a private network (Tailscale). See **[Driving a remote
-  ComfyUI](#driving-a-remote-comfyui)** for what is and isn't remoted. Unset ⇒ nothing changes.
+  GPU box reachable over a private network (Tailscale); either one always overrides the Desktop
+  discovery. See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)** for what is and isn't
+  remoted.
 - **`COMFY_MCP_REMOTE_SHARED_MODELS` (optional — only meaningful alongside the variables above).**
   `download_model` writes to *this* machine's models dir and has no remote mode, so with a remote
   configured it refuses rather than downloading onto the wrong disk. Set this to `1` when this
@@ -735,8 +748,13 @@ back, and nothing is ever refused on its account. Pass `check_local=False` to sk
 
 ## Driving a remote ComfyUI
 
-By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at a ComfyUI running
-**elsewhere** — e.g. a GPU box reachable over a private network (Tailscale) — by setting one of:
+By default the server drives ComfyUI on this machine — the Comfy Desktop instance it can discover
+via its own port-lock file when exactly one live instance is found (see [Optional environment
+variables](#optional-environment-variables) above), or comfy-cli's own local target otherwise
+(normally `127.0.0.1:8188`, but `COMFY_LOCAL_URL` or a comfy-cli-launched background server can
+already point it elsewhere — see [Which address variable do I want?](#which-address-variable-do-i-want)).
+Point it at a ComfyUI running **elsewhere** — e.g. a GPU box reachable over a private network
+(Tailscale) — by setting one of:
 
 - **`COMFYUI_URL`** — a full URL, e.g. `http://gpu-box:8188` (host-only is fine; port defaults to
   `8188`). Takes precedence over the pair below. Only the **host and port** are forwarded to
@@ -750,10 +768,12 @@ By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at 
 - **`COMFYUI_HOST`** (+ optional **`COMFYUI_PORT`**, default `8188`) — e.g. `COMFYUI_HOST=gpu-box`.
   A port without a host (setting only `COMFYUI_PORT`) is rejected — set the host too.
 
-Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set,
-behavior is unchanged (`127.0.0.1:8188` on this machine). If what you actually have is a ComfyUI on
-*this* machine on a different port, you want `COMFY_LOCAL_URL` instead — see [Which address variable
-do I want?](#which-address-variable-do-i-want).
+Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set, these
+tools target a discovered Comfy Desktop instance when exactly one live one is found, else
+comfy-cli's own local target (see [Optional environment variables](#optional-environment-variables)
+above). If what you actually have is a ComfyUI on *this* machine on a different port (and Desktop
+discovery doesn't apply — e.g. it wasn't launched via Comfy Desktop), you want `COMFY_LOCAL_URL`
+instead — see [Which address variable do I want?](#which-address-variable-do-i-want).
 
 When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
 accept them — `comfy run`, `comfy run-template`, `comfy jobs …` and `comfy upload` — so every tool
@@ -847,21 +867,23 @@ address. Seeing `:8189` there (and the server reported running) confirms the ove
 this server accepts honors the variable. The floor is not a guarantee, though: the version guard
 fails OPEN on a `--version` it can't parse, that errors, or that times out, so a source build or
 fork older than 1.13.0 can still slip past it and silently ignore the variable. On any comfy-cli
-without the support the variable is simply ignored (no error) and every tool keeps targeting
-`127.0.0.1:8188` — which is why the `server_info` check above is the way to confirm it took
-effect, rather than the version alone.
+without the support the variable is simply never consulted — every tool resolves via whatever that
+comfy-cli's own local-target logic does without it (the same **Precedence** below, minus this step)
+— which is why the `server_info` check above is the way to confirm `COMFY_LOCAL_URL` took effect,
+rather than the version alone.
 
-**Still reporting `:8188`?** Three causes, all silent, in the order worth checking:
+**Still reporting `:8188`?** Three causes, all silent, in the order worth checking — each one just
+means `COMFY_LOCAL_URL` didn't win, so comfy-cli falls through to the next step in **Precedence**
+below (normally the hardcoded default, but not always — see there):
 
 1. **The value never reached comfy-cli** — it's in the wrong `env` block, or the client wasn't
    restarted after the edit. The workspace/Python fields `server_info` reports confirm which
    comfy-cli install you're actually talking to.
-2. **The value is malformed** — comfy-cli ignores it and falls back to `127.0.0.1:8188`, emitting
-   only a one-line stderr warning that this server's success path discards, so a typo
-   (`https://…` — only `http` is accepted; a non-numeric port; a port outside 1–65535) looks
-   exactly like the other two causes from the MCP side. Confirm by running
-   `COMFY_LOCAL_URL=<your value> comfy env` in a terminal and reading stderr; see
-   **Accepted values** above.
+2. **The value is malformed** — comfy-cli ignores it, emitting only a one-line stderr warning that
+   this server's success path discards, so a typo (`https://…` — only `http` is accepted; a
+   non-numeric port; a port outside 1–65535) looks exactly like the other two causes from the MCP
+   side. Confirm by running `COMFY_LOCAL_URL=<your value> comfy env` in a terminal and reading
+   stderr; see **Accepted values** above.
 3. **comfy-cli is too old** — it predates the variable and ignored it. `server_info`'s
    `compatibility.comfy_cli_version` reports the detected version.
 
