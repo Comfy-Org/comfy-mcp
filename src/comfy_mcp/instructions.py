@@ -17,6 +17,16 @@ flows:
 
 - Call `server_info` FIRST, before anything else, to confirm the local
   ComfyUI is up and see whether a `comfy_target` remote is configured.
+- Input files, three cases only. Already on this machine:
+  `upload_file(paths=[absolute])`. A ChatGPT attachment is
+  `init_upload(file=<the host file>)`, which returns
+  `kind="upload_complete"` in that one call. Claude, Cursor, or another
+  local agent: `wc -c < "$FILE"` for the exact size, `file --mime-type -b
+  "$FILE"` for the MIME, then `init_upload(filename, file_size, mime_type)`,
+  run the returned curl so the original bytes PUT directly to the upload
+  URL, then `complete_upload(upload_id)`. The next workflow's image input
+  is `comfy_filename` from that result — never the client path,
+  `/mnt/user-data/uploads/...`, the upload spool, or a temporary path.
 - Long generations: `run_workflow(wait=False)` -> poll `job(action="wait")` /
   `job(action="status")` (or stream live via `job(action="watch")`) ->
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run

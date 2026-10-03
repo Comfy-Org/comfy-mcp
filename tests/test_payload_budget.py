@@ -51,7 +51,14 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # so there was no version of it that fit the slack left after the
 # `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
 # next growth is still a decision.
-_BUDGET_TOKENS = 15_650
+#
+# 15,650 -> 16,400 when direct upload added `init_upload` and `complete_upload`
+# plus the handshake's three-way file sequence. Two tools, and a sequence an
+# agent cannot infer from `upload_file`: a ChatGPT host file completes in
+# `init_upload`, a Claude/Cursor file is a direct PUT of the original bytes
+# then `complete_upload`, and the next workflow uses `comfy_filename`.
+# Measured ~16,308 after it (42 tool docstrings).
+_BUDGET_TOKENS = 16_400
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

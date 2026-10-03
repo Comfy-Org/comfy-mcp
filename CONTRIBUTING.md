@@ -25,8 +25,9 @@ result, and returns its `data`. Do not bypass it.
 
 This means:
 
-- **No HTTP client.** This server never talks to ComfyUI (or anything else) over
-  HTTP directly — comfy-cli owns all I/O with ComfyUI.
+- **No HTTP client toward ComfyUI.** comfy-cli owns all I/O with ComfyUI. The
+  file-ingress exception (`init_upload`, `complete_upload`, `comfy-mcp-upload-server`)
+  only streams bytes to a temporary file and then calls `comfy upload`.
 - **New functionality belongs in comfy-cli.** If a feature can't be expressed as
   a `comfy` subcommand, the fix is a comfy-cli change, not a workaround here.
 - **No code from the cloud MCP.** Don't copy code, patterns, or dependencies
@@ -41,6 +42,13 @@ Python ≥ 3.10. Everything runs through pip + setuptools.
 
 ```bash
 pip install -e '.[dev]'    # install with dev extras (pytest, ruff)
+```
+
+`comfy-mcp` and `comfy-mcp-upload-server` are separate long-running processes.
+After a change to the shared upload code, restart both:
+
+```bash
+systemctl restart comfy-mcp-upload comfy-mcp
 ```
 
 ## Run the checks

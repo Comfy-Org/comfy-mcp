@@ -78,10 +78,13 @@ authenticate: this one signs in to Comfy through comfy-cli ([`auth_login`](#part
 `COMFY_API_KEY`), the cloud one through OAuth in your browser or a Comfy Cloud API key. Both can
 spend credits on **partner** models, so partner generation is not the dividing line — what this
 server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud queue, no
-cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
+cross-session cloud batches. Every ComfyUI operation shells out to `comfy --where local`.
+The one transport exception is file ingress (`init_upload` / `complete_upload`): bytes are
+staged in a temporary file, then `comfy upload` moves them. This server still does not
+call ComfyUI's HTTP API. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 40 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 42 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -758,7 +761,8 @@ do I want?](#which-address-variable-do-i-want).
 When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
 accept them — `comfy run`, `comfy run-template`, `comfy jobs …` and `comfy upload` — so every tool
 that **submits a job, reads one back, or stages the files a job will read** targets the remote:
-`run_workflow`, `generate_image`, `run_template`, `job` (every action), `upload_file`. `server_info`
+`run_workflow`, `generate_image`, `run_template`, `job` (every action), `upload_file`,
+`init_upload` (ChatGPT file mode), `complete_upload`. `server_info`
 reports the configured target under a `comfy_target` block.
 
 That set is deliberately closed under submit-then-poll: a `prompt_id` only means something to the
@@ -770,7 +774,7 @@ they are read here and their bytes sent to the target. Remote upload needs comfy
 (this server's floor); an older one rejects the forwarded `--host` and `upload_file` raises with the
 upgrade step rather than silently staging into the local `input` dir.
 
-**Not remoted (this repo is a thin wrapper and never opens its own socket):**
+**Not remoted (these stay on this machine; ComfyUI itself is still reached only through comfy-cli):**
 
 - **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `update_comfyui`,
   `switch_comfyui_version`, `install_node`, `get_logs`) — these manage a **local** ComfyUI
@@ -879,7 +883,7 @@ different layers. Pick by which one you need; the table is the whole answer.
 | **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never reads it |
 | **Means** | "a ComfyUI on **another machine** I control" | "the ComfyUI on **this machine** is not on `127.0.0.1:8188`" |
 | **How it acts** | this server forwards `--host` / `--port` to the verbs that accept them | comfy-cli resolves its own target from the environment it inherits |
-| **What it moves** | the **submit / job** tools plus `upload_file` (`run_workflow`, `generate_image`, `run_template`, the `jobs` family, and input staging) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
+| **What it moves** | the **submit / job** tools plus input staging (`run_workflow`, `generate_image`, `run_template`, the `jobs` family, `upload_file`, ChatGPT `init_upload`, and `complete_upload`) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
 | **Reported as** | a `comfy_target` block on `server_info` | the resolved `server` URL on `server_info` — **no** `comfy_target` block |
 | **Use it for** | a GPU box over Tailscale / a private network | a port clash, a second instance, a container publishing a different port |
 
@@ -952,10 +956,70 @@ Set it in the client registration `env` block, same as `COMFY_BIN`:
 }
 ```
 
+## Uploading an input file
+
+Three cases. There is no base64 upload and no generic URL upload.
+
+| Where the file is | Call |
+| --- | --- |
+| Already on the machine running comfy-mcp | `upload_file(paths=[absolute, ...])` |
+| A ChatGPT attachment | `init_upload(file=<the host file>)`. This returns `kind="upload_complete"` in that one call. |
+| A Claude, Cursor, or other local-agent file | `init_upload(filename, file_size, mime_type)` → the returned curl PUT of the original bytes → `complete_upload(upload_id)` |
+
+Size and MIME for the local-agent path, from the client that can see the file:
+
+```bash
+wc -c < "$FILE" | tr -d ' '
+file --mime-type -b "$FILE"
+```
+
+Run the curl command `init_upload` returns, with `$FILE` set to that local path. The bytes go from the client filesystem to the upload service. They do not pass through MCP.
+
+The next workflow must load `comfy_filename` from the `upload_complete` result. That is the name `comfy upload` accepted (`uploads[].cloud_name`), for a local ComfyUI and for a remote one. Do not reference the client path, `/mnt/user-data/uploads/...`, the upload spool, or the temporary file.
+
+Direct upload is a transport in front of comfy-cli:
+
+```text
+MCP / direct HTTP → temporary local file → comfy upload → ComfyUI
+```
+
+`comfy-mcp` stays on stdio. A second process, `comfy-mcp-upload-server`, binds loopback (default `127.0.0.1:8192`) and accepts `PUT /upload/{upload_id}` plus `GET /healthz`. Put the existing reverse proxy in front of it. The upload uses a one-time Bearer token from `init_upload`, not the MCP credential, and that token stays in the `Authorization` header.
+
+Both processes are long-running Python interpreters that import this package. A change to the shared upload code (`upload_session`, `file_ingress`, or anything either process imports) is invisible until both are restarted:
+
+```bash
+systemctl restart comfy-mcp-upload comfy-mcp
+```
+
+Each process logs one startup line, `startup process=... version=... git=...`, so a mismatch between those two lines means they are not running the same build. Set `COMFY_MCP_GIT_SHA` in both units when the deploy does not include a git checkout.
+
+```nginx
+location ^~ /upload/ {
+    proxy_pass http://127.0.0.1:8192;
+    proxy_http_version 1.1;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    client_max_body_size 0;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+```
+
+| Variable | Role |
+| --- | --- |
+| `COMFY_MCP_UPLOAD_PUBLIC_BASE_URL` | HTTPS origin the curl command targets. Required for a direct PUT session. Example: `https://uploads.example`. |
+| `COMFY_MCP_UPLOAD_DIR` | Shared spool. Default `/var/lib/comfy-mcp/uploads`. |
+| `COMFY_MCP_UPLOAD_TTL_SECONDS` | Session lifetime. Default `600`. |
+| `COMFY_MCP_MAX_UPLOAD_MB` | Maximum original-byte size. Default `1024`. |
+| `COMFY_MCP_UPLOAD_HOST` | Loopback bind. Default `127.0.0.1`. `::1` is the other accepted value. |
+| `COMFY_MCP_UPLOAD_PORT` | Default `8192`. |
+
 ## Tools
 
-40 tools, grouped below by what they do. Every tool runs `comfy` with the global
-`--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
+42 tools, grouped below by what they do. Tools that talk to ComfyUI run `comfy` with the global
+`--json --where local` flags, unwrap comfy-cli's `envelope/1`, and return its `data`.
+`init_upload` without a host file only opens a direct-upload session; `complete_upload`
+is the call that runs `comfy upload`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
 instructions say the same thing): an input workflow file is always `workflow_path`, an output
@@ -1028,7 +1092,9 @@ handle is `prompt_id`.
 | `update_comfyui(target="comfy", confirm_update_all=False)` | `comfy update <all\|comfy\|cli>` | Update the local install: `"comfy"` = ComfyUI core, `"all"` = the installed custom node packs, `"cli"` = comfy-cli itself. This is what `server_info`'s `freshness` block points at when it reports a stale install. Slow (a core update re-installs requirements; 30-minute timeout) and the updated code only takes effect after a `restart_comfyui`. **`target="all"` asks the USER first — and only that target.** It `git pull`s and `pip install`s **every** third-party custom node pack into ComfyUI's Python environment, so it runs code those packs' authors have published since you installed them, and it can move a pack (or a shared dependency) to a version other packs and your saved workflows don't work with. comfy-cli does not gate that, so on a client that supports MCP elicitation a prompt naming exactly that is raised and a decline runs nothing; on a client that cannot show prompts the call errors unless `confirm_update_all=True`, which an agent may pass **only** when the user has actually agreed. That prompt is raised even when `confirm_update_all=True` is passed, so a host's "always allow this tool" toggle is not standing authority to run third-party code. `target="comfy"` and `target="cli"` update first-party code from known repositories and are never prompted. Any other `target` is rejected before comfy-cli is invoked (and before anyone is asked), and a second update requested while one is still running is refused rather than run in parallel (concurrent `git`/`pip` against one workspace can leave it half-installed) — that refusal comes before the prompt too, so nobody approves a call that was never going to run. |
 | `switch_comfyui_version(version, confirm_switch=False)` | `comfy update comfy --version <version>` | Move the local ComfyUI install to a **specific** version — `"nightly"`, `"latest"`, or a release like `"0.24.0"` / `"v0.24.0"` — so you can roll **back** to reproduce or rule out a regression (`update_comfyui` only ever moves forward to the latest). **Destructive:** the engine stashes any uncommitted changes in the ComfyUI checkout, moves it to that version, and reinstalls that version's Python dependencies (minutes, not seconds; 15-minute timeout). **The USER is asked to confirm every call** — on a client that supports MCP elicitation a prompt naming exactly that is raised, and a decline cancels with nothing changed; on a client that cannot show prompts the call errors unless `confirm_switch=True`, which an agent may pass **only** when the user has actually agreed. That prompt is raised even when `confirm_switch=True` is passed, so a host's "always allow this tool" toggle is not standing authority over the install. It **refuses while a local ComfyUI is running** (reinstalling under a live process can leave it serving half-replaced code) — checked both before the prompt and again immediately before the switch, since the prompt may sit unanswered for minutes, and fail-closed, so a `comfy env` this server cannot read is refused rather than read as "stopped" — and it does **not** restart anything — the flow is `stop_comfyui` → `switch_comfyui_version` → `launch_comfyui` → `server_info` to confirm what came up. Returns `{switched_to, result, restart_required: true}`. A malformed version is rejected before comfy-cli is invoked; a comfy-cli whose `comfy update` predates `--version` surfaces as an "upgrade comfy-cli" error rather than a raw usage dump; and it shares `update_comfyui`'s one-at-a-time lock. |
 | `install_node(names, confirm_install=False)` | `comfy node install <name...> --exit-on-fail` | Install custom node packs into the local ComfyUI — the acquisition half of the missing-node story, after `validate_workflow` / `run_workflow` names a node class this install lacks and `node_dependencies(registry_id=…)` pre-checks the pack's requirements. `names` are **registry pack ids** (slugs like `"comfyui-impact-pack"`), not node class names: a git URL, a filesystem path, or `"all"` is refused before comfy-cli is invoked — the URL case deliberately, because the confirmation prompt promises the user a *named pack from the registry*, so nothing else may ride through it. (To update the packs you already have, use `update_comfyui(target="all")`; to install from a URL, run `comfy node install` in a terminal.) **Installing a pack runs third-party code** — a `pip install` of its dependencies into the ComfyUI environment plus the pack's own install script — so **the USER is asked to confirm every call**, and that prompt is raised even when `confirm_install=True`, since a host's "always allow this tool" toggle is not standing authority to execute third-party code and the pack names are frequently a model's guess. On a client that cannot show prompts the call errors unless `confirm_install=True`, which an agent may pass **only** once the user has actually agreed. It does **not** restart anything — new nodes are invisible until ComfyUI restarts, so the flow is `install_node` → `restart_comfyui` → `nodes(action="search")` — and it shares `update_comfyui`'s one-at-a-time lock (same venv, same `pip`). `--exit-on-fail` is always forwarded, because without it comfy-cli reports a failed install as success — but it is not sufficient on its own: ComfyUI-Manager prints a pack's failure *before* consulting the flag, so `comfy node install` can report a pack as failed and still exit 0. The verdict is therefore read out of the engine's own output rather than off the exit status. 30-minute timeout. Returns `{installed, result, restart_required}` — **`installed` lists only the packs the engine did not report as failed, not an echo of `names`** — plus `{failed, error}` when any pack failed, where each `failed` entry carries the engine's own message and a `code` of `pack_not_found` (the id is not in this install's registry channel, so retrying it will not help) or `install_failed`. `restart_required` is `false` when nothing was installed, because there is then nothing for a restart to pick up. |
-| `upload_file(paths, overwrite=False)` | `comfy upload <files...> --overwrite/--no-overwrite` | Stage source images/masks into the target ComfyUI's `input` dir (unlocks img2img / inpaint). Goes to whichever ComfyUI the server targets — the local install by default, or the remote a configured `COMFYUI_URL`/`COMFYUI_HOST` names, the same one `run_workflow` submits to ([Driving a remote ComfyUI](#driving-a-remote-comfyui)); remote upload needs comfy-cli ≥ 1.14.0, and an older one raises with the upgrade step instead of staging locally where the remote run cannot see the files. Entries must already exist on **this** filesystem (they are read here and sent to the target) and **should be absolute** — comfy-cli runs with the ComfyUI workspace as its working directory, so a relative path resolves against the workspace, not the agent's cwd. **For an image the user attached in chat:** an MCP server never receives attachment *bytes* (the protocol has no client-to-server path for them), but several clients save the attachment and put its absolute path in the agent's context — Claude Code injects an `[Image: source: <absolute path>]` line — and that path is an ordinary local file you can pass straight to `paths`. If your client gives no path, ask the user to save the file and supply it; that is the portable flow. |
+| `upload_file(paths, overwrite=False)` | `comfy upload <files...> --overwrite/--no-overwrite` | Stage source images/masks that are **already on this machine** into the target ComfyUI's `input` dir (unlocks img2img / inpaint). `paths` stays required. Goes to whichever ComfyUI the server targets — the local install by default, or the remote a configured `COMFYUI_URL`/`COMFYUI_HOST` names, the same one `run_workflow` submits to ([Driving a remote ComfyUI](#driving-a-remote-comfyui)); remote upload needs comfy-cli ≥ 1.14.0, and an older one raises with the upgrade step instead of staging locally where the remote run cannot see the files. Entries must already exist on **this** filesystem and **should be absolute**. A chat attachment is not this tool — see [Uploading an input file](#uploading-an-input-file). |
+| `init_upload(file=None, filename=None, file_size=None, mime_type=None, overwrite=False)` | `comfy upload` after the bytes are local | Open an upload. **ChatGPT:** pass the host `file`. The server streams `download_url` to a temporary file, runs `comfy upload`, and returns `kind="upload_complete"` with `comfy_filename`. **Claude / Cursor / local agent:** omit `file` and pass `filename` (basename only), `file_size` (exact original bytes), and `mime_type`. The result is `kind="upload_initialized"` plus a one-time `Authorization: Bearer` header and a curl command. PUT the original file at that URL, then `complete_upload`. The workflow that follows uses `comfy_filename` only. |
+| `complete_upload(upload_id)` | `comfy upload` | Finish a direct PUT once the session is `ready`. `overwrite` was stored by `init_upload`. Returns `kind="upload_complete"` and `comfy_filename` (`uploads[].cloud_name`). Use that name in the next workflow. |
 | `download_model(url, relative_path=None, filename=None, wait=True, timeout_seconds=110.0)` | `comfy model download --url <url> [--relative-path <path>] [--filename <name>] --background` | Download a model file by direct URL (HuggingFace / CivitAI) into the local models dir; download-by-URL only, not a hub search. Local-only and **enforced**: `comfy model download` has no `--host`/`--port`, so with a remote configured (`COMFYUI_URL`/`COMFYUI_HOST`) this refuses instead of writing the checkpoint to a disk the remote cannot see — install the model on the remote host itself, or set `COMFY_MCP_REMOTE_SHARED_MODELS=1` if this machine's models dir *is* the remote's (shared NFS / tailnet mount). See [Driving a remote ComfyUI](#driving-a-remote-comfyui). The transfer is **submitted** to comfy-cli's background worker and returns a `download_id`, so a multi-GB checkpoint no longer holds the MCP request open past the client's deadline: `wait=True` (default) polls that id for you within a bounded budget and returns `{"timed_out": True, "download_id": …}` — not an error — if the transfer is still running, while a `failed` / `cancelled` download raises with comfy-cli's own error. On that path `timeout_seconds` is the **end-to-end** budget for the whole call, submit included, so the submit and the poll cannot add up past the client deadline the 110s default is chosen to sit under. `wait=False` returns the submit payload immediately and keeps the submit's own fixed budget. Every payload from that background path keys the handle `download_id`, matching the argument name every download tool takes, so an id read out of one result goes straight back into the next call — the legacy foreground fallback below is the exception, since no id is ever minted on it. The file is written straight to its final path as it transfers, so a filesystem / `search_models` check mid-flight sees a present-but-incomplete file — `download(action="status")` is the source of truth. `relative_path` resolves from the workspace root and must be the models dir or a subfolder of it — `models`, `models/loras` (a bare `loras` is rejected, not assumed); sibling dirs like `custom_nodes/…`, `input`, `output` are refused. Use `/` as the separator on every host, Windows included. Against a comfy-cli too old to know `--background` (anything below 1.14.0, which only reaches here past the fail-open version guard) it falls back to the previous foreground download — which has no id to detach or poll, so it blocks even on `wait=False`, and every payload it returns is marked `background_unsupported: true` to say so. On that fallback `wait=True` is bounded by what is left of your `timeout_seconds` (capped at 1800s) rather than by a silent half hour: when the bound expires the transfer is killed and the error names where an incomplete file may remain, since there is no `download_id` to check it with. Cancelling the tool call kills the transfer the same way instead of orphaning it. |
 | `download(action="status", download_id="", timeout_seconds=None)` | `comfy model download-status/download-cancel <download_id>` | One grouped tool over the three former `download_status`/`wait_for_download`/`cancel_download` tools — pick a behavior with `action`. Does **not** start a transfer — that's `download_model`, whose `download_id` this tool consumes. `"status"` (default) returns `status`, `completed_bytes` / `total_bytes` / `percent`, `elapsed_seconds`, `dest`, and `error` — the only proof a model is complete and loadable. `"wait"` polls (bounded, default 25.0s, ceiling 3600s) until a download reaches a terminal state (completed / failed / cancelled), returning a `{"timed_out": True, …}` payload on expiry — chain several rather than one long call, the `job(action="wait")` shape, for transfers. `"cancel"` stops a running download and removes its partial file. `download_id` is required for every action; `timeout_seconds` only for `"wait"` — passing it elsewhere is rejected rather than silently ignored. Every payload keys the handle `download_id` on the way back out too, including the status nested inside a `"wait"` timeout, so a handle read out of one result passes straight into the next call without renaming; comfy-cli spells the same field `id`, and that spelling is kept alongside rather than replaced. On a comfy-cli without the verb, returns `{"error": …, "unsupported": true}` instead of a raw usage dump — that shape carries no handle at all, since a CLI that old can never have minted one. |
 

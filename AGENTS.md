@@ -18,10 +18,13 @@ Hard guardrails — a PR breaking any of these should be rejected:
 - **Every tool is a `comfy --json --where local` passthrough.** New functionality belongs in
   comfy-cli, exposed here as a thin `_run_comfy` call. A feature that can't be a `comfy`
   subcommand needs a comfy-cli change, not a workaround here.
-- **No HTTP client.** This server never talks to ComfyUI (or anything else) over HTTP
-  directly — no `httpx`/`requests`/`aiohttp`/`urllib` calls to a server. comfy-cli owns all
-  I/O with ComfyUI (reaching a *local* process means shelling out to `comfy`, never opening
-  a socket).
+- **No HTTP client toward ComfyUI.** comfy-cli owns all I/O with ComfyUI (reaching a
+  *local* process means shelling out to `comfy`, never opening a socket to it). This fork's
+  one transport exception is file ingress, and it stops at a temporary file:
+  `init_upload` / `complete_upload` and `comfy-mcp-upload-server` may stream bytes onto
+  local disk, then `comfy upload` via `_run_comfy` / `_run_comfy_async`. That path is
+  `MCP or direct HTTP → temporary file → comfy-cli → ComfyUI`. It is not a client of
+  ComfyUI's upload API, and it is not a general URL downloader.
 - **No code from the cloud MCP.** Do not copy code, patterns, or dependencies from
   `Comfy-Org/comfy-cloud-mcp-server` — a multi-tenant HTTP service with per-session state,
   signed URLs, analytics, and a cloud API client, none of which apply here. This repo is
@@ -100,7 +103,7 @@ custom nodes included — not a static catalog.
 ## Module layout
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the `--json-stream`
-machinery, the spend-consent plumbing) and every `@mcp.tool()`. Ten **leaf** modules sit
+machinery, the spend-consent plumbing) and every `@mcp.tool()`. Thirteen **leaf** modules sit
 under it — none imports `server`, so the dependency edges only ever point one way:
 
 | Module | Owns |
@@ -115,12 +118,15 @@ under it — none imports `server`, so the dependency edges only ever point one 
 | `target.py` | remote-target resolution/redaction/provenance for run/job tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, and divergence notes on `system_stats`/`free_memory` so an agent doesn't gate a remote run on local numbers |
 | `params.py` | param/slot marshaling into comfy-cli argv for `generate`/`run-template`/`set-slot`/`vary`, incl. the structured slot machinery — `SlotOverride`/`SlotVariants` are this module's public TYPES (carve-out below) |
 | `cli.py` | the console script's own argv surface — the `--help` / `--version` text a HUMAN who types `comfy-mcp` in a terminal gets, plus the installed-metadata version lookup (`_version`) behind it. That lookup is the SINGLE answer to "which release is this?": `server._server_version` delegates to it for the handshake's `serverInfo.version`, so the string a client displays is the string the terminal prints |
+| `file_ingress.py` | ChatGPT host-file download for `init_upload` — HTTPS only, streamed to a temp file, SSRF checks on the host-minted `download_url`. `OpenAIFile` is its public TYPE (carve-out below). Not a general URL tool |
+| `upload_session.py` | the shared filesystem spool, one-time token hash, session state machine, and stale-session cleanup used by both the MCP process and the upload HTTP service |
+| `upload_server.py` | `comfy-mcp-upload-server`: loopback `PUT /upload/{id}` and `GET /healthz` only. Streams the body through `upload_session` and does not call ComfyUI |
 
 `server` reaches them **module-qualified** (e.g. `failure_log._log_failure(...)`) and
 re-exports no BEHAVIOR: patching a moved name on `server` would silently patch nothing.
 **Patch the owning module** (`monkeypatch.setattr(failure_log, "_FAILURE_LOG_PATH", …)`),
 not `server` — the wrong one now raises `AttributeError`. Carve-out: public exception/model
-TYPES (`ComfyCliError`, `SlotOverride`, `SlotVariants`) ARE name-imported — they ride many
+TYPES (`ComfyCliError`, `SlotOverride`, `SlotVariants`, `OpenAIFile`) ARE name-imported — they ride many
 `except`/`isinstance`/tool-signature sites and hold no mutable state a test could patch the
 wrong copy of, so that risk doesn't apply.
 
@@ -176,7 +182,7 @@ nothing blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two 
 runners live there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a
 plain-JSON twin of `_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread`
 worker, so a client giving up left the child running; it carries the longest-lived children
-(foreground `model download`, `workflow_deps`, `upload_file`). Each stream keeps only a
+(foreground `model download`, `workflow_deps`, `upload_file`, ChatGPT `init_upload`, `complete_upload`). Each stream keeps only a
 `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 

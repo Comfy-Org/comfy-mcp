@@ -149,6 +149,8 @@ def test_target_aware_tools_do_not_claim_to_be_local_only():
         server.run_template,
         server.job,
         server.upload_file,
+        server.init_upload,
+        server.complete_upload,
     ):
         lines = (tool.__doc__ or "").strip().splitlines()
         # Report a missing docstring as itself: under `python -OO` (or if one is

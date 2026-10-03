@@ -10,9 +10,11 @@ forwards ``--host`` / ``--port`` to comfy-cli. A LOCAL ComfyUI on a non-default
 address (e.g. ``:8189``) instead needs no code here at all: ``COMFY_LOCAL_URL``
 rides the environment passthrough (see ``_comfy_env``) and is resolved by
 comfy-cli, which ranks a ``--host``/``--port`` flag above ``COMFY_LOCAL_URL``,
-that above a background record, and ``127.0.0.1:8188`` last. There is
-deliberately no HTTP client and no code shared with the Comfy Cloud MCP —
-comfy-cli is the engine.
+that above a background record, and ``127.0.0.1:8188`` last. ComfyUI itself
+is reached only through comfy-cli. This fork's one transport exception is
+file ingress: a ChatGPT host file is streamed to a temporary file, and a
+Claude/Cursor upload is a direct HTTP PUT into a local spool, and both then
+go through ``comfy upload``. Neither path calls ComfyUI's HTTP API.
 
 Tools so far: the run -> get-output core loop plus job management via the
 grouped ``job(action=...)`` tool (``"status"`` / ``"wait"`` / ``"watch"`` /
@@ -69,6 +71,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -92,12 +95,15 @@ from . import (
     clitext,
     errors,
     failure_log,
+    file_ingress,
     instructions,
     params,
     target,
     tcc,
+    upload_session,
 )
 from .errors import ComfyCliError
+from .file_ingress import OpenAIFile
 from .params import SlotOverride, SlotVariants
 
 
@@ -1297,9 +1303,11 @@ def _run_comfy_raw(
 def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
     """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
 
-    comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
-    for ``--json``, or an NDJSON stream whose final line is the envelope). We
-    keep the last JSON object and unwrap ``ok`` / ``data`` / ``error``.
+    comfy-cli emits a versioned ``envelope/1`` object on stdout: one complete
+    JSON document for ``--json`` (compact or pretty-printed), or an NDJSON
+    stream whose envelope line is the result. A whole document is parsed
+    first; otherwise the last JSON object is kept. Then ``ok`` / ``data`` /
+    ``error`` are unwrapped.
 
     ``plain_ok`` relaxes the envelope requirement for the commands that print
     human text and exit 0 WITHOUT emitting an envelope — the lifecycle verbs
@@ -1712,6 +1720,7 @@ def _unwrap_envelope(
     with no declared schema is assumed compatible.
     """
     if envelope is None:
+        _log_no_json_shape(stdout)
         if tcc._looks_like_tcc_denial(stderr):
             # comfy-cli emitted no envelope because macOS denied it a protected
             # folder (see the TCC block above) — a permission problem the user
@@ -1942,7 +1951,25 @@ def _unwrap_envelope(
 
 
 def _last_json_object(stdout: str) -> dict | None:
-    """Return the last JSON object on stdout, preferring a ``type==envelope`` one."""
+    """Return the JSON object on stdout, preferring a ``type==envelope`` one.
+
+    ``--json`` may be one complete document, compact or pretty-printed. JSON
+    whitespace includes carriage return, and a string may contain a Unicode
+    line separator. :meth:`str.splitlines` breaks on both, so a line scan
+    destroys a document ``json.loads`` accepts whole. The whole capture is
+    parsed first. NDJSON and diagnostic text mixed with a JSON line are not
+    one document; those still use the line scan, where the latest
+    ``type==envelope`` object wins and any object is kept until one appears.
+    """
+    text = stdout.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
     best: dict | None = None
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -1959,6 +1986,57 @@ def _last_json_object(stdout: str) -> dict | None:
         elif best is None or best.get("type") != "envelope":
             best = obj  # fallback to any JSON object until an envelope appears
     return best
+
+
+def _json_shape_label(value: object) -> str:
+    """A short identifier safe to write next to a ``no_json`` failure."""
+    if (
+        isinstance(value, str)
+        and value.isascii()
+        and 1 <= len(value) <= 80
+        and all(char.isalnum() or char in "._/-" for char in value)
+    ):
+        return value
+    return "-"
+
+
+def _log_no_json_shape(stdout: str) -> None:
+    """Structural facts about a capture that produced no envelope.
+
+    Counts and the top-level JSON kind only. The bounded stream tail already
+    recorded by :func:`failure_log._log_failure` is the only copy of the text.
+    """
+    text = stdout.strip()
+    whole_valid = False
+    top_level = "none"
+    json_type = "-"
+    schema = "-"
+    if text:
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            top_level = "invalid"
+        else:
+            whole_valid = True
+            top_level = type(parsed).__name__
+            if isinstance(parsed, dict):
+                json_type = _json_shape_label(parsed.get("type"))
+                schema = _json_shape_label(parsed.get("schema"))
+    try:
+        nbytes = len(stdout.encode("utf-8"))
+    except UnicodeEncodeError:
+        nbytes = len(stdout.encode("utf-8", "replace"))
+    logging.getLogger(__name__).warning(
+        "no_json shape stdout_chars=%s stdout_bytes=%s splitlines=%s "
+        "whole_json_valid=%s top_level_type=%s json_type=%s schema=%s",
+        len(stdout),
+        nbytes,
+        len(stdout.splitlines()),
+        "true" if whole_valid else "false",
+        top_level,
+        json_type,
+        schema,
+    )
 
 
 def _real_envelope(obj: dict | None) -> dict | None:
@@ -11771,30 +11849,11 @@ def download(
 _UPLOAD_STDOUT_MAX_CHARS = 4 * 1024 * 1024
 
 
-@mcp.tool()
-async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
-    """Upload files from this machine into the target ComfyUI's ``input`` directory.
+async def _upload_local_paths(paths: list[str], overwrite: bool) -> Any:
+    """Run ``comfy upload`` for files that already exist on this machine.
 
-    Wraps ``comfy upload <files...> --overwrite/--no-overwrite``. Stages
-    source images/masks a workflow references by filename — required for
-    img2img/inpaint.
-
-    Args:
-        overwrite: True replaces an existing file; False (default) keeps it
-            and stores the upload under a deduplicated name.
-
-    Uploads to whichever ComfyUI this server targets (local, or a configured
-    ``COMFYUI_URL``/``COMFYUI_HOST``) — needs comfy-cli >= 1.14.0 for the
-    remote case; older raises rather than silently staging files the remote
-    can never find.
-
-    Gotchas:
-    - Every path must exist on THIS filesystem and be ABSOLUTE — a relative
-      path resolves against comfy-cli's workspace cwd, not the agent's.
-    - A cancelled/timed-out call strands a partial batch; re-run to finish.
-    - If attached in chat, MCP never receives the bytes — look for the
-      absolute path some clients inject into context (e.g. Claude Code's
-      ``[Image: source: <path>]``) and pass that.
+    ``upload_file``, ChatGPT ``init_upload``, and ``complete_upload`` share
+    this call. The return value is comfy-cli's envelope ``data``, unchanged.
     """
     # Off the event loop: see `argv._validate_upload_paths` for why its scan must not
     # run inline in an async tool.
@@ -11849,6 +11908,375 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
             "address instead — every comfy-cli verb resolves it, upload "
             "included, so uploads and runs both land there."
         ) from exc
+
+
+def _comfy_filename(result: Any) -> str:
+    """The name ComfyUI accepted, from ``uploads[].cloud_name``.
+
+    The same field is the reference for a local target and a remote one.
+    A missing or path-like value is a failure: the spool path is not a
+    substitute a later workflow can load.
+    """
+    uploads = result.get("uploads") if isinstance(result, dict) else None
+    first = uploads[0] if isinstance(uploads, list) and uploads else None
+    name = first.get("cloud_name") if isinstance(first, dict) else None
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or any(ord(char) < 32 for char in name)
+        or any(char in name for char in "/\\")
+    ):
+        raise ComfyCliError(
+            "comfy upload did not return a usable uploads[].cloud_name. "
+            "Do not substitute a client path, the upload spool, or a temporary file."
+        )
+    return name
+
+
+def _sanitize_client_text(text: str) -> str:
+    """A failure sentence safe to hand back through MCP.
+
+    Drops bearer tokens, URLs, environment assignments, and absolute paths.
+    The spool directory and a signed download URL must not reach the client.
+    """
+    cleaned = failure_log._scrub_text(text)
+    cleaned = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", cleaned)
+    cleaned = re.sub(
+        r"(?i)\bAuthorization\s*[:=]\s*\S+", "Authorization [redacted]", cleaned
+    )
+    cleaned = re.sub(r"https?://\S+", "[url]", cleaned)
+    cleaned = re.sub(r"\b[A-Z][A-Z0-9_]{2,}=[^\s]+", "[env]", cleaned)
+    cleaned = re.sub(r"(?:(?:/|[A-Za-z]:\\)[^\s\"']+)", "[path]", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 300:
+        cleaned = cleaned[:300] + "..."
+    return cleaned
+
+
+def _upload_error(
+    upload_id: str | None,
+    stage: str,
+    message: str,
+    *,
+    retryable: bool,
+) -> dict[str, Any]:
+    return {
+        "kind": "upload_error",
+        "upload_id": upload_id or "",
+        "stage": stage,
+        "message": message,
+        "retryable": retryable,
+    }
+
+
+def _upload_error_from(exc: upload_session.UploadFailed) -> dict[str, Any]:
+    upload_session._event(
+        exc.stage,
+        exc.upload_id,
+        exc.state,
+        outcome="error",
+        error_type="UploadFailed",
+    )
+    return _upload_error(
+        exc.upload_id,
+        exc.stage,
+        exc.message,
+        retryable=exc.retryable,
+    )
+
+
+def _upload_complete(
+    source_filename: str,
+    mime_type: str,
+    byte_size: int,
+    sha256: str,
+    result: Any,
+) -> dict[str, Any]:
+    return {
+        "kind": "upload_complete",
+        "source_filename": source_filename,
+        "comfy_filename": _comfy_filename(result),
+        "mime_type": mime_type,
+        "byte_size": byte_size,
+        "sha256": sha256,
+        "upload_result": result,
+    }
+
+
+def _stage_dir() -> str:
+    path = tempfile.mkdtemp(prefix="comfy-mcp-upload-")
+    os.chmod(path, 0o700)
+    return path
+
+
+async def _init_from_host_file(file: OpenAIFile, overwrite: bool) -> dict[str, Any]:
+    correlation = "hx" + secrets.token_hex(4)
+    work = await asyncio.to_thread(_stage_dir)
+    try:
+        upload_session._event("download_host_file", correlation)
+        try:
+            staged = await asyncio.to_thread(file_ingress.stage_openai_file, file, work)
+        except ComfyCliError as exc:
+            raise upload_session.UploadFailed(
+                "download_host_file",
+                "init_upload failed: " + _sanitize_client_text(str(exc)),
+                upload_id=correlation,
+                retryable=False,
+            ) from None
+        upload_session._event(
+            "invoke_comfy_upload",
+            correlation,
+            basename=staged.filename,
+            overwrite=overwrite,
+        )
+        try:
+            result = await _upload_local_paths([staged.path], overwrite)
+        except ComfyCliError as exc:
+            raise upload_session.UploadFailed(
+                "invoke_comfy_upload",
+                "init_upload failed while running comfy upload: "
+                + _sanitize_client_text(str(exc)),
+                upload_id=correlation,
+                retryable=True,
+            ) from None
+        try:
+            payload = _upload_complete(
+                staged.filename,
+                staged.mime_type,
+                staged.byte_size,
+                staged.sha256,
+                result,
+            )
+        except ComfyCliError as exc:
+            raise upload_session.UploadFailed(
+                "parse_comfy_result",
+                "init_upload failed while reading the comfy upload result: "
+                + _sanitize_client_text(str(exc)),
+                upload_id=correlation,
+                retryable=False,
+            ) from None
+        upload_session._event(
+            "parse_comfy_result",
+            correlation,
+            cloud_name=payload["comfy_filename"],
+            comfy_filename=payload["comfy_filename"],
+        )
+        return payload
+    finally:
+        upload_session._event("cleanup", correlation, "completed")
+        await asyncio.shield(asyncio.to_thread(shutil.rmtree, work, True))
+
+
+@mcp.tool()
+async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
+    """Upload files from this machine into the target ComfyUI's ``input`` directory.
+
+    Wraps ``comfy upload <files...> --overwrite/--no-overwrite``. Stages
+    source images/masks a workflow references by filename — required for
+    img2img/inpaint.
+
+    Args:
+        overwrite: True replaces an existing file; False (default) keeps it
+            and stores the upload under a deduplicated name.
+
+    Uploads to whichever ComfyUI this server targets (local, or a configured
+    ``COMFYUI_URL``/``COMFYUI_HOST``) — needs comfy-cli >= 1.14.0 for the
+    remote case; older raises rather than silently staging files the remote
+    can never find.
+
+    Gotchas:
+    - Every path must exist on THIS filesystem and be ABSOLUTE — a relative
+      path resolves against comfy-cli's workspace cwd, not the agent's.
+    - A cancelled/timed-out call strands a partial batch; re-run to finish.
+    - ``paths`` is only for a file already on this machine. A ChatGPT
+      attachment is ``init_upload(file=...)``. A Claude or Cursor local file
+      is ``init_upload`` then the returned curl PUT then ``complete_upload``.
+      The next workflow uses ``comfy_filename`` from that result.
+    """
+    return await _upload_local_paths(paths, overwrite)
+
+
+@mcp.tool(meta={"openai/fileParams": ["file"]})
+async def init_upload(
+    file: OpenAIFile | None = None,
+    filename: str | None = None,
+    file_size: int | None = None,
+    mime_type: str | None = None,
+    overwrite: bool = False,
+) -> Any:
+    """Stage one file into the target ComfyUI ``input`` directory.
+
+    Two modes, exactly one per call. A ChatGPT host file (``file``) is
+    downloaded and uploaded in this call and returns ``kind="upload_complete"``.
+    With no ``file``, pass ``filename``, ``file_size``, and ``mime_type`` to
+    open a direct PUT session (``kind="upload_initialized"``); stream the
+    original bytes with the returned curl command, then call
+    ``complete_upload``. Bytes never travel through MCP, base64, or tool
+    arguments.
+
+    The workflow that follows must use ``comfy_filename`` — the name
+    ``comfy upload`` accepted (``uploads[].cloud_name``) — and never the
+    client path, ``/mnt/user-data/uploads/...``, the upload spool, or a
+    temporary file.
+
+    Args:
+        file: ChatGPT host file (``download_url``, ``file_id``, optional
+            ``mime_type`` and ``file_name``). Omit it for a direct PUT.
+        filename: Basename only. Required when ``file`` is omitted.
+        file_size: Exact original byte count. Required when ``file`` is omitted.
+        mime_type: Declared type/subtype such as ``image/png``. Metadata only.
+        overwrite: True replaces an existing ComfyUI input of the same name.
+            Captured now and reused by ``complete_upload``.
+
+    Gotchas:
+    - Claude/Cursor: size is ``wc -c < "$FILE"``, MIME is
+      ``file --mime-type -b "$FILE"``, then run the returned curl with the
+      real local path in ``$FILE``, then ``complete_upload(upload_id)``.
+    - Do not ask the user to copy the file into ComfyUI when the client can
+      run that curl.
+    """
+    manual = filename is not None or file_size is not None or mime_type is not None
+    stage = "validate_arguments"
+    try:
+        if file is not None:
+            if manual:
+                raise upload_session.UploadFailed(
+                    "validate_arguments",
+                    "init_upload failed: pass either the host file or "
+                    "filename, file_size, and mime_type.",
+                    retryable=False,
+                )
+            stage = "download_host_file"
+            return await _init_from_host_file(file, overwrite)
+        if filename is None or file_size is None or mime_type is None:
+            raise upload_session.UploadFailed(
+                "validate_arguments",
+                "init_upload failed: filename, file_size, and mime_type are "
+                "required when no host file is provided.",
+                retryable=False,
+            )
+        stage = "create_session"
+        try:
+            return await asyncio.to_thread(
+                upload_session.initialize, filename, file_size, mime_type, overwrite
+            )
+        except ComfyCliError as exc:
+            raise upload_session.UploadFailed(
+                "create_session",
+                "init_upload failed: " + _sanitize_client_text(str(exc)),
+                retryable=False,
+            ) from None
+    except upload_session.UploadFailed as exc:
+        return _upload_error_from(exc)
+    except Exception as exc:
+        logging.getLogger("comfy_mcp.upload").exception(
+            "upload_id=- stage=%s error_type=%s",
+            stage,
+            type(exc).__name__,
+        )
+        raise
+
+
+@mcp.tool()
+async def complete_upload(upload_id: str) -> Any:
+    """Finish a direct PUT and stage it into the target ComfyUI ``input`` directory.
+
+    Accepts only a session whose PUT has reached ``ready``. Returns
+    ``kind="upload_complete"`` and ``comfy_filename``, the name ``comfy upload``
+    accepted (``uploads[].cloud_name``). The next workflow uses that name and
+    never the client path, ``/mnt/user-data/uploads/...``, the upload spool, or
+    a temporary file. ``overwrite`` was fixed by ``init_upload``. An expected
+    failure returns ``kind="upload_error"`` with ``stage`` and ``message``.
+
+    Args:
+        upload_id: The id returned by ``init_upload``.
+    """
+    stage = "load_session"
+    filename: str | None = None
+    try:
+        try:
+            ready = await asyncio.to_thread(upload_session.begin_complete, upload_id)
+        except upload_session.UploadFailed as exc:
+            return _upload_error_from(exc)
+        filename = ready.filename
+        stage = "invoke_comfy_upload"
+        upload_session._event(
+            "invoke_comfy_upload",
+            upload_id,
+            "completing",
+            basename=ready.filename,
+            overwrite=ready.overwrite,
+        )
+        try:
+            result = await _upload_local_paths([ready.path], ready.overwrite)
+            stage = "parse_comfy_result"
+            payload = _upload_complete(
+                ready.filename,
+                ready.mime_type,
+                ready.byte_size,
+                ready.sha256,
+                result,
+            )
+        except ComfyCliError as exc:
+            failed_stage = stage
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        upload_session.abort_complete, upload_id, "comfy upload failed"
+                    )
+                )
+            upload_session._event(
+                failed_stage,
+                upload_id,
+                "ready",
+                outcome="error",
+                error_type="ComfyCliError",
+            )
+            if failed_stage == "parse_comfy_result":
+                message = (
+                    "complete_upload failed while reading the comfy upload result: "
+                    + _sanitize_client_text(str(exc))
+                )
+                retryable = False
+            else:
+                message = (
+                    "complete_upload failed while running comfy upload: "
+                    + _sanitize_client_text(str(exc))
+                )
+                retryable = True
+            return _upload_error(upload_id, failed_stage, message, retryable=retryable)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        upload_session.abort_complete, upload_id, "comfy upload failed"
+                    )
+                )
+            raise
+        upload_session._event(
+            "parse_comfy_result",
+            upload_id,
+            "completing",
+            cloud_name=payload["comfy_filename"],
+            comfy_filename=payload["comfy_filename"],
+        )
+        stage = "cleanup"
+        await asyncio.shield(
+            asyncio.to_thread(upload_session.finish_complete, upload_id)
+        )
+        return payload
+    except upload_session.UploadFailed as exc:
+        return _upload_error_from(exc)
+    except Exception as exc:
+        logging.getLogger("comfy_mcp.upload").exception(
+            "upload_id=%s stage=%s filename=%s error_type=%s",
+            upload_id,
+            stage,
+            filename or "-",
+            type(exc).__name__,
+        )
+        raise
 
 
 @mcp.tool()
@@ -12525,6 +12953,7 @@ def main(args: list[str] | None = None) -> None:
         # the same translated guidance as the rest.
         if cli._handle_argv(sys.argv[1:] if args is None else args, _MIN_COMFY_CLI_STR):
             return
+        cli._log_startup("comfy-mcp")
         # Before serving: enrich the handshake instructions with the one-shot
         # machine snapshot. Runs inside this try on purpose — the
         # probe swallows its own failures (including a PermissionError, an

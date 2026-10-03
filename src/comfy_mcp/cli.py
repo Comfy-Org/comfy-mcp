@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import subprocess
 import sys
 from importlib import metadata
 
@@ -87,6 +89,57 @@ def _version() -> str:
     # `or`, not a bare return: metadata with no `Version:` field yields None,
     # which would reach a client as the very empty version this exists to fix.
     return installed or __version__
+
+
+_git_sha_cached: str | None = None
+_SHA_RE = re.compile(r"[0-9a-fA-F]{7,40}\Z")
+
+
+def _git_sha() -> str:
+    """Package identity for one process, resolved at most once.
+
+    ``COMFY_MCP_GIT_SHA`` wins when it is a hex commit. Otherwise one
+    ``git rev-parse HEAD`` runs from the source tree. A missing git, a
+    timeout, or a non-checkout answers ``unknown`` and is not retried.
+    """
+    global _git_sha_cached
+    if _git_sha_cached is not None:
+        return _git_sha_cached
+    injected = os.environ.get("COMFY_MCP_GIT_SHA", "").strip()
+    if _SHA_RE.fullmatch(injected):
+        _git_sha_cached = injected.lower()
+        return _git_sha_cached
+    _git_sha_cached = _git_sha_from_repo()
+    return _git_sha_cached
+
+
+def _git_sha_from_repo() -> str:
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    sha = completed.stdout.strip()
+    if completed.returncode == 0 and _SHA_RE.fullmatch(sha):
+        return sha.lower()
+    return "unknown"
+
+
+def _log_startup(process: str) -> None:
+    """One INFO line shared by ``comfy-mcp`` and ``comfy-mcp-upload-server``."""
+    logging.getLogger("comfy_mcp").info(
+        "startup process=%s version=%s git=%s",
+        process,
+        _version(),
+        _git_sha(),
+    )
 
 
 def _print(text: str) -> None:
