@@ -1,0 +1,26 @@
+# Loopback PUT service. The entry point refuses any bind other than
+# 127.0.0.1 or ::1. Host and port come from /etc/comfy-mcp.env
+# (COMFY_MCP_UPLOAD_HOST / COMFY_MCP_UPLOAD_PORT).
+#
+#   sudo cp deploy/systemd/comfy-mcp-upload.service.example /etc/systemd/system/comfy-mcp-upload.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now comfy-mcp-upload
+
+[Unit]
+Description=comfy-mcp direct upload server (loopback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=comfy
+Group=comfy
+EnvironmentFile=/etc/comfy-mcp.env
+WorkingDirectory=/opt/src/comfy-mcp
+UMask=0077
+Restart=on-failure
+RestartSec=3
+ExecStart=/opt/comfy-mcp/bin/comfy-mcp-upload-server
+
+[Install]
+WantedBy=multi-user.target

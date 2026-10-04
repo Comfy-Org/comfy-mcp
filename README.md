@@ -403,6 +403,8 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
 - [Which address variable do I want?](#which-address-variable-do-i-want)
 - [Project anchoring](#project-anchoring)
+- [Uploading an input file](#uploading-an-input-file)
+- [Self-hosted remote MCP deployment](#self-hosted-remote-mcp-deployment)
 - [Tools](#tools)
 - [Troubleshooting](#troubleshooting)
 - [Failure log (opt-in)](#failure-log-opt-in)
@@ -983,7 +985,7 @@ Direct upload is a transport in front of comfy-cli:
 MCP / direct HTTP → temporary local file → comfy upload → ComfyUI
 ```
 
-`comfy-mcp` stays on stdio. A second process, `comfy-mcp-upload-server`, binds loopback (default `127.0.0.1:8192`) and accepts `PUT /upload/{upload_id}` plus `GET /healthz`. Put the existing reverse proxy in front of it. The upload uses a one-time Bearer token from `init_upload`, not the MCP credential, and that token stays in the `Authorization` header.
+`comfy-mcp` stays on stdio. A second process, `comfy-mcp-upload-server`, binds loopback (default `127.0.0.1:8192`) and accepts `PUT /upload/{upload_id}` plus `GET /healthz`. Put a reverse proxy in front of it. The upload uses a one-time Bearer token from `init_upload`, not the MCP credential, and that token stays in the `Authorization` header. The proxy snippet, systemd units, and the rest of a remote deployment are in [Self-hosted remote MCP deployment](#self-hosted-remote-mcp-deployment).
 
 Both processes are long-running Python interpreters that import this package. A change to the shared upload code (`upload_session`, `file_ingress`, or anything either process imports) is invisible until both are restarted:
 
@@ -993,18 +995,6 @@ systemctl restart comfy-mcp-upload comfy-mcp
 
 Each process logs one startup line, `startup process=... version=... git=...`, so a mismatch between those two lines means they are not running the same build. Set `COMFY_MCP_GIT_SHA` in both units when the deploy does not include a git checkout.
 
-```nginx
-location ^~ /upload/ {
-    proxy_pass http://127.0.0.1:8192;
-    proxy_http_version 1.1;
-    proxy_request_buffering off;
-    proxy_buffering off;
-    client_max_body_size 0;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-}
-```
-
 | Variable | Role |
 | --- | --- |
 | `COMFY_MCP_UPLOAD_PUBLIC_BASE_URL` | HTTPS origin the curl command targets. Required for a direct PUT session. Example: `https://uploads.example`. |
@@ -1013,6 +1003,24 @@ location ^~ /upload/ {
 | `COMFY_MCP_MAX_UPLOAD_MB` | Maximum original-byte size. Default `1024`. |
 | `COMFY_MCP_UPLOAD_HOST` | Loopback bind. Default `127.0.0.1`. `::1` is the other accepted value. |
 | `COMFY_MCP_UPLOAD_PORT` | Default `8192`. |
+
+## Self-hosted remote MCP deployment
+
+A simple home layout: ComfyUI and this fork on one personal machine, internal services on localhost, and an HTTPS tunnel in front of Nginx. It is a homelab sketch, not a hardened production deployment. Tailscale Funnel is one possible tunnel. Any other HTTPS proxy in front of the same local port works. Tailscale is not a dependency of this package.
+
+```text
+Internet → HTTPS tunnel → Nginx 127.0.0.1:8191
+  /                 Basic Auth        → ComfyUI 127.0.0.1:8189
+  /mcp              permanent Bearer  → Supergateway 127.0.0.1:8190 → comfy-mcp (stdio) → comfy-cli → ComfyUI
+  /upload/          one-time Bearer   → comfy-mcp-upload-server 127.0.0.1:8192 → spool → comfy upload
+  /view?type=output read-only, no Basic Auth → ComfyUI 127.0.0.1:8189
+```
+
+`comfy-mcp` itself does not open a socket. Supergateway, an external process, wraps its stdio server as Streamable HTTP on `127.0.0.1:8190/mcp`. The upload server only receives client bytes into a temporary file; every ComfyUI call still goes through `comfy`. The ports are a known working set and can be changed together. An example ComfyUI checkout path is `/opt/ComfyUI`.
+
+Public fetch of generated files is a known gap. This layout leaves `GET` and `HEAD` of `/view` open only when `type=output`, so a remote agent can retrieve a result. `type=input` and `type=temp` stay closed. A later version should replace that open output URL with a tighter download path. An exact output URL is readable by anyone who has it.
+
+Layout, environment, systemd units, the Nginx file, the checklist, and troubleshooting: [docs/self-hosted-deployment.md](docs/self-hosted-deployment.md). Sanitized templates: `deploy/`.
 
 ## Tools
 

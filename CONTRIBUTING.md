@@ -45,7 +45,8 @@ pip install -e '.[dev]'    # install with dev extras (pytest, ruff)
 ```
 
 `comfy-mcp` and `comfy-mcp-upload-server` are separate long-running processes.
-After a change to the shared upload code, restart both:
+After a change to the shared upload code, restart both. The self-hosted layout
+is [docs/self-hosted-deployment.md](docs/self-hosted-deployment.md).
 
 ```bash
 systemctl restart comfy-mcp-upload comfy-mcp

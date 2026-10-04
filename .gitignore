@@ -29,6 +29,10 @@ uv.lock
 .env.*
 !.env.example
 
+# Operator copies of the deployment templates. The tracked files are *.example.
+deploy/comfy-mcp.env
+deploy/*.local
+
 # OS / editor
 .DS_Store
 .idea/

@@ -1,0 +1,31 @@
+# comfy-mcp stays on stdio. Supergateway (an external npm package) exposes it
+# as Streamable HTTP on loopback only. Nginx is the public boundary.
+#
+# Install Supergateway first and confirm the binary path and flags:
+#   supergateway --help
+# --host defaults to every interface. This unit passes 127.0.0.1 on purpose.
+# Do not add --apiKey here; the reference keeps the permanent MCP Bearer in
+# Nginx, outside the git checkout.
+#
+#   sudo cp deploy/systemd/comfy-mcp.service.example /etc/systemd/system/comfy-mcp.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now comfy-mcp
+
+[Unit]
+Description=comfy-mcp via Supergateway (loopback Streamable HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=comfy
+Group=comfy
+EnvironmentFile=/etc/comfy-mcp.env
+WorkingDirectory=/opt/src/comfy-mcp
+UMask=0077
+Restart=on-failure
+RestartSec=3
+ExecStart=/usr/local/bin/supergateway --stdio /opt/comfy-mcp/bin/comfy-mcp --outputTransport streamableHttp --host 127.0.0.1 --port 8190 --streamableHttpPath /mcp
+
+[Install]
+WantedBy=multi-user.target
