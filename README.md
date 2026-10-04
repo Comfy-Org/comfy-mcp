@@ -395,6 +395,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Comfy Cloud MCP](#comfy-cloud-mcp)
 - [Prerequisites](#prerequisites)
 - [When to use this server](#when-to-use-this-server)
+- [Generation guidance](#generation-guidance)
 - [Using with local LLMs (VRAM coordination)](#using-with-local-llms-vram-coordination)
 - [Partner-API nodes](#partner-api-nodes)
 - [Spending credits on partner models](#spending-credits-on-partner-models)
@@ -534,6 +535,14 @@ The instructions walk these as an ordered procedure, because several of the chec
 The `hardware` block comes straight through from `comfy env`, and a comfy-cli that predates it simply omits the key. There is no HTTP client and no cloud code here — the cloud/partner steer is guidance text only.
 
 **Which model to use is deliberately not encoded here.** The instructions tell the agent to pick via `search_templates` / `search_models` rather than assume a classic default (e.g. SDXL), because the gallery tracks current models and a hardcoded name would rot. Current-model guidance lives in **[Comfy-Org/comfy-skills](https://github.com/Comfy-Org/comfy-skills)**, which is its canonical home.
+
+## Generation guidance
+
+The handshake tells the agent to handle technical complexity and surface meaningful choices. It looks up what this install can actually run — checkpoints, templates, slots, nodes — and recommends one option in terms of the result, the time, and the cost. Creative framing, a real quality jump, and any spend stay with the user.
+
+A first video, or a large prompt or workflow change, starts from a practical draft the selected workflow supports, so composition, motion, and timing can be checked before a long or expensive render. Refinements keep the seed and the settings that did not change. After the draft, the agent inspects the output before suggesting a higher-quality rerun.
+
+An oversized keyframe is prepared for the workflow that will use it: a matching-ratio downscale can happen without asking; a crop that would change the framing is a creative choice. There is no recommendation endpoint and no fixed model ranking in this server. Paid routes stay behind the existing spend confirmation, and a local option is preferred for early exploration when it can do the job.
 
 ## Using with local LLMs (VRAM coordination)
 
@@ -977,7 +986,7 @@ file --mime-type -b "$FILE"
 
 Run the curl command `init_upload` returns, with `$FILE` set to that local path. The bytes go from the client filesystem to the upload service. They do not pass through MCP.
 
-The next workflow must load `comfy_filename` from the `upload_complete` result. That is the name `comfy upload` accepted (`uploads[].cloud_name`), for a local ComfyUI and for a remote one. Do not reference the client path, `/mnt/user-data/uploads/...`, the upload spool, or the temporary file.
+The next workflow must load `comfy_filename` from the `upload_complete` result. That is the name `comfy upload` accepted (`uploads[].cloud_name`), for a local ComfyUI and for a remote one. Do not reference the client path, `/mnt/user-data/uploads/...`, the upload spool, or the temporary file. When the workflow is already chosen, an oversized reference should be resized or cropped to the ratio and resolution that workflow will actually use before the bytes are sent; see [Generation guidance](#generation-guidance).
 
 Direct upload is a transport in front of comfy-cli:
 

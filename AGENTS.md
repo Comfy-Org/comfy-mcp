@@ -103,7 +103,7 @@ custom nodes included — not a static catalog.
 ## Module layout
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the `--json-stream`
-machinery, the spend-consent plumbing) and every `@mcp.tool()`. Thirteen **leaf** modules sit
+machinery, the spend-consent plumbing) and every `@mcp.tool()`. Fourteen **leaf** modules sit
 under it — none imports `server`, so the dependency edges only ever point one way:
 
 | Module | Owns |
@@ -111,7 +111,8 @@ under it — none imports `server`, so the dependency edges only ever point one 
 | `textutil.py` | pure text helpers: `_tail` / `_stream_tail` (bounded stream tails) and `_redact_url` (userinfo masking) |
 | `tcc.py` | macOS protected-folder (TCC) detection + the guidance message |
 | `failure_log.py` | the opt-in `COMFY_MCP_DEBUG_LOG` failure log (its config, its module state, and `_log_failure`) **and the URL scrubbers** — `_scrub_text` / `_scrubbed_stream_tail` also mask credentials on the way to the MCP CLIENT, not just to disk |
-| `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — client-handshake text |
+| `instructions.py` | the `INSTRUCTIONS` constant handed to `MCPServer(..., instructions=...)` — client-handshake text, including the creative-assistant guidance |
+| `tool_annotations.py` | semantic MCP tool hints (`readOnlyHint` and the rest) applied to every public tool — hints, not authorization |
 | `errors.py` | `ComfyCliError`; the "nothing recorded to stop" detector; the `error.details` renderer + per-field char cap |
 | `clitext.py` | comfy-cli **human-output** parsing for verbs with no envelope — `Saved:`-block/install-failure extraction, `plain_ok` synthesis, missing-verb/-option probes, `install_node`'s per-pack verdict, echoed-argv forgery guards. Its extractors are the documented cm-cli contract (see architecture rule above) — move or edit byte-for-byte |
 | `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload paths) |

@@ -58,7 +58,15 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # `init_upload`, a Claude/Cursor file is a direct PUT of the original bytes
 # then `complete_upload`, and the next workflow uses `comfy_filename`.
 # Measured ~16,308 after it (42 tool docstrings).
-_BUDGET_TOKENS = 16_400
+#
+# 16,400 -> 18,300 when the handshake gained the creative-assistant policy
+# (draft before quality, seed comparability, reference preparation, one
+# recommendation from the live install, inspect before escalation) plus a
+# short pointer on the generation tools and `init_upload`. That policy is
+# handshake text an agent cannot infer from the tool list. No new tool.
+# Measured ~18,138 after it (42 tool docstrings, 49446 doc chars +
+# INSTRUCTIONS 23108 chars). The slack is the next growth's decision.
+_BUDGET_TOKENS = 18_300
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

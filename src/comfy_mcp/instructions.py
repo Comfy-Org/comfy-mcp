@@ -2,8 +2,12 @@
 
 Leaf module: a single constant, no imports from this package, so anything may
 depend on it. ``server`` hands this to ``MCPServer(..., instructions=...)`` so
-every client sees it once, at connection time, before any tool call — the
-canonical flows an agent would otherwise have to rediscover tool-by-tool.
+every client sees it once, at connection time, before any tool call.
+
+The constant is one coherent block. Its sections are the canonical tool flows,
+the user-interaction and generation policy, the machine-routing procedure, and
+the local-only close. A startup probe may append a machine snapshot after this
+text; that append lives in ``server``, not here.
 """
 
 from __future__ import annotations
@@ -178,6 +182,100 @@ polls with). No tool takes a bare `path` or `workflow` argument. RETURNED
 payloads use those same names, so a handle read out of one result passes
 straight back in — a download payload that HAS a handle keys it `download_id`,
 comfy-cli's own `id` kept alongside.
+
+Working with the user — handle technical complexity, surface meaningful
+choices. Resolve implementation details yourself through the discovery tools
+whenever you can: which checkpoint is installed (`search_models`), which
+workflow supports a capability (`search_templates` / `nodes`), which
+resolution a template expects (`list_workflow_slots` / `get_template`),
+whether a required model is present, and which node implements a feature. Do
+not ask the user to make those choices. Involve the user when a choice
+materially changes creative intent, framing, quality, generation time, or
+monetary cost. Phrase the recommendation in those terms. A model or workflow
+name may be mentioned; it is not the decision you are asking for unless the
+user is working at that level.
+
+Draft before quality. For a first video, or after a substantial prompt or
+workflow change, suggest one practical low-resolution or draft/fast setting
+the SELECTED workflow actually supports before a production-quality run. The
+first pass validates composition, subject consistency, movement, camera
+behavior, timing, and prompt adherence with the user. Once those hold,
+suggest raising resolution and/or quality for the final. Do not force a
+draft when the user already asked for final or high-quality output. Do not
+pick a setting so low that the pass stops representing the result; prefer
+the lowest PRACTICAL draft.
+
+Preserve comparability between iterations. When refining, keep every
+parameter unrelated to the requested change — especially the seed, and also
+the workflow or model, resolution, quality mode, and other unrelated
+settings when only the prompt is changing. Reuse the previous seed from the
+current client context when that context still has it. Change the seed when
+the user wants exploration or variation, when the composition is
+fundamentally unsuitable, or when the workflow requires a new one. Do not
+promise memory beyond what this session's context actually holds.
+
+Prepare references for the selected workflow before uploading a keyframe or
+reference image. Determine the workflow or model, its expected aspect ratio,
+and the resolution it will actually consume, then inspect the source
+dimensions. If the source is substantially larger than that, prepare an
+optimized copy and upload that copy — do not send a multi-megapixel original
+the workflow will immediately shrink. When the aspect ratio already matches
+closely, downscale, preserve the composition, keep the original file, and
+upload the derived copy; that is not a user decision, and a client with
+local image tooling should do the resize after any framing choice is
+settled. Do not upscale a source merely to match a larger generation
+resolution. When matching the ratio needs a meaningful crop, say what would
+be removed in creative terms (subject placement, background kept or lost)
+and involve the user if that crop could change the composition. Do not crop
+meaningful content away silently. Prefer "the image is wider than the video
+format; I can keep the subject centered and crop some background from the
+sides" over asking the user to pick pixel dimensions.
+
+When the user names a model or workflow, use it unless it is unavailable,
+incompatible, or clearly unable to do the job. When they do not, inspect
+what THIS install can actually run and make ONE primary recommendation.
+Weigh, in order: the required capability (text-to-image, image-to-image,
+text-to-video, image-to-video, continuation, editing, lipsync, native
+audio), duration and input constraints, aspect ratio and resolution,
+installed and runnable availability, hardware and VRAM (the routing steps
+below), iteration speed, quality, then monetary cost. Mention one
+alternative only for a real trade-off, such as a faster draft versus a
+higher final quality, local versus paid, native audio versus silent, a
+short duration versus a longer one, or stronger identity consistency versus
+a faster generation. Explain why the choice fits the user's goal. There is
+no recommendation tool and no fixed model ranking in this server — live
+discovery is the source, and a ranking that would rot belongs in comfy-cli
+rather than here.
+
+Before a substantial escalation from a draft to a slower or more expensive
+final, involve the user: a large resolution jump, a large quality or step
+increase, a paid API, a much longer generation, or a change that alters the
+creative result. Do not ask about every small technical adjustment. The
+spend-confirmation rules above are unchanged — `confirm_spend`, elicitation,
+and `comfy generate consent always` still govern every paid call; this
+paragraph does not relax or replace that gate. When several options satisfy
+the goal, prefer a suitable local, non-paid one for early exploration.
+Recommend a paid model only for a real benefit: native audio, a duration or
+a consistency the local install cannot do, or a model the user named. Do
+not silently move a local run onto a paid API for a marginal gain; say the
+trade-off in the same user terms.
+
+After a draft finishes, inspect or retrieve the result (`fetch_outputs`,
+inline images when the client can look) before suggesting another expensive
+generation. Look at framing, subject consistency, motion, camera, timing,
+prompt adherence, and visible artifacts, then recommend the next step. A
+job that merely completed is not a reason to raise resolution.
+
+Reuse work you already have: an uploaded input, a returned `comfy_filename`,
+a previous seed, a generated output, a continuation workflow, an
+intermediate asset. Do not re-upload or regenerate an asset you can reuse.
+For a continuation, prefer the existing previous output.
+
+Operate internally as understand, recommend, prepare, draft, review with the
+user, refine, then final quality. Do not narrate that sequence as a
+checklist. The user should get fewer technical questions, one clear
+recommendation, and a checkpoint when the creative result, the time, or the
+cost changes.
 
 Routing — check the machine before running local diffusion. `server_info`
 passes through comfy-cli's `hardware` block (`os`, `arch`, `ram_bytes`, and a

@@ -100,6 +100,7 @@ from . import (
     params,
     target,
     tcc,
+    tool_annotations,
     upload_session,
 )
 from .errors import ComfyCliError
@@ -3762,6 +3763,11 @@ async def run_workflow(
             never gated by this.
 
     Gotchas:
+        - For a first video, or after a large prompt or workflow change,
+          prefer a practical draft the graph supports, keep the seed and
+          other unrelated settings when refining, and inspect the output
+          before raising resolution, quality, or cost. The handshake states
+          that policy; do not force a draft the user already refused.
         - Without consent, a paid workflow fails CLOSED
           (``spend_consent_required``, nothing spent) on a comfy-cli carrying
           the gate — the enforced floor; a source build past the fail-open
@@ -4062,6 +4068,9 @@ async def generate_image(
     as much as this wait's, so no expiry drops the handle.
 
     Gotchas:
+    - Same iteration policy as ``run_workflow``: a practical draft first when
+      the pass is exploratory, keep the seed when refining, inspect before
+      a slower or costlier rerun. The handshake states the policy.
     - Always FREE, a local OSS graph — use ``partner_generate`` for paid
       PARTNER models.
     - For a chosen template or hand-authored workflow, use
@@ -4951,7 +4960,9 @@ async def partner_generate(
     PARTNER's infrastructure — the user's local ComfyUI never executes anything.
     For local execution, use ``emit_partner_workflow`` -> ``run_workflow`` ->
     ``fetch_outputs`` instead (covers only the models comfy-cli can render as a
-    node).
+    node). This call always spends: inspect the result before another paid
+    run, and keep the seed when the user is refining rather than exploring.
+    The handshake states when a paid route is the one to recommend.
 
     Args:
         params: the model's own inputs (``prompt``, ``aspect_ratio``, ``seed``,
@@ -5641,6 +5652,9 @@ async def run_template(
         timeout_seconds: bounds this call's wall clock (default 600s).
 
     Gotchas:
+        - Same iteration policy as ``run_workflow``: a practical draft first
+          on a first video or a large prompt change, keep the seed when
+          refining, and inspect the output before a slower or paid rerun.
         - Without consent, a paid template fails CLOSED
           (``spend_consent_required``, nothing spent); free templates run.
         - A missing referenced model surfaces as a per-node error.
@@ -12135,6 +12149,11 @@ async def init_upload(
       real local path in ``$FILE``, then ``complete_upload(upload_id)``.
     - Do not ask the user to copy the file into ComfyUI when the client can
       run that curl.
+    - When the target workflow is already known, an oversized reference
+      should be resized or cropped to that workflow's useful ratio and
+      resolution before transfer. A downscale that keeps the framing is not
+      a user decision; a crop that would change the composition is. The
+      generation policy lives in the handshake, not here.
     """
     manual = filename is not None or file_size is not None or mime_type is not None
     stage = "validate_arguments"
@@ -12685,6 +12704,11 @@ def vary_workflow(
         argv._reject_nul("out_dir", out_dir)
         args += ["--out-dir", out_dir]
     return _run_comfy(*args, timeout=120.0)
+
+
+# After every @mcp.tool has registered. A tool missing from the table raises
+# here, at import, rather than reaching a client without a hint.
+tool_annotations.apply(mcp)
 
 
 # How long the startup snapshot probe may hold up the handshake, WALL-CLOCK.
