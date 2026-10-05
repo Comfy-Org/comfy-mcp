@@ -948,3 +948,19 @@ def test_search_templates_finds_a_weight_filename(monkeypatch):
     assert _names(server.search_templates("flux2_dev_fp8mixed")) == [
         "image_flux2_text_to_image"
     ]
+
+
+def test_instructions_tell_agents_to_title_hand_written_nodes():
+    """A hand-written graph carries a `_meta.title` per node; templates win.
+
+    Dragged into ComfyUI, an API-format graph is auto-arranged and each node is
+    labelled `_meta.title`, else its bare class_type — so an untitled graph is
+    illegible. Tripwire on the load-bearing facts, not whole sentences.
+    """
+    flat = " ".join(instructions.INSTRUCTIONS.split())
+    assert "Hand-writing a workflow" in flat
+    assert "`_meta.title` on EVERY node" in flat
+    assert "layout is auto-generated" in flat
+    assert "Prefer `fetch_template` + `set_workflow_slot`" in flat
+    # The `run_workflow` description carries the same hint at the call site.
+    assert "_meta.title" in (server.run_workflow.__doc__ or "")

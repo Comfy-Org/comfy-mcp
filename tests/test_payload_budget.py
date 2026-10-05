@@ -51,7 +51,14 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # so there was no version of it that fit the slack left after the
 # `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
 # next growth is still a decision.
-_BUDGET_TOKENS = 15_650
+#
+# 15,650 -> 15,800 for the hand-written-workflow bullet in INSTRUCTIONS plus
+# one sentence on `run_workflow` (+~146 tokens). The tree was already at
+# ~15,622, so no useful version fit the 28 tokens of slack. Not inferable
+# elsewhere: an API-format graph dragged into ComfyUI is auto-arranged and
+# labelled by `_meta.title` (else bare class_type), so an agent that omits it
+# hands the user an illegible canvas. Measured ~15,768 after the edit.
+_BUDGET_TOKENS = 15_800
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
