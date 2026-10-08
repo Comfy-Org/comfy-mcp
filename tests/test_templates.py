@@ -965,5 +965,9 @@ def test_instructions_tell_agents_to_title_hand_written_nodes():
     assert "layout is auto-generated" in flat
     assert "`validate_workflow` it before `run_workflow`" in flat
     assert "Prefer `fetch_template` + `set_workflow_slot`" in flat
-    # The `run_workflow` description carries the same hint at the call site.
-    assert "_meta.title" in (server.run_workflow.__doc__ or "")
+    assert "generic node-type name" in flat
+    # The `run_workflow` description carries the same hint at the call site,
+    # and says the title is a canvas label, not a run prerequisite.
+    doc = " ".join((server.run_workflow.__doc__ or "").split())
+    assert "_meta.title" in doc
+    assert "canvas label only, never execution" in doc
