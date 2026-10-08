@@ -1026,6 +1026,41 @@ def test_restart_comfyui_raises_on_malformed_url_target(patched_run, monkeypatch
     assert calls == []
 
 
+def test_restart_comfyui_refusal_masks_host_userinfo(patched_run, monkeypatch):
+    """``COMFYUI_HOST`` is taken verbatim, so its userinfo must not reach the client."""
+    monkeypatch.setenv("COMFYUI_HOST", "<user>:<pass>@gpu.example")
+    calls = patched_run(envelope(data={"pid": 99, "port": 8188}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart()
+
+    message = str(excinfo.value)
+    assert "<user>" not in message and "<pass>" not in message
+    assert f"***@gpu.example:{target.DEFAULT_COMFYUI_PORT}" in message
+    assert calls == []
+
+
+def test_restart_comfyui_refusal_brackets_an_ipv6_host(patched_run, monkeypatch):
+    """An IPv6 remote is named as ``[host]:port`` so the port does not read as a hextet."""
+    monkeypatch.setenv("COMFYUI_URL", "http://[2001:db8::1]:8188")
+    calls = patched_run(envelope(data={"pid": 99, "port": 8188}))
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart()
+
+    assert "[2001:db8::1]:8188" in str(excinfo.value)
+    assert calls == []
+
+
+def test_restart_comfyui_reject_guard_ignores_a_lone_port(monkeypatch):
+    """A port alone selects no remote, so it must not brick a LOCAL restart."""
+    monkeypatch.delenv("COMFYUI_URL", raising=False)
+    monkeypatch.delenv("COMFYUI_HOST", raising=False)
+    monkeypatch.setenv("COMFYUI_PORT", "8189")
+
+    assert target._reject_remote_restart() is None
+
+
 def test_restart_comfyui_reject_guard_is_a_no_op_when_unconfigured():
     """No remote configured -> the guard returns without raising (byte-identical).
 

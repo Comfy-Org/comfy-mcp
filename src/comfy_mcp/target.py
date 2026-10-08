@@ -456,22 +456,38 @@ def _reject_remote_restart() -> None:
     malformed value: the raise comes straight out of :func:`_comfy_target`,
     because the caller opted into a remote and the only open question is WHICH
     one — an unparseable answer is an error, not something to shrug off and
-    restart locally.
+    restart locally. A lone ``COMFYUI_PORT`` is NOT that case: a port alone
+    selects no remote (:func:`_comfy_target` raises only to flag the stray
+    knob), so with neither ``COMFYUI_URL`` nor ``COMFYUI_HOST`` set this is a
+    purely local session and the restart proceeds — the untracked-kill gate's
+    own fail-closed read still declines to kill on that unreadable config.
+
+    No loopback carve-out: ``COMFYUI_URL=http://127.0.0.1:<p>`` is as often an
+    SSH tunnel to a remote GPU box as a second local server, and this server
+    cannot tell which — the exact wrong-machine guess this guard exists to stop.
     """
+    if not (
+        os.environ.get("COMFYUI_URL", "").strip()
+        or os.environ.get("COMFYUI_HOST", "").strip()
+    ):
+        return
     target = _comfy_target()
     if target is None:
         return
     host, port, source = target
+    endpoint = _format_target_endpoint(_redact_target_host(host), port)
     raise ComfyCliError(
         "restart_comfyui is LOCAL-ONLY, but a remote ComfyUI is configured "
-        f"({source} -> {host}:{port}). It composes `comfy stop` + `comfy "
+        f"({source} -> {endpoint}). It composes `comfy stop` + `comfy "
         "launch`, which take no --host/--port and only manage the ComfyUI "
         "process comfy-cli started on the machine running this MCP server — so "
         "it would kill and relaunch the LOCAL server while reporting success, "
-        f"and the remote at {host}:{port} was NOT touched. To restart that "
-        "remote, do it on the remote host itself (its own comfy-cli / MCP "
-        "server, or however that ComfyUI is managed). To manage a local server "
-        "from here, unset COMFYUI_URL/COMFYUI_HOST."
+        f"and the remote at {endpoint} was NOT touched. stop_comfyui and "
+        "launch_comfyui are equally local-only, so calling them in sequence "
+        "would do the same. To restart that remote, do it on the remote host "
+        "itself (its own comfy-cli / MCP server, or however that ComfyUI is "
+        "managed). To manage a local server from here, unset "
+        "COMFYUI_URL/COMFYUI_HOST."
     )
 
 

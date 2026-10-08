@@ -540,6 +540,28 @@ def test_a_malformed_remote_config_fails_loudly_before_any_lifecycle_action(
     assert state["launches"] == []
 
 
+def test_a_lone_port_restarts_locally_but_never_unlocks_a_kill(clash, monkeypatch):
+    """A stray ``COMFYUI_PORT`` selects no remote, so the restart itself proceeds.
+
+    But ``_comfy_target`` still raises on it, and the kill gate reads that
+    unreadable config as "configured", never as "local" — so the launch's port
+    error comes back with no probe and no prompt. `[]` as the reply list is the
+    assertion: any `_run_comfy` call at all fails the test.
+    """
+    monkeypatch.setenv("COMFYUI_PORT", "8189")
+    state = clash([])
+    ctx = _FakeCtx()
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart(ctx=ctx)
+
+    assert "LOCAL-ONLY" not in str(excinfo.value)  # not refused as a remote
+    assert "almost certainly started outside comfy-cli" in str(excinfo.value)
+    assert len(state["launches"]) == 1  # the restart really ran locally
+    assert ctx.elicitations == []
+    assert state["runs"] == []
+
+
 def test_an_unreadable_port_is_never_guessed_at(clash):
     """`--port` present but unparseable is UNKNOWN, not "probably 8188".
 
