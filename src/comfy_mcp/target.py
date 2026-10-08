@@ -615,7 +615,60 @@ def _with_target_provenance(err: ComfyCliError) -> ComfyCliError:
     """
     if not _comfy_cli_ran(err):
         return err
-    suffix = _target_provenance_suffix()
+    return _with_suffix(err, _target_provenance_suffix())
+
+
+def _stop_target_suffix() -> str:
+    """The remote-target caveat for ``comfy stop``'s "nothing recorded" error.
+
+    ``comfy stop`` consults only comfy-cli's registry of BACKGROUND launches on
+    THIS machine, so with ``COMFYUI_URL`` / ``COMFYUI_HOST`` configured its
+    "No ComfyUI is running in the background" reads as a verdict on the remote
+    the run/job tools submit to — a remote that may well be up. This names the
+    configured target as UNCHECKED rather than refusing the stop: the local
+    stop still runs (a local background server, a loopback/tunnel target and
+    ``restart_comfyui``'s stop half all need it), and only the one misleading
+    answer gets the caveat.
+
+    Returns ``""`` when nothing is configured, so the local default stays
+    byte-identical. Fail-soft on a malformed config, as
+    :func:`_target_provenance_suffix` is: stop never touches the remote, so a bad
+    ``COMFYUI_URL`` must not change whether it works — but the typo is still
+    named rather than read as "nothing configured".
+    """
+    try:
+        target = _comfy_target()
+    except ComfyCliError as exc:
+        return (
+            " (note: the remote-target config (COMFYUI_URL / COMFYUI_HOST / "
+            "COMFYUI_PORT) is set but invalid, so no remote is resolved; this "
+            "answer covers only comfy-cli's local background-launch registry. "
+            f"The config error is: {exc})"
+        )
+    if target is None:
+        return ""
+    host, port, source = target
+    endpoint = _format_target_endpoint(_redact_target_host(host), port)
+    return (
+        f" (note: {source} is set to {endpoint}, which this did NOT check — "
+        "`comfy stop` only consults comfy-cli's registry of background launches "
+        "on THIS machine. This is not a verdict that the configured ComfyUI is "
+        "down; it may be up and serving the run/job tools. To stop it, stop it on "
+        "the host that runs it.)"
+    )
+
+
+def _with_stop_target_note(err: ComfyCliError) -> ComfyCliError:
+    """*err* with :func:`_stop_target_suffix` appended, or *err* itself.
+
+    Every attribute is carried across, so ``errors._is_no_recorded_server``
+    still recognizes the result and ``restart_comfyui`` still relaunches.
+    """
+    return _with_suffix(err, _stop_target_suffix())
+
+
+def _with_suffix(err: ComfyCliError, suffix: str) -> ComfyCliError:
+    """A copy of *err* with *suffix* appended, or *err* itself when it is empty."""
     if not suffix:
         return err
     return ComfyCliError(
