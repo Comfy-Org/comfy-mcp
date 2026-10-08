@@ -60,6 +60,11 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # from any other tool's docs — and an agent that does not know it acts on a
 # launch that never touched the remote it meant to (re)start. Measured ~15,704
 # after the edit, so the next growth is still a decision.
+#
+# `restart_comfyui`'s matching remote-target refusal (it RAISES rather than kill
+# the local server) landed under the same ceiling, trimmed to one sentence and
+# offset by dropping its now-redundant "skipped with a remote" note. Measured
+# ~15,747 after it — the next growth is a decision.
 _BUDGET_TOKENS = 15_750
 
 
