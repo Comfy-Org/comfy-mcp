@@ -958,6 +958,146 @@ def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
     ]
 
 
+# --- launch_comfyui refuses a configured remote ----------------------------
+#
+# `comfy launch` is LOCAL-ONLY — it takes no `--host` / `--port` and always
+# spawns ComfyUI on the machine running THIS server. So with a remote configured,
+# a launch would start a SECOND local process while the configured remote is
+# never (re)started, reporting an unqualified success that hides the swap. It is
+# refused up front with a structured verdict instead, so a caller can branch on
+# `launched` rather than parse a free-text message.
+
+
+def _launch(*args, **kwargs):
+    """Drive the async ``launch_comfyui`` tool from these synchronous tests."""
+    return asyncio.run(server.launch_comfyui(*args, **kwargs))
+
+
+def test_launch_refuses_configured_url_target(patched_run, monkeypatch):
+    """A COMFYUI_URL remote yields a structured refusal and spawns NOTHING."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    result = _launch()
+
+    # The explicit, branchable field the ticket requires: a caller does not have
+    # to scrape prose to learn no local process ran.
+    assert result["ok"] is False
+    assert result["launched"] is False
+    assert result["reason"] == "remote_target_configured"
+    assert result["remote_target"] == {
+        "host": "gpu.example",
+        "port": 9001,
+        "source": "COMFYUI_URL",
+    }
+    message = result["message"]
+    assert "gpu.example:9001" in message  # names the remote it will not touch
+    assert "COMFYUI_URL" in message  # ... and which knob selected it
+    assert "No local process was spawned" in message
+    # The whole point of the guard: it lands BEFORE the spawn.
+    assert calls == []
+
+
+def test_launch_refuses_configured_host_target(patched_run, monkeypatch):
+    """The COMFYUI_HOST spelling is guarded too, with its default port named."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    result = _launch()
+
+    assert result["launched"] is False
+    assert result["remote_target"] == {
+        "host": "gpu.example",
+        "port": target.DEFAULT_COMFYUI_PORT,
+        "source": "COMFYUI_HOST",
+    }
+    assert f"gpu.example:{target.DEFAULT_COMFYUI_PORT}" in result["message"]
+    assert calls == []
+
+
+def test_launch_refusal_precedes_the_network_exposure_gate(patched_run, monkeypatch):
+    """With a remote configured, the refusal wins over the exposure consent gate.
+
+    A bare-`--listen` launch on an unpromptable client normally RAISES for
+    missing consent. With a remote configured there is no local launch to expose,
+    so the remote refusal must land first — returned, not raised — and still
+    spawn nothing.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    result = _launch(["--listen"], ctx=None)
+
+    assert result["launched"] is False
+    assert result["reason"] == "remote_target_configured"
+    assert calls == []
+
+
+def test_launch_raises_on_malformed_url_target(patched_run, monkeypatch):
+    """A malformed remote config fails LOUDLY, never silently launching locally.
+
+    Same posture as ``download_model``: the caller asked for a remote, so an
+    unparseable value is an error rather than something to shrug off and launch
+    a local process instead.
+    """
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        _launch()
+
+    assert calls == []
+
+
+def test_launch_refusal_masks_userinfo_in_host(patched_run, monkeypatch):
+    """A credential written into COMFYUI_HOST is not echoed raw in the refusal."""
+    monkeypatch.setenv("COMFYUI_HOST", "<user>:<sekret>@gpu.example")
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    result = _launch()
+
+    assert "<sekret>" not in result["message"]
+    assert "<sekret>" not in result["remote_target"]["host"]
+    assert result["remote_target"]["host"] == "***@gpu.example"
+    assert calls == []
+
+
+def test_launch_lone_port_launches_locally(patched_run, monkeypatch):
+    """A lone COMFYUI_PORT selects no remote, so it must not brick the launch.
+
+    It is also what unsetting only COMFYUI_HOST — the refusal's own advice —
+    leaves behind from a HOST + PORT setup, so that advice has to land here.
+    """
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    assert _launch() == {"pid": 42}
+
+    assert calls[0]["cmd"][4:] == ["launch", "--background"]
+
+
+def test_launch_refuses_host_with_port_target(patched_run, monkeypatch):
+    """COMFYUI_HOST + COMFYUI_PORT is refused with the configured port named."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    result = _launch()
+
+    assert result["launched"] is False
+    assert result["remote_target"]["port"] == 9001
+    assert calls == []
+
+
+def test_launch_unconfigured_is_unchanged(patched_run):
+    """No remote configured -> byte-identical to today (the guard is a no-op)."""
+    calls = patched_run(envelope(data={"pid": 42}))
+
+    assert _launch() == {"pid": 42}
+
+    assert calls[0]["cmd"][4:] == ["launch", "--background"]
+
+
 # --- system_stats / free_memory annotate a configured remote ---------------
 #
 # `comfy system-stats` and `comfy free` take no `--host` / `--port` (only

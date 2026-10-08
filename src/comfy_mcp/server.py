@@ -6861,8 +6861,8 @@ async def launch_comfyui(
     **LOCAL-ONLY.** With ``COMFYUI_URL``/``COMFYUI_HOST`` set this cannot touch
     that remote, so it launches nothing and returns a refusal with ``ok`` and
     ``launched`` both ``False`` (and ``reason: remote_target_configured``, plus
-    ``remote_target``); branch on ``launched``. A malformed value raises. Unset
-    those to launch locally.
+    ``remote_target``); test ``launched is False`` — a success omits it, a
+    failure raises. A malformed value raises. Unset those to launch locally.
     """
     refusal = target._local_launch_refusal_for_remote_target()
     if refusal is not None:

@@ -448,8 +448,17 @@ def _local_launch_refusal_for_remote_target() -> dict[str, Any] | None:
     byte-identical to the local-only default and spawns as it always has. A
     set-but-malformed value raises out of :func:`_comfy_target` (as it does for
     ``download_model``): a typo must fail loudly, never fall through to a silent
-    local launch.
+    local launch. A lone ``COMFYUI_PORT`` is the exception: it selects no remote
+    (:func:`_comfy_target` says so itself), so there is nothing to substitute
+    for, and it must not brick the local launch — which is also what makes the
+    message's "unset COMFYUI_URL / COMFYUI_HOST" advice sufficient when a
+    ``COMFYUI_PORT`` was set alongside the host.
     """
+    if not (
+        os.environ.get("COMFYUI_URL", "").strip()
+        or os.environ.get("COMFYUI_HOST", "").strip()
+    ):
+        return None
     target = _comfy_target()
     if target is None:
         return None
