@@ -6897,11 +6897,10 @@ async def launch_comfyui(
 def stop_comfyui() -> Any:
     """Stop the LOCAL ComfyUI server that comfy-cli launched.
 
-    Wraps ``comfy stop``. Ownership semantics: comfy-cli only kills the pid it
-    recorded when IT launched the server (via ``launch_comfyui``) — it cannot
-    stop a ComfyUI started by the desktop app or by hand, and raises
-    :class:`ComfyCliError` naming "no recorded server" instead of killing an
-    unrelated process.
+    Wraps ``comfy stop``. comfy-cli only kills the pid it recorded when IT
+    launched the server (via ``launch_comfyui``) — it cannot stop a ComfyUI
+    started by the desktop app or by hand, and raises :class:`ComfyCliError`
+    naming "no recorded server" (no verdict on a configured remote) instead.
 
     Prints text with no JSON envelope; success returns a synthesized
     ``{"ok": True, ...}``.
@@ -6911,7 +6910,15 @@ def stop_comfyui() -> Any:
     is in flight, rather than racing comfy-cli's single recorded pid.
     """
     with _lifecycle_slot("stop"):
-        return _run_comfy("stop", timeout=60.0, plain_ok=True)
+        try:
+            return _run_comfy("stop", timeout=60.0, plain_ok=True)
+        except ComfyCliError as exc:
+            if not errors._is_no_recorded_server(exc):
+                raise
+            annotated = target._with_stop_target_note(exc)
+            if annotated is exc:
+                raise
+            raise annotated from exc
 
 
 # A launch that lost the port race. Matched on the phrasing rather than a fixed

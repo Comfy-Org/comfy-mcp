@@ -33,7 +33,7 @@ import subprocess
 import pytest
 from conftest import _OK_STREAM, envelope
 
-from comfy_mcp import server, target
+from comfy_mcp import errors, server, target
 
 # --- _comfy_target env parsing ---------------------------------------------
 
@@ -983,6 +983,155 @@ def test_download_lifecycle_tools_are_not_guarded(patched_run, monkeypatch):
         ["model", "download-status"],
         ["model", "download-cancel"],
     ]
+
+
+# --- stop_comfyui caveats "nothing recorded" with a configured remote ------
+#
+# `comfy stop` consults only comfy-cli's registry of BACKGROUND launches on THIS
+# machine, so with a remote configured its "No ComfyUI is running in the
+# background" reads as a FALSE verdict on the remote the run/job tools submit to.
+# The local stop still runs — a local background server and a loopback/tunnel
+# target both need it — and only that one answer is caveated, naming the
+# configured target as unchecked. (restart_comfyui refuses a configured remote up
+# front; only a lone COMFYUI_PORT reaches its stop half with a note attached.)
+
+_NOTHING_RECORDED = "No ComfyUI is running in the background."
+
+
+def test_stop_nothing_recorded_names_configured_url_target_unchecked(
+    patched_plain_run, monkeypatch
+):
+    """A COMFYUI_URL remote turns "not running" into "local registry only"."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_plain_run(1, stdout=_NOTHING_RECORDED)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    message = str(excinfo.value)
+    assert _NOTHING_RECORDED in message  # comfy-cli's own verdict, kept
+    assert "COMFYUI_URL is set to gpu.example:9001" in message
+    assert "did NOT check" in message
+    assert "not a verdict that the configured ComfyUI is down" in message
+    # Structure carried across, so restart_comfyui still reads it as benign.
+    assert excinfo.value.no_envelope is True
+    assert excinfo.value.returncode == 1
+    assert errors._is_no_recorded_server(excinfo.value)
+    assert calls[0]["cmd"][4:] == ["stop"]  # the local stop really ran
+
+
+def test_stop_nothing_recorded_names_configured_host_target(
+    patched_plain_run, monkeypatch
+):
+    """The COMFYUI_HOST spelling is named too, with its default port."""
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    patched_plain_run(1, stdout=_NOTHING_RECORDED)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert f"COMFYUI_HOST is set to gpu.example:{target.DEFAULT_COMFYUI_PORT}" in str(
+        excinfo.value
+    )
+
+
+def test_stop_with_remote_configured_still_stops_local_server(
+    patched_plain_run, monkeypatch
+):
+    """A recorded LOCAL background server is still stopped, uncaveated."""
+    monkeypatch.setenv("COMFYUI_URL", "http://127.0.0.1:8188")  # e.g. a tunnel
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    result = server.stop_comfyui()
+
+    assert result["ok"] is True
+    assert result["action"] == "stop"
+    assert "note" not in result["message"]
+    assert calls[0]["cmd"][4:] == ["stop"]
+
+
+def test_stop_other_failures_are_not_caveated(patched_plain_run, monkeypatch):
+    """Only the "nothing recorded" answer is about the registry; others pass as-is."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    patched_plain_run(1, stderr="Permission denied killing pid 42")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert "gpu.example" not in str(excinfo.value)
+
+
+def test_stop_malformed_target_does_not_brick_local_stop(
+    patched_plain_run, monkeypatch
+):
+    """A malformed config never blocks the LOCAL stop, which ignores it anyway."""
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")  # scheme rejected
+    calls = patched_plain_run(0, stderr="Stopped ComfyUI server (pid 42).")
+
+    assert server.stop_comfyui()["ok"] is True
+    assert calls[0]["cmd"][4:] == ["stop"]
+
+
+def test_stop_malformed_target_is_named_on_nothing_recorded(
+    patched_plain_run, monkeypatch
+):
+    """... but on "nothing recorded" the typo is named, not read as unconfigured."""
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")
+    patched_plain_run(1, stdout=_NOTHING_RECORDED)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    message = str(excinfo.value)
+    assert "set but invalid" in message
+    assert "scheme" in message
+    assert errors._is_no_recorded_server(excinfo.value)
+
+
+def test_stop_note_masks_userinfo_in_host(patched_plain_run, monkeypatch):
+    """A credential written into COMFYUI_HOST is not echoed raw in the note."""
+    monkeypatch.setenv("COMFYUI_HOST", "<user>:<sekret>@gpu.example")
+    patched_plain_run(1, stdout=_NOTHING_RECORDED)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert "<sekret>" not in str(excinfo.value)
+    assert "***@gpu.example" in str(excinfo.value)
+
+
+def test_stop_unconfigured_nothing_recorded_is_unchanged(patched_plain_run):
+    """No remote configured -> the SAME error object comfy-cli's verdict raised."""
+    patched_plain_run(1, stdout=_NOTHING_RECORDED)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+
+    assert "note:" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None  # re-raised, not re-wrapped
+
+
+def test_restart_with_lone_port_reads_noted_stop_as_benign(
+    patched_plain_run, monkeypatch
+):
+    """A lone COMFYUI_PORT passes the restart guard; the noted stop stays benign."""
+    monkeypatch.delenv("COMFYUI_URL", raising=False)
+    monkeypatch.delenv("COMFYUI_HOST", raising=False)
+    monkeypatch.setenv("COMFYUI_PORT", "8189")
+    calls = patched_plain_run(1, stdout=_NOTHING_RECORDED)
+    launched = []
+    monkeypatch.setattr(
+        server, "_launch_comfyui_sync", lambda args: launched.append(args) or {}
+    )
+
+    assert target._reject_remote_restart() is None
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.stop_comfyui()
+    assert "set but invalid" in str(excinfo.value)  # the note really attaches
+    assert server._restart_comfyui_locked(["--cpu"]) == {}
+
+    assert [c["cmd"][4:] for c in calls] == [["stop"], ["stop"]]
+    assert launched == [["--cpu"]]
 
 
 # --- restart_comfyui refuses a configured remote ---------------------------
