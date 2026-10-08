@@ -53,11 +53,13 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # next growth is still a decision.
 #
 # 15,650 -> 15,800 for the hand-written-workflow bullet in INSTRUCTIONS plus
-# one sentence on `run_workflow` (+~146 tokens). The tree was already at
+# one sentence on `run_workflow` (+~170 tokens). The tree was already at
 # ~15,622, so no useful version fit the 28 tokens of slack. Not inferable
 # elsewhere: an API-format graph dragged into ComfyUI is auto-arranged and
-# labelled by `_meta.title` (else bare class_type), so an agent that omits it
-# hands the user an illegible canvas. Measured ~15,768 after the edit.
+# labelled by `_meta.title` (else a generic node-type name), so an agent that
+# omits it hands the user a canvas that doesn't say what each step does; and
+# its invented class_types need the `validate_workflow` pointer the existing
+# missing-nodes bullet doesn't cover. Measured ~15,792 after the edit.
 _BUDGET_TOKENS = 15_800
 
 

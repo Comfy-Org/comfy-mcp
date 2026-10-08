@@ -954,13 +954,16 @@ def test_instructions_tell_agents_to_title_hand_written_nodes():
     """A hand-written graph carries a `_meta.title` per node; templates win.
 
     Dragged into ComfyUI, an API-format graph is auto-arranged and each node is
-    labelled `_meta.title`, else its bare class_type — so an untitled graph is
-    illegible. Tripwire on the load-bearing facts, not whole sentences.
+    labelled `_meta.title`, else its generic node-type name — so an untitled
+    graph doesn't say what each step does. Its invented class_types are the
+    likeliest to be wrong, so it is pre-flighted with `validate_workflow`.
+    Tripwire on the load-bearing facts, not whole sentences.
     """
     flat = " ".join(instructions.INSTRUCTIONS.split())
     assert "Hand-writing a workflow" in flat
     assert "`_meta.title` on EVERY node" in flat
     assert "layout is auto-generated" in flat
+    assert "`validate_workflow` it before `run_workflow`" in flat
     assert "Prefer `fetch_template` + `set_workflow_slot`" in flat
     # The `run_workflow` description carries the same hint at the call site.
     assert "_meta.title" in (server.run_workflow.__doc__ or "")

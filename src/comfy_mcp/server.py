@@ -3663,7 +3663,7 @@ async def run_workflow(
     That is this machine unless ``COMFYUI_URL``/``COMFYUI_HOST`` points the
     run/job tools at another one. Wraps ``comfy run --workflow <path>``;
     accepts an API-format or UI-export file. Give a hand-written API-format
-    graph a ``_meta.title`` per node — its canvas label in ComfyUI.
+    graph a ``_meta.title`` per node — a canvas label only, never execution.
 
     Args:
         wait: if True (default), block until the run finishes and return the
