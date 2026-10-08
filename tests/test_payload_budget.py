@@ -52,14 +52,19 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
 # next growth is still a decision.
 #
-# 15,650 -> 15,750 for `restart_comfyui`'s remote-target refusal (~70 tokens).
-# This one a caller cannot do without: `restart_comfyui` is LOCAL-ONLY, and with
-# a remote configured it would kill and relaunch the LOCAL server while
-# reporting success for a machine it never touched — so the docstring has to say
-# it refuses, exactly as `download_model`'s does for the same reason. The tree
-# was already at ~15,596, spending most of the slack the last ratchet left, so
-# there was no version of the note that fit under 15,650. Measured ~15,721 after
-# the edit (docstring trimmed against this ceiling first).
+# 15,650 -> 15,750 for `launch_comfyui`'s remote-target refusal (+~110 tokens,
+# already trimmed twice against this ceiling). Growth a caller cannot do
+# without: that `launch_comfyui` is LOCAL-ONLY and, with a remote configured,
+# spawns NOTHING and returns a structured refusal (``launched: False``) rather
+# than starting a second local ComfyUI and reporting success, is not inferable
+# from any other tool's docs — and an agent that does not know it acts on a
+# launch that never touched the remote it meant to (re)start. Measured ~15,704
+# after the edit, so the next growth is still a decision.
+#
+# `restart_comfyui`'s matching remote-target refusal (it RAISES rather than kill
+# the local server) landed under the same ceiling, trimmed to one sentence and
+# offset by dropping its now-redundant "skipped with a remote" note. Measured
+# ~15,747 after it — the next growth is a decision.
 _BUDGET_TOKENS = 15_750
 
 

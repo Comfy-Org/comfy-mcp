@@ -6857,7 +6857,21 @@ async def launch_comfyui(
     comfy-cli records (kept as ``recorded_pid``); ``pid_source``/``pid_note``
     say which you got. Stop the server with ``stop_comfyui``, never by killing
     a reported pid.
+
+    **LOCAL-ONLY.** With ``COMFYUI_URL``/``COMFYUI_HOST`` set this cannot touch
+    that remote, so it launches nothing and returns a refusal with ``ok`` and
+    ``launched`` both ``False`` (and ``reason: remote_target_configured``, plus
+    ``remote_target``); test ``launched is False`` — a success omits it, a
+    failure raises. A malformed value raises. Unset those to launch locally.
     """
+    refusal = target._local_launch_refusal_for_remote_target()
+    if refusal is not None:
+        # Before spawning ANYTHING: a remote target means this local-only launch
+        # is the wrong tool, so refuse up front (like `download_model`) rather
+        # than starting a second local process and reporting a success that hides
+        # it. Ahead of the network-exposure consent too — there is no launch to
+        # expose, so the user must not be prompted for one.
+        return refusal
     guarded = argv._guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
         guarded,
@@ -7642,11 +7656,9 @@ async def restart_comfyui(
     Composes ``stop_comfyui`` + ``launch_comfyui`` (no ``comfy restart`` verb);
     ``extra_args`` forward to the new server. Returns the new server's status.
 
-    **LOCAL-ONLY: REFUSES when a remote ComfyUI is configured**
-    (``COMFYUI_URL`` / ``COMFYUI_HOST``) — the ``comfy stop`` / ``comfy launch``
-    it composes take no ``--host``/``--port``, so it would restart the LOCAL
-    server and report success while the remote went untouched. Restart the
-    remote on its own host. Mirrors ``download_model``'s remote refusal.
+    **LOCAL-ONLY: RAISES if ``COMFYUI_URL``/``COMFYUI_HOST`` names a remote**
+    (``comfy stop``/``launch`` take no ``--host``/``--port``); restart a remote
+    on its own host.
 
     Carries ``launch_comfyui``'s **network-exposure confirmation** unchanged
     (non-loopback ``--listen``/``--enable-cors-header`` asks the USER, BEFORE
@@ -7657,8 +7669,7 @@ async def restart_comfyui(
     raise. If the freed port is then held by a server comfy-cli didn't start,
     this identifies it and asks the USER to recycle it — gated the same way,
     via ``confirm_kill_untracked`` (default False kills nothing); a decline
-    reproduces the port error. Skipped with a remote target configured (the
-    LOCAL-ONLY refusal above fires first).
+    reproduces the port error.
 
     **One lifecycle call at a time** — a concurrent launch/stop/restart is
     refused immediately rather than racing comfy-cli's one recorded server.

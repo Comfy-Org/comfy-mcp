@@ -415,9 +415,10 @@ def _reject_remote_model_download() -> None:
     if target is None:
         return
     host, port, source = target
+    endpoint = _format_target_endpoint(_redact_target_host(host), port)
     raise ComfyCliError(
         "download_model is LOCAL-ONLY, but a remote ComfyUI is configured "
-        f"({source} -> {host}:{port}). `comfy model download` takes no "
+        f"({source} -> {endpoint}). `comfy model download` takes no "
         "--host/--port: it writes into the models directory of the machine "
         "running this MCP server, so that remote would never see the file and a "
         "run there would still fail on a missing model. Either (1) run the "
@@ -482,13 +483,64 @@ def _reject_remote_restart() -> None:
         "launch`, which take no --host/--port and only manage the ComfyUI "
         "process comfy-cli started on the machine running this MCP server — so "
         "it would kill and relaunch the LOCAL server while reporting success, "
-        f"and the remote at {endpoint} was NOT touched. stop_comfyui and "
-        "launch_comfyui are equally local-only, so calling them in sequence "
-        "would do the same. To restart that remote, do it on the remote host "
+        f"and the remote at {endpoint} was NOT touched. stop_comfyui is "
+        "equally local-only and launch_comfyui refuses a configured remote "
+        "too. To restart that remote, do it on the remote host "
         "itself (its own comfy-cli / MCP server, or however that ComfyUI is "
         "managed). To manage a local server from here, unset "
         "COMFYUI_URL/COMFYUI_HOST."
     )
+
+
+def _local_launch_refusal_for_remote_target() -> dict[str, Any] | None:
+    """The structured refusal ``launch_comfyui`` returns when a remote is configured.
+
+    ``comfy launch`` is a LOCAL-ONLY lifecycle verb — it takes no ``--host`` /
+    ``--port`` and always spawns ComfyUI on the machine running THIS server. So
+    with ``COMFYUI_URL`` / ``COMFYUI_HOST`` pointing elsewhere, a launch would
+    start a SECOND local process while the configured remote is never touched,
+    reporting an unqualified success that hides the substitution. Same family as
+    :func:`_reject_remote_model_download` — a tool that cannot be diverted saying
+    so — but it RETURNS a structured verdict rather than raising, because the
+    caller needs a machine-branchable answer (``launched: False``) that
+    distinguishes this refusal from a launch failure, not just an error string.
+
+    Returns ``None`` when nothing is configured, so :func:`launch_comfyui` stays
+    byte-identical to the local-only default and spawns as it always has. A
+    set-but-malformed value raises out of :func:`_comfy_target` (as it does for
+    ``download_model``): a typo must fail loudly, never fall through to a silent
+    local launch. A lone ``COMFYUI_PORT`` is the exception: it selects no remote
+    (:func:`_comfy_target` says so itself), so there is nothing to substitute
+    for, and it must not brick the local launch — which is also what makes the
+    message's "unset COMFYUI_URL / COMFYUI_HOST" advice sufficient when a
+    ``COMFYUI_PORT`` was set alongside the host.
+    """
+    if not (
+        os.environ.get("COMFYUI_URL", "").strip()
+        or os.environ.get("COMFYUI_HOST", "").strip()
+    ):
+        return None
+    target = _comfy_target()
+    if target is None:
+        return None
+    host, port, source = target
+    masked_host = _redact_target_host(host)
+    endpoint = _format_target_endpoint(masked_host, port)
+    return {
+        "ok": False,
+        "launched": False,
+        "reason": "remote_target_configured",
+        "remote_target": {"host": masked_host, "port": port, "source": source},
+        "message": (
+            f"A remote ComfyUI is configured ({source} -> {endpoint}). "
+            "launch_comfyui can only start a LOCAL ComfyUI on the machine running "
+            "this MCP server — `comfy launch` takes no --host/--port — so it will "
+            "not launch, (re)start, or otherwise touch that remote. No local "
+            "process was spawned by this call. To (re)start the remote, do so on "
+            "the remote host itself (its own comfy-cli / MCP server); to launch a "
+            "LOCAL ComfyUI instead, unset COMFYUI_URL / COMFYUI_HOST first."
+        ),
+    }
 
 
 _COMFY_TARGET_NOTE_KEY = "comfy_target_note"
