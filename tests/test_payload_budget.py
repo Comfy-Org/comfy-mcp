@@ -65,7 +65,16 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # the local server) landed under the same ceiling, trimmed to one sentence and
 # offset by dropping its now-redundant "skipped with a remote" note. Measured
 # ~15,747 after it — the next growth is a decision.
-_BUDGET_TOKENS = 15_750
+#
+# 15,750 -> 15,950 for the hand-written-workflow bullet in INSTRUCTIONS plus
+# one sentence on `run_workflow` (+~170 tokens). The tree was already at
+# ~15,747, so no useful version fit the 3 tokens of slack. Not inferable
+# elsewhere: an API-format graph dragged into ComfyUI is auto-arranged and
+# labelled by `_meta.title` (else a generic node-type name), so an agent that
+# omits it hands the user a canvas that doesn't say what each step does; and
+# its invented class_types need the `validate_workflow` pointer the existing
+# missing-nodes bullet doesn't cover. Measured ~15,916 after the edit.
+_BUDGET_TOKENS = 15_950
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

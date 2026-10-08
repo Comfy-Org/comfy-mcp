@@ -55,6 +55,14 @@ flows:
   the partner-models bullet below for what that gate does and does not
   guarantee. For the quickest text-to-image path, `generate_image(prompt)`
   runs the same way, free, no API key.
+- Hand-writing a workflow (no template fits): write API format with a
+  plain-language `_meta.title` on EVERY node (e.g. "Mask background") —
+  dragged into ComfyUI it is auto-arranged and each node labelled by that
+  title, else its generic node-type name. Its class_types are guesses, so
+  `validate_workflow` it before `run_workflow`. If the user will EDIT the
+  graph, say the layout is auto-generated and give the saved file path.
+  Prefer `fetch_template` + `set_workflow_slot` whenever a template covers
+  the task: templates carry authored layout, groups and notes.
 - Model families often ship BOTH a free local template and a paid `API` one
   under identical titles (e.g. two "MiniMax H3: Text to Video" rows) — check
   BOTH routes (row `tags`, or a second `search_templates(exclude_api=True)`)
