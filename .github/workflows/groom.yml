@@ -8,22 +8,24 @@ name: Groom
 # and ledger that match the workflow filing the issues; the upstream bump
 # dispatcher (GROOM_CALLERS) opens SHA-bump PRs automatically once registered.
 #
-# FINDS-ONLY. The opt-in auto-builder (`builder: true`, which turns findings
-# into review-gated PRs) is deliberately left OFF here. This repo's whole
-# contract is the thin-wrapper rule in AGENTS.md — "every tool is a
-# `comfy --json --where local` passthrough" — and that is a judgement a
-# refactor agent cannot make from the code alone: the most "duplicated" -looking
-# passthroughs are duplicated ON PURPOSE, because collapsing them would move
-# behavior out of comfy-cli and into this repo. Groom files issues a human
-# triages; it opens no PRs, writes no commits, and never merges.
+# AUTO-BUILDER ON (`builder: true` below): the top `max_prs` CONFIRMED,
+# non-security findings become REVIEW-GATED PRs; groom never merges. Review
+# them against the thin-wrapper rule in AGENTS.md — "every tool is a
+# `comfy --json --where local` passthrough" — which a refactor agent cannot
+# judge from the code alone: the most "duplicated"-looking passthroughs are
+# duplicated ON PURPOSE, because collapsing them would move behavior out of
+# comfy-cli and into this repo. Close a builder PR that does that.
 #
-# PREREQUISITE (operator): `secrets.ANTHROPIC_API_KEY` must reach this repo (org-
-# or repo-level) — the finder and verifier agents bill through it, and the
-# reusable declares it `required: true`. If it is absent the run fails LOUD at
-# the agent step by design, so the sweep is never silently inert. `vars.APP_ID` +
-# `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` are optional here: with them, issues are
-# filed as cloud-code-bot; without, the reusable degrades to github-actions[bot]
-# rather than failing.
+# PREREQUISITES (operator) — ALL are hard requirements with the builder on:
+#   - `secrets.ANTHROPIC_API_KEY` must reach this repo (org- or repo-level): the
+#     finder and verifier agents bill through it, and the reusable declares it
+#     `required: true`, so an absent key fails LOUD at the agent step.
+#   - `vars.APP_ID` + `secrets.CLOUD_CODE_BOT_PRIVATE_KEY`: no longer optional.
+#     `build_select` hard-fails `builder=true` with an empty `bot_app_id`, and
+#     `build_pr` has no github.token fallback — after the agents have billed.
+#   - the cloud-code-bot App INSTALLED on this repo with contents, pull-requests
+#     AND issues: write — `build_pr` mints its token with all three, and a
+#     missing grant fails that mint the same post-billing way.
 
 on:
   schedule:
@@ -94,7 +96,8 @@ jobs:
       # in lock-step with the `uses:` SHA above. Bump both together.
       workflows_ref: 23c7b69392d08e57f545d393faa391e43cf4dd55
       # File as cloud-code-bot so groom's issues are a distinct, queryable actor
-      # rather than github-actions[bot]. Unset -> reusable falls back gracefully.
+      # rather than github-actions[bot]. REQUIRED now that `builder: true` is
+      # set: unset, `build_select` hard-fails instead of falling back.
       bot_app_id: ${{ vars.APP_ID }}
       # Turn the top `max_prs` CONFIRMED, non-security findings into REVIEW-GATED
       # PRs instead of issues, which is what `vars.GROOM_CONFIG`'s `max_findings: 0`
@@ -102,9 +105,12 @@ jobs:
       # slice, not "unlimited"), so without the builder this repo runs the full
       # finder + verifier and emits nothing at all.
       #
-      # `max_prs` is NOT set here on purpose: `vars.GROOM_CONFIG` already carries
-      # it (currently 2) and the variable outranks this `with:` block, so a value
-      # here would be dead config that reads as authoritative. Retune the variable.
+      # That same `max_findings: 0` still slices the `file` job, which with the
+      # builder on receives every finding the builder may NOT take: security /
+      # auth-adjacent findings, DOWNGRADE verdicts, and anything past `max_prs`.
+      # At 0 those reach NO sink (a `::warning::` only) and, never filed, stay
+      # out of the dedup ledger, so they are re-found next run. Raise
+      # `max_findings` in the variable if those should still arrive as issues.
       #
       # HARD PREREQUISITE — do not merge before it is met. `build_pr` reads
       # `steps.bot_token.outputs.token` with NO github.token fallback (the issue
@@ -115,9 +121,19 @@ jobs:
       # agents have billed. Provision the PRIVATE KEY FIRST and the APP_ID SECOND:
       # the reusable mints whenever bot_app_id is non-empty and hard-fails on an
       # empty key, so the reverse order breaks the runs that currently work.
+      # The App installation also needs contents, pull-requests AND issues:
+      # write (see PREREQUISITES at the top of this file).
       builder: true
+      # Precedence is `with:` < `vars.GROOM_CONFIG` < `config`, and the variable
+      # sets max_prs (currently 2), so the variable governs. This line is the
+      # FLOOR it falls back to: the resolver drops a malformed variable (or a
+      # missing key) to this layer, and without it that typo would silently
+      # lift the cap to the reusable's default of 5 PRs per run.
+      max_prs: '2'
       # Manual dispatch may dry-run; the schedule always files live
       # (github.event.inputs is null on a schedule -> '' != 'true' -> false).
+      # `vars.GROOM_CONFIG` outranks this too: a `dry_run` key there overrides a
+      # dispatched dry run, so keep that variable free of `dry_run`.
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
       # Effective cadence, re-read every run, so retuning needs no edit to this
       # file:
@@ -141,7 +157,9 @@ jobs:
       # Below the default of 12. This is a ~30-file repo whose entire source is
       # one server module plus three leaves, so a cap sized for a large service
       # would mostly buy restatements of the same few observations. Raise it if
-      # real findings start hitting the ceiling.
+      # real findings start hitting the ceiling. Like `max_prs`, this is only
+      # the fallback layer: `vars.GROOM_CONFIG` currently sets `max_findings: 0`
+      # and outranks it (see the builder comment above).
       max_findings: 5
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
