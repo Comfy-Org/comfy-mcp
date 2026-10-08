@@ -512,6 +512,30 @@ def test_a_remote_session_neither_probes_nor_prompts(clash, monkeypatch, var, va
     assert "almost certainly started outside comfy-cli" in str(excinfo.value)
 
 
+def test_a_comfy_desktop_discovered_target_still_probes_and_prompts(clash, monkeypatch):
+    """The Comfy Desktop fallback is same-machine, not remote — the gate must stay on.
+
+    `target._comfy_target()` returns non-``None`` for this case too (a
+    discovered Desktop port), but unlike an explicit `COMFYUI_URL`/`COMFYUI_HOST`
+    it names THIS machine's own instance. Treating it as remote would silently
+    disable the guided-restart recovery for exactly the sessions the Desktop
+    fallback exists for: nothing explicitly configured, ComfyUI launched via
+    Comfy Desktop. `COMFYUI_URL`/`COMFYUI_HOST` stay unset (the `_local_session`
+    fixture's baseline) — only Desktop discovery is patched to look live.
+    """
+    monkeypatch.setattr(server.target, "_discover_comfy_desktop_port", lambda: 8188)
+    state = clash([_dry_run(), _stopped()])
+    ctx = _FakeCtx()
+
+    assert _restart(ctx=ctx) == {"pid": 99, "port": 8188}
+
+    assert state["runs"] == [
+        ("stop", "--port", "8188", "--dry-run"),
+        ("stop", "--port", "8188"),
+    ]
+    assert ctx.elicitations != []
+
+
 def test_an_unreadable_port_is_never_guessed_at(clash):
     """`--port` present but unparseable is UNKNOWN, not "probably 8188".
 
