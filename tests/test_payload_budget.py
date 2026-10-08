@@ -52,15 +52,29 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # `generate_image` bump. Measured ~15,596 after it (40 tool docstrings), so the
 # next growth is still a decision.
 #
-# 15,650 -> 15,800 for the hand-written-workflow bullet in INSTRUCTIONS plus
+# 15,650 -> 15,750 for `launch_comfyui`'s remote-target refusal (+~110 tokens,
+# already trimmed twice against this ceiling). Growth a caller cannot do
+# without: that `launch_comfyui` is LOCAL-ONLY and, with a remote configured,
+# spawns NOTHING and returns a structured refusal (``launched: False``) rather
+# than starting a second local ComfyUI and reporting success, is not inferable
+# from any other tool's docs — and an agent that does not know it acts on a
+# launch that never touched the remote it meant to (re)start. Measured ~15,704
+# after the edit, so the next growth is still a decision.
+#
+# `restart_comfyui`'s matching remote-target refusal (it RAISES rather than kill
+# the local server) landed under the same ceiling, trimmed to one sentence and
+# offset by dropping its now-redundant "skipped with a remote" note. Measured
+# ~15,747 after it — the next growth is a decision.
+#
+# 15,750 -> 15,950 for the hand-written-workflow bullet in INSTRUCTIONS plus
 # one sentence on `run_workflow` (+~170 tokens). The tree was already at
-# ~15,622, so no useful version fit the 28 tokens of slack. Not inferable
+# ~15,747, so no useful version fit the 3 tokens of slack. Not inferable
 # elsewhere: an API-format graph dragged into ComfyUI is auto-arranged and
 # labelled by `_meta.title` (else a generic node-type name), so an agent that
 # omits it hands the user a canvas that doesn't say what each step does; and
 # its invented class_types need the `validate_workflow` pointer the existing
-# missing-nodes bullet doesn't cover. Measured ~15,792 after the edit.
-_BUDGET_TOKENS = 15_800
+# missing-nodes bullet doesn't cover. Measured ~15,916 after the edit.
+_BUDGET_TOKENS = 15_950
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
