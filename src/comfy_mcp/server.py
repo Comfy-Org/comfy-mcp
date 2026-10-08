@@ -6857,7 +6857,21 @@ async def launch_comfyui(
     comfy-cli records (kept as ``recorded_pid``); ``pid_source``/``pid_note``
     say which you got. Stop the server with ``stop_comfyui``, never by killing
     a reported pid.
+
+    **LOCAL-ONLY.** With ``COMFYUI_URL``/``COMFYUI_HOST`` set this cannot touch
+    that remote, so it launches nothing and returns a refusal with ``ok`` and
+    ``launched`` both ``False`` (and ``reason: remote_target_configured``, plus
+    ``remote_target``); test ``launched is False`` — a success omits it, a
+    failure raises. A malformed value raises. Unset those to launch locally.
     """
+    refusal = target._local_launch_refusal_for_remote_target()
+    if refusal is not None:
+        # Before spawning ANYTHING: a remote target means this local-only launch
+        # is the wrong tool, so refuse up front (like `download_model`) rather
+        # than starting a second local process and reporting a success that hides
+        # it. Ahead of the network-exposure consent too — there is no launch to
+        # expose, so the user must not be prompted for one.
+        return refusal
     guarded = argv._guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
         guarded,
@@ -6883,16 +6897,13 @@ async def launch_comfyui(
 def stop_comfyui() -> Any:
     """Stop the LOCAL ComfyUI server that comfy-cli launched.
 
-    Wraps ``comfy stop``. Ownership semantics: comfy-cli only kills the pid it
-    recorded when IT launched the server (via ``launch_comfyui``) — it cannot
-    stop a ComfyUI started by the desktop app or by hand, and raises
-    :class:`ComfyCliError` naming "no recorded server" instead of killing an
-    unrelated process.
+    Wraps ``comfy stop``. comfy-cli only kills the pid it recorded when IT
+    launched the server (via ``launch_comfyui``) — it cannot stop a ComfyUI
+    started by the desktop app or by hand, and raises :class:`ComfyCliError`
+    naming "no recorded server" (no verdict on a configured remote) instead.
 
     Prints text with no JSON envelope; success returns a synthesized
     ``{"ok": True, ...}``.
-
-    **LOCAL-ONLY**: "nothing recorded" says nothing of a configured remote.
 
     **One lifecycle call at a time** — shares ``_LIFECYCLE_LOCK`` with
     ``launch_comfyui``/``restart_comfyui``; refused immediately if one of those
@@ -7652,6 +7663,10 @@ async def restart_comfyui(
     Composes ``stop_comfyui`` + ``launch_comfyui`` (no ``comfy restart`` verb);
     ``extra_args`` forward to the new server. Returns the new server's status.
 
+    **LOCAL-ONLY: RAISES if ``COMFYUI_URL``/``COMFYUI_HOST`` names a remote**
+    (``comfy stop``/``launch`` take no ``--host``/``--port``); restart a remote
+    on its own host.
+
     Carries ``launch_comfyui``'s **network-exposure confirmation** unchanged
     (non-loopback ``--listen``/``--enable-cors-header`` asks the USER, BEFORE
     the stop so a decline leaves the server alone); ``confirm_network_exposure``
@@ -7661,11 +7676,17 @@ async def restart_comfyui(
     raise. If the freed port is then held by a server comfy-cli didn't start,
     this identifies it and asks the USER to recycle it — gated the same way,
     via ``confirm_kill_untracked`` (default False kills nothing); a decline
-    reproduces the port error. Skipped with a remote target configured.
+    reproduces the port error.
 
     **One lifecycle call at a time** — a concurrent launch/stop/restart is
     refused immediately rather than racing comfy-cli's one recorded server.
     """
+    # FIRST, before argument validation, the network-exposure prompt, and
+    # anything spawned: a configured remote makes this whole call the wrong
+    # operation (a destructive action on the wrong machine), not a call with a
+    # bad argument. A malformed value fails loudly here. See
+    # `target._reject_remote_restart` for why it cannot be made to work instead.
+    target._reject_remote_restart()
     guarded = argv._guard_extra_args(extra_args)
     await _resolve_network_exposure_consent(
         guarded,
