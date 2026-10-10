@@ -38,6 +38,7 @@ from conftest import (
     envelope,
     stream_reader,
 )
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
 from comfy_mcp import argv, clitext, errors, failure_log, server, tcc, textutil
 
@@ -506,6 +507,48 @@ def test_error_envelope_carries_structured_code(patched_run):
         server._run_comfy("env")
 
     assert excinfo.value.code == "server_not_running"
+
+
+def test_error_envelope_reaches_the_client_and_not_only_the_log(patched_run):
+    """Issue #267: the reason has to survive the SDK's crash/anticipated split.
+
+    MCP Python SDK 2.x forwards a ``ToolError``'s text to the client and drops
+    every other exception's — "the exception's own text stays on the server"
+    (``mcp/server/mcpserver/tools/base.py``). ``MCPServer.call_tool`` re-raises
+    the first as ``ToolError`` and the second as ``UnexpectedToolError``, whose
+    message is only ``Error executing tool <name>``; either way
+    ``_handle_call_tool`` puts ``str(exc)`` into the ``CallToolResult``. So the
+    exception class this raises IS the client's error surface, which is why the
+    negative assertion matters as much as the positive one: while
+    ``ComfyCliError`` was a plain ``RuntimeError``, every failure of this server
+    reached the model as that bare line, with no code, no hint and no way to
+    correct itself.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "workflow_not_found",
+                "message": "/tmp/missing.json does not exist",
+                "hint": "pass a path to a frontend-format workflow JSON",
+            },
+        ),
+        returncode=1,
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(
+            server.mcp.call_tool(
+                "list_workflow_slots", {"workflow_path": "/tmp/missing.json"}
+            )
+        )
+
+    assert not isinstance(excinfo.value, UnexpectedToolError), (
+        "an UnexpectedToolError is the masked one: the client would see only the tool name"
+    )
+    message = str(excinfo.value)
+    assert "workflow_not_found" in message
+    assert "pass a path to a frontend-format workflow JSON" in message
 
 
 def test_error_envelope_carries_its_data_payload(patched_run):
