@@ -22,11 +22,35 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 from . import failure_log
 
 
-class ComfyCliError(RuntimeError):
+class ComfyCliError(ToolError, RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope.
+
+    Deriving from the SDK's ``ToolError`` is what puts the reason in front of
+    the model. MCP Python SDK 2.x splits an anticipated tool failure from a
+    crash (``mcp/server/mcpserver/tools/base.py``): a ``ToolError``'s text is
+    forwarded to the client, while any other exception is treated as a crash
+    and "the exception's own text stays on the server". Under SDK 1.x every
+    exception's text was forwarded, so when this server moved to ``mcp>=2`` its
+    whole error surface went dark at once, without a line of it changing: every
+    failure reached the client as the bare ``Error executing tool <name>``, and
+    an agent could not tell a missing model file from a server that was down
+    from a typo in a slot address. That is issue #267, and it is the reason for
+    the first base class.
+
+    Everything this module does to the message assumes it is client-facing —
+    ``_render_error_details`` scrubs it, ``_MAX_ERROR_FIELD_CHARS`` bounds it so
+    a multi-KB ``hint`` cannot bloat what the client receives. That intent is
+    only realized now.
+
+    ``RuntimeError`` stays as the second base so that neither the hundreds of
+    ``except ComfyCliError`` sites nor any caller that catches ``RuntimeError``
+    changes meaning: this is still a runtime failure, it is now also one the
+    server means to report.
 
     ``code`` carries the envelope's structured ``error.code`` when the failure
     came from an error envelope (used to drive the bounded credential retry in
