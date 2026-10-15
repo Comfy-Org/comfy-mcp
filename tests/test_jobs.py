@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import _OK_STREAM, _BlockingStreamProc, _RecordingCtx, envelope
+from conftest import _OK_STREAM, _RecordingCtx, envelope
 
 from comfy_mcp import server
 
@@ -1026,20 +1026,6 @@ def _patch_jobs_status(monkeypatch, payload, *, raises=None) -> list[dict]:
     return calls
 
 
-def _patch_blocking_stream(monkeypatch, first_lines) -> list[_BlockingStreamProc]:
-    """Spawn `_BlockingStreamProc`s that emit *first_lines* and then hang (force a timeout)."""
-    procs: list[_BlockingStreamProc] = []
-
-    async def fake_exec(*cmd, stdout, stderr, env, **kwargs):
-        proc = _BlockingStreamProc(cmd, list(first_lines))
-        procs.append(proc)
-        return proc
-
-    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
-    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
-    return procs
-
-
 def test_job_watch_refuses_a_comfy_cli_below_1_16_0(monkeypatch, patched_stream):
     """The gate is LOUD and fires BEFORE the spawn: on 1.15.0 the caller gets one
     sentence naming the fix, not a silent block for the full timeout."""
@@ -1086,13 +1072,15 @@ def test_job_watch_allows_1_16_0_itself(monkeypatch, patched_stream):
     assert procs[0].cmd[4:] == ["jobs", "watch", "pid"]
 
 
-def test_job_watch_zero_event_timeout_embeds_a_status_poll_and_a_hint(monkeypatch):
+def test_job_watch_zero_event_timeout_embeds_a_status_poll_and_a_hint(
+    monkeypatch, blocking_stream
+):
     """The regression this ticket exists for: a watch that streamed NOTHING used
     to time out into `{"timed_out": true, "status": {progress: null, total:
     null, nodes_done: 0}}` — strictly less than `job(action="wait")` would have
     said about the same job. Now it embeds the poll and says what zero means."""
     calls = _patch_jobs_status(monkeypatch, {"status": "running", "workflow_size": 4})
-    procs = _patch_blocking_stream(monkeypatch, [])
+    procs = blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1114,10 +1102,12 @@ def test_job_watch_zero_event_timeout_embeds_a_status_poll_and_a_hint(monkeypatc
     assert [c["args"] for c in calls] == [("jobs", "status", "pid")] * 2
 
 
-def test_job_watch_zero_event_timeout_omits_job_when_the_poll_fails(monkeypatch):
+def test_job_watch_zero_event_timeout_omits_job_when_the_poll_fails(
+    monkeypatch, blocking_stream
+):
     """A failed fallback poll must never mask the timeout it was only describing."""
     _patch_jobs_status(monkeypatch, None, raises=server.ComfyCliError("no ComfyUI"))
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1131,11 +1121,13 @@ def test_job_watch_zero_event_timeout_omits_job_when_the_poll_fails(monkeypatch)
     assert result["status"]["total"] is None  # the seed failed too: unseeded
 
 
-def test_job_watch_zero_event_timeout_omits_the_hint_on_a_terminal_job(monkeypatch):
+def test_job_watch_zero_event_timeout_omits_the_hint_on_a_terminal_job(
+    monkeypatch, blocking_stream
+):
     """ "Still running" would be WRONG for a job that already finished — the watch
     simply missed the end — so the embedded poll ships without the hint."""
     _patch_jobs_status(monkeypatch, {"status": "completed", "workflow_size": 2})
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1146,13 +1138,13 @@ def test_job_watch_zero_event_timeout_omits_the_hint_on_a_terminal_job(monkeypat
     assert "hint" not in result
 
 
-def test_job_watch_timeout_that_saw_events_skips_the_fallback_poll(monkeypatch):
+def test_job_watch_timeout_that_saw_events_skips_the_fallback_poll(
+    monkeypatch, blocking_stream
+):
     """A watch with live progress has its own answer in `status`; only the seed
     poll runs, and no `job`/`hint` is attached."""
     calls = _patch_jobs_status(monkeypatch, {"status": "running", "workflow_size": 3})
-    _patch_blocking_stream(
-        monkeypatch, [json.dumps({"type": "executed", "node": "1"}) + "\n"]
-    )
+    blocking_stream([json.dumps({"type": "executed", "node": "1"}) + "\n"])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1166,11 +1158,13 @@ def test_job_watch_timeout_that_saw_events_skips_the_fallback_poll(monkeypatch):
     assert len(calls) == 1  # the seed only
 
 
-def test_job_watch_seeds_total_from_the_jobs_status_workflow_size(monkeypatch):
+def test_job_watch_seeds_total_from_the_jobs_status_workflow_size(
+    monkeypatch, blocking_stream
+):
     """`jobs watch` attaches post-submit and never sees the run dialect's
     `queued` manifest, so `total` comes from `jobs status`'s `workflow_size`."""
     _patch_jobs_status(monkeypatch, {"status": "running", "workflow_size": 10})
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1192,12 +1186,14 @@ def test_job_watch_seeds_total_from_the_jobs_status_workflow_size(monkeypatch):
     ],
 )
 def test_job_watch_leaves_total_unseeded_on_an_unusable_workflow_size(
-    monkeypatch, status_payload
+    monkeypatch,
+    status_payload,
+    blocking_stream,
 ):
     """Every non-usable shape degrades to today's behavior — an unseeded
     `total: null` — rather than fabricating a node count."""
     _patch_jobs_status(monkeypatch, status_payload)
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1207,13 +1203,14 @@ def test_job_watch_leaves_total_unseeded_on_an_unusable_workflow_size(
     assert result["status"]["total"] is None
 
 
-def test_job_watch_counts_a_cached_node_LIST_as_that_many_nodes(monkeypatch):
+def test_job_watch_counts_a_cached_node_LIST_as_that_many_nodes(
+    monkeypatch, blocking_stream
+):
     """`jobs watch` relays ComfyUI's single `execution_cached` message, whose
     `nodes` is the whole cached list — counting it as one node reported
     `nodes_done: 1` for a fully-cached ten-node workflow."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(
-        monkeypatch,
+    blocking_stream(
         [json.dumps({"type": "execution_cached", "nodes": ["1", "2", "3"]}) + "\n"],
     )
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
@@ -1239,14 +1236,15 @@ def test_job_watch_counts_a_cached_node_LIST_as_that_many_nodes(monkeypatch):
     ],
 )
 def test_job_watch_counts_a_per_node_cached_event_as_one(
-    monkeypatch, event, expected_message
+    monkeypatch,
+    event,
+    expected_message,
+    blocking_stream,
 ):
     """The OTHER dialect is unchanged: `comfy run` emits one `execution_cached`
     per node keyed `node`, and an absent/empty `nodes` still counts as one."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(
-        monkeypatch, [json.dumps({"type": "execution_cached", **event}) + "\n"]
-    )
+    blocking_stream([json.dumps({"type": "execution_cached", **event}) + "\n"])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
     ctx = _RecordingCtx()
 
@@ -1507,7 +1505,9 @@ def test_job_tool_docstring_within_its_own_token_budget():
 # first cut of the gate said something the code itself could disprove.
 
 
-def test_a_rejected_per_verb_floor_un_memoizes_the_version(monkeypatch):
+def test_a_rejected_per_verb_floor_un_memoizes_the_version(
+    monkeypatch, blocking_stream
+):
     """The upgrade the error message asks for has to be able to TAKE EFFECT.
 
     1.15.0 clears the server-wide `_MIN_COMFY_CLI`, so `_check_comfy_version`
@@ -1525,13 +1525,12 @@ def test_a_rejected_per_verb_floor_un_memoizes_the_version(monkeypatch):
 
     monkeypatch.setattr(server, "_version_checked", False)
     monkeypatch.setattr(server, "_comfy_cli_version", None)
-    # The rate limit exists to stop a CLIENT retry loop re-probing per refused
-    # call; the human upgrade-and-retry this test models takes far longer than
-    # the window, so zero it rather than sleep through it.
-    monkeypatch.setattr(server, "_VERSION_REPROBE_MIN_INTERVAL", 0.0)
+    # The rate limit is deliberately LEFT at its real value: the refusal below
+    # is decided by a probe that has only just returned, and it must still
+    # un-latch — the window runs from the last un-latch, not from the probe.
     monkeypatch.setattr(server.subprocess, "run", fake)
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    procs = _patch_blocking_stream(monkeypatch, [])
+    procs = blocking_stream([])
 
     with pytest.raises(server.ComfyCliError, match="1.16.0"):
         asyncio.run(server.job(action="watch", prompt_id="pid"))
@@ -1647,12 +1646,14 @@ def test_the_watch_polls_are_carved_out_of_the_callers_timeout(monkeypatch):
     assert calls[1]["timeout"] + seen["timeout"] <= 5.0
 
 
-def test_the_watch_polls_run_on_the_cancellable_spawn_path(monkeypatch):
+def test_the_watch_polls_run_on_the_cancellable_spawn_path(
+    monkeypatch, blocking_stream
+):
     """Both polls must go through `_run_comfy_async`, not
     `asyncio.to_thread(_run_comfy, ...)`: a client that gives up mid-watch can
     cancel a coroutine but never a worker thread's `comfy jobs status` child."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     def forbidden(*args, **kwargs):
@@ -1667,12 +1668,14 @@ def test_the_watch_polls_run_on_the_cancellable_spawn_path(monkeypatch):
     assert result["job"] == {"status": "running"}
 
 
-def test_the_no_events_hint_names_the_version_when_it_is_unknown(monkeypatch):
+def test_the_no_events_hint_names_the_version_when_it_is_unknown(
+    monkeypatch, blocking_stream
+):
     """The fail-OPEN case is the one the version half of the hint exists for: an
     install the gate could not identify may well be the too-old one, and this is
     the only place left to say so."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version unreleased-dev")
 
     result = asyncio.run(
@@ -1693,13 +1696,15 @@ def test_the_no_events_hint_names_the_version_when_it_is_unknown(monkeypatch):
         ["not", "a", "dict"],
     ],
 )
-def test_the_no_events_hint_needs_a_POSITIVELY_active_status(monkeypatch, job_payload):
+def test_the_no_events_hint_needs_a_POSITIVELY_active_status(
+    monkeypatch, job_payload, blocking_stream
+):
     """`not _is_terminal(...)` is not the test the docstring promised: it is also
     False for a payload carrying no readable status at all, so an unreadable
     blob used to be answered with "the job is still running" — exactly the guess
     the hint must never be. Only a recognized ACTIVE status earns the claim."""
     _patch_jobs_status(monkeypatch, job_payload)
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1714,7 +1719,9 @@ def test_the_no_events_hint_needs_a_POSITIVELY_active_status(monkeypatch, job_pa
     "workflow_size",
     [float("inf"), float("nan"), 10**400],
 )
-def test_a_non_finite_workflow_size_leaves_total_unseeded(monkeypatch, workflow_size):
+def test_a_non_finite_workflow_size_leaves_total_unseeded(
+    monkeypatch, workflow_size, blocking_stream
+):
     """`json.loads` accepts bare `Infinity`/`NaN`, and a Python int has no upper
     bound — so `float(size)` could either seed a non-finite `total` that leaves
     the payload as non-standard JSON, or raise `OverflowError` straight out of a
@@ -1722,7 +1729,7 @@ def test_a_non_finite_workflow_size_leaves_total_unseeded(monkeypatch, workflow_
     _patch_jobs_status(
         monkeypatch, {"status": "running", "workflow_size": workflow_size}
     )
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1734,13 +1741,15 @@ def test_a_non_finite_workflow_size_leaves_total_unseeded(monkeypatch, workflow_
 
 
 @pytest.mark.parametrize("etype", ["execution_start", "execution_error", "output"])
-def test_a_non_progress_execution_event_still_counts_as_seen(monkeypatch, etype):
+def test_a_non_progress_execution_event_still_counts_as_seen(
+    monkeypatch, etype, blocking_stream
+):
     """`events_seen` is a claim about the WATCHER, not about progress. An
     `execution_error` on the first node proves `jobs watch` attached — reporting
     zero there sent the caller off to check a comfy-cli version that was fine,
     and burned a second `jobs status` spawn to do it."""
     calls = _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(monkeypatch, [json.dumps({"type": etype}) + "\n"])
+    blocking_stream([json.dumps({"type": etype}) + "\n"])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1753,13 +1762,13 @@ def test_a_non_progress_execution_event_still_counts_as_seen(monkeypatch, etype)
     assert len(calls) == 1  # the seed only: no fallback poll
 
 
-def test_unrecognized_stream_chatter_does_not_count_as_an_event(monkeypatch):
+def test_unrecognized_stream_chatter_does_not_count_as_an_event(
+    monkeypatch, blocking_stream
+):
     """The other half of the same claim: a custom node's own line proves nothing
     about the websocket attach, so it must not suppress the diagnosis."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(
-        monkeypatch, [json.dumps({"type": "some-custom-node-line"}) + "\n"]
-    )
+    blocking_stream([json.dumps({"type": "some-custom-node-line"}) + "\n"])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -1770,13 +1779,12 @@ def test_unrecognized_stream_chatter_does_not_count_as_an_event(monkeypatch):
     assert result["job"] == {"status": "running"}
 
 
-def test_progress_never_exceeds_its_own_total(monkeypatch):
+def test_progress_never_exceeds_its_own_total(monkeypatch, blocking_stream):
     """`total` is a lower bound an under-counting `workflow_size` can disprove.
     When the run gets further than the seed promised, the SEED was wrong — raise
     it rather than hand a client a progress above its own total to render."""
     _patch_jobs_status(monkeypatch, {"status": "running", "workflow_size": 2})
-    _patch_blocking_stream(
-        monkeypatch,
+    blocking_stream(
         [
             json.dumps({"type": "execution_cached", "nodes": ["1", "2", "3", "4"]})
             + "\n"
@@ -1795,7 +1803,9 @@ def test_progress_never_exceeds_its_own_total(monkeypatch):
     assert all(c["progress"] <= c["total"] for c in ctx.calls if c["total"] is not None)
 
 
-def test_the_version_gate_reads_the_version_the_check_RETURNED(monkeypatch):
+def test_the_version_gate_reads_the_version_the_check_RETURNED(
+    monkeypatch, blocking_stream
+):
     """The gate must not run `_check_comfy_version` and then re-read the mutable
     `_comfy_cli_version`: those two steps are not atomic, and a concurrent
     refusal's `_invalidate_version_cache` nulls the global in between — so the
@@ -1805,7 +1815,7 @@ def test_the_version_gate_reads_the_version_the_check_RETURNED(monkeypatch):
     proves which one the gate believes."""
     monkeypatch.setattr(server, "_comfy_cli_version", None)
     monkeypatch.setattr(server, "_checked_comfy_version", lambda: (1, 15, 0))
-    procs = _patch_blocking_stream(monkeypatch, [])
+    procs = blocking_stream([])
 
     with pytest.raises(server.ComfyCliError, match="1.16.0"):
         asyncio.run(server.job(action="watch", prompt_id="pid"))
@@ -1885,7 +1895,9 @@ def test_a_refused_watch_does_not_re_probe_the_version_on_every_retry(monkeypatc
     """`_invalidate_version_cache` is rate-limited. Every refused watch calls it,
     so without the limit a client retrying `job(action="watch")` in a loop forces
     a fresh `comfy --version` per call — each taken with `_VERSION_CHECK_LOCK`
-    HELD, so every other tool call in the process queues behind it."""
+    HELD, so every other tool call in the process queues behind it. The first
+    refusal re-arms ONE re-probe (so an upgrade is picked up on the very next
+    call); the rest inside the window are answered from the memo."""
     probes: list[int] = []
 
     def fake(cmd, capture_output, text, timeout, check, errors=None, cwd=None):
@@ -1896,22 +1908,64 @@ def test_a_refused_watch_does_not_re_probe_the_version_on_every_retry(monkeypatc
 
     monkeypatch.setattr(server, "_version_checked", False)
     monkeypatch.setattr(server, "_comfy_cli_version", None)
-    monkeypatch.setattr(server, "_version_probed_at", None)
+    monkeypatch.setattr(server, "_version_invalidated_at", None)
     monkeypatch.setattr(server.subprocess, "run", fake)
 
     for _ in range(5):
         with pytest.raises(server.ComfyCliError, match="1.16.0"):
             asyncio.run(server.job(action="watch", prompt_id="pid"))
 
-    assert probes == [1]
+    assert probes == [1, 1]
+    assert server._version_checked is True  # the re-probe's refusal did not un-latch
 
 
-def test_the_total_seed_poll_does_not_delay_the_websocket_attach(monkeypatch):
+def test_a_refusal_after_a_quiet_window_re_arms_the_probe(monkeypatch):
+    """The window runs from the last UN-LATCH. A client loop's refusals stay on
+    the memo until it has elapsed; the first refusal after it un-latches again,
+    so a user who upgraded meanwhile is re-probed on their next call rather than
+    refused once more from a stale memo."""
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.15.0")
+    clock = [1000.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    server._checked_comfy_version()
+
+    server._invalidate_version_cache()  # first refusal: un-latches
+    assert server._version_checked is False
+    server._checked_comfy_version()
+
+    clock[0] += server._VERSION_REPROBE_MIN_INTERVAL / 2
+    server._invalidate_version_cache()  # inside the window: memo stays
+    assert server._version_checked is True
+
+    clock[0] += server._VERSION_REPROBE_MIN_INTERVAL
+    server._invalidate_version_cache()  # past it: re-armed
+    assert server._version_checked is False
+
+
+def test_concurrent_refusals_un_latch_once_per_window(monkeypatch):
+    """Two watches refused off the same probe: the first un-latches and stamps
+    the window, the second finds it open and leaves the stamp alone — so the
+    window is not pushed forward by every refusal in a burst."""
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 1.15.0")
+    server._checked_comfy_version()
+
+    server._invalidate_version_cache()
+    stamp = server._version_invalidated_at
+    server._version_checked = True  # a re-probe latched in between
+    server._invalidate_version_cache()
+
+    assert server._version_checked is True
+    assert server._version_invalidated_at == stamp
+
+
+def test_the_total_seed_poll_does_not_delay_the_websocket_attach(
+    monkeypatch, blocking_stream
+):
     """The seed costs a whole extra `comfy jobs status` child. Awaited BEFORE the
     spawn it sits between submit and the websocket attach and every execution
     event in that window is lost — manufacturing the `events_seen: 0` payload
     this diagnosis exists to explain. It has to race the stream instead."""
-    procs = _patch_blocking_stream(monkeypatch, [])
+    procs = blocking_stream([])
     monkeypatch.setattr(server, "_WATCH_POLL_MIN", 0.0)
     order: list[str] = []
 
@@ -1991,13 +2045,15 @@ def test_a_tiny_watch_budget_skips_diagnosis_rather_than_shrinking_it(monkeypatc
     assert seen["fallback"] is None  # and nothing to spend it on
 
 
-def test_the_no_events_hint_uses_the_version_the_gate_captured(monkeypatch):
+def test_the_no_events_hint_uses_the_version_the_gate_captured(
+    monkeypatch, blocking_stream
+):
     """`_watch_no_events_hint` used to re-read `_comfy_cli_version` at TIMEOUT
     time. That global is nulled by `_invalidate_version_cache` — which every
     refused watch calls — so a watch that positively cleared 1.16.0 could still
     be told its comfy-cli was too old. Here the fallback poll nulls it mid-flight
     to stand in for that concurrent refusal."""
-    _patch_blocking_stream(monkeypatch, [])
+    blocking_stream([])
     monkeypatch.setattr(server, "_WATCH_POLL_MIN", 0.0)
 
     async def fake_run(*args, **kwargs):
@@ -2015,15 +2071,13 @@ def test_the_no_events_hint_uses_the_version_the_gate_captured(monkeypatch):
     assert "queued behind another" in result["hint"]
 
 
-def test_a_progress_state_event_counts_as_proof_of_attach(monkeypatch):
+def test_a_progress_state_event_counts_as_proof_of_attach(monkeypatch, blocking_stream):
     """`progress_state` is ComfyUI's per-step tick and the handler
     `_MIN_WATCH_COMFY_CLI` exists to require. Uncounted, a window carrying only
     those reports `events_seen: 0` — so a demonstrably attached, mid-node watch
     earns the "nothing reached the watcher" diagnosis."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(
-        monkeypatch, [json.dumps({"type": "progress_state", "nodes": {}}) + "\n"]
-    )
+    blocking_stream([json.dumps({"type": "progress_state", "nodes": {}}) + "\n"])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(
@@ -2035,12 +2089,14 @@ def test_a_progress_state_event_counts_as_proof_of_attach(monkeypatch):
 
 
 @pytest.mark.parametrize("etype", [["execution_start"], {"a": 1}])
-def test_an_unhashable_event_type_is_ignored_not_fatal(monkeypatch, etype):
+def test_an_unhashable_event_type_is_ignored_not_fatal(
+    monkeypatch, etype, blocking_stream
+):
     """`etype in _NON_PROGRESS_EVENTS` raises `TypeError: unhashable type` on a
     `type` that JSON made a list or a dict — aborting the whole stream over one
     malformed line instead of ignoring it as chatter."""
     _patch_jobs_status(monkeypatch, {"status": "running"})
-    _patch_blocking_stream(monkeypatch, [json.dumps({"type": etype}) + "\n"])
+    blocking_stream([json.dumps({"type": etype}) + "\n"])
     _patch_comfy_version(monkeypatch, "comfy-cli, version 1.16.0")
 
     result = asyncio.run(

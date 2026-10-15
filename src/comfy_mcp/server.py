@@ -488,14 +488,14 @@ _version_probe_refusal: str | None = None
 # an install where only `jobs watch` is broken.
 _comfy_cli_version: tuple[int, int, int] | None = None
 
-# `time.monotonic()` when the last `comfy --version` probe's subprocess
-# returned, or None if none has. Read only by `_invalidate_version_cache`, to
+# `time.monotonic()` when `_invalidate_version_cache` last actually un-latched
+# the memo, or None if it never has. Owned and read only by that function, to
 # keep a per-verb floor's un-latching from turning into a re-probe per refused
 # call — see the rate-limit note there.
-_version_probed_at: float | None = None
+_version_invalidated_at: float | None = None
 
-# How recently a probe must have run for `_invalidate_version_cache` to skip
-# un-latching. Sized for the gap between two refusals a CLIENT drives (a retry
+# How recently `_invalidate_version_cache` must have un-latched for it to skip
+# doing so again. Sized for the gap between two refusals a CLIENT drives (a retry
 # loop, a queue of watch calls: milliseconds), not the one a HUMAN drives (read
 # the error, `pip install -U comfy-cli`, retry — tens of seconds at the very
 # least), which is the only gap the invalidation exists to serve.
@@ -862,7 +862,7 @@ def _probe_comfy_version() -> None:
     probe, and a per-verb floor reading it in that window would see "unknown" on
     an install whose version is perfectly readable and fail OPEN.
     """
-    global _version_checked, _comfy_cli_version, _version_probed_at
+    global _version_checked, _comfy_cli_version
     try:
         proc = _spawn_comfy_version()
     except subprocess.TimeoutExpired:
@@ -897,13 +897,6 @@ def _probe_comfy_version() -> None:
         # a later call re-checks rather than permanently disabling the guard.
         _comfy_cli_version = None
         return
-    # Stamped only once the spawn has RETURNED, which is the point
-    # `_invalidate_version_cache`'s rate limit measures from — a stamp taken
-    # before a 30s `--version` would already be 30s stale by the time the
-    # refusal it is meant to throttle happens. Every path that can reach that
-    # invalidation runs through here: it needs a version this probe positively
-    # parsed, so the exits above (which leave it None and fail OPEN) cannot.
-    _version_probed_at = time.monotonic()
     if proc.returncode != 0 and tcc._looks_like_tcc_denial(proc.stderr):
         _comfy_cli_version = None  # the write-once rule; see the docstring
         # comfy-cli's own interpreter could not start because macOS denied it
@@ -998,18 +991,30 @@ def _invalidate_version_cache() -> None:
     magnitude shorter than the human upgrade-and-retry this exists to serve, so
     the recovery story is unchanged.
 
-    Takes no lock. Both globals it touches are single-word, and the one race
-    that matters resolves the right way on its own: if a probe is in flight it
+    The window is measured from the last un-latch THIS function performed, not
+    from when the probe ran. Every refusal it serves is decided by a probe that
+    has only just returned, so a probe-relative window would swallow the first
+    refusal's un-latch every time — and the user who upgrades and retries would
+    be refused once more from the memo before the call after that re-probed.
+    Measured from the un-latch, the first refusal after a quiet period always
+    re-arms the probe, while a retry loop still re-probes at most once per
+    window.
+
+    Takes no lock. Both globals it touches are single-word; two concurrent
+    refusals racing the window check at worst both un-latch, which is
+    idempotent. The one race that matters resolves the right way on its own: if a probe is in flight it
     will latch ``_version_checked`` after this returns, discarding the un-latch
     — which is correct, because that probe started after this refusal and its
     answer is the fresher of the two.
     """
-    global _version_checked
+    global _version_checked, _version_invalidated_at
+    now = time.monotonic()
     if (
-        _version_probed_at is not None
-        and time.monotonic() - _version_probed_at < _VERSION_REPROBE_MIN_INTERVAL
+        _version_invalidated_at is not None
+        and now - _version_invalidated_at < _VERSION_REPROBE_MIN_INTERVAL
     ):
         return
+    _version_invalidated_at = now
     _version_checked = False
 
 
