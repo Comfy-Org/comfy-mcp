@@ -43,6 +43,36 @@ def test_target_none_when_unset():
     assert target._comfy_target() is None
 
 
+def test_validation_uses_the_configured_catalog(monkeypatch, patched_run):
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    report = {"valid": True, "errors": []}
+    calls = patched_run(envelope(data=report))
+
+    assert server.validate_workflow("workflow.json") == report
+    assert calls[0]["cmd"][4:] == [
+        "validate",
+        "--workflow",
+        "workflow.json",
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+
+
+@pytest.mark.parametrize("tool", [server.nodes, server.validate_workflow])
+def test_catalog_tools_do_not_fall_back_on_a_bad_target(monkeypatch, patched_run, tool):
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")
+    calls = patched_run()
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        if tool is server.nodes:
+            tool(action="types")
+        else:
+            tool("workflow.json")
+    assert calls == []
+
+
 def test_target_from_host_defaults_port(monkeypatch):
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     assert target._comfy_target() == (

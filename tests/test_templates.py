@@ -516,6 +516,29 @@ def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
     assert len(calls) == 1  # no validate call when the check is skipped
 
 
+def test_fetch_template_checks_the_configured_catalog(
+    monkeypatch, patched_run, tmp_path
+):
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    calls = patched_run(envelope(data={"valid": True, "errors": []}))
+    out = tmp_path / "flux.json"
+
+    result = server.fetch_template("flux_dev", str(out))
+
+    assert calls[0]["cmd"][4:] == ["templates", "fetch", "flux_dev", "--out", str(out)]
+    assert calls[1]["cmd"][4:] == [
+        "validate",
+        "--workflow",
+        str(out),
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+    assert result["local_check"]["runnable"] is True
+
+
 def test_fetch_template_resolves_relative_path(monkeypatch):
     """A relative out_path is returned as an absolute path (ready for run_workflow)."""
     monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: None)
