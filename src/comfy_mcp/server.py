@@ -10291,6 +10291,7 @@ def _local_template_check(workflow_path: str) -> dict:
     stops the comparison from happening — no ComfyUI running, so no
     ``object_info`` — comes back ``checked: False`` rather than a denial.
     """
+    remote_target = _remote_target_configured()
     try:
         result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
     except ComfyCliError as exc:
@@ -10300,11 +10301,16 @@ def _local_template_check(workflow_path: str) -> dict:
         # check could not run at all". The payload is what tells them apart.
         result = exc.data
         if _validation_report(result) is None:
+            start_hint = (
+                "on the configured remote target"
+                if remote_target
+                else "with `launch_comfyui`"
+            )
             return _unchecked(
                 "could not check this template against your ComfyUI install "
                 "(the live node catalog was unreachable — the server may not be "
-                "running). The template was still written. Start ComfyUI with "
-                "`launch_comfyui`, then re-check with "
+                f"running). The template was still written. Start ComfyUI {start_hint}, "
+                "then re-check with "
                 "`validate_workflow(workflow_path=...)`. "
                 f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}",
                 "check_unavailable",
@@ -10350,11 +10356,14 @@ def _local_template_check(workflow_path: str) -> dict:
             "see `validate_workflow` for what it cannot see."
         )
     else:
+        update_hint = (
+            "on the configured remote target" if remote_target else "(`update_comfyui`)"
+        )
         summary = (
             f"{len(validation_errors)} problem(s): this template needs a node "
             "class or an input option your ComfyUI install does not have — a "
             "template served from the gallery can be newer than your install. "
-            "Update ComfyUI and its custom nodes (`update_comfyui`), or pick "
+            f"Update ComfyUI and its custom nodes {update_hint}, or pick "
             f"another template. First: {_finding_line(validation_errors[0])}"
             if validation_errors
             else (
