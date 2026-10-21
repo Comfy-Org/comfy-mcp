@@ -94,9 +94,8 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-The local differentiator: discovery reads the **live install**, not a static catalog.
-`nodes` follows the configured ComfyUI target (custom nodes included); `search_models`
-still reads this machine's model files.
+Discovery reads the **live install**, not a static catalog: `nodes` follows the configured
+ComfyUI target (custom nodes included); `search_models` reads this machine's model files.
 
 ## Module layout
 
