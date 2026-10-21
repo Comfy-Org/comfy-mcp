@@ -94,8 +94,8 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-The local differentiator: discovery (`nodes`, `search_models`) reads the **live install** —
-custom nodes included — not a static catalog.
+Discovery reads the **live install**, not a static catalog: `nodes` follows the configured
+ComfyUI target (custom nodes included); `search_models` reads this machine's model files.
 
 ## Module layout
 
@@ -112,7 +112,7 @@ under it — none imports `server`, so the dependency edges only ever point one 
 | `errors.py` | `ComfyCliError`; the "nothing recorded to stop" detector; the `error.details` renderer + per-field char cap |
 | `clitext.py` | comfy-cli **human-output** parsing for verbs with no envelope — `Saved:`-block/install-failure extraction, `plain_ok` synthesis, missing-verb/-option probes, `install_node`'s per-pack verdict, echoed-argv forgery guards. Its extractors are the documented cm-cli contract (see architecture rule above) — move or edit byte-for-byte |
 | `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload paths) |
-| `target.py` | remote-target resolution/redaction/provenance for run/job tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, and divergence notes on `system_stats`/`free_memory` (and on `stop_comfyui`'s "nothing recorded") so an agent doesn't gate a remote run on local numbers |
+| `target.py` | remote-target resolution/redaction/provenance for run/job and live node discovery/validation tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, and divergence notes on `system_stats`/`free_memory` (and on `stop_comfyui`'s "nothing recorded") so an agent doesn't gate a remote run on local numbers |
 | `params.py` | param/slot marshaling into comfy-cli argv for `generate`/`run-template`/`set-slot`/`vary`, incl. the structured slot machinery — `SlotOverride`/`SlotVariants` are this module's public TYPES (carve-out below) |
 | `cli.py` | the console script's own argv surface — the `--help` / `--version` text a HUMAN who types `comfy-mcp` in a terminal gets, plus the installed-metadata version lookup (`_version`) behind it. That lookup is the SINGLE answer to "which release is this?": `server._server_version` delegates to it for the handshake's `serverInfo.version`, so the string a client displays is the string the terminal prints |
 
