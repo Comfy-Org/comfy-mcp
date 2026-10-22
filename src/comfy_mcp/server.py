@@ -7069,6 +7069,13 @@ def fetch_outputs(
     # ahead of the NUL refusal for the ordering reason `argv._guard_arg_len` gives.
     argv._guard_arg_len("out_dir", out_dir)
     out_dir = argv._reject_nul("out_dir", out_dir)
+    preview_dir = out_dir
+    if inline_images and not url_only:
+        # Match the download child's cwd before it runs; the MCP client's cwd
+        # may contain a stale, same-named output directory.
+        preview_dir = os.path.realpath(
+            os.path.join(_project_root() or os.curdir, out_dir)
+        )
     args = ["download", prompt_id, "-o", out_dir]
     if url_only:
         args.append("--url-only")
@@ -7078,7 +7085,7 @@ def fetch_outputs(
     # a previous run into ``out_dir`` (which would contradict the docstring).
     if not inline_images or url_only:
         return data
-    paths = _select_inline_images(_collect_output_images(data, out_dir))
+    paths = _select_inline_images(_collect_output_images(data, preview_dir))
     images = [Image(path=path) for path in paths]
     return [data, *images]
 
