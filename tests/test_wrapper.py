@@ -6022,6 +6022,52 @@ def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
     assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
 
 
+@pytest.mark.parametrize(
+    ("project_set", "absolute_out_dir", "cwd_shadow"),
+    [
+        (True, False, True),
+        (True, False, False),
+        (True, True, True),
+        (False, False, False),
+    ],
+    ids=["project-with-shadow", "project-without-shadow", "absolute", "unanchored"],
+)
+def test_fetch_outputs_inline_images_uses_the_download_cwd(
+    patched_run, tmp_path, monkeypatch, project_set, absolute_out_dir, cwd_shadow
+):
+    """Preview the file downloaded by the CLI, including a relative project output."""
+    cwd = tmp_path / "client"
+    project = tmp_path / "project"
+    cwd.mkdir()
+    project.mkdir()
+    monkeypatch.chdir(cwd)
+    if project_set:
+        monkeypatch.setenv("COMFY_PROJECT", str(project))
+    download_cwd = project if project_set else cwd
+    output = download_cwd / "outputs"
+    out_dir = str(output) if absolute_out_dir else "outputs"
+    if cwd_shadow:
+        (cwd / "outputs").mkdir()
+        (cwd / "outputs" / "gen.png").write_bytes(b"stale-client-output")
+
+    def download(cmd):
+        output.mkdir(exist_ok=True)
+        (output / "gen.png").write_bytes(_FAKE_PNG)
+
+    data = {"out_dir": str(output), "files": [{"path": str(output / "gen.png")}]}
+    calls = patched_run(envelope(data=data), on_spawn=download)
+    result = server.fetch_outputs("pid", out_dir, inline_images=True)
+
+    assert calls[0]["cwd"] == (str(project) if project_set else None)
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", out_dir]
+    assert result[0] == data
+    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    assert len(images) == 1
+    import base64
+
+    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+
+
 def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
     """url_only downloads no bytes, so inline_images can't surface stale out_dir files."""
     # A stale image from a prior run whose basename the emitted URL echoes.
