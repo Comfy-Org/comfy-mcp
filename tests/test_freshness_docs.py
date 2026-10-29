@@ -4,7 +4,8 @@ This server has four catalog-shaped surfaces with four genuinely different
 freshness behaviors, and a docstring is the only place a calling agent can learn
 which one it is holding:
 
-* the node tools read the running ComfyUI's ``object_info`` — **LIVE**;
+* the node tools read the running ComfyUI's ``object_info`` by default —
+  **LIVE**, or a caller-selected saved catalog — **SNAPSHOT**;
 * the template tools read comfy-cli's gallery cache — **CACHED**, with a TTL that
   depends on the installed comfy-cli;
 * ``search_models`` reads the install's disk — **LIVE**, filenames only;
@@ -35,8 +36,9 @@ import pytest
 from comfy_mcp import instructions, server
 
 # The node tool — one grouped `nodes(action=...)` since the tool-consolidation
-# series, all of whose actions resolve against the live local `object_info`.
-LIVE_NODE_TOOLS = ("nodes",)
+# series. Every action reads live local `object_info` by default and accepts the
+# same saved-catalog override.
+NODE_CATALOG_TOOLS = ("nodes",)
 
 # The gallery-backed template tools.
 CACHED_TEMPLATE_TOOLS = ("search_templates", "get_template", "fetch_template")
@@ -47,7 +49,7 @@ CACHED_TEMPLATE_TOOLS = ("search_templates", "get_template", "fetch_template")
 PINNED_PARTNER_TOOLS = ("list_partner_models", "partner_model_schema")
 
 ALL_CATALOG_TOOLS = (
-    *LIVE_NODE_TOOLS,
+    *NODE_CATALOG_TOOLS,
     *CACHED_TEMPLATE_TOOLS,
     "search_models",
     *PINNED_PARTNER_TOOLS,
@@ -110,16 +112,18 @@ def test_every_catalog_tool_states_a_freshness_policy(tool_name):
     )
 
 
-@pytest.mark.parametrize("tool_name", LIVE_NODE_TOOLS)
-def test_node_tools_are_documented_as_live(tool_name):
-    """LIVE, and explicitly inclusive of the install's own staleness.
+@pytest.mark.parametrize("tool_name", NODE_CATALOG_TOOLS)
+def test_node_tools_document_live_default_and_snapshot_override(tool_name):
+    """LIVE by default, with an explicit caller-selected SNAPSHOT mode.
 
     The staleness clause is the non-obvious half: "live" alone reads as
     "authoritative", when what it actually means is "authoritative about THIS
-    install" — an outdated ComfyUI truthfully reports an outdated node set.
+    install" — an outdated ComfyUI truthfully reports an outdated node set. The
+    snapshot clause prevents the default from being mistaken for the only mode.
     """
     text = doc(tool_name)
-    assert "Freshness: LIVE" in text
+    assert "Freshness: LIVE by default" in text
+    assert "SNAPSHOT with `object_info_path`" in text
     assert "object_info" in text
     assert "outdated install lists outdated nodes" in text
 
