@@ -22,6 +22,10 @@ def test_no_internal_tracker_references():
     scanned = [
         _ROOT / "README.md",
         _ROOT / "AGENTS.md",
+        # AGENTS.md's reference detail lives under `docs/agents/`, so the ban
+        # has to follow the content out of the root file — otherwise moving a
+        # paragraph is all it takes to escape the rule.
+        *sorted((_ROOT / "docs").rglob("*.md")),
         *sorted((_ROOT / "src").rglob("*.py")),
         *sorted((_ROOT / "tests").rglob("*.py")),
     ]
