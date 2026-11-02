@@ -33,9 +33,9 @@ jobs:
     # SHA-pinned. Bump this SHA to pick up upstream changes; keep workflows_ref
     # matching so prompts/scripts load from the same commit. The
     # bump-cursor-review-callers workflow updates this automatically.
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@cc22b08462d7d8153b7b5aa7433003d77fc61f3e # github-workflows main (cc22b08)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@e7d7bcfbeeb1b9c4dcb003ddc95cdcefa3ac41df # github-workflows main (e7d7bcf)
     with:
-      workflows_ref: cc22b08462d7d8153b7b5aa7433003d77fc61f3e
+      workflows_ref: e7d7bcfbeeb1b9c4dcb003ddc95cdcefa3ac41df
       # Lockfiles, venvs, caches, and egg-info carry no review signal and would
       # only eat into the diff size cap. LICENSE/NOTICE are legal source-of-truth
       # files, so they stay in scope for future licensing-change review.
