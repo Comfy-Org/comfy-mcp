@@ -562,6 +562,30 @@ def test_a_lone_port_restarts_locally_but_never_unlocks_a_kill(clash, monkeypatc
     assert state["runs"] == []
 
 
+def test_a_comfy_desktop_discovered_target_still_probes_and_prompts(clash, monkeypatch):
+    """The Comfy Desktop fallback is same-machine, not remote — the gate must stay on.
+
+    A discovered Desktop port feeds only the `--host`/`--port` forward
+    (`target._forward_target`); `target._comfy_target()` stays ``None`` for it,
+    so the gate reads the session as local. Were it read as remote, the
+    guided-restart recovery would be silently disabled for exactly the sessions
+    the Desktop fallback exists for: nothing explicitly configured, ComfyUI
+    launched via Comfy Desktop. `COMFYUI_URL`/`COMFYUI_HOST` stay unset (the `_local_session`
+    fixture's baseline) — only Desktop discovery is patched to look live.
+    """
+    monkeypatch.setattr(server.target, "_discover_comfy_desktop_port", lambda: 8188)
+    state = clash([_dry_run(), _stopped()])
+    ctx = _FakeCtx()
+
+    assert _restart(ctx=ctx) == {"pid": 99, "port": 8188}
+
+    assert state["runs"] == [
+        ("stop", "--port", "8188", "--dry-run"),
+        ("stop", "--port", "8188"),
+    ]
+    assert ctx.elicitations != []
+
+
 def test_an_unreadable_port_is_never_guessed_at(clash):
     """`--port` present but unparseable is UNKNOWN, not "probably 8188".
 
