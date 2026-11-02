@@ -175,8 +175,8 @@ def _clear_comfyui_target_env(monkeypatch):
 def _isolate_comfy_desktop_discovery(monkeypatch):
     """Default every test to "no Comfy Desktop port-lock directory found".
 
-    ``_comfy_target`` falls back to :func:`target._discover_comfy_desktop_port`
-    when neither ``COMFYUI_URL`` nor ``COMFYUI_HOST`` is set, which in turn
+    ``_forward_target`` falls back to :func:`target._discover_comfy_desktop_port`
+    when no ``COMFYUI_*`` target or ``COMFY_LOCAL_URL`` is set, which in turn
     reads :func:`target._comfy_desktop_port_locks_dir` — the REAL
     ``%APPDATA%\\Comfy Desktop\\port-locks`` (or the macOS/Linux equivalent) —
     whatever happens to be on the machine running the suite. Left ambient, a

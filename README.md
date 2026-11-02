@@ -472,8 +472,8 @@ full cloud tool list, and the slash-command/prompt tables live.
   full precedence chain; every example in
   [Configure your AI client](#configure-your-ai-client) shows where it goes.
 - **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a ComfyUI on *another
-  machine*).** Read by **this server**. With neither set, the **submit / job** tools target
-  Comfy Desktop's current port when it can be discovered — read from Comfy Desktop's own
+  machine*).** Read by **this server**. With none of these and no `COMFY_LOCAL_URL` set, the **submit / job**
+  tools target Comfy Desktop's current port when it can be discovered — read from Comfy Desktop's own
   `port-locks` directory and matched against a live process, only when exactly one instance is
   running — otherwise no `--host`/`--port` is forwarded and comfy-cli resolves its own local
   target the usual way (`COMFY_LOCAL_URL`, then a comfy-cli-launched background server, then its
@@ -487,7 +487,9 @@ full cloud tool list, and the slash-command/prompt tables live.
   `COMFYUI_URL` (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`,
   default `8188`) pair — to point the **submit / job** tools at a ComfyUI running elsewhere, e.g. a
   GPU box reachable over a private network (Tailscale); either one always overrides the Desktop
-  discovery. See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)** for what is and isn't
+  discovery, and so does `COMFY_LOCAL_URL` (an address you chose is never retargeted by discovery).
+  Discovery never makes the server treat the session as remote: `download_model` and the
+  guided restart stay available. See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)** for what is and isn't
   remoted.
 - **`COMFY_MCP_REMOTE_SHARED_MODELS` (optional — only meaningful alongside the variables above).**
   `download_model` writes to *this* machine's models dir and has no remote mode, so with a remote
@@ -758,6 +760,7 @@ via its own port-lock file when exactly one live instance is found (see [Optiona
 variables](#optional-environment-variables) above), or comfy-cli's own local target otherwise
 (normally `127.0.0.1:8188`, but `COMFY_LOCAL_URL` or a comfy-cli-launched background server can
 already point it elsewhere — see [Which address variable do I want?](#which-address-variable-do-i-want)).
+(An explicitly set `COMFY_LOCAL_URL` takes precedence over that discovery.)
 Point it at a ComfyUI running **elsewhere** — e.g. a GPU box reachable over a private network
 (Tailscale) — by setting one of:
 
