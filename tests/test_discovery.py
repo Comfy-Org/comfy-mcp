@@ -314,33 +314,6 @@ def test_nodes_path_refuses_a_pre_fix_engines_default_answer(patched_run):
     ]
 
 
-def _sequenced_run(monkeypatch, replies: list) -> list:
-    """Answer successive `_run_comfy` calls from `replies`; record argv + kwargs.
-
-    The conftest fakes hand back ONE canned reply per fixture, and the mode
-    fallback needs a different answer per call — the multi-call case AGENTS.md
-    leaves to a local stub. A reply that is an exception is RAISED rather than
-    returned, which is how the re-ask's failure paths are driven. `kwargs` is
-    recorded alongside the argv because the pair's shared deadline lives in the
-    second call's `timeout`, not in its argv. An exhausted iterator fails loudly.
-    """
-    calls: list[dict] = []
-    pending = iter(replies)
-
-    def fake_run(*args, **kwargs):
-        calls.append({"args": args, "kwargs": kwargs})
-        try:
-            reply = next(pending)
-        except StopIteration:
-            raise AssertionError(f"unexpected extra comfy-cli call: {args}") from None
-        if isinstance(reply, BaseException):
-            raise reply
-        return reply
-
-    monkeypatch.setattr(server, "_run_comfy", fake_run)
-    return calls
-
-
 def _fake_monotonic(monkeypatch, *ticks: float) -> None:
     """Pin `time.monotonic` to `ticks`, holding the last one once exhausted.
 
@@ -375,7 +348,7 @@ def _no_such_loose_option() -> Exception:
     )
 
 
-def test_nodes_path_fallback_relays_the_canonical_model_to_image_route(monkeypatch):
+def test_nodes_path_fallback_relays_the_canonical_model_to_image_route(patched_run):
     """The route an agent reads back after the fallback fires.
 
     Pins the ticket's acceptance on the wrapper half: `KSampler -> VAEDecode`
@@ -404,9 +377,14 @@ def test_nodes_path_fallback_relays_the_canonical_model_to_image_route(monkeypat
             }
         ],
     }
-    calls = _sequenced_run(monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, loose])
+    calls = patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+            envelope(data=loose),
+        ]
+    )
     data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
-    assert [c["args"][-1] for c in calls] == ["10", "--loose"]
+    assert [c["cmd"][-1] for c in calls] == ["10", "--loose"]
     assert data == loose
     steps = data["paths"][0]["steps"]
     assert [s["node"] for s in steps] == ["KSampler", "VAEDecode"]
@@ -459,7 +437,9 @@ def test_nodes_path_trusts_a_modern_engines_no_route_answer(patched_run):
     assert "--loose" not in calls[0]["cmd"]
 
 
-def test_nodes_path_retry_gets_what_is_left_of_the_shared_budget(monkeypatch):
+def test_nodes_path_retry_gets_what_is_left_of_the_shared_budget(
+    monkeypatch, patched_run
+):
     """The pair shares one 60s budget; the re-ask does not get a fresh one.
 
     Two 60s calls would put the worst case at ~120s — the whole request budget a
@@ -468,15 +448,18 @@ def test_nodes_path_retry_gets_what_is_left_of_the_shared_budget(monkeypatch):
     child would keep running after the caller gave up.
     """
     _fake_monotonic(monkeypatch, 1000.0, 1041.0)
-    calls = _sequenced_run(
-        monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _PRE_FIX_MODEL_TO_IMAGE]
+    calls = patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+        ]
     )
     server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
-    assert calls[0]["kwargs"]["timeout"] == pytest.approx(60.0)
-    assert calls[1]["kwargs"]["timeout"] == pytest.approx(19.0)
+    assert calls[0]["timeout"] == pytest.approx(60.0)
+    assert calls[1]["timeout"] == pytest.approx(19.0)
 
 
-def test_nodes_path_retry_budget_never_falls_below_its_floor(monkeypatch):
+def test_nodes_path_retry_budget_never_falls_below_its_floor(monkeypatch, patched_run):
     """A first call that ate the budget still leaves the re-ask a real attempt.
 
     The re-ask is the call whose answer is returned; letting the remainder reach
@@ -484,14 +467,17 @@ def test_nodes_path_retry_budget_never_falls_below_its_floor(monkeypatch):
     of a payload the wrapper is about to throw away.
     """
     _fake_monotonic(monkeypatch, 1000.0, 1059.5)
-    calls = _sequenced_run(
-        monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _PRE_FIX_MODEL_TO_IMAGE]
+    calls = patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+        ]
     )
     server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
-    assert calls[1]["kwargs"]["timeout"] == pytest.approx(15.0)
+    assert calls[1]["timeout"] == pytest.approx(15.0)
 
 
-def test_nodes_path_degrades_when_the_engine_has_no_loose_flag(monkeypatch):
+def test_nodes_path_degrades_when_the_engine_has_no_loose_flag(patched_run):
     """An engine with the verb and no `--loose` gets its own answer back.
 
     No RELEASE produces this shape — the verb, the mode flags and `envelope/1`
@@ -501,15 +487,18 @@ def test_nodes_path_degrades_when_the_engine_has_no_loose_flag(monkeypatch):
     no sounder answer to be had on such an engine, so the choice is this file's
     pre-change behavior or no answer at all.
     """
-    calls = _sequenced_run(
-        monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _no_such_loose_option()]
+    calls = patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+            _no_such_loose_option(),
+        ]
     )
     data = server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
     assert data == _PRE_FIX_MODEL_TO_IMAGE
-    assert [c["args"][-1] for c in calls] == ["10", "--loose"]
+    assert [c["cmd"][-1] for c in calls] == ["10", "--loose"]
 
 
-def test_nodes_path_reraises_a_retry_failure_that_is_not_a_missing_flag(monkeypatch):
+def test_nodes_path_reraises_a_retry_failure_that_is_not_a_missing_flag(patched_run):
     """A timeout on the re-ask propagates — the discarded payload stays discarded.
 
     The engine HAS a sound mode here and simply did not answer. Relaying the
@@ -517,20 +506,19 @@ def test_nodes_path_reraises_a_retry_failure_that_is_not_a_missing_flag(monkeypa
     route with nothing in it to say so, which is the exact failure this fallback
     exists to prevent; an honest error is the better answer.
     """
-    _sequenced_run(
-        monkeypatch,
-        [
-            _PRE_FIX_MODEL_TO_IMAGE,
+    patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
             server.ComfyCliError(
                 "`comfy nodes path` timed out after 19s", no_envelope=True
             ),
-        ],
+        ]
     )
     with pytest.raises(server.ComfyCliError, match="timed out"):
         server.nodes(action="path", from_type="MODEL", to_type="IMAGE")
 
 
-def test_nodes_path_degrade_ignores_a_phrase_the_caller_supplied(monkeypatch):
+def test_nodes_path_degrade_ignores_a_phrase_the_caller_supplied(patched_run):
     """A caller who types the parser's wording gets the raw error, not a degrade.
 
     `_phrase_is_only_the_caller_s`, the same guard `node_dependencies` puts on
@@ -538,10 +526,37 @@ def test_nodes_path_degrade_ignores_a_phrase_the_caller_supplied(monkeypatch):
     saying the option is missing, so the engine never said it and the first
     payload must not be substituted for the failure.
     """
-    _sequenced_run(monkeypatch, [_PRE_FIX_MODEL_TO_IMAGE, _no_such_loose_option()])
+    patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+            _no_such_loose_option(),
+        ]
+    )
     with pytest.raises(server.ComfyCliError, match="No such option"):
         server.nodes(
             action="path", from_type="MODEL", to_type="No such option: --loose"
+        )
+
+
+def test_nodes_path_degrade_subtracts_object_info_path(patched_run):
+    """A catalog path cannot forge the missing-``--loose`` fallback."""
+    catalog = "catalog No such option: --loose.json"
+    echoed = server.ComfyCliError(
+        f"invalid value for --input: {catalog}", no_envelope=True, returncode=2
+    )
+    patched_run(
+        replies=[
+            envelope(data=_PRE_FIX_MODEL_TO_IMAGE),
+            echoed,
+        ]
+    )
+
+    with pytest.raises(server.ComfyCliError, match="invalid value for --input"):
+        server.nodes(
+            action="path",
+            from_type="MODEL",
+            to_type="IMAGE",
+            object_info_path=catalog,
         )
 
 
@@ -572,6 +587,86 @@ def test_nodes_categories_argv(patched_run):
     calls = patched_run(envelope(data={"loaders": {}}))
     assert server.nodes(action="categories") == {"loaders": {}}
     assert calls[0]["cmd"][4:] == ["nodes", "categories"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"action": "search", "query": "sampler"}, ["nodes", "search", "sampler"]),
+        ({"action": "get", "name": "KSampler"}, ["nodes", "show", "KSampler"]),
+        ({"action": "list"}, ["nodes", "ls"]),
+        (
+            {"action": "upstream", "name": "KSampler"},
+            ["nodes", "upstream", "KSampler"],
+        ),
+        (
+            {"action": "downstream", "name": "KSampler"},
+            ["nodes", "downstream", "KSampler"],
+        ),
+        (
+            {"action": "path", "from_type": "MODEL", "to_type": "IMAGE"},
+            [
+                "nodes",
+                "path",
+                "MODEL",
+                "IMAGE",
+                "--max-depth",
+                "6",
+                "--max-paths",
+                "10",
+            ],
+        ),
+        ({"action": "types"}, ["nodes", "types"]),
+        ({"action": "categories"}, ["nodes", "categories"]),
+    ],
+    ids=(
+        "search",
+        "get",
+        "list",
+        "upstream",
+        "downstream",
+        "path",
+        "types",
+        "categories",
+    ),
+)
+def test_every_nodes_action_forwards_object_info_path(patched_run, kwargs, expected):
+    """The saved catalog is one shared option on every grouped action."""
+    calls = patched_run(envelope(data={}))
+
+    server.nodes(**kwargs, object_info_path="catalog.json")
+
+    assert calls[0]["cmd"][4:] == [*expected, "--input", "catalog.json"]
+    if kwargs["action"] == "path":
+        assert calls[1]["cmd"][4:] == [
+            *expected,
+            "--input",
+            "catalog.json",
+            "--loose",
+        ]
+
+
+@pytest.mark.parametrize(
+    ("object_info_path", "match"),
+    [
+        ("--catalog.json", r"object_info_path.*leading '-'"),
+        ("catalog\0.json", r"object_info_path.*embedded NUL"),
+        ("c" * (argv._MAX_PATH_ARG_LEN + 1), r"object_info_path.*exceeds"),
+        ("/tmp/\ud800.json", r"object_info_path.*cannot be encoded"),
+    ],
+    ids=("option-like", "nul", "oversized", "unencodable"),
+)
+def test_nodes_rejects_invalid_object_info_path_before_spawn(
+    patched_run, object_info_path, match
+):
+    calls = patched_run(envelope(data={}))
+
+    with pytest.raises(server.ComfyCliError, match=match):
+        server.nodes(
+            action="search", query="sampler", object_info_path=object_info_path
+        )
+
+    assert calls == []
 
 
 # --- `exclude_api` (paid partner-API nodes) --------------------------------

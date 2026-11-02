@@ -277,25 +277,71 @@ def test_discover_ignores_a_lock_with_a_non_positive_or_non_int_pid(
     assert target._discover_comfy_desktop_port() is None
 
 
-# --- _comfy_target integration -----------------------------------------------
+# --- _forward_target / _comfy_target integration -----------------------------
 
 
-def test_target_falls_back_to_comfy_desktop_port(monkeypatch):
-    """Nothing configured, but Desktop has one live instance -> use it."""
+def test_forward_target_falls_back_to_comfy_desktop_port(monkeypatch):
+    """Nothing configured, but Desktop has one live instance -> forward it."""
     monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
 
-    assert target._comfy_target() == (
+    assert target._forward_target() == (
         "127.0.0.1",
         8003,
         target._COMFY_DESKTOP_PORT_LOCK_SOURCE,
     )
 
 
-def test_target_none_when_discovery_finds_nothing(monkeypatch):
+def test_with_target_forwards_the_discovered_desktop_port(monkeypatch):
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+
+    assert target._with_target(("run", "wf.json")) == (
+        "run",
+        "wf.json",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8003",
+    )
+
+
+def test_forward_target_none_when_discovery_finds_nothing(monkeypatch):
     """Nothing configured, no Comfy Desktop instance either -> unchanged None."""
     monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: None)
 
+    assert target._forward_target() is None
+    assert target._with_target(("run", "wf.json")) == ("run", "wf.json")
+
+
+def test_desktop_discovery_is_not_a_configured_target(monkeypatch):
+    """`_comfy_target` answers "is a remote configured?" — Desktop never is.
+
+    Every remote-only guard (download refusal, restart kill gate, divergence
+    notes, server_info's remote banner) reads `_comfy_target`, so a discovered
+    same-machine Desktop must leave it None.
+    """
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+
     assert target._comfy_target() is None
+
+
+def test_download_is_not_refused_for_a_discovered_desktop(monkeypatch):
+    """Regression: a lone live Desktop lock must not trip the remote-download guard."""
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+
+    target._reject_remote_model_download()  # must not raise
+
+
+def test_comfy_local_url_beats_desktop_discovery(monkeypatch):
+    """An explicitly configured local address is never retargeted by discovery.
+
+    `--host`/`--port` outrank `COMFY_LOCAL_URL` in comfy-cli, so forwarding the
+    discovered port would silently send the job to a different ComfyUI.
+    """
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+    monkeypatch.setenv("COMFY_LOCAL_URL", "http://127.0.0.1:8189")
+
+    assert target._forward_target() is None
+    assert target._with_target(("run", "wf.json")) == ("run", "wf.json")
 
 
 def test_comfyui_url_wins_over_desktop_discovery(monkeypatch):
@@ -303,7 +349,7 @@ def test_comfyui_url_wins_over_desktop_discovery(monkeypatch):
     monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
 
-    assert target._comfy_target() == ("gpu.example", 9001, "COMFYUI_URL")
+    assert target._forward_target() == ("gpu.example", 9001, "COMFYUI_URL")
 
 
 def test_comfyui_host_wins_over_desktop_discovery(monkeypatch):
@@ -311,7 +357,7 @@ def test_comfyui_host_wins_over_desktop_discovery(monkeypatch):
     monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
 
-    assert target._comfy_target() == (
+    assert target._forward_target() == (
         "gpu.example",
         target.DEFAULT_COMFYUI_PORT,
         "COMFYUI_HOST",

@@ -22,7 +22,8 @@ flows:
   `fetch_outputs`. Prefer this over `run_workflow(wait=True)` so a slow run
   does not block; same for `generate_image` / `run_template` on slow hardware,
   where YOUR transport cap bounds a `wait=True` call too. A run that outlives
-  a wait keeps going — poll its `prompt_id`, never re-run it.
+  a wait keeps going — poll its `prompt_id`, never re-run it. For video/audio,
+  call `preview_media` on a path returned by `fetch_outputs`.
 - Large model downloads: `download_model` submits to a background worker and
   returns a `download_id`; poll `download(action="wait")` /
   `download(action="status")`, or `download(action="cancel")` to stop one.
@@ -55,6 +56,14 @@ flows:
   the partner-models bullet below for what that gate does and does not
   guarantee. For the quickest text-to-image path, `generate_image(prompt)`
   runs the same way, free, no API key.
+- Hand-writing a workflow (no template fits): write API format with a
+  plain-language `_meta.title` on EVERY node (e.g. "Mask background") —
+  dragged into ComfyUI it is auto-arranged and each node labelled by that
+  title, else its generic node-type name. Its class_types are guesses, so
+  `validate_workflow` it before `run_workflow`. If the user will EDIT the
+  graph, say the layout is auto-generated and give the saved file path.
+  Prefer `fetch_template` + `set_workflow_slot` whenever a template covers
+  the task: templates carry authored layout, groups and notes.
 - Model families often ship BOTH a free local template and a paid `API` one
   under identical titles (e.g. two "MiniMax H3: Text to Video" rows) — check
   BOTH routes (row `tags`, or a second `search_templates(exclude_api=True)`)
@@ -79,8 +88,8 @@ flows:
   node CLASS and you do not know which pack provides it, `workflow_deps`
   names the packs a workflow's classes come from and which are missing:
   `validate_workflow` -> `workflow_deps` -> `install_node` ->
-  `restart_comfyui`. `nodes(action="search")` cannot answer this — it only ever finds
-  classes already installed. A `workflow_deps` key that is a repo URL rather
+  `restart_comfyui`. `nodes(action="search")` only searches its selected
+  `object_info` catalog; live is default. A `workflow_deps` key that is a repo URL rather
   than a registry id is NOT installable by `install_node`; hand those to the
   USER. A missing MODEL is `download_model`.
 - Manage in-flight work with `job(action="queue")` (list jobs) and
@@ -158,8 +167,9 @@ flows:
 Argument naming is uniform across the tool surface — do not guess it: input
 workflow files use `workflow_path` (`run_workflow`, `validate_workflow`,
 `list_workflow_slots`, `list_workflow_notes`, `set_workflow_slot`,
-`vary_workflow`); output files use `out_path` (`fetch_template`,
-`partner_generate`, `emit_partner_workflow`); output directories use
+`vary_workflow`); catalogs use `object_info_path`; input media uses `media_path`
+(`preview_media`); output files use `out_path` (`fetch_template`, `partner_generate`,
+`emit_partner_workflow`, `preview_media`); output directories use
 `out_dir` (`fetch_outputs`, `vary_workflow`); registry lookup keys use `name`
 (`get_template`, `nodes`, `run_template`); job handles use `prompt_id`
 (`job`, `fetch_outputs`); and

@@ -90,19 +90,35 @@ def test_server_reads_the_comfyui_vars_and_not_comfy_local_url():
             f"{ours} is no longer read"
         )
 
+    # COMFY_LOCAL_URL is comfy-cli's variable: this server never PARSES it. The
+    # one sanctioned read is target.py's set-or-unset presence check, so the
+    # Comfy Desktop port-lock fallback can stand down (a forwarded --host/--port
+    # outranks it in comfy-cli and would silently retarget a configured session).
     for name, source in sources.items():
+        if name == "target.py":
+            continue
         assert not _reads_env(source, "COMFY_LOCAL_URL"), (
             f"{name} now reads COMFY_LOCAL_URL directly — it is comfy-cli's "
             "variable, and the README's ownership split (and the decision not to "
             "rename it) assumes the passthrough, not a direct read"
         )
+    target_src = sources["target.py"]
+    assert len(re.findall(r"environ\.get\(\s*[\"']COMFY_LOCAL_URL", target_src)) == 1, (
+        "target.py may read COMFY_LOCAL_URL exactly once, as a presence check"
+    )
+    assert not re.search(
+        r"COMFY_LOCAL_URL[\"']\s*[,)]\s*[\"'][^\"']+[\"']\s*\)\s*(?:\.|\[)(?!strip\(\)\))",
+        target_src,
+    ), "target.py must not parse COMFY_LOCAL_URL"
 
 
 def test_section_names_the_owner_of_each_variable(section: str):
     """A reader has to be able to tell which program reads which variable."""
     assert "COMFYUI_URL" in section and "COMFY_LOCAL_URL" in section
     assert "comfy-cli" in section, "the section no longer names COMFY_LOCAL_URL's owner"
-    assert "never reads it" in section, "the 'not read by this server' claim is gone"
+    assert "never *interprets* it" in section, (
+        "the 'not parsed by this server' claim is gone"
+    )
 
 
 def test_section_states_that_neither_variable_is_deprecated(section: str):

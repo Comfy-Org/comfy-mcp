@@ -96,7 +96,7 @@ Issues = "https://github.com/Comfy-Org/comfy-mcp/issues"
 # A range spanning that change cannot be green on both, so pin past it: a lint
 # toolchain whose verdicts differ by patch release is the exact problem the
 # pinned rule selection exists to prevent.
-dev = ["pytest>=8", "ruff>=0.16,<0.17"]
+dev = ["pytest>=8", "ruff>=0.16,<0.18"]
 
 [project.scripts]
 comfy-mcp = "comfy_mcp.server:main"

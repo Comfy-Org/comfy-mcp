@@ -56,8 +56,25 @@ from comfy_mcp import failure_log, server, target
 
 @pytest.fixture(autouse=True)
 def _skip_version_guard(monkeypatch):
-    """Neutralize the once-per-process comfy-cli version guard for unit tests."""
+    """Neutralize the once-per-process comfy-cli version guard for unit tests.
+
+    Both halves of the guard's module state are reset, not just the latch.
+    ``_comfy_cli_version`` caches the version the guard last PARSED, and the
+    dedicated guard tests below re-enable the guard and let it write that global
+    for real — via ``global``, which `monkeypatch` cannot see. Without this
+    second `setattr` recording (and so restoring) it, a faked 1.14.0 in
+    `test_wrapper.py` would leak into every later test in the session, and the
+    readers that gate on a HIGHER floor — `job(action="watch")`, which needs
+    1.16.0 — would refuse in tests that never mentioned a version at all.
+
+    ``_version_invalidated_at`` is reset for the same leak, one step removed: it
+    is what rate-limits `_invalidate_version_cache`, so an un-latch left stamped
+    by an earlier test would silently turn a later test's invalidation into a no-op
+    depending only on how fast the suite ran.
+    """
     monkeypatch.setattr(server, "_version_checked", True)
+    monkeypatch.setattr(server, "_comfy_cli_version", None)
+    monkeypatch.setattr(server, "_version_invalidated_at", None)
 
 
 @pytest.fixture(autouse=True)
@@ -392,7 +409,9 @@ class _FakeRunProc:
         self.returncode = -9
 
 
-def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_spawn):
+def _canonical_run(
+    calls: list[dict], *, stdout, returncode, stderr, raises, on_spawn, replies=None
+):
     """The one ``subprocess.Popen`` stand-in for the plain (non-streaming) path.
 
     Its parameter list mirrors ``_run_comfy_raw``'s exact ``subprocess.Popen``
@@ -410,6 +429,11 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
     see ``server._project_root``), and ``proc`` is the spawned
     :class:`_FakeRunProc` (absent when the spawn itself raised).
 
+    ``replies`` optionally supplies one stdout body or exception per spawn. It
+    drives fallback tests where successive comfy-cli calls must answer
+    differently; exhausting it fails at the unexpected call instead of silently
+    replaying the last result.
+
     ``on_spawn(cmd)`` models the SIDE EFFECT of a verb whose real answer is not
     its stdout: ``comfy node deps-in-workflow`` writes its manifest to the
     ``--output`` path it was handed, and a fake that only cans stdout would
@@ -418,6 +442,7 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
     a ``Popen`` that never returned wrote nothing either.
     """
     canned_stdout, canned_stderr = stdout, stderr
+    pending = iter(replies) if replies is not None else None
 
     def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session, cwd):
         record = {
@@ -430,18 +455,31 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
             "cwd": cwd,
         }
         calls.append(record)
-        if raises is not None and _raises_at_spawn(raises):
-            raise raises
+        current_stdout, current_raises = canned_stdout, raises
+        if pending is not None:
+            try:
+                reply = next(pending)
+            except StopIteration:
+                raise AssertionError(
+                    f"unexpected extra comfy-cli call: {cmd}"
+                ) from None
+            if isinstance(reply, BaseException):
+                current_stdout, current_raises = "", reply
+            else:
+                current_stdout = json.dumps(reply) if isinstance(reply, dict) else reply
+                current_raises = None
+        if current_raises is not None and _raises_at_spawn(current_raises):
+            raise current_raises
         _encode_argv_like_posix(cmd)
         if on_spawn is not None:
             on_spawn(cmd)
         return _FakeRunProc(
             cmd,
             record,
-            stdout=canned_stdout,
+            stdout=current_stdout,
             stderr=canned_stderr,
             returncode=returncode,
-            raises=raises,
+            raises=current_raises,
         )
 
     return fake
@@ -451,8 +489,8 @@ def _canonical_run(calls: list[dict], *, stdout, returncode, stderr, raises, on_
 def patched_run(monkeypatch):
     """Patch ``shutil.which`` + ``subprocess.Popen`` for the plain ``--json`` path.
 
-    Returns ``setup(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) ->
-    calls``:
+    Returns ``setup(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…,
+    replies=…) -> calls``:
 
     * ``stdout`` — a dict (JSON-encoded for you, the common case: pass an
       :func:`envelope`) or a raw string; defaults to an empty-``data`` success
@@ -464,6 +502,8 @@ def patched_run(monkeypatch):
     * ``on_spawn`` — a callable handed the spawned argv, for a verb whose real
       output is a FILE rather than stdout (``node deps-in-workflow`` writes to
       its ``--output`` path). See :func:`_canonical_run`.
+    * ``replies`` — stdout bodies or exceptions consumed once per spawn. Use it
+      when a compatibility fallback must receive different successive answers.
 
     ``calls`` is the live list every invocation is recorded into, for the exact
     argv assertions this suite is built on.
@@ -476,7 +516,10 @@ def patched_run(monkeypatch):
         stderr: str = "",
         raises=None,
         on_spawn=None,
+        replies=None,
     ):
+        if replies is not None and (stdout is not None or raises is not None):
+            raise ValueError("pass replies instead of stdout or raises")
         if stdout is None:
             stdout = envelope()
         if isinstance(stdout, dict):
@@ -493,6 +536,7 @@ def patched_run(monkeypatch):
                 stderr=stderr,
                 raises=raises,
                 on_spawn=on_spawn,
+                replies=replies,
             ),
         )
         return calls

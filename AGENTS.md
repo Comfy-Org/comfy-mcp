@@ -94,8 +94,8 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-The local differentiator: discovery (`nodes`, `search_models`) reads the **live install** —
-custom nodes included — not a static catalog.
+Local differentiators: discovery (`nodes`, `search_models`) reads the **live install**, custom nodes
+included (`nodes` can take a saved `object_info`); `preview_media` returns comfy-cli's PNG inline.
 
 ## Module layout
 
@@ -112,7 +112,7 @@ under it — none imports `server`, so the dependency edges only ever point one 
 | `errors.py` | `ComfyCliError`; the "nothing recorded to stop" detector; the `error.details` renderer + per-field char cap |
 | `clitext.py` | comfy-cli **human-output** parsing for verbs with no envelope — `Saved:`-block/install-failure extraction, `plain_ok` synthesis, missing-verb/-option probes, `install_node`'s per-pack verdict, echoed-argv forgery guards. Its extractors are the documented cm-cli contract (see architecture rule above) — move or edit byte-for-byte |
 | `argv.py` | argument-injection and OS-limit guards for every tool-facing string headed for `subprocess`: shared primitives plus per-domain guards (workflow path, prompt id, download id, extra args, version, node names, log port, model path/filename, upload paths) |
-| `target.py` | remote-target resolution/redaction/provenance for run/job tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, divergence notes on `system_stats`/`free_memory` so an agent doesn't gate a remote run on local numbers, and — only when neither `COMFYUI_URL` nor `COMFYUI_HOST` is set — the Comfy Desktop port-lock fallback (`_comfy_desktop_port_locks_dir`/`_pid_is_alive`/`_discover_comfy_desktop_port`): a same-machine, submit/job-only default resolved from Desktop's own `port-locks` directory when exactly one live instance is found, never from `COMFY_LOCAL_URL` or comfy-cli's own resolution |
+| `target.py` | remote-target resolution/redaction/provenance for run/job tools — `COMFYUI_URL`/`HOST`/`PORT` parsing, `--host`/`--port` forwarding, the local-only `download_model` refusal, divergence notes on `system_stats`/`free_memory` (and on `stop_comfyui`'s "nothing recorded") so an agent doesn't gate a remote run on local numbers, and — only when no explicit target (`COMFYUI_URL`/`COMFYUI_HOST`, or a configured `COMFY_LOCAL_URL`) is set — the Comfy Desktop port-lock fallback (`_comfy_desktop_port_locks_dir`/`_pid_is_alive`/`_discover_comfy_desktop_port`): a same-machine, submit/job-only default resolved from Desktop's own `port-locks` directory when exactly one live instance is found; classified local in every remote-only guard |
 | `params.py` | param/slot marshaling into comfy-cli argv for `generate`/`run-template`/`set-slot`/`vary`, incl. the structured slot machinery — `SlotOverride`/`SlotVariants` are this module's public TYPES (carve-out below) |
 | `cli.py` | the console script's own argv surface — the `--help` / `--version` text a HUMAN who types `comfy-mcp` in a terminal gets, plus the installed-metadata version lookup (`_version`) behind it. That lookup is the SINGLE answer to "which release is this?": `server._server_version` delegates to it for the handshake's `serverInfo.version`, so the string a client displays is the string the terminal prints |
 
@@ -151,10 +151,10 @@ has its own file. Add a tool's test with it.
 They mirror how `server` spawns the CLI: a spawn-signature change is one edit, not a sweep:
 
 - `envelope(ok=…, data=…, error=…)` — build an `envelope/1` body.
-- `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…) -> calls` — the plain
-  `--json` path (`subprocess.run`); `calls` records `cmd`/`env`/`timeout`/`encoding` per
-  call for exact-argv checks; `on_spawn(cmd)` fires at spawn so the one verb whose answer is
-  a FILE writes its `--output`.
+- `patched_run(stdout=…, returncode=…, stderr=…, raises=…, on_spawn=…, replies=…) -> calls` — the plain
+  `--json` path (`subprocess.Popen` + bounded `communicate`); `calls` records `cmd`/`env`/
+  `timeout`/`encoding` per call for exact-argv checks; `on_spawn(cmd)` fires at spawn so the one
+  verb whose answer is a FILE writes its `--output`.
 - `patched_plain_run(returncode, stdout, stderr) -> calls` — same, for verbs that print
   human text with no envelope (`launch`/`stop`/`generate`).
 - `patched_stream(stdout_text) -> procs` — the `--json-stream` NDJSON path
@@ -171,17 +171,17 @@ They mirror how `server` spawns the CLI: a spawn-signature change is one edit, n
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool for async
-callers); anything STREAMING or long-lived spawns via `asyncio.create_subprocess_exec` —
-nothing blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two async
-runners live there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a
-plain-JSON twin of `_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread`
-worker, so a client giving up left the child running; it carries the longest-lived children
-(foreground `model download`, `workflow_deps`, `upload_file`). Each stream keeps only a
-`_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
+callers); anything STREAMING or long-lived spawns via `asyncio.create_subprocess_exec` — nothing
+blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two async runners live
+there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON twin of
+`_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread` worker, so a client
+giving up left the child running; it carries the longest-lived children (foreground `model
+download`, `workflow_deps`, `upload_file`, `job("watch")`'s status polls). Each stream keeps
+only a `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 
 A local stub is justified only where the call genuinely differs — the `comfy --version` probe
-(its own kwargs), multi-call sequenced replies, and `test_wrapper.py`'s `_StderrBlockingProc`
+(its own kwargs) and `test_wrapper.py`'s `_StderrBlockingProc`
 (stdout EOFs fast while `stderr.read()` blocks, which neither streaming fixture models).
 
 ## Destined-public hygiene
