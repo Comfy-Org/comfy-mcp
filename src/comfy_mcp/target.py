@@ -1,9 +1,9 @@
-"""Remote-target resolution, redaction, and provenance for the run/job tools.
+"""Remote-target resolution, redaction, and provenance for target-aware tools.
 
 Leaf module over :mod:`comfy_mcp.errors` and :mod:`comfy_mcp.textutil`: it owns
-everything about pointing the run/job tools (``run_workflow``, ``run_template``,
-``generate_image``, the ``jobs``/``upload`` verbs) at a ComfyUI running
-ELSEWHERE via ``COMFYUI_URL`` / ``COMFYUI_HOST`` (+ optional ``COMFYUI_PORT``)
+everything about pointing target-aware tools (``run_workflow``, ``run_template``,
+``generate_image``, the ``jobs``/``upload``/``nodes``/``validate`` verbs) at a
+ComfyUI running ELSEWHERE via ``COMFYUI_URL`` / ``COMFYUI_HOST`` (+ optional ``COMFYUI_PORT``)
 instead of the implicit local default — resolution (:func:`_comfy_target`),
 the ``--host``/``--port`` forward (:func:`_with_target`), userinfo/credential
 redaction on the way back to the client (:func:`_redact_config_url`,
@@ -59,9 +59,9 @@ REMOTE_SHARED_MODELS_ENV = "COMFY_MCP_REMOTE_SHARED_MODELS"
 _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
-# run``, ``comfy run-template``, every ``comfy jobs`` subcommand, and ``comfy
-# upload`` — every verb that SUBMITS a job, reads one back, or stages the files
-# a job will read, which is the set that has to agree on which server it is
+# run``, ``comfy run-template``, every ``comfy jobs`` subcommand, ``comfy
+# upload``, ``comfy nodes`` and ``comfy validate`` — every verb that submits or
+# reads a job, stages its inputs, or checks its node catalog must agree on the server it is
 # talking to. ``run`` / ``jobs`` / ``upload`` are the set comfy-cli's
 # ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
 # options and resolves them through that module's own ``resolve_host_port``
@@ -122,14 +122,16 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 #     files, because it resolves the ``prompt_id`` from the state file this
 #     machine wrote at submit (which records absolute ``/view`` URLs on the
 #     remote) instead of asking a server — see ``fetch_outputs``.
-#   * ``nodes`` / ``validate`` DO accept ``--host`` / ``--port`` in current
-#     comfy-cli, but remoting live discovery/validation is out of scope here;
-#     forwarding them is a clean follow-up. Their local answers are advisory —
-#     ``run_workflow`` and ``run_template`` already submit to a remote whose node
-#     set a local check cannot see.
+#
+# ``nodes`` / ``validate`` accept both options in comfy-cli >= 1.14.0 (this
+# server's floor). Forward them too so live discovery and pre-flight checks,
+# including fetch_template/get_template's validate call, inspect the same
+# catalog that a later run will use. Template fetching itself stays local.
 # Forwarding is a no-op for the local default regardless, so unconfigured
 # behavior is unchanged for every tool.
-_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "run-template", "jobs", "upload"})
+_TARGET_AWARE_SUBCOMMANDS = frozenset(
+    {"run", "run-template", "jobs", "upload", "nodes", "validate"}
+)
 
 
 def _strip_brackets(host: str) -> str:
@@ -342,8 +344,7 @@ def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
-    The flags are injected into the SUBCOMMAND args (after the ``run`` /
-    ``run-template`` / ``jobs`` / ``upload`` verb), never into the global
+    The flags are injected into the SUBCOMMAND args, never into the global
     ``--json`` / ``--where`` prefix, since ``--host`` / ``--port`` are
     subcommand options. A no-op for the local default (``_comfy_target`` is
     None) and for any subcommand that doesn't accept the flags (see

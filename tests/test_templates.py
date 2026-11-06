@@ -516,6 +516,142 @@ def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
     assert len(calls) == 1  # no validate call when the check is skipped
 
 
+def test_fetch_template_checks_the_configured_catalog(
+    monkeypatch, patched_run, tmp_path
+):
+    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_PORT", "9001")
+    calls = patched_run(envelope(data={"valid": True, "errors": []}))
+    out = tmp_path / "flux.json"
+
+    result = server.fetch_template("flux_dev", str(out))
+
+    assert calls[0]["cmd"][4:] == ["templates", "fetch", "flux_dev", "--out", str(out)]
+    assert calls[1]["cmd"][4:] == [
+        "validate",
+        "--workflow",
+        str(out),
+        "--host",
+        "gpu.example",
+        "--port",
+        "9001",
+    ]
+    assert result["local_check"]["runnable"] is True
+
+
+@pytest.mark.parametrize("tool", ["fetch", "get"])
+@pytest.mark.parametrize("outcome", ["unavailable", "missing_nodes"])
+@pytest.mark.parametrize(
+    "target_env, target_flags",
+    [
+        ({}, []),
+        (
+            {"COMFYUI_URL": "http://gpu.example:9001"},
+            ["--host", "gpu.example", "--port", "9001"],
+        ),
+        (
+            {"COMFYUI_HOST": "[2001:db8::1]", "COMFYUI_PORT": "9002"},
+            ["--host", "2001:db8::1", "--port", "9002"],
+        ),
+        (
+            {"COMFYUI_HOST": "127.0.0.1"},
+            ["--host", "127.0.0.1", "--port", "8188"],
+        ),
+    ],
+    ids=["local", "url", "ipv6-host", "explicit-loopback"],
+)
+def test_template_repair_guidance_follows_the_checked_target(
+    monkeypatch, patched_run, tmp_path, tool, outcome, target_env, target_flags
+):
+    """Both entry points relay repair advice for the catalog they actually checked."""
+    for name, value in target_env.items():
+        monkeypatch.setenv(name, value)
+    finding = {"node_id": "12", "code": "missing_node_type", "message": "missing Foo"}
+    response = (
+        envelope(ok=False, error={"code": "cql_no_graph", "message": "no object_info"})
+        if outcome == "unavailable"
+        else envelope(ok=False, data=_report(valid=False, errors=[finding]))
+    )
+    validation_batches = []
+
+    def after_fetch(cmd):
+        # Keep the shared spawn fixture for both replies: template fetch succeeds,
+        # then the real validation wrapper unwraps the failure envelope.
+        if cmd[4:6] == ["templates", "fetch"]:
+            validation_batches.append(patched_run(response, returncode=1))
+
+    template_calls = patched_run(envelope(data={}), on_spawn=after_fetch)
+    if tool == "fetch":
+        out = tmp_path / "flux.json"
+        result = server.fetch_template("flux_dev", str(out))
+        assert result["path"] == str(out)
+    else:
+        result = server.get_template("flux_dev")
+
+    assert len(template_calls) == (1 if tool == "fetch" else 2)
+    assert all(call["cmd"][4] == "templates" for call in template_calls)
+    assert len(validation_batches) == 1
+    assert len(validation_batches[0]) == 1
+    cmd = validation_batches[0][0]["cmd"]
+    assert cmd[4:6] == ["validate", "--workflow"]
+    assert cmd[7:] == target_flags  # No lifecycle/update child was spawned.
+    check = result["local_check"]
+    summary = check["summary"]
+    if outcome == "unavailable":
+        assert check["checked"] is False
+        assert check["reason"] == "check_unavailable"
+        assert "runnable" not in check
+        assert "cql_no_graph" in summary
+        if target_env:
+            assert "Start ComfyUI on the configured remote target" in summary
+        else:
+            assert summary.split("Details: ", 1)[0] == (
+                "could not check this template against your ComfyUI install "
+                "(the live node catalog was unreachable — the server may not be "
+                "running). The template was still written. Start ComfyUI with "
+                "`launch_comfyui`, then re-check with "
+                "`validate_workflow(workflow_path=...)`. "
+            )
+    else:
+        assert check["checked"] is True
+        assert check["runnable"] is False
+        assert check["error_count"] == 1
+        assert check["errors"] == ["node 12: missing Foo"]
+        if target_env:
+            assert (
+                "Update ComfyUI and its custom nodes on the configured remote target"
+                in summary
+            )
+        else:
+            assert summary == (
+                "1 problem(s): this template needs a node class or an input option "
+                "your ComfyUI install does not have — a template served from the "
+                "gallery can be newer than your install. Update ComfyUI and its "
+                "custom nodes (`update_comfyui`), or pick another template. "
+                "First: node 12: missing Foo"
+            )
+    if target_env:
+        assert "launch_comfyui" not in summary
+        assert "update_comfyui" not in summary
+
+
+@pytest.mark.parametrize("url", ["https://gpu.example", "http://[2001:db8::1"])
+def test_template_bad_target_does_not_recommend_local_repair(
+    monkeypatch, patched_run, url
+):
+    monkeypatch.setenv("COMFYUI_URL", url)
+    calls = patched_run()
+
+    check = server._local_template_check("workflow.json")
+
+    assert calls == []
+    assert check["checked"] is False
+    assert check["reason"] == "check_unavailable"
+    assert "COMFYUI_URL" in check["summary"]
+    assert "launch_comfyui" not in check["summary"]
+    assert "update_comfyui" not in check["summary"]
+
+
 def test_fetch_template_resolves_relative_path(monkeypatch):
     """A relative out_path is returned as an absolute path (ready for run_workflow)."""
     monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: None)

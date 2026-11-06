@@ -46,6 +46,42 @@ def test_nodes_search_is_the_default_action(patched_run):
     assert calls[0]["cmd"][4:] == ["nodes", "search", "sampler"]
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "cli_args"),
+    [
+        ({"query": "sampler"}, ["search", "sampler"]),
+        ({"action": "get", "name": "KSampler"}, ["show", "KSampler"]),
+        ({"action": "list"}, ["ls"]),
+        ({"action": "upstream", "name": "KSampler"}, ["upstream", "KSampler"]),
+        ({"action": "downstream", "name": "KSampler"}, ["downstream", "KSampler"]),
+        (
+            {"action": "path", "from_type": "MODEL", "to_type": "IMAGE"},
+            ["path", "MODEL", "IMAGE", "--max-depth", "6", "--max-paths", "10"],
+        ),
+        ({"action": "types"}, ["types"]),
+        ({"action": "categories"}, ["categories"]),
+    ],
+)
+def test_nodes_use_the_configured_catalog(monkeypatch, patched_run, kwargs, cli_args):
+    monkeypatch.setenv("COMFYUI_URL", "http://[2001:db8::1]:9001")
+    data = {"mode": "exact", "paths": []}
+    calls = patched_run(envelope(data=data))
+
+    assert server.nodes(**kwargs) == data
+    assert calls[0]["cmd"] == [
+        server.COMFY_BIN,
+        "--json",
+        "--where",
+        "local",
+        "nodes",
+        *cli_args,
+        "--host",
+        "2001:db8::1",
+        "--port",
+        "9001",
+    ]
+
+
 # `nodes`' leading-dash + NUL rejection is covered for the whole family by
 # `test_nodes_reject_option_like_positionals` and
 # `test_nodes_reject_embedded_nul` below (landed on main in #86, regrouped in
