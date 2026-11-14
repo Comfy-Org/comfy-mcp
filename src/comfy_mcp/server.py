@@ -60,6 +60,7 @@ against a real comfy-cli install and a running local ComfyUI.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import errno
 import functools
@@ -6953,11 +6954,43 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 # suffix would fall back to ``application/octet-stream`` and not render).
 _INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
+# Audio/video outputs ComfyUI saves. Audio that fits the budget rides back as an
+# MCP ``AudioContent`` block; video has no MCP content type, so a small clip is a
+# base64 data URL on its ``structuredContent`` record instead. Both — and any file
+# past the budget — always get a manifest record so the on-disk copy is reachable
+# even when its bytes are not base64'd.
+_INLINE_AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus")
+_INLINE_VIDEO_SUFFIXES = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v")
+
+# Explicit, OS-independent media types for the manifest + any data URL (stdlib
+# ``mimetypes`` varies by host and this payload is protocol-visible).
+_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".opus": "audio/opus",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".m4v": "video/x-m4v",
+}
+
 # Bounds on what ``fetch_outputs(inline_images=True)`` base64-inlines into the
 # reply, mirroring the module's other output caps (``_TRACEBACK_TAIL_MAX_CHARS``,
 # ``_EXCEPTION_TEXT_MAX_CHARS``): a big batch or high-res render must not force an
 # unbounded allocation / blow the agent's context. The on-disk copies in
-# ``out_dir`` are untouched — only the inline preview is capped.
+# ``out_dir`` are untouched — only the inline preview is capped. The cap is one
+# shared budget across images, audio and video (see ``_render_output_media``).
 _INLINE_IMAGE_MAX_COUNT = 8
 _INLINE_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 
@@ -6979,24 +7012,44 @@ def _is_within(root: str, path: str) -> bool:
     return path == root or path.startswith(root + os.sep)
 
 
-def _collect_output_images(data: Any, out_dir: str) -> list[str]:
-    """Resolve image files referenced by ``comfy download``'s data to on-disk paths.
+def _media_kind(name: str) -> str | None:
+    """Classify ``name`` by suffix as ``"image"`` / ``"audio"`` / ``"video"``, else None."""
+    lower = name.lower()
+    if lower.endswith(_INLINE_IMAGE_SUFFIXES):
+        return "image"
+    if lower.endswith(_INLINE_AUDIO_SUFFIXES):
+        return "audio"
+    if lower.endswith(_INLINE_VIDEO_SUFFIXES):
+        return "video"
+    return None
 
-    Walks every string in the envelope ``data``, keeps those with an image
-    suffix, and returns the ones that resolve to a real file **inside**
-    ``out_dir`` (deduped, order-preserving). ``comfy download -o out_dir`` writes
-    every file it produces into ``out_dir``, so scoping to that directory is what
-    keeps the inline preview honest: a bare/relative name binds to the copy just
-    written rather than a same-named file in the process CWD, and an absolute or
-    ``../``-traversal path that escapes ``out_dir`` (an input reference, a URL
-    basename, or an outright traversal in the metadata) is rejected instead of
-    read and inlined. Inline return is best-effort and never masks the on-disk
-    copy.
+
+def _media_type(path: str) -> str:
+    """The manifest/data-URL media type for ``path`` by suffix (octet-stream if unknown)."""
+    return _MEDIA_TYPES.get(
+        os.path.splitext(path)[1].lower(), "application/octet-stream"
+    )
+
+
+def _collect_output_media(data: Any, out_dir: str) -> list[tuple[str, str]]:
+    """Resolve media files referenced by ``comfy download``'s data to on-disk paths.
+
+    Walks every string in the envelope ``data``, keeps those with an image, audio
+    or video suffix, and returns ``(realpath, kind)`` for the ones that resolve to
+    a real file **inside** ``out_dir`` (deduped, order-preserving). ``comfy
+    download -o out_dir`` writes every file it produces into ``out_dir``, so
+    scoping to that directory is what keeps the manifest honest: a bare/relative
+    name binds to the copy just written rather than a same-named file in the
+    process CWD, and an absolute or ``../``-traversal path that escapes
+    ``out_dir`` (an input reference, a URL basename, or an outright traversal in
+    the metadata) is rejected instead of read and surfaced. This is best-effort
+    and never masks the on-disk copy.
     """
     out_root = os.path.realpath(out_dir)
-    resolved: dict[str, None] = {}
+    resolved: dict[str, str] = {}
     for value in _iter_strings(data):
-        if not value.lower().endswith(_INLINE_IMAGE_SUFFIXES):
+        kind = _media_kind(value)
+        if kind is None:
             continue
         # Most-specific form first (the value as given, then joined onto out_dir,
         # then bare basename in out_dir) — but every candidate must resolve to a
@@ -7010,9 +7063,9 @@ def _collect_output_images(data: Any, out_dir: str) -> list[str]:
         ):
             real = os.path.realpath(candidate)
             if _is_within(out_root, real) and os.path.isfile(real):
-                resolved.setdefault(real, None)
+                resolved.setdefault(real, kind)
                 break
-    return list(resolved)
+    return list(resolved.items())
 
 
 def _select_inline_images(paths: list[str]) -> list[str]:
@@ -7021,6 +7074,8 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     Preserves order and stops as soon as either bound would be exceeded, so a
     large batch or a high-res render can't force an unbounded base64 payload into
     the reply. Unreadable files are skipped (the on-disk copy still stands).
+    Used by ``preview_media`` for its single rendered PNG; ``fetch_outputs`` uses
+    ``_render_output_media`` instead, which spans media kinds.
     """
     selected: list[str] = []
     total = 0
@@ -7036,6 +7091,73 @@ def _select_inline_images(paths: list[str]) -> list[str]:
         selected.append(path)
         total += size
     return selected
+
+
+def _read_b64(path: str) -> str | None:
+    """Base64 of ``path``'s bytes, or None if it can't be read (on-disk copy stands)."""
+    try:
+        with open(path, "rb") as handle:
+            return base64.b64encode(handle.read()).decode()
+    except OSError:
+        return None
+
+
+def _render_output_media(
+    media: list[tuple[str, str]],
+) -> tuple[list[types.ContentBlock], list[dict[str, Any]]]:
+    """Split collected media into inline content blocks and a ``structuredContent`` manifest.
+
+    One shared budget (``_INLINE_IMAGE_MAX_COUNT`` files, ``_INLINE_IMAGE_MAX_BYTES``
+    aggregate raw bytes) spans every kind, so a leading large file can't starve
+    the rest — each file is inlined only while both bounds still hold. EVERY file
+    gets a manifest record (on-disk path, media type, byte size, ``inline`` flag),
+    which is what lifts the path out of the metadata JSON. What rides inline
+    differs by kind: an image/audio clip that fits comes back as an MCP content
+    block (its bytes there, not duplicated on the record); a video that fits has
+    no MCP content type, so its bytes ride as a base64 data URL ON the record;
+    anything that doesn't fit is a path-only, ResourceLink-style record the client
+    reads off disk. The content block's media type is the manifest's, so the two
+    never disagree. The caps are preserved exactly — the 9th image, or the file
+    that would cross the byte budget, is recorded rather than inlined.
+    """
+    blocks: list[types.ContentBlock] = []
+    records: list[dict[str, Any]] = []
+    total = 0
+    count = 0
+    for path, kind in media:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        media_type = _media_type(path)
+        record: dict[str, Any] = {
+            "path": path,
+            "media_type": media_type,
+            "bytes": size,
+            "inline": False,
+        }
+        # First file is always allowed (even if it alone exceeds the byte cap),
+        # matching `_select_inline_images`; later ones stop at either bound.
+        fits = count < _INLINE_IMAGE_MAX_COUNT and (
+            count == 0 or total + size <= _INLINE_IMAGE_MAX_BYTES
+        )
+        encoded = _read_b64(path) if fits else None
+        if encoded is not None:
+            record["inline"] = True
+            count += 1
+            total += size
+            if kind == "image":
+                blocks.append(
+                    types.ImageContent(type="image", data=encoded, mime_type=media_type)
+                )
+            elif kind == "audio":
+                blocks.append(
+                    types.AudioContent(type="audio", data=encoded, mime_type=media_type)
+                )
+            else:  # video — no MCP content type, so it rides as a data URL
+                record["data_url"] = f"data:{media_type};base64,{encoded}"
+        records.append(record)
+    return blocks, records
 
 
 # The docstring below says "not in _TARGET_AWARE_SUBCOMMANDS" without a module
@@ -7060,8 +7182,9 @@ def fetch_outputs(
     ``_TARGET_AWARE_SUBCOMMANDS``: the submitting run's local state file maps
     ``prompt_id`` to output URLs. An unknown local id has no record.
 
-    ``inline_images=True`` appends bounded MCP images to the metadata. Disk
-    copies remain uncapped.
+    ``inline_images=True`` adds bounded MCP media (images, small audio) plus a
+    ``structuredContent`` manifest of every output's path/type/size; a small video
+    rides as a data URL there, over-cap files as path-only records. Disk uncapped.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
@@ -7089,9 +7212,16 @@ def fetch_outputs(
     # a previous run into ``out_dir`` (which would contradict the docstring).
     if not inline_images or url_only:
         return data
-    paths = _select_inline_images(_collect_output_images(data, preview_dir))
-    images = [Image(path=path) for path in paths]
-    return [data, *images]
+    blocks, records = _render_output_media(_collect_output_media(data, preview_dir))
+    # A `CallToolResult` is how this verb carries BOTH content blocks and a
+    # `structuredContent` manifest — a bare list return produces only the former.
+    # `fetch_outputs` returns `Any`, so the SDK validates no output schema and
+    # passes this through unchanged (see `convert_result`).
+    content: list[types.ContentBlock] = [
+        types.TextContent(type="text", text=json.dumps(data, indent=2, default=str)),
+        *blocks,
+    ]
+    return types.CallToolResult(content=content, structured_content={"media": records})
 
 
 def _preview_image_path(data: Any) -> str | None:
