@@ -34,6 +34,7 @@ import asyncio
 
 import pytest
 from conftest import envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -66,11 +67,24 @@ class _FakeCtx:
     so a change to the spend or version prompt cannot silently retune these.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
+        # This gate fires MID-SEQUENCE, after the stop half has run, so it is the
+        # one gate that cannot round-trip an `InputRequiredResult` (a retry would
+        # re-run the stop). On 2026-07-28 it therefore fails closed rather than
+        # asking; these doubles carry the version so that path can be exercised.
+        self.protocol_version = protocol_version
+        self.input_responses = None
+        self.request_state = None
 
     async def elicit(self, message, schema):
         self.elicitations.append(message)
@@ -242,6 +256,46 @@ def test_a_foreign_command_line_cannot_redress_the_prompt(clash):
 
 
 # --- refusals: nothing is killed, and the error says what is on the port -----
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize("volunteered_answer", [False, True])
+def test_input_required_transport_fails_the_kill_gate_closed(
+    clash, confirm, volunteered_answer
+):
+    """2026-07-28 cannot round-trip THIS gate — it fires after the stop half.
+
+    Every other gate on 2026-07-28 carries its question out as the tool's
+    `InputRequiredResult` and is answered on a retry; this one cannot, because a
+    retry would re-run the stop-then-launch sequence. So it fails CLOSED — the
+    identity is still read (the dry-run probe), nobody is asked, nothing is
+    killed, and the caller gets the port-clash error plus the terminal guidance,
+    exactly as a client that could not be prompted does today.
+    """
+    state = clash([_dry_run()])
+    ctx = _FakeCtx(protocol_version="2026-07-28")
+    if volunteered_answer:
+        # A client cannot pre-approve a prompt this server never issued: an
+        # accept on the gate's key (with any state) is not even read.
+        key = server._consent_channel_key(server._KILL_UNTRACKED_APPROVAL_WORDING)
+        ctx.input_responses = {
+            key: types.ElicitResult(action="accept", content={"approve": True})
+        }
+        ctx.request_state = "anything"
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _restart(confirm_kill_untracked=confirm, ctx=ctx)
+
+    message = str(excinfo.value)
+    assert _PORT_TAKEN in message
+    assert "comfy stop --port 8188" in message  # the terminal escape hatch
+    # No retry can ever ask, so the guidance must not send the agent round it.
+    assert "call restart_comfyui again" not in message
+    assert "Retrying restart_comfyui will not change that" in message
+    assert ctx.elicitations == []  # no back-channel prompt was attempted
+    # The identity was read, but nothing was killed or relaunched.
+    assert state["runs"] == [("stop", "--port", "8188", "--dry-run")]
+    assert len(state["launches"]) == 1
 
 
 def test_declining_leaves_the_server_running_and_names_it(clash):

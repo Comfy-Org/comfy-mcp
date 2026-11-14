@@ -51,6 +51,7 @@ from unittest import mock
 
 import pytest
 from conftest import envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -58,6 +59,16 @@ from mcp.server.elicitation import (
 )
 
 from comfy_mcp import argv, clitext, instructions, server
+
+# The negotiated protocol revision on which `ctx.elicit()` has no back-channel, so
+# the install prompt must round-trip through the tool result.
+_INPUT_REQUIRED = "2026-07-28"
+
+
+def _answer(action, approve=False):
+    """One `ElicitResult` as it arrives on `ctx.input_responses` on the retry round."""
+    return types.ElicitResult(action=action, content={"approve": approve})
+
 
 # Captured before any test patches it, so the one test that wants the REAL
 # `comfy env` pre-flight can put it back and drive the probe end to end through
@@ -115,11 +126,25 @@ class _FakeCtx:
     retune these tests.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+        input_responses=None,
+        request_state=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
+        # The 2026-07-28 input-required transport: a negotiated version and the
+        # client's retry answers. Left `None` (the default) this is the handshake
+        # transport unchanged — `_elicit_approval` still uses `elicit`.
+        self.protocol_version = protocol_version
+        self.input_responses = input_responses
+        self.request_state = request_state
 
     async def elicit(self, message, schema):
         self.elicitations.append(message)
@@ -836,6 +861,171 @@ def test_the_prompt_is_raised_even_when_confirm_install_is_true(patched_plain_ru
     _install(["comfyui-impact-pack"], confirm_install=True, ctx=ctx)
 
     assert len(ctx.elicitations) == 1
+    assert len(calls) == 1
+
+
+# --- the 2026-07-28 input-required transport --------------------------------
+#
+# install_node prompts on EVERY call, so it is the cleanest demonstration that a
+# 2026-07-28 client is asked by RETRY rather than over a (now absent)
+# back-channel, and that nothing is installed until the retry carries a yes.
+
+
+def test_install_handshake_version_still_elicits(patched_plain_run):
+    """A negotiated 2025-11-25 keeps the back-channel `elicitation/create`."""
+    calls = patched_plain_run(0, stderr="done")
+    ctx = _FakeCtx(action="accept", approve=True, protocol_version="2025-11-25")
+
+    _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert len(ctx.elicitations) == 1
+    assert len(calls) == 1
+
+
+def test_install_input_required_first_round_asks_via_the_result(patched_plain_run):
+    """2026-07-28, no answer yet: return `input_required`, install nothing."""
+    calls = patched_plain_run(0, stderr="done")
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED, input_responses=None)
+
+    result = _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert isinstance(result, types.InputRequiredResult)
+    assert result.result_type == "input_required"
+    [request] = result.input_requests.values()
+    assert isinstance(request, types.ElicitRequest)
+    assert ctx.elicitations == []
+    assert calls == []
+
+
+def test_install_input_required_retry_with_approve_runs(patched_plain_run):
+    """The retry carries the client's `approve` answer: the install runs."""
+    calls = patched_plain_run(0, stderr="done")
+    pending = _install(
+        ["comfyui-impact-pack"], ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED)
+    )
+    [key] = pending.input_requests
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
+    )
+    _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert len(calls) == 1
+    assert ctx.elicitations == []
+
+
+@pytest.mark.parametrize(
+    ("action", "approve", "match"),
+    [
+        ("decline", False, "node install not confirmed"),  # said no
+        ("cancel", False, "did not present"),  # dismissed
+        ("accept", False, "node install not confirmed"),  # accepted without a yes
+    ],
+)
+def test_install_input_required_refusal_spawns_no_child(
+    patched_plain_run, action, approve, match
+):
+    """Decline, cancel, and a yes-less accept on the retry all install nothing."""
+    calls = patched_plain_run(0, stderr="done")
+    pending = _install(
+        ["comfyui-impact-pack"], ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED)
+    )
+    [key] = pending.input_requests
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer(action, approve=approve)},
+        request_state=pending.request_state,
+    )
+    with pytest.raises(server.ComfyCliError, match=match):
+        _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert calls == []
+
+
+def _pending_install(names):
+    """The first round: the `InputRequiredResult` and the key it asks on."""
+    pending = _install(names, ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED))
+    [key] = pending.input_requests
+    return pending, key
+
+
+def test_install_input_required_answer_without_a_prompt_is_ignored(
+    patched_plain_run,
+):
+    """A "yes" attached to a call nobody was prompted on re-asks, installs nothing.
+
+    The key is a fixed per-gate constant, so a client can fill it in on its very
+    FIRST call; only the `request_state` this server minted proves a prompt was
+    issued for this call.
+    """
+    calls = patched_plain_run(0, stderr="done")
+    _, key = _pending_install(["comfyui-impact-pack"])
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=None,
+    )
+    result = _install(["comfyui-impact-pack"], ctx=ctx)
+
+    assert isinstance(result, types.InputRequiredResult)
+    assert calls == []
+
+
+def test_install_input_required_answer_for_other_packs_is_ignored(
+    patched_plain_run,
+):
+    """A "yes" to one pack list does not authorize a different one on the retry."""
+    calls = patched_plain_run(0, stderr="done")
+    pending, key = _pending_install(["comfyui-impact-pack"])
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
+    )
+    result = _install(["comfyui-impact-pack", "some-other-pack"], ctx=ctx)
+
+    assert isinstance(result, types.InputRequiredResult)
+    assert calls == []
+
+
+def test_install_input_required_answer_is_honored_once(patched_plain_run):
+    """Replaying an answered prompt's state asks again instead of re-installing."""
+    calls = patched_plain_run(0, stderr="done")
+    pending, key = _pending_install(["comfyui-impact-pack"])
+
+    def _retry():
+        return _install(
+            ["comfyui-impact-pack"],
+            ctx=_FakeCtx(
+                protocol_version=_INPUT_REQUIRED,
+                input_responses={key: _answer("accept", approve=True)},
+                request_state=pending.request_state,
+            ),
+        )
+
+    _retry()
+    assert len(calls) == 1
+    assert isinstance(_retry(), types.InputRequiredResult)
+    assert len(calls) == 1
+
+
+def test_install_input_required_accepts_a_mapping_answer(patched_plain_run):
+    """An answer arriving as a plain mapping is read, not mistaken for a cancel."""
+    calls = patched_plain_run(0, stderr="done")
+    pending, key = _pending_install(["comfyui-impact-pack"])
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: {"action": "accept", "content": {"approve": True}}},
+        request_state=pending.request_state,
+    )
+    _install(["comfyui-impact-pack"], ctx=ctx)
+
     assert len(calls) == 1
 
 

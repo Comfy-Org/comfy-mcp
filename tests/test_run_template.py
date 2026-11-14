@@ -31,6 +31,7 @@ import json
 
 import pytest
 from conftest import _OK_STREAM, _RecordingCtx, envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -38,6 +39,16 @@ from mcp.server.elicitation import (
 )
 
 from comfy_mcp import server
+
+# The negotiated protocol revision on which `ctx.elicit()` has no back-channel, so
+# the spend prompt must round-trip through the tool result (see
+# `server._INPUT_REQUIRED_PROTOCOL`).
+_INPUT_REQUIRED = "2026-07-28"
+
+
+def _answer(action, approve=False):
+    """One `ElicitResult` as it arrives on `ctx.input_responses` on the retry round."""
+    return types.ElicitResult(action=action, content={"approve": approve})
 
 
 def _run_template(*args, **kwargs):
@@ -74,12 +85,26 @@ class _FakeCtx:
     would be pretending the two are separate objects.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+        input_responses=None,
+        request_state=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
         self.progress: list[dict] = []
+        # The 2026-07-28 input-required transport: a negotiated version and the
+        # client's retry answers, read by `_elicit_approval` instead of `elicit`.
+        # Left `None` (the default) this fake is the handshake transport unchanged.
+        self.protocol_version = protocol_version
+        self.input_responses = input_responses
+        self.request_state = request_state
 
     async def report_progress(self, progress, total=None, message=None):
         self.progress.append({"progress": progress, "total": total, "message": message})
@@ -402,6 +427,232 @@ def test_run_template_falls_back_to_confirm_spend_when_client_cannot_elicit(
 
     assert ctx.elicitations == []
     assert "--allow-spend" in calls[0]["cmd"]
+
+
+def test_run_template_handshake_version_still_elicits(patched_streamed_run):
+    """A negotiated 2025-11-25 keeps the back-channel `elicitation/create`."""
+    calls = patched_streamed_run()
+    ctx = _FakeCtx(action="accept", approve=True, protocol_version="2025-11-25")
+
+    _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=ctx
+    )
+
+    assert len(ctx.elicitations) == 1
+    assert "--allow-spend" in calls[0]["cmd"]
+
+
+# --- the 2026-07-28 input-required transport --------------------------------
+#
+# Once the client negotiates 2026-07-28 there is no back-channel for
+# `elicitation/create`, so the spend prompt is carried out as the tool's
+# `InputRequiredResult` and answered when the client RETRIES the call. The gate's
+# fail-closed verdict is identical to the handshake path's.
+
+
+def test_run_template_input_required_first_round_asks_via_the_result(
+    patched_streamed_run,
+):
+    """2026-07-28, no answer yet: return `input_required`, send no `elicitation/create`."""
+    calls = patched_streamed_run()
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED, input_responses=None)
+
+    result = _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+
+    assert isinstance(result, types.InputRequiredResult)
+    assert result.result_type == "input_required"
+    # The question rides the result, keyed for this gate; nothing was spent.
+    [(key, request)] = result.input_requests.items()
+    assert isinstance(request, types.ElicitRequest)
+    assert "SPENDS Comfy credits" in request.params.message
+    assert ctx.elicitations == []
+    assert calls == []
+
+
+def test_run_template_input_required_retry_with_approve_runs(patched_streamed_run):
+    """The retry carries the client's `approve` answer: the run is unlocked."""
+    calls = patched_streamed_run()
+    # Replay what the client sends on the retry — the answer keyed as the first
+    # round asked for it.
+    # The retry repeats the first round's arguments exactly: the SDK binds the
+    # sealed state to them, so an approval never covers a changed call.
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=first
+    )
+    [key] = pending.input_requests
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
+    )
+    _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=ctx
+    )
+
+    assert "--allow-spend" in calls[0]["cmd"]
+    assert ctx.elicitations == []
+
+
+def _approved_retry(pending):
+    [key] = pending.input_requests
+    return _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
+    )
+
+
+def test_run_template_input_required_answer_is_honored_once(patched_streamed_run):
+    """Replaying one prompt's sealed state + "yes" asks afresh, not a second run."""
+    calls = patched_streamed_run()
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    replay = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(pending)
+    )
+
+    assert isinstance(replay, types.InputRequiredResult)
+    assert len(calls) == 1
+
+
+def test_consumed_nonce_survives_a_full_cache(patched_streamed_run, monkeypatch):
+    """The size cap never forgets a nonce still inside the request-state TTL.
+
+    Count-based eviction would drop the oldest consumed nonce once the cache
+    filled — declined answers fill it too — and re-admit a replay of its sealed
+    state, still valid to the SDK, as a second run on one approval.
+    """
+    calls = patched_streamed_run()
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES", server.OrderedDict())
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES_MAX", 2)
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    for _ in range(3):  # overflow the cap with fresh, separately answered prompts
+        other = _run_template("api_seedance", confirm_spend=True, ctx=first)
+        _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(other))
+
+    replay = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(pending)
+    )
+
+    assert isinstance(replay, types.InputRequiredResult)
+    assert pending.request_state.rsplit(":", 1)[1] in server._CONSUMED_CONSENT_NONCES
+    # Only the two answers that fit ran; the overflow fails closed (asks afresh).
+    assert len(calls) == 2
+
+
+def test_consumed_nonce_is_forgotten_only_after_the_state_ttl(
+    patched_streamed_run, monkeypatch
+):
+    """Retention follows the policy's TTL: expired nonces are pruned, live ones kept."""
+    patched_streamed_run()
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES", server.OrderedDict())
+    clock = [1_000_000.0]
+    monkeypatch.setattr(server.time, "time", lambda: clock[0])
+    ttl = server._REQUEST_STATE_SECURITY.ttl
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    [nonce] = server._CONSUMED_CONSENT_NONCES
+
+    clock[0] += ttl - 1  # still inside the TTL: retained across a new claim
+    other = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(other))
+    assert nonce in server._CONSUMED_CONSENT_NONCES
+
+    clock[0] += 2  # past the TTL: the SDK rejects the state now, so it is pruned
+    third = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(third))
+    assert nonce not in server._CONSUMED_CONSENT_NONCES
+
+
+def test_expired_consent_is_refused_at_redemption(patched_streamed_run, monkeypatch):
+    """A state past the TTL is refused by the gate itself, not only by the SDK.
+
+    The SDK checks expiry when the request arrives; a gate reached after an
+    awaited preflight redeems later. Mint at t0, consume at t0+1, and a replay
+    reaching the gate past the TTL — after its consumed nonce was pruned — must
+    re-ask, not run a second time on the one approval.
+    """
+    calls = patched_streamed_run()
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES", server.OrderedDict())
+    clock = [1_000_000.0]
+    monkeypatch.setattr(server.time, "time", lambda: clock[0])
+    ttl = server._REQUEST_STATE_SECURITY.ttl
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    clock[0] += 1
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    assert len(calls) == 1
+
+    clock[0] += ttl + 1  # the consumed nonce is now prunable
+    replay = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(pending)
+    )
+
+    assert isinstance(replay, types.InputRequiredResult)
+    assert len(calls) == 1
+    # An expired answer never reaches the consumed set or the pruning pass.
+    unanswered = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    clock[0] += ttl
+    refused = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(unanswered)
+    )
+    assert isinstance(refused, types.InputRequiredResult)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("answer", "match"),
+    [
+        ({"__key__": _answer("decline")}, "spend not confirmed"),  # said no
+        ({"__key__": _answer("cancel")}, "did not present"),  # dismissed
+        (
+            {"__key__": _answer("accept", approve=False)},
+            "spend not confirmed",
+        ),  # no yes
+        ({}, None),  # answered a DIFFERENT question — still unanswered here
+    ],
+)
+def test_run_template_input_required_refusal_spawns_no_child(
+    patched_streamed_run, answer, match
+):
+    """Decline, cancel, a yes-less accept, or a missing answer all spend nothing."""
+    calls = patched_streamed_run()
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    [key] = pending.input_requests
+    responses = {key if k == "__key__" else k: v for k, v in answer.items()}
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses=responses,
+        request_state=pending.request_state,
+    )
+    if not responses:
+        # No answer for this gate's key: the gate asks again rather than running.
+        result = _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+        assert isinstance(result, types.InputRequiredResult)
+    else:
+        with pytest.raises(server.ComfyCliError, match=match):
+            _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+    assert calls == []
+
+
+def test_run_template_free_run_is_never_asked_on_input_required(patched_streamed_run):
+    """`confirm_spend=False` cannot spend, so even 2026-07-28 raises no question."""
+    calls = patched_streamed_run()
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+
+    _run_template("image_flux2", params={"prompt": "a cat"}, ctx=ctx)
+
+    assert "--allow-spend" not in calls[0]["cmd"]
+    assert ctx.elicitations == []
 
 
 def test_run_template_does_not_consult_the_generate_auto_confirm(

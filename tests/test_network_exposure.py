@@ -36,6 +36,7 @@ import contextlib
 
 import pytest
 from conftest import envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -43,6 +44,14 @@ from mcp.server.elicitation import (
 )
 
 from comfy_mcp import argv, server
+
+#: The negotiated protocol revision with no back-channel for `elicitation/create`.
+_INPUT_REQUIRED = "2026-07-28"
+
+
+def _answer(action, approve=False):
+    """One `ElicitResult` as it arrives on `ctx.input_responses` on the retry round."""
+    return types.ElicitResult(action=action, content={"approve": approve})
 
 
 def _launch(*args, **kwargs):
@@ -87,11 +96,25 @@ class _FakeCtx:
     retune these tests.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+        input_responses=None,
+        request_state=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
+        # The 2026-07-28 input-required transport. The network gate runs at the
+        # TOP of launch/restart, before any side effect, so unlike the kill gate
+        # it DOES round-trip; left `None` this is the handshake transport unchanged.
+        self.protocol_version = protocol_version
+        self.input_responses = input_responses
+        self.request_state = request_state
 
     async def elicit(self, message, schema):
         self.elicitations.append(message)
@@ -343,6 +366,51 @@ def test_promptable_client_refusal_spawns_nothing(
 
     assert "network exposure not confirmed" in str(excinfo.value)
     assert calls == []  # in particular, `restart` did not stop the running server
+
+
+@_TOOLS
+@_EXPOSING
+def test_input_required_first_round_asks_via_the_result(patched_run, drive, extra_args):
+    """2026-07-28, no answer yet: return `input_required`, start nothing.
+
+    The network gate runs BEFORE the launch (and before `restart`'s stop), so it
+    round-trips cleanly: a decline on the retry leaves the server untouched.
+    """
+    calls = patched_run(envelope(data={"pid": 5}))
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+
+    result = drive(extra_args, ctx=ctx)
+
+    assert isinstance(result, types.InputRequiredResult)
+    assert result.result_type == "input_required"
+    [request] = result.input_requests.values()
+    assert "NO authentication" in request.params.message
+    assert ctx.elicitations == []
+    assert calls == []  # nothing launched, and `restart` did not stop anything
+
+
+@_TOOLS
+@_EXPOSING
+def test_input_required_retry_with_approve_launches(patched_run, drive, extra_args):
+    """The retry carries the client's `approve`: the exposing launch goes through."""
+    calls = patched_run(envelope(data={"pid": 5}))
+    pending = drive(extra_args, ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED))
+    [key] = pending.input_requests
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
+    )
+    assert drive(extra_args, ctx=ctx) == {"pid": 5}
+
+    assert ctx.elicitations == []
+    assert calls[_LAUNCH_CALL_INDEX[drive]]["cmd"][4:] == [
+        "launch",
+        "--background",
+        "--",
+        *extra_args,
+    ]
 
 
 @_TOOLS

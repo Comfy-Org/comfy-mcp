@@ -64,6 +64,7 @@ import base64
 import contextlib
 import errno
 import functools
+import hashlib
 import inspect
 import ipaddress
 import json
@@ -71,6 +72,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -78,14 +80,17 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import anyio.to_thread
 from mcp import types
-from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.server.elicitation import render_elicitation_schema
+from mcp.server.mcpserver import Context, Image, MCPServer, RequestStateSecurity
+from mcp.types.version import is_version_at_least
 from pydantic import BaseModel, Field
 
 from . import (
@@ -149,12 +154,67 @@ _apps = output_viewer.build_apps()
 # unversioned server answers `initialize` with `"serverInfo": {"name":
 # "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
 # correlate a bug report against.
+#
+# The request-state policy is the SDK's own default (`ephemeral()`: a
+# process-local key, 600s TTL), built here only so the consent gates can READ the
+# TTL their sealed `request_state` lives for — `_claim_consent_nonce` must remember
+# a consumed nonce for at least that long, and deriving it from the policy in use
+# means a changed TTL cannot silently outlive that memory.
+_REQUEST_STATE_SECURITY = RequestStateSecurity.ephemeral()
+
 mcp = MCPServer(
     "comfy-mcp",
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
+    request_state_security=_REQUEST_STATE_SECURITY,
     extensions=[_apps],
 )
+
+
+class _ElicitationInputRequired(Exception):
+    """Internal: a consent gate needs an answer the client has not sent yet.
+
+    The ``2026-07-28`` protocol revision removed the server-to-client back-channel
+    that ``ctx.elicit()`` sends ``elicitation/create`` on, so a gate running there
+    cannot ask mid-call; it must carry the question out as the tool's RESULT (an
+    :class:`~mcp.types.InputRequiredResult`) and read the answer off
+    ``ctx.input_responses`` when the client retries the same ``tools/call``.
+
+    :func:`_elicit_approval` raises this on the first round of that flow and
+    :func:`_resumable_consent` — the decorator every gated tool wears — catches it
+    and returns the carried result. It is deliberately NOT a
+    :class:`~comfy_mcp.errors.ComfyCliError`: a gate's own fail-closed ``except``
+    must let a pending question propagate to that decorator rather than mistake it
+    for a refusal. On the handshake transport it is never raised at all.
+    """
+
+    def __init__(self, result: types.InputRequiredResult) -> None:
+        super().__init__("elicitation requires a client round-trip")
+        self.result = result
+
+
+def _resumable_consent(fn):
+    """Let a ``2026-07-28`` consent prompt round-trip through the tool result.
+
+    On that transport :func:`_elicit_approval` raises
+    :class:`_ElicitationInputRequired` on the first round instead of asking over a
+    (now absent) back-channel; this returns the carried
+    :class:`~mcp.types.InputRequiredResult`, which the SDK surfaces as
+    ``resultType: "input_required"``. The client answers by RETRYING the call, the
+    tool body re-runs — its work up to the gate is read-only, so re-running is
+    safe — and the gate reads the answer off ``ctx.input_responses`` rather than
+    raising. On the handshake transport (``<= 2025-11-25``) nothing is raised and
+    this is a pass-through, so every gated tool wears it unconditionally.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except _ElicitationInputRequired as pending:
+            return pending.result
+
+    return wrapper
 
 
 def _as_object(payload: Any) -> Any:
@@ -4211,6 +4271,7 @@ async def auth_login() -> Any:
         openWorldHint=True,
     )
 )
+@_resumable_consent
 @_object_payload
 async def run_workflow(
     workflow_path: str,
@@ -5075,6 +5136,233 @@ def _is_preauthorized(wording: _ApprovalWording) -> bool:
     return "all" in granted or token.lower() in granted
 
 
+# First protocol revision whose `tools/call` carries an elicitation INSIDE an
+# `InputRequiredResult` the client answers on a retry, instead of over a
+# standalone `elicitation/create` server-to-client request. On it and later there
+# is no back-channel: `ctx.elicit()` raises `NoBackChannelError`, so every consent
+# gate must round-trip its question through the tool RESULT. Pinned to the
+# revision that introduced the flow (not the latest), mirroring the SDK's own
+# resolver, so a newer revision does not silently move the boundary.
+_INPUT_REQUIRED_PROTOCOL = "2026-07-28"
+
+
+def _uses_input_required(ctx: Context | None) -> bool:
+    """Whether this request must elicit via `InputRequiredResult` (>= 2026-07-28).
+
+    ``ctx.protocol_version`` is ``None`` outside an active request — and on the
+    test doubles that predate it — which means the handshake transport, the one
+    that still sends ``elicitation/create`` over the back-channel, so a missing
+    version keeps today's ``ctx.elicit()`` path.
+    """
+    version = getattr(ctx, "protocol_version", None)
+    return version is not None and is_version_at_least(
+        version, _INPUT_REQUIRED_PROTOCOL
+    )
+
+
+def _consent_channel_key(wording: _ApprovalWording) -> str:
+    """The `input_requests`/`input_responses` key this gate answers on.
+
+    Must be DISTINCT for any two gates that can fire within one ``tools/call``:
+    ``restart_comfyui`` raises the network-exposure gate and then, mid-sequence,
+    the untracked-kill gate, and a shared key would let the kill gate read the
+    network gate's "yes" as its own and stop a server nobody approved stopping.
+    ``consent_token`` is already unique per gate where it is set; the spend gates
+    leave it empty (that is what holds them out of the pre-authorization
+    mechanism) and no two spend gates ever fire in one call, so the subject is a
+    safe fallback there.
+
+    The key only ROUTES an answer; it never authorizes one. It is a fixed
+    constant any client can fill in, so an answer counts only alongside the
+    ``request_state`` the prompt minted (:func:`_claim_consent_nonce`), which the
+    SDK binds to the tool and its arguments and which carries the prompt text's
+    digest — a ``run_template`` "yes" on ``"spend"`` cannot unlock a
+    ``partner_generate`` call, because that call never echoes its state.
+    """
+    return wording.consent_token or wording.subject
+
+
+def _consent_from_outcome(
+    action: Any, approved: bool, wording: _ApprovalWording
+) -> bool:
+    """Interpret one answered consent prompt — the SINGLE fail-closed verdict.
+
+    Shared by both transports so the accept / decline / everything-else handling
+    cannot drift between them: ``ctx.elicit()``'s ``ElicitationResult`` and the
+    ``>= 2026-07-28`` ``ElicitResult`` carried on ``ctx.input_responses`` are each
+    read down to the same ``(action, approved)`` pair and judged here.
+
+    Three outcomes, not two — the distinction the QA pass found missing:
+
+    * True — a person saw the prompt and approved.
+    * False — the client answered ``"decline"``. USUALLY a person saying no, but
+      not provably one: a client may auto-decline a prompt it cannot show (see
+      :data:`_DECLINE_MAY_BE_AUTOMATIC`), and that is indistinguishable here. A
+      caller may report a refusal, but must not assert WHO made it.
+    * raises — the client never got a decision to us (``"cancel"``, a missing
+      action, an auto-answer). Failing closed is the same; claiming a human
+      refused is not, so that wording is not available to the caller at all.
+    """
+    if action == "accept":
+        return approved is True
+    if action == "decline":
+        # "DECLINE" is an ANSWER to the request — usually a person saying no,
+        # but not provably one: a client may auto-decline a prompt it could not
+        # show (see `_DECLINE_MAY_BE_AUTOMATIC`), so callers report the refusal
+        # without naming who made it.
+        return False
+    # Anything else — "cancel", a missing action, a client that resolves the
+    # request without ever rendering it — is not even an answer, and reporting it
+    # as a decision would be a lie about a human: this is the bug behind "the user
+    # declined ..." appearing in sessions where no prompt was ever displayed.
+    # Failing closed is right; naming a refusal nobody made is not.
+    raise ComfyCliError(
+        f"{wording.subject} not confirmed: the client did not present the "
+        f"confirmation prompt (it answered {action!r} without a user "
+        f"decision), so nobody was asked. {wording.nothing_done}"
+        f"{wording.escape_hatch}"
+    )
+
+
+# Prefix of every `request_state` a consent prompt mints. The SDK's
+# `RequestStateBoundary` (installed by `MCPServer` by default) seals that value
+# and binds it to the tool name and its arguments, and only ever hands a handler
+# plaintext THIS server minted — so a state the server never issued, or one
+# minted for a call with different arguments, never reaches the gate at all.
+_CONSENT_STATE_PREFIX = "comfy-mcp/consent/v1"
+
+# Nonces of consent prompts already answered, so one prompt's answer is honored
+# ONCE: a client replaying a sealed state plus its "yes" (inside the SDK's TTL)
+# gets a fresh prompt instead of a second run on the first approval. Each nonce
+# maps to the wall-clock time it was consumed and is forgotten only once
+# `_REQUEST_STATE_SECURITY.ttl` has passed since then — by which point
+# `_claim_consent_nonce` itself rejects the state as expired (it was minted no
+# later than it was consumed, and its sealed issuance time is read on the same
+# wall clock). That expiry check is this gate's own, not the SDK's: the SDK
+# checks `exp` when the request ARRIVES, and a gate reached after an awaited
+# preflight (`partner_generate`'s) can redeem the answer past it. The size cap is a
+# MEMORY bound only: it never evicts a live nonce, so a full cache refuses the
+# claim (the gate asks afresh) rather than forget one that could be replayed.
+_CONSUMED_CONSENT_NONCES: OrderedDict[str, float] = OrderedDict()
+_CONSUMED_CONSENT_NONCES_MAX = 4096
+_CONSUMED_CONSENT_LOCK = threading.Lock()
+
+
+def _consent_state(key: str, message: str, suffix: str) -> str:
+    """The `request_state` one prompt mints: the gate, the prompt text, a suffix.
+
+    The message digest is what ties an answer to the question a person actually
+    SAW: every gated prompt names what it authorizes (the model, the packs, the
+    version, the exposed address), so a retry whose prompt would read differently
+    no longer matches the state its answer came back with. The ``suffix`` is
+    ``<issued>:<nonce>`` when minting (:func:`_mint_consent_state`) and empty when
+    building the prefix a retry's state must start with.
+    """
+    digest = hashlib.sha256(message.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{_CONSENT_STATE_PREFIX}:{key}:{digest}:{suffix}"
+
+
+def _mint_consent_state(key: str, message: str) -> str:
+    """A fresh prompt's state, carrying its issuance time and a one-use nonce.
+
+    The issuance time rides INSIDE the sealed state, so the SDK authenticates it
+    along with everything else; it is floored to whole seconds, which can only
+    make a state look older (fail closed), never younger.
+    """
+    issued = int(time.time())
+    return _consent_state(key, message, f"{issued}:{secrets.token_urlsafe(16)}")
+
+
+def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
+    """Whether this retry's `request_state` answers THIS prompt, first time.
+
+    False — the answer is ignored and the gate asks afresh — when the state is
+    absent (an answer attached to a first call nobody was prompted on), minted
+    for another gate or another prompt text, older than the state TTL, already
+    consumed, or the consumed set is full of nonces still inside the state TTL.
+
+    The age check runs HERE, at redemption, before any pruning: the SDK rejects an
+    expired state only when the request arrives, so a replay admitted just inside
+    the TTL could otherwise reach this gate after its consumed nonce was pruned
+    and run a second time on one approval.
+    """
+    state = getattr(ctx, "request_state", None)
+    if not isinstance(state, str):
+        return False
+    expected = _consent_state(key, message, "")
+    if not state.startswith(expected):
+        return False
+    issued_text, _, nonce = state[len(expected) :].partition(":")
+    if not issued_text.isdigit() or not nonce:
+        return False
+    now = time.time()
+    ttl = _REQUEST_STATE_SECURITY.ttl
+    # `>=` matches the pruning horizon below: a nonce is pruned once `ttl` has
+    # passed since it was consumed, and it was minted no later than that, so any
+    # replay of a pruned nonce is already refused here.
+    if now - int(issued_text) >= ttl:
+        return False
+    with _CONSUMED_CONSENT_LOCK:
+        # Insertion order is consumption order, so the expired entries lead.
+        horizon = now - ttl
+        while _CONSUMED_CONSENT_NONCES:
+            oldest, consumed_at = next(iter(_CONSUMED_CONSENT_NONCES.items()))
+            if consumed_at > horizon:
+                break
+            del _CONSUMED_CONSENT_NONCES[oldest]
+        if nonce in _CONSUMED_CONSENT_NONCES:
+            return False
+        if len(_CONSUMED_CONSENT_NONCES) >= _CONSUMED_CONSENT_NONCES_MAX:
+            return False
+        _CONSUMED_CONSENT_NONCES[nonce] = now
+    return True
+
+
+def _consent_via_input_required(
+    ctx: Context, message: str, schema: type, wording: _ApprovalWording
+) -> bool:
+    """Elicit on ``>= 2026-07-28``, where ``ctx.elicit()`` has no back-channel.
+
+    First round (no answer this server asked for): raise
+    :class:`_ElicitationInputRequired` carrying the
+    :class:`~mcp.types.InputRequiredResult` the gated tool returns, so the client
+    is asked by RETRYING the call. The ``requested_schema`` is rendered by the
+    SDK's own :func:`render_elicitation_schema`, the same one ``ctx.elicit()``
+    sends, so the prompt a client sees is identical across the two transports.
+
+    Resume round: an answer counts only when the retry echoes the
+    ``request_state`` this prompt minted (:func:`_claim_consent_nonce`) — never
+    on the ``input_responses`` key alone, which is a fixed per-gate constant any
+    client can fill in on a first call. Anything else is "not asked yet" and
+    re-asks. A claimed answer is judged by the same :func:`_consent_from_outcome`
+    the back-channel path uses. ``getattr``/``Mapping`` throughout, because a
+    non-conforming client's content must fail closed, never crash.
+    """
+    key = _consent_channel_key(wording)
+    responses = getattr(ctx, "input_responses", None)
+    answer = responses.get(key) if isinstance(responses, Mapping) else None
+    if answer is None or not _claim_consent_nonce(ctx, key, message):
+        request = types.ElicitRequest(
+            params=types.ElicitRequestFormParams(
+                message=message,
+                requested_schema=render_elicitation_schema(schema),
+            )
+        )
+        state = _mint_consent_state(key, message)
+        raise _ElicitationInputRequired(
+            types.InputRequiredResult(
+                input_requests={key: request}, request_state=state
+            )
+        )
+    if isinstance(answer, Mapping):
+        action, content = answer.get("action"), answer.get("content")
+    else:
+        action = getattr(answer, "action", None)
+        content = getattr(answer, "content", None)
+    approved = content.get("approve", False) if isinstance(content, Mapping) else False
+    return _consent_from_outcome(action, approved, wording)
+
+
 async def _elicit_approval(
     ctx: Context, message: str, schema: type, wording: _ApprovalWording
 ) -> bool:
@@ -5084,18 +5372,20 @@ async def _elicit_approval(
     destructive install gates (``switch_comfyui_version``, ``update_comfyui``'s
     ``target="all"``), and the launch pair's network-exposure gate. Only the
     message, the answer schema, and ``wording`` differ; the fail-closed handling
-    below must not. True = the user affirmatively approved.
+    must not. True = the user affirmatively approved.
 
-    Three outcomes, not two — the distinction the QA pass found missing:
+    Two transports, ONE fail-closed verdict (:func:`_consent_from_outcome`):
 
-    * True — a person saw the prompt and approved.
-    * False — the client answered ``"decline"``. USUALLY a person saying no,
-      but not provably one: a client may auto-decline a prompt it cannot show
-      (see :data:`_DECLINE_MAY_BE_AUTOMATIC`), and that is indistinguishable
-      here. A caller may report a refusal, but must not assert WHO made it.
-    * raises — the client never got a decision to us (``"cancel"``, a missing
-      action, an auto-answer). Failing closed is the same; claiming a human
-      refused is not, so that wording is not available to the caller at all.
+    * ``<= 2025-11-25`` — the handshake back-channel: ``ctx.elicit()`` sends
+      ``elicitation/create`` and awaits the answer in-call.
+    * ``>= 2026-07-28`` — no back-channel: the question is carried out as the
+      tool's ``InputRequiredResult`` and answered when the client retries (see
+      :func:`_consent_via_input_required` and :func:`_resumable_consent`).
+
+    Either way a timeout, a client error, a decline, a cancel, and an accept that
+    never actually said yes all mean "not approved"; the ``confirm_*`` arguments
+    remain the fallback for a client that cannot elicit at all (handled by the
+    callers' :func:`_client_elicitation_support` check, unchanged).
     """
     if _is_preauthorized(wording):
         # Checked BEFORE contacting the client: the operator has already decided,
@@ -5108,6 +5398,8 @@ async def _elicit_approval(
             _ASSUME_CONSENT_ENV,
         )
         return True
+    if _uses_input_required(ctx):
+        return _consent_via_input_required(ctx, message, schema, wording)
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message=message, schema=schema),
@@ -5131,31 +5423,8 @@ async def _elicit_approval(
     # with no `.action`/`.data`, and an AttributeError here would escape as an
     # uncaught crash instead of the refusal this contract promises.
     action = getattr(result, "action", None)
-    if action != "accept":
-        # "DECLINE" is an ANSWER to the request — usually a person saying no,
-        # but not provably one: a client may auto-decline a prompt it could not
-        # show (see `_DECLINE_MAY_BE_AUTOMATIC`), so callers report the refusal
-        # without naming who made it. Anything else — "cancel", a missing
-        # action, a client that resolves the request without ever rendering it —
-        # is not even an answer, and reporting it as a decision is a lie about a
-        # human.
-        #
-        # This is the bug behind "the user declined ..." appearing in sessions
-        # where no prompt was ever displayed, across four different gates: every
-        # non-accept answer collapsed into the same False, and each caller then
-        # raised its "the user declined" text. Failing closed was right; naming a
-        # refusal nobody made was not — it sends the reader to argue with a user
-        # who was never asked, and hides that the client is the thing that needs
-        # fixing.
-        if action == "decline":
-            return False
-        raise ComfyCliError(
-            f"{wording.subject} not confirmed: the client did not present the "
-            f"confirmation prompt (it answered {action!r} without a user "
-            f"decision), so nobody was asked. {wording.nothing_done}"
-            f"{wording.escape_hatch}"
-        )
-    return getattr(getattr(result, "data", None), "approve", False) is True
+    approved = getattr(getattr(result, "data", None), "approve", False)
+    return _consent_from_outcome(action, approved, wording)
 
 
 async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
@@ -5449,6 +5718,7 @@ def partner_model_schema(model: str) -> Any:
         openWorldHint=True,
     )
 )
+@_resumable_consent
 @_object_payload
 async def partner_generate(
     model: str,
@@ -6139,6 +6409,7 @@ async def _run_template_exec(
         openWorldHint=True,
     )
 )
+@_resumable_consent
 @_object_payload
 async def run_template(
     name: str,
@@ -8024,6 +8295,7 @@ def _launch_comfyui_sync(extra_args: list[str]) -> Any:
         openWorldHint=False,
     )
 )
+@_resumable_consent
 async def launch_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -8217,6 +8489,7 @@ def _untracked_server_guidance(
     extra_args: list[str] | None = None,
     listener: _UntrackedListener | None = None,
     refusal: str = "",
+    retry_can_ask: bool = True,
 ) -> str:
     """Explain a port clash that followed a stop with nothing recorded to stop.
 
@@ -8236,7 +8509,8 @@ def _untracked_server_guidance(
       confirmation prompt on a retry, or running ``comfy stop --port <p>``
       directly. ``refusal`` says why this call did not, and is the only part
       that varies between a decline, an unanswered prompt, and a client that
-      could not be asked.
+      could not be asked. ``retry_can_ask=False`` drops the retry route where
+      no retry could ever prompt (``refusal`` then names the terminal one).
     """
     suggested = _ALT_PORT_SUGGESTION
     if _requested_port(extra_args) == suggested:
@@ -8259,13 +8533,17 @@ def _untracked_server_guidance(
             f"Either stop it the way you started it and retry, or {alongside}"
         )
     trailer = f"{refusal} " if refusal else ""
+    recycle = (
+        "To recycle that server, call restart_comfyui again and approve the "
+        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        if retry_can_ask
+        else ""
+    )
     return (
         f"Port {listener.port} is held by pid {listener.pid}, which comfy-cli "
         f"identified as a ComfyUI it did not start: `{listener.display_cmdline()}`. "
         "That is why there was nothing for the restart to stop and the fresh launch "
-        f"then hit the occupied port. {trailer}"
-        "To recycle that server, call restart_comfyui again and approve the "
-        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        f"then hit the occupied port. {trailer}{recycle}"
         f"Otherwise {alongside}"
     )
 
@@ -8602,6 +8880,10 @@ class _KillDecision(NamedTuple):
 
     approved: bool
     reason: str
+    #: Whether calling ``restart_comfyui`` again can raise the prompt. False only
+    #: where no retry ever could (the ``>= 2026-07-28`` transport), so the
+    #: guidance names the terminal route alone instead of a loop.
+    retry_can_ask: bool = True
 
 
 async def _elicit_kill_untracked_consent(
@@ -8650,7 +8932,27 @@ async def _resolve_kill_untracked_consent(
     errors (an unanswered prompt, a client that errored) are folded into
     ``reason`` instead, so every refusal — decline included — surfaces as the
     enriched guidance error rather than three differently-shaped failures.
+
+    On the ``>= 2026-07-28`` transport it refuses OUTRIGHT, before any
+    capability check or answer is read: that transport asks by returning the
+    question and re-running the call on a retry, but this gate fires mid-sequence
+    on the restart's worker thread, after the stop half — there is no result to
+    carry a question out on, and no prompt is ever issued. So an
+    ``input_responses`` answer the client attached is ignored (nobody was asked
+    it), ``confirm_kill_untracked`` is not a substitute for the human the
+    capable client could otherwise reach, and the reason names the terminal
+    route rather than a retry that can never succeed.
     """
+    if _uses_input_required(ctx):
+        return _KillDecision(
+            False,
+            "This MCP protocol revision cannot raise a confirmation prompt from "
+            "inside a restart already in progress, so nothing was asked and pid "
+            f"{listener.pid} is still running. Retrying restart_comfyui will "
+            "not change that; stop it from a terminal with `comfy stop --port "
+            f"{listener.port}` if the USER wants it stopped, then retry.",
+            retry_can_ask=False,
+        )
     if _client_elicitation_support(ctx) is not False:
         try:
             approved = await _elicit_kill_untracked_consent(ctx, listener)
@@ -8786,6 +9088,7 @@ def _offer_untracked_kill(
     port = _kill_target_port(extra_args)
     listener = None
     refusal = ""
+    retry_can_ask = True
     if kill_approver is not None and port is not None:
         if not _remote_target_configured():
             listener = _verified_untracked_listener(port)
@@ -8794,8 +9097,10 @@ def _offer_untracked_kill(
         if decision.approved:
             return _recycle_untracked_server(clash, extra_args, listener)
         refusal = decision.reason
+        retry_can_ask = decision.retry_can_ask
+    guidance = _untracked_server_guidance(extra_args, listener, refusal, retry_can_ask)
     raise ComfyCliError(
-        f"{clash}\n\n{_untracked_server_guidance(extra_args, listener, refusal)}",
+        f"{clash}\n\n{guidance}",
         code=clash.code,
         no_envelope=clash.no_envelope,
         returncode=clash.returncode,
@@ -8859,6 +9164,7 @@ def _recycle_untracked_server(
         openWorldHint=False,
     )
 )
+@_resumable_consent
 async def restart_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -9095,6 +9401,7 @@ async def _resolve_update_all_consent(
         openWorldHint=True,
     )
 )
+@_resumable_consent
 async def update_comfyui(
     target: str = "comfy",
     confirm_update_all: bool = False,
@@ -9428,6 +9735,7 @@ def _run_version_switch(version: str) -> Any:
         openWorldHint=True,
     )
 )
+@_resumable_consent
 async def switch_comfyui_version(
     version: str,
     confirm_switch: bool = False,
@@ -9965,6 +10273,7 @@ def _run_node_install(names: list[str]) -> Any:
         openWorldHint=True,
     )
 )
+@_resumable_consent
 async def install_node(
     names: list[str],
     confirm_install: bool = False,
