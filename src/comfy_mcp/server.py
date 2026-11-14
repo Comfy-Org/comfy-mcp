@@ -12708,12 +12708,11 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
 
 @mcp.tool()
 def validate_workflow(workflow_path: str, object_info_path: str = "") -> Any:
-    """Pre-flight a workflow against a node catalog before running it.
+    """Validate a workflow.
 
     Wraps ``comfy validate --workflow <path> [--input <object_info.json>]``.
-    Checks class_types, input shapes, enums and wiring against the target's
-    live ``object_info`` or the saved ``object_info_path``. The live target
-    follows COMFYUI_URL/COMFYUI_HOST, like run_workflow and nodes.
+    Checks class_types, input shapes, enums and wiring against a saved
+    ``object_info_path`` or the live local/loopback catalog. Non-loopback stays local.
 
     Returns:
         comfy-cli's own report: ``{"valid": bool, "errors": [...], "warnings":
