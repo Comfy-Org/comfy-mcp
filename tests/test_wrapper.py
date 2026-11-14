@@ -2715,43 +2715,49 @@ def test_validate_workflow_does_not_mutate_the_engine_payload(patched_run):
 # always-polls-once, caps-each-poll, gives-full-budget,
 # deadline-poll-timeout-as-timed-out, the three reraise cases,
 # sleeps-the-shared-poll-interval) moved to tests/test_jobs.py as
-# `job(action="wait")`. Several were rewritten there to call
-# `_poll_until_terminal` directly rather than scripting `time.monotonic()`
-# through the tool: `job` now off-loads the "wait" branch onto a REAL
-# `anyio.to_thread.run_sync` worker thread (R2), and that thread hand-off
-# itself reads the process-global `time.monotonic()` — a scripted fake that
-# stops ADVANCING (a fixed final value, or `StopIteration`) livelocks the
-# hand-off, since it never observes time moving and never signals the
-# coroutine that the thread is done. See test_jobs.py's module docstring and
-# `test_job_wait_clamps_an_oversized_timeout`'s docstring for the confirmed
-# repro.
+# `job(action="wait")`. The one-poll-minimum / per-poll-budget / re-raise
+# invariants are exercised by calling the SYNC `_poll_until_terminal` directly
+# there, scripting `time.monotonic()` with no event loop or thread to perturb
+# the clock; `job(action="wait")` itself now runs the cancellable async twin
+# `_poll_until_terminal_async`. See test_jobs.py's module docstring.
 
 
-def test_the_two_bounded_polls_run_on_one_shared_loop(monkeypatch):
-    """`job(action="wait")` and `_poll_download` both route through the shared loop.
+def test_the_two_bounded_polls_share_one_loop_across_the_sync_async_twins(monkeypatch):
+    """`job(action="wait")` and `_poll_download` route through the twin loops.
 
     The two ran statement-for-statement identical loops — the one-poll minimum,
     the per-poll budget cap, the three-clause re-raise — and drifted apart in the
-    only place they were spelled twice. Re-inlining either one is what this
-    guards against; the loop's own behavior is covered by the tests around it.
+    only place they were spelled twice. The cancellation migration split that
+    into a sync/async TWIN pair (`_poll_until_terminal` / `_async`), so this now
+    pins that each caller reaches its twin with the identical argv, predicate and
+    extra-key contract — re-inlining or crossing either wiring is what it guards.
     """
-    calls: list[tuple[tuple, dict]] = []
+    async_calls: list[tuple[tuple, dict]] = []
+    sync_calls: list[tuple[tuple, dict]] = []
 
-    def fake_poll(*args, **kwargs):
-        calls.append((args, kwargs))
+    async def fake_poll_async(*args, **kwargs):
+        async_calls.append((args, kwargs))
         return {"status": "completed"}
 
+    def fake_poll(*args, **kwargs):
+        sync_calls.append((args, kwargs))
+        return {"status": "completed"}
+
+    monkeypatch.setattr(server, "_poll_until_terminal_async", fake_poll_async)
     monkeypatch.setattr(server, "_poll_until_terminal", fake_poll)
 
     asyncio.run(server.job(action="wait", prompt_id="pid", timeout_seconds=25.0))
     server._poll_download("a1b2c3d4e5f6", 25.0)
 
-    assert calls[0][0] == ("jobs", "status", "pid")
-    assert calls[0][1]["is_terminal"] is server._is_terminal
-    assert "timed_out_extra" not in calls[0][1]  # jobs add no extra key
-    assert calls[1][0] == ("model", "download-status", "a1b2c3d4e5f6")
-    assert calls[1][1]["is_terminal"] is server._is_download_terminal
-    assert calls[1][1]["timed_out_extra"] == {"download_id": "a1b2c3d4e5f6"}
+    # job(action="wait") -> the CANCELLABLE async twin, with the jobs-status cap.
+    assert async_calls[0][0] == ("jobs", "status", "pid")
+    assert async_calls[0][1]["is_terminal"] is server._is_terminal
+    assert "timed_out_extra" not in async_calls[0][1]  # jobs add no extra key
+    assert async_calls[0][1]["stdout_cap"] == server._JOB_STATUS_STDOUT_MAX_CHARS
+    # _poll_download -> the sync loop (the sync `download` tool depends on it).
+    assert sync_calls[0][0] == ("model", "download-status", "a1b2c3d4e5f6")
+    assert sync_calls[0][1]["is_terminal"] is server._is_download_terminal
+    assert sync_calls[0][1]["timed_out_extra"] == {"download_id": "a1b2c3d4e5f6"}
 
 
 def test_the_shared_poll_puts_its_extra_keys_before_the_status(monkeypatch):

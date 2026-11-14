@@ -12,15 +12,23 @@ of a direct, synchronous call — ``job`` is ``async def`` because the
 ``"watch"`` action must stream on the event loop).
 
 R2 is the load-bearing risk this file exists to pin: ``job`` is one
-``async def`` tool, but five of its six actions are blocking (a
-``subprocess`` call, or — for ``"wait"`` — a ``time.sleep`` poll loop that can
-run up to an hour). Only ``"watch"`` is genuinely async (asyncio subprocess +
-stream reads). Those five MUST be off-loaded to a worker thread via
+``async def`` tool, but four of its six actions are single blocking
+``subprocess`` calls. Those four MUST be off-loaded to a worker thread via
 ``anyio.to_thread.run_sync`` (the same mechanism the MCP SDK itself uses to
 run a plain ``def`` tool) or they would block the event loop for the whole
 call — wedging every OTHER concurrent MCP request this server is handling.
 ``test_a_blocking_branch_does_not_wedge_the_event_loop`` proves that
 concurrency guarantee directly, ahead of the thread-identity checks below it.
+
+``"watch"`` and ``"wait"`` are the two that stay ON the event loop: ``"watch"``
+streams through ``_run_comfy_streaming`` (asyncio subprocess + stream reads),
+and ``"wait"`` runs the cancellable async poll loop
+(``_poll_until_terminal_async`` via ``_job_wait_async``) rather than the
+thread pool — so a client that gives up on a wait of up to an hour reaps the
+in-flight ``comfy jobs status`` child instead of orphaning it. The SYNC
+``_poll_until_terminal`` it twins still serves ``_poll_download`` (the
+``download`` tool and ``download_model``'s background wait), and its own
+timing-edge tests below exercise it directly.
 """
 
 from __future__ import annotations
@@ -88,34 +96,32 @@ def test_a_blocking_branch_does_not_wedge_the_event_loop(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("action", "kwargs", "patch_target"),
+    ("action", "kwargs"),
     [
-        ("status", {"prompt_id": "pid"}, "_run_comfy"),
-        ("error", {"prompt_id": "pid"}, "_run_comfy"),
-        ("cancel", {"prompt_id": "pid"}, "_run_comfy"),
-        ("queue", {}, "_run_comfy"),
-        ("wait", {"prompt_id": "pid"}, "_poll_until_terminal"),
+        ("status", {"prompt_id": "pid"}),
+        ("error", {"prompt_id": "pid"}),
+        ("cancel", {"prompt_id": "pid"}),
+        ("queue", {}),
     ],
 )
-def test_every_non_watch_action_runs_off_the_event_loop_thread(
-    monkeypatch, action, kwargs, patch_target
+def test_every_blocking_action_runs_off_the_event_loop_thread(
+    monkeypatch, action, kwargs
 ):
-    """Every sync branch executes on a DIFFERENT thread than the event loop.
+    """Each of the four single-`subprocess` branches runs on a DIFFERENT thread.
 
     A weaker, faster-running companion to the concurrency proof above,
-    parametrized across all five off-loaded actions (not just "status") so a
-    regression that off-loads only one of them is still caught.
+    parametrized across all four off-loaded actions (not just "status") so a
+    regression that off-loads only one of them is still caught. "wait" is NOT
+    here — it stays on the event loop (its on-loop proof is the next test).
     """
     main_thread_ident = threading.get_ident()
     seen: dict[str, int] = {}
 
     def fake(*args, **kwargs2):
         seen["ident"] = threading.get_ident()
-        if action == "wait":
-            return {"status": "completed"}
         return {"status": "completed"} if action != "queue" else {"jobs": []}
 
-    monkeypatch.setattr(server, patch_target, fake)
+    monkeypatch.setattr(server, "_run_comfy", fake)
 
     asyncio.run(server.job(action=action, **kwargs))
 
@@ -138,6 +144,25 @@ def test_watch_runs_on_the_event_loop_not_offloaded(monkeypatch):
 
     monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
     asyncio.run(server.job(action="watch", prompt_id="pid"))
+
+    assert seen["ident"] == main_thread_ident
+
+
+def test_wait_runs_on_the_event_loop_not_offloaded(monkeypatch):
+    """Wait also stays on the event loop: its poll loop
+    (`_poll_until_terminal_async`) spawns each `comfy jobs status` through
+    `_run_comfy_async`, so cancelling the awaiting coroutine reaps the in-flight
+    child. Off-loading it to a worker thread would resurrect the orphaned-child
+    bug this migration closes."""
+    seen: dict[str, int] = {}
+    main_thread_ident = threading.get_ident()
+
+    async def fake_poll(*args, **kwargs):
+        seen["ident"] = threading.get_ident()
+        return {"status": "completed"}
+
+    monkeypatch.setattr(server, "_poll_until_terminal_async", fake_poll)
+    asyncio.run(server.job(action="wait", prompt_id="pid"))
 
     assert seen["ident"] == main_thread_ident
 
@@ -493,50 +518,67 @@ def test_cap_traceback_tail_hard_truncates_single_oversized_frame():
 # --- action="wait" --------------------------------------------------------------
 
 
-def test_job_wait_returns_terminal_status(monkeypatch):
-    statuses = iter(
+def test_job_wait_returns_terminal_status(patched_async_run, monkeypatch):
+    procs = patched_async_run(
         [
-            {"status": "running"},
-            {"status": "running"},
-            {"status": "completed", "outputs": ["/tmp/gen.png"]},
+            envelope(data={"status": "running"}),
+            envelope(data={"status": "running"}),
+            envelope(data={"status": "completed", "outputs": ["/tmp/gen.png"]}),
         ]
     )
-    calls: list[tuple] = []
-
-    def fake_run(*args, **kwargs):
-        calls.append(args)
-        return next(statuses)
-
-    monkeypatch.setattr(server, "_run_comfy", fake_run)
-    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(server, "_POLL_INTERVAL", 0.0)
 
     result = asyncio.run(
         server.job(action="wait", prompt_id="pid", timeout_seconds=25.0)
     )
 
     assert result == {"status": "completed", "outputs": ["/tmp/gen.png"]}
-    assert calls[0] == ("jobs", "status", "pid")
-    assert len(calls) == 3
+    assert [p.cmd[4:] for p in procs] == [["jobs", "status", "pid"]] * 3
 
 
-def test_job_wait_times_out_cleanly(monkeypatch):
-    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: {"status": "running"})
-    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+def test_job_wait_times_out_cleanly(patched_async_run, monkeypatch):
+    """A job still running at the bound returns `timed_out` with its last status.
 
-    clock = {"t": 0.0}
+    Driven by a REAL (short) bound rather than a fake `time.monotonic()`: the
+    poll now runs through `_run_comfy_async`'s `asyncio.wait_for`, whose deadline
+    reads the same process-global clock, so a fake that jumps 10s per read would
+    fire every poll's own timeout instead of exercising the caller's bound.
+    """
+    procs = patched_async_run(envelope(data={"status": "running"}))
+    monkeypatch.setattr(server, "_POLL_INTERVAL", 0.01)
 
-    def fake_monotonic():
-        now = clock["t"]
-        clock["t"] += 10.0
-        return now
+    result = asyncio.run(
+        server.job(action="wait", prompt_id="pid", timeout_seconds=0.2)
+    )
 
-    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+    assert len(procs) >= 2  # it re-polled until the bound, not just once
+
+
+def test_job_wait_parses_an_envelope_larger_than_any_tail_bound(patched_async_run):
+    """A terminal `jobs status` envelope bigger than the async runner's tail
+    bounds still parses, instead of losing its head and reading as "no JSON".
+
+    `_run_comfy_async` keeps only the TRAILING bytes of stdout by default; the
+    synchronous `_run_comfy` this wait used to run retained the whole envelope.
+    Nothing bounds a `jobs status` payload (a many-output job, a failed run's
+    whole traceback), so the terminal poll — the one the wait exists to return —
+    must not be truncated. Sized well past both the default
+    `_STDERR_MAX_CHARS` and the 1 MiB cap the wait briefly carried.
+    """
+    traceback = ["frame " + "x" * 1000 for _ in range(3 * 1024)]  # ~3 MiB
+    status = {
+        "status": "error",
+        "error": {"exception_message": "boom", "traceback": traceback},
+    }
+    patched_async_run(envelope(data=status))
 
     result = asyncio.run(
         server.job(action="wait", prompt_id="pid", timeout_seconds=25.0)
     )
 
-    assert result == {"timed_out": True, "status": {"status": "running"}}
+    assert len(json.dumps(result)) > 2 * 1024 * 1024
+    assert result == status
 
 
 # --- R1: default timeouts (wait=25.0, watch=600.0) ------------------------------
@@ -545,11 +587,11 @@ def test_job_wait_times_out_cleanly(monkeypatch):
 def test_job_wait_default_timeout_is_25_seconds(monkeypatch):
     seen: dict = {}
 
-    def fake_poll(*args, **kwargs):
+    async def fake_poll(*args, **kwargs):
         seen["timeout_seconds"] = kwargs["timeout_seconds"]
         return {"status": "completed"}
 
-    monkeypatch.setattr(server, "_poll_until_terminal", fake_poll)
+    monkeypatch.setattr(server, "_poll_until_terminal_async", fake_poll)
 
     asyncio.run(server.job(action="wait", prompt_id="pid"))
 
@@ -587,28 +629,19 @@ def test_job_wait_clamps_an_oversized_timeout(monkeypatch, oversized):
     """An oversized/infinite bound is clamped to `_MAX_WATCH_TIMEOUT` before it
     ever reaches the poll loop.
 
-    Proven at the `_poll_until_terminal` call boundary (mocked out) rather
-    than by feeding the loop a scripted `time.monotonic()` sequence, the way
-    `wait_for_job`'s equivalent test did: `job`'s "wait" branch now runs
-    `_job_wait_sync` inside a REAL `anyio.to_thread.run_sync` worker thread
-    (R2), and that thread hand-off itself reads `time.monotonic()` some
-    unpredictable number of times. `time.monotonic` is a process-global
-    function — `monkeypatch.setattr(server.time, "monotonic", ...)` patches
-    the actual `time` module, not a copy — so a fake that stops advancing
-    (either a fixed final value via `next(reads, X)`, or `StopIteration`
-    aborting the sequence) livelocks the anyio thread hand-off itself: it
-    never observes time moving forward and never signals completion back to
-    this coroutine. Confirmed by reproducing the hang while writing this
-    test, not merely asserted; the fix is to never freeze the CLOCK under
-    this branch — assert the CLAMP at the boundary instead.
+    Proven at the `_poll_until_terminal_async` call boundary (mocked out) rather
+    than by feeding the loop a scripted `time.monotonic()` sequence: the clamp is
+    `_job_wait_async`'s own `argv._bounded_timeout` call, so asserting it at the
+    boundary is the precise unit test regardless of how the loop below spends the
+    bound.
     """
     seen: dict = {}
 
-    def fake_poll(*args, **kwargs):
+    async def fake_poll(*args, **kwargs):
         seen["timeout_seconds"] = kwargs["timeout_seconds"]
         return {"status": "running"}
 
-    monkeypatch.setattr(server, "_poll_until_terminal", fake_poll)
+    monkeypatch.setattr(server, "_poll_until_terminal_async", fake_poll)
 
     asyncio.run(server.job(action="wait", prompt_id="pid", timeout_seconds=oversized))
 
@@ -616,32 +649,25 @@ def test_job_wait_clamps_an_oversized_timeout(monkeypatch, oversized):
 
 
 @pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
-def test_job_wait_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
-    def fake_run(*args, **kwargs):
-        raise AssertionError("job(action='wait') polled with an invalid timeout")
-
-    monkeypatch.setattr(server, "_run_comfy", fake_run)
-    monkeypatch.setattr(server.time, "sleep", lambda _s: None)
+def test_job_wait_rejects_a_non_positive_or_nan_timeout(patched_async_run, bad):
+    procs = patched_async_run(envelope(data={"status": "running"}))
 
     with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
         asyncio.run(server.job(action="wait", prompt_id="pid", timeout_seconds=bad))
+
+    assert procs == []  # refused before any `jobs status` child was spawned
 
 
 def test_poll_until_terminal_always_polls_at_least_once(monkeypatch):
     """A bound that expires before the first poll still reports a real status.
 
-    This is `_poll_until_terminal`'s own invariant (shared by `job(action=
-    "wait")` and `_poll_download`), so it is exercised by calling the helper
-    DIRECTLY — plain, synchronous, no `job()` / anyio thread hand-off
-    involved — rather than through `job(action="wait")`. Two reasons: (1) the
-    invariant belongs to the helper, not to `job`'s dispatch, so this is the
-    more precise unit test regardless of threading; (2) a scripted, exhausting
-    `time.monotonic()` fake like the one this test used to run through
-    `wait_for_job` freezes once exhausted, and freezing the global clock
-    livelocks the REAL worker thread `job(action="wait")` now hands this call
-    to (see `test_job_wait_clamps_an_oversized_timeout`'s docstring for the
-    confirmed repro) — calling the sync helper directly sidesteps that
-    entirely, since no second thread is ever involved here.
+    This is `_poll_until_terminal`'s own invariant (shared with its async twin
+    `_poll_until_terminal_async`, and serving `_poll_download`), so it is
+    exercised by calling the sync helper DIRECTLY — plain, synchronous, no
+    `job()` dispatch involved. The invariant belongs to the helper, not to any
+    one caller, so a scripted, exhausting `time.monotonic()` fake drives the
+    loop deterministically here with no event loop or second thread to perturb
+    the clock.
     """
     calls = 0
 
@@ -841,18 +867,63 @@ def test_poll_until_terminal_reraises_a_non_timeout_poll_failure(monkeypatch):
         )
 
 
-def test_job_wait_sleeps_the_shared_poll_interval(monkeypatch):
-    statuses = iter([{"status": "running"}, {"status": "completed"}])
-    monkeypatch.setattr(server, "_run_comfy", lambda *a, **k: next(statuses))
+def test_job_wait_sleeps_the_shared_poll_interval(patched_async_run, monkeypatch):
+    patched_async_run(
+        [
+            envelope(data={"status": "running"}),
+            envelope(data={"status": "completed"}),
+        ]
+    )
 
     slept: list[float] = []
-    monkeypatch.setattr(server.time, "sleep", slept.append)
+
+    async def fake_sleep(duration):
+        slept.append(duration)
+
+    monkeypatch.setattr(server.asyncio, "sleep", fake_sleep)
 
     result = asyncio.run(
         server.job(action="wait", prompt_id="pid", timeout_seconds=600.0)
     )
     assert result == {"status": "completed"}
     assert slept == [server._POLL_INTERVAL]
+
+
+def test_job_wait_cancellation_reaps_the_poll_child(patched_async_run):
+    """A client that gives up on a wait reaps the in-flight `jobs status` child.
+
+    This is the case the thread pool could not serve at all: under
+    `anyio.to_thread.run_sync` the cancellation never reached the worker, so the
+    loop kept re-spawning `comfy jobs status` until its (up to 3600s) bound and
+    the in-flight child was orphaned. On the async twin the cancel lands on the
+    `await`, and `_run_comfy_async`'s `finally` kills the poll's whole process
+    group on the way out. The child is cancelled while still "running" (hang=True
+    holds its pipes open), exactly as an uncompleted status poll would be.
+    """
+
+    async def drive():
+        # Built inside the loop so the spawn signal is an `asyncio.Event` bound
+        # to it, as in `billing_status`'s cancellation test.
+        spawned = asyncio.Event()
+        procs = patched_async_run(
+            envelope(data={"status": "running"}),
+            hang=True,
+            on_spawn=lambda _cmd: spawned.set(),
+        )
+        task = asyncio.ensure_future(
+            server.job(action="wait", prompt_id="pid", timeout_seconds=3600.0)
+        )
+        # Pull the rug only once the poll child is actually running.
+        await asyncio.wait_for(spawned.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return procs
+
+    procs = asyncio.run(drive())
+
+    assert procs[0].killed is True
+    assert procs[0].cmd[4:] == ["jobs", "status", "pid"]
 
 
 # --- action="watch" (streamed) --------------------------------------------------

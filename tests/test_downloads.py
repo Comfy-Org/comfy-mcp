@@ -1312,6 +1312,48 @@ def test_download_model_legacy_wait_false_keeps_the_full_cap(monkeypatch):
     assert seen["bound"] == server._DOWNLOAD_SYNC_TIMEOUT
 
 
+def test_download_model_legacy_foreground_cancellation_kills_the_child(
+    patched_async_run, legacy_comfy_cli
+):
+    """A client that gives up on a legacy foreground download reaps the child.
+
+    The pre-`--background` fallback runs the whole multi-GB transfer in the
+    foreground, inside this call, on `_run_comfy_async`. That runner exists so a
+    cancel — a client disconnect, `notifications/cancelled`, a closing stdio
+    session — kills the `comfy model download` child and its whole process group
+    rather than orphaning it (and the half-written file) on a worker thread the
+    cancellation could never reach. Here the transfer is cancelled while still
+    "running" (hang=True holds its pipes open), and the runner's `finally` fires.
+    """
+
+    async def drive():
+        spawned = asyncio.Event()
+        procs = patched_async_run(hang=True, on_spawn=lambda _cmd: spawned.set())
+        task = asyncio.ensure_future(
+            server.download_model("https://hf.co/x.safetensors", wait=True)
+        )
+        # Pull the rug only once the foreground transfer is actually running.
+        await asyncio.wait_for(spawned.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return procs
+
+    procs = asyncio.run(drive())
+
+    # The child's whole process group was signalled on the way out — the
+    # acceptance the thread pool could not meet.
+    assert procs[0].killed is True
+    # ...and it was the foreground transfer (no `--background`), not the submit.
+    assert procs[0].cmd[4:8] == [
+        "model",
+        "download",
+        "--url",
+        "https://hf.co/x.safetensors",
+    ]
+    assert "--background" not in procs[0].cmd
+
+
 def test_download_model_does_not_fall_back_on_a_real_submit_failure(monkeypatch):
     """Only an unknown `--background` degrades — anything else must propagate.
 
