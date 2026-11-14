@@ -120,8 +120,10 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-Local differentiators: discovery (`nodes`, `search_models`) reads the **live install**, custom nodes
-included (`nodes` can take a saved `object_info`); `preview_media` returns comfy-cli's PNG inline.
+Discovery reads the configured **loopback** target's live install (custom nodes included).
+Non-loopback targets keep comfy-cli's local catalog behavior; they are not fetched.
+Alternatively, use a saved `object_info` catalog supplied to `nodes` / `validate_workflow`. `search_models`
+reads this machine's model files; `preview_media` returns comfy-cli's PNG inline.
 
 ## Module layout
 
