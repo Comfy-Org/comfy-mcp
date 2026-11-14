@@ -229,7 +229,7 @@ Cloud keeps its character ceiling for `https` results: `MAX_GET_OUTPUT_RESULT_CH
 
 Cloud mints two kinds of `https` media URL. A shortlink (`/api/s/<id>`) lasts about 5 minutes. A signed `storage.googleapis.com` URL lasts about 6 hours. Those are the lifetimes the cloud server mints today.
 
-When a media element fails to load, the viewer replaces it with "Preview unavailable" through `textContent`. It does not `fetch` a replacement. On cloud, the iframe may call `get_output` with `{prompt_id}`, plus `offset` when the displayed result carries a non-zero `offset` (the read-only call below), which re-mints the links on the page it is showing. A legacy `results` or `outputs` result carries no `offset`, so the viewer cannot tell its page and offers Refresh there only when the text names no next page; otherwise it shows the text, and the model refreshes with the `offset` the text names. The model does the same when the person or the viewer says the link expired: call `get_output` again, with `offset` when the text names one. Do not reuse a URL past the lifetime above, and do not paste the signed query into the reply.
+When a media element fails to load, the viewer replaces it with "Preview unavailable" through `textContent`. It does not `fetch` a replacement. On cloud, the iframe may call `get_output` with `{prompt_id}`, plus `offset` when the displayed result carries a non-zero `offset` (the read-only call below), which re-mints the links on the page it is showing. A legacy `results` or `outputs` result carries no `offset`, so the viewer cannot tell its page and offers no Refresh there; it shows "Preview unavailable" and the text, and the model refreshes with the `offset` the text names. The model does the same when the person or the viewer says the link expired: call `get_output` again, with `offset` when the text names one. Do not reuse a URL past the lifetime above, and do not paste the signed query into the reply.
 
 ## Cloud `wait_for_job` exception
 
@@ -257,7 +257,7 @@ Against PR 1894, PR 2005, and cloud `main` on 2026-11-14. PR 2005 only shares th
 - `url_omitted: true` stays the character-ceiling signal. Do not delete the flag.
 - A batch entry may keep `job_id`. The viewer accepts it as `prompt_id`.
 - `size_bytes` stays omitted when the length is unknown, including when only `width` and `height` are known. Do not emit `0` for unknown.
-- `wait_for_job` may keep `_meta.ui`. The read-only `get_output({prompt_id})` call from the iframe stays, including Refresh after a media error, which also sends the displayed page's `offset` when it is not 0.
+- `wait_for_job` may keep `_meta.ui`. The read-only `get_output({prompt_id})` call from the iframe stays, including Refresh after a media error on an `items` result, which also sends the displayed page's `offset` when it is not 0.
 - Filename extensions may keep classifying legacy entries. `kind` and `mime_type` are required only on an opted-in `items` entry.
 - Security pins stay: no `fetch`, no `innerHTML`, text through `textContent`, no `connectDomains`, and the `chatgpt` profile stays resource-free. The upload widget, catalog picker, run-settings panel, and the iterate buttons stay outside this contract.
 - `resourceDomains` stay this session's public API origin and the storage host those URLs redirect to (`https://storage.googleapis.com` today, or a narrower bucket origin when the server knows it). Do not add another environment's origin.
