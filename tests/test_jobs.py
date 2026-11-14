@@ -1428,9 +1428,11 @@ def test_job_queue_passes_through_foreign_payload_shapes(patched_run):
         }
     )
 
-    assert asyncio.run(server.job(action="queue")) == [
-        {"prompt_id": "a", "where": "cloud"}
-    ]
+    # Kept verbatim, under `data`: `job` publishes an object outputSchema, so a
+    # bare list would fail the SDK's output validation (test_structured_output).
+    assert asyncio.run(server.job(action="queue")) == {
+        "data": [{"prompt_id": "a", "where": "cloud"}]
+    }
 
 
 def test_job_queue_passes_through_payload_without_jobs(patched_run):

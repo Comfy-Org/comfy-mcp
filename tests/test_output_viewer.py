@@ -146,9 +146,11 @@ def test_fetch_outputs_still_returns_its_text_payload_alongside_images(
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert isinstance(result, list)
-    assert result[0] == {"downloaded": ["gen.png"]}  # the text payload, first
-    assert any(isinstance(item, server.Image) for item in result[1:])
+    assert isinstance(result, server.types.CallToolResult)
+    first, *rest = result.content
+    assert first.type == "text"
+    assert json.loads(first.text) == {"downloaded": ["gen.png"]}  # the payload, first
+    assert any(item.type == "image" for item in rest)
 
 
 def test_preview_media_still_returns_its_text_payload(patched_run):
