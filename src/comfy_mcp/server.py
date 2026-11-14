@@ -63,6 +63,7 @@ import asyncio
 import contextlib
 import errno
 import functools
+import inspect
 import ipaddress
 import json
 import logging
@@ -140,6 +141,44 @@ mcp = MCPServer(
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
 )
+
+
+def _as_object(payload: Any) -> Any:
+    """Hand back ``payload`` as the object an ``outputSchema`` tool must return.
+
+    A ``dict`` (and a prebuilt ``CallToolResult``) passes through untouched; any
+    other shape — a list, ``None``, a scalar — is kept verbatim under ``data``,
+    the spelling ``_with_cancel_verdict`` already uses for a non-object reply.
+    """
+    if isinstance(payload, (dict, types.CallToolResult)):
+        return payload
+    return {"data": payload}
+
+
+def _object_payload(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Make a ``-> dict[str, Any]`` tool's reply satisfy its own ``outputSchema``.
+
+    The SDK validates a structured tool's return value against that schema AFTER
+    the tool ran, and ``_run_comfy`` returns the envelope's ``data`` unchanged —
+    so a ``null`` or list payload would turn a call that already spent credits,
+    cancelled a job, or finished a download into a validation-error failure the
+    agent is invited to retry. Wrapping every exit here, below ``@mcp.tool()``,
+    keeps that guarantee in one place instead of at each tool's return sites.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(await fn(*args, **kwargs))
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(fn(*args, **kwargs))
+
+    return wrapper
+
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
@@ -3370,6 +3409,7 @@ def _freshness_report() -> Any:
 
 
 @mcp.tool()
+@_object_payload
 def server_info() -> dict[str, Any]:
     """Report the local ComfyUI/comfy-cli environment and verify compatibility.
 
@@ -4122,6 +4162,7 @@ async def auth_login() -> Any:
 
 
 @mcp.tool()
+@_object_payload
 async def run_workflow(
     workflow_path: str,
     wait: bool = True,
@@ -5331,6 +5372,7 @@ def partner_model_schema(model: str) -> Any:
 
 
 @mcp.tool()
+@_object_payload
 async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
@@ -6006,6 +6048,7 @@ async def _run_template_exec(
 # unrelated subsystem and wrongly refuse free, local-only template runs on a
 # CLI that lacks it.
 @mcp.tool()
+@_object_payload
 async def run_template(
     name: str,
     params: dict[str, Any] | None = None,
@@ -6639,6 +6682,7 @@ _JOB_ACTIONS_TAKING_TIMEOUT = ("wait", "watch")
 
 
 @mcp.tool()
+@_object_payload
 async def job(
     action: str = "status",
     prompt_id: str = "",
@@ -7039,9 +7083,7 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     return selected
 
 
-def _inline_image_result(
-    data: dict[str, Any], images: list[Image]
-) -> types.CallToolResult:
+def _inline_image_result(data: Any, images: list[Image]) -> types.CallToolResult:
     """Carry the download metadata as BOTH ``structuredContent`` and a JSON text
     block, with the inline images as image content blocks after it.
 
@@ -7053,8 +7095,10 @@ def _inline_image_result(
     ride alongside it in ``content``, where a viewer reads them. The text block is
     serialized identically to the SDK's own unstructured conversion
     (``pydantic_core.to_json(..., indent=2)``), so the metadata reads the same
-    whether or not images were inlined.
+    whether or not images were inlined. A non-object payload is first wrapped by
+    ``_as_object``, exactly as ``_object_payload`` wraps the plain return.
     """
+    data = _as_object(data)
     text = types.TextContent(
         type="text",
         text=pydantic_core.to_json(data, fallback=str, indent=2).decode(),
@@ -7072,6 +7116,7 @@ def _inline_image_result(
 # (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
 # being made below.
 @mcp.tool()
+@_object_payload
 def fetch_outputs(
     prompt_id: str,
     out_dir: str,
@@ -12242,6 +12287,7 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 
 
 @mcp.tool()
+@_object_payload
 async def download_model(
     url: str,
     relative_path: str | None = None,
@@ -12540,6 +12586,7 @@ _DOWNLOAD_ACTION_VERB = {
 
 
 @mcp.tool()
+@_object_payload
 def download(
     action: str = "status",
     download_id: str = "",

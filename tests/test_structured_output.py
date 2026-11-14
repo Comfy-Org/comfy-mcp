@@ -21,6 +21,7 @@ import asyncio
 import json
 import sys
 
+import pytest
 from conftest import envelope
 
 from comfy_mcp import server
@@ -147,3 +148,47 @@ def test_fetch_outputs_inline_images_call_keeps_structured_metadata_and_images(
     import base64
 
     assert base64.b64decode(images[0].data) == png
+
+
+@pytest.mark.parametrize("payload", [[{"prompt_id": "a"}], None, "queued"])
+def test_a_non_object_payload_is_kept_under_data_not_failed(patched_run, payload):
+    """A list/``null``/scalar ``data`` still yields a valid structured reply.
+
+    The SDK validates the return value against the object ``outputSchema`` only
+    after comfy-cli ran, so a bare non-object payload would turn a call that
+    already happened (a cancel, a paid generation) into a tool error. It is kept
+    verbatim under ``data`` instead, in ``structuredContent`` and the text block.
+    """
+    patched_run(envelope(data=payload))
+
+    result = asyncio.run(server.mcp.call_tool("job", {"action": "queue"}))
+
+    assert not result.is_error
+    assert result.structured_content == {"data": payload}
+    text_blocks = [c for c in result.content if c.type == "text"]
+    assert json.loads(text_blocks[0].text) == {"data": payload}
+
+
+def test_every_structured_tool_wraps_a_non_object_reply():
+    """Each schema'd tool is wrapped, so none can return a bare non-object.
+
+    Guards the set against a tool gaining ``-> dict[str, Any]`` without the
+    wrapper: ``functools.wraps`` leaves ``__wrapped__`` on exactly those.
+    """
+    for name in _STRUCTURED_TOOLS:
+        assert hasattr(getattr(server, name), "__wrapped__"), name
+
+
+def test_fetch_outputs_inline_images_wraps_a_non_object_payload(patched_run, tmp_path):
+    """The hand-built ``CallToolResult`` branch wraps a non-object payload too."""
+    patched_run(envelope(data=None))
+
+    result = asyncio.run(
+        server.mcp.call_tool(
+            "fetch_outputs",
+            {"prompt_id": "p1", "out_dir": str(tmp_path), "inline_images": True},
+        )
+    )
+
+    assert not result.is_error
+    assert result.structured_content == {"data": None}
