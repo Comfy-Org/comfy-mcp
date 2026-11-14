@@ -126,8 +126,9 @@ def test_fetch_outputs_inline_images_call_keeps_structured_metadata_and_images(
     """Inlined images ride in ``content`` while the metadata stays structured.
 
     The ``inline_images`` branch hands back a hand-built ``CallToolResult`` so an
-    object schema can coexist with image content blocks — the metadata is
-    ``structuredContent``, the PNG is an ``image`` block alongside the JSON text.
+    object schema can coexist with image content blocks — ``structuredContent`` is
+    the metadata plus the ``media`` manifest, the PNG is an ``image`` block
+    alongside the metadata's JSON text.
     """
     png = b"\x89PNG\r\n\x1a\nfake"
     (tmp_path / "gen.png").write_bytes(png)
@@ -142,7 +143,11 @@ def test_fetch_outputs_inline_images_call_keeps_structured_metadata_and_images(
     )
 
     assert not result.is_error
+    media = result.structured_content.pop("media")
     assert result.structured_content == data
+    assert [r["inline"] for r in media] == [True]
+    text_blocks = [c for c in result.content if c.type == "text"]
+    assert json.loads(text_blocks[0].text) == data  # text keeps the metadata alone
     images = [c for c in result.content if c.type == "image"]
     assert len(images) == 1
     import base64
@@ -191,4 +196,4 @@ def test_fetch_outputs_inline_images_wraps_a_non_object_payload(patched_run, tmp
     )
 
     assert not result.is_error
-    assert result.structured_content == {"data": None}
+    assert result.structured_content == {"data": None, "media": []}

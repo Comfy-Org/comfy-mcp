@@ -148,9 +148,12 @@ Four steps take you from a fresh install to your first generated image.
 name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
 the originals stay in the ComfyUI workspace.
 
-For video or audio output, pass the downloaded file to `preview_media`. It asks comfy-cli to
-render a PNG contact sheet or waveform and returns that image inline, so the agent can inspect
-the result without trying to embed the original media file in the MCP response.
+For video or audio output, `fetch_outputs(inline_images=True)` records every output's on-disk
+path, media type and size in `structuredContent` and inlines small audio clips directly as MCP
+audio content, while a video — MCP has no video content type — and anything past the cap stays a
+path-only record. For a visual summary of a video, pass the downloaded file to `preview_media`: it asks
+comfy-cli to render a PNG contact sheet or waveform and returns that image inline, so the agent can
+inspect the result without embedding the whole media file in the MCP response.
 
 ## Upgrading from `comfy-local-mcp`
 
@@ -403,6 +406,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Templates your install can't run](#templates-your-install-cant-run)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
+- [ComfyUI Desktop and the Windows portable package](#comfyui-desktop-and-the-windows-portable-package)
 - [Which address variable do I want?](#which-address-variable-do-i-want)
 - [Project anchoring](#project-anchoring)
 - [Tools](#tools)
@@ -875,6 +879,56 @@ effect, rather than the version alone.
 **Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port` flag →
 `COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.
 
+## ComfyUI Desktop and the Windows portable package
+
+`comfy install` creates a comfy-cli workspace. ComfyUI Desktop (the Electron app) and the Windows
+portable package (`ComfyUI_windows_portable`) are installs you may already be running. Reach the
+one that is up through the address and workspace settings below.
+
+**ComfyUI Desktop.** The app defaults to `127.0.0.1` and port 8000; check the port the app
+shows. This server's unset default is `127.0.0.1:8188`. Set
+`COMFY_LOCAL_URL` to `http://127.0.0.1:<that port>` in the MCP client `env` block, beside
+`COMFY_BIN`, as in [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address).
+Confirm the URL `server_info` reports. `launch_comfyui` and `stop_comfyui` start and stop the
+ComfyUI process comfy-cli itself launched. `restart_comfyui` does that too, and if comfy-cli has
+nothing recorded and the new launch finds the port taken, it names the process listening there
+and asks before killing it (`confirm_kill_untracked` defaults to false, so a decline kills
+nothing). That process can be Desktop's server. Start and quit Desktop from the app.
+
+**Windows portable.** `run_nvidia_gpu.bat` runs the package's embedded Python
+(`python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build`) and passes no
+`--port`. ComfyUI's own default listen port is 8188, the same default this server uses. With the
+bat's server on 8188 and no `COMFY_LOCAL_URL`, tools follow the precedence above, so a background
+server comfy-cli has already launched is chosen ahead of 8188. `server_info` is the check.
+Start the portable copy with the bat. `launch_comfyui` starts the ComfyUI in the comfy-cli
+workspace, which also defaults to 8188, so give that launch a different `--port` in `extra_args`
+while the bat's server is up. `restart_comfyui` can ask to kill the process holding the port,
+which in that case is the portable server.
+
+**Where model downloads go.** comfy-cli 1.25 and newer can save a CivitAI or Hugging Face
+`download_model` that omits `relative_path` into the folder the running server scans for that
+model type, when the server comfy-cli reaches is on a loopback address. That address is the
+precedence above: `COMFY_LOCAL_URL`, then a background server comfy-cli launched, then
+`127.0.0.1:8188`. A plain file URL has no model type, so that call saves under the workspace
+`models` directory. Older comfy-cli, including this server's 1.14.0 floor, writes the comfy-cli
+workspace for every download. For the portable package, `comfy set-default` on
+`ComfyUI_windows_portable\ComfyUI` makes that tree the workspace, so those downloads land in its
+`models` directory (`models\checkpoints` is where the package tells you to put checkpoints).
+`launch_comfyui`, `install_node`, `update_comfyui`, and `switch_comfyui_version` then act on that
+same tree, using the Python comfy-cli resolves for it (an active virtualenv, a `.venv` or `venv`
+inside the tree, or the Python running comfy-cli). The bat's interpreter stays
+`python_embeded`, next to that tree. `COMFY_PROJECT` is a separate knob: it sets the cwd of
+every comfy-cli spawn, which also selects the workspace when that directory looks like a ComfyUI
+tree, and it is where `project(action="init")` and relative paths land. Desktop creates a
+`models` directory in the install folder you chose and records it in `extra_models_config.yaml`
+in the app's user-data directory (`base_path` plus `download_model_base: models`, and a second
+root when you imported models from another install). A file that landed in the comfy-cli
+workspace is a different directory; move it into that `models` folder, or into a path the yaml
+lists.
+
+Install `comfy-mcp` and `comfy-cli` with the Python the MCP client will run. When `comfy` is off
+that client's `PATH`, set `COMFY_BIN` to its absolute path.
+
 ## Which address variable do I want?
 
 Two variables point ComfyUI work at an address, their names are similar, and they are **not**
@@ -979,7 +1033,7 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 | `emit_partner_workflow(model, out_path, params=None)` | `comfy generate <model> [--param=value…] --emit-workflow=<path>` | Write a runnable workflow JSON that drives the partner model's **API node** instead of calling the proxy, so **your own ComfyUI executes the partner model** (the other way there is an existing `API`-tagged gallery template via `search_templates` / `run_template`; this is the path from a model *alias*). Chain it: `emit_partner_workflow` → `run_workflow` → `fetch_outputs` (the three stay separate so the graph can be inspected, edited with `set_workflow_slot`, re-run, or embedded in a bigger pipeline). Calls no partner API, needs no API key, and **spends nothing**, so unlike `partner_generate` it has no `confirm_spend` argument and raises no confirmation prompt — *running* the emitted graph is what bills the partner node, so that `run_workflow` step is the one that needs `confirm_spend=True`. **Coverage is narrow:** comfy-cli maps only `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana` and `seedance` to a node class, a small subset of `list_partner_models()`; every other model reaches its partner through the proxy only, so send those to `partner_generate`. An unsupported model raises with comfy-cli's own `emit_workflow_failed` message, which names the supported set for the comfy-cli you actually have installed. Returns comfy-cli's envelope data — `{"out", "model", "nodes"}`. |
 | `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=True` (the default) streams the run's live progress as MCP progress notifications, the same way `run_workflow` / `job(action="watch")` do, so a long template run is not a silent block; `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job(action="status", prompt_id="", timeout_seconds=None)` | `comfy jobs status/watch/cancel/ls <prompt_id>` | One grouped tool over the six former `job_status`/`wait_for_job`/`watch_job`/`get_execution_error`/`cancel_job`/`get_queue` tools — pick a behavior with `action`. `"status"` (default) polls status + outputs. `"error"` returns a compact failure verdict — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; `error: None` on a healthy prompt. Failures comfy-cli diagnosed itself rather than ComfyUI (a `server_died` crash mid-run) carry no node-level fields, so the verdict also reports `error_code` — comfy-cli's own code, `None` on an ordinary node failure — with its message backfilling `exception_message`. `"wait"` polls (bounded, default 25.0s) until a job reaches a terminal status, returning a `{"timed_out": True, …}` payload on expiry — chain several rather than one long call. `"watch"` streams live progress (bounded, default 600.0s) as MCP progress notifications, same `timed_out` shape except `status` is a live `{progress, total, nodes_done}` snapshot. `"cancel"` stops a queued/running job. `"queue"` lists known jobs (Comfy Cloud-tracked rows filtered out, since this server never drives them; follows a configured remote like the other job actions). `prompt_id` is required for every action but `"queue"`; `timeout_seconds` only for `"wait"`/`"watch"` — passing either where the action does not use it is rejected rather than silently ignored. |
-| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` surfaces the outputs as MCP content plus a `structuredContent` object — the download metadata with a `media` manifest under `media`: images and small audio clips inline (audio as MCP audio content), a video always as a path-only record, and every output's on-disk path, media type and size recorded (files past the 8-file / 16 MiB cap are path-only records). No listening socket is opened. |
 | `preview_media(media_path, out_path="", grid="4x3", width=480, inline_image=True)` | `comfy preview <media_path> [--out <out_path>] --grid <COLSxROWS> --width <pixels>` | Render a local image thumbnail, video contact sheet, or audio waveform as PNG. comfy-cli owns media classification and rendering; this server does not parse media or call ffmpeg. By default the result contains comfy-cli's metadata followed by the generated PNG as inline MCP image content; `inline_image=False` returns metadata only. `grid` controls video frame sampling, and `out_path` is optional because comfy-cli otherwise writes `<media>.preview.png`. The input must exist on the MCP host, so for a remote job call `fetch_outputs` first and pass one of its downloaded paths here. Relative paths follow `COMFY_PROJECT`. |
 
 ### Resource management
