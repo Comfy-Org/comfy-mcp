@@ -5138,9 +5138,12 @@ _CONSENT_STATE_PREFIX = "comfy-mcp/consent/v1"
 # ONCE: a client replaying a sealed state plus its "yes" (inside the SDK's TTL)
 # gets a fresh prompt instead of a second run on the first approval. Each nonce
 # maps to the wall-clock time it was consumed and is forgotten only once
-# `_REQUEST_STATE_SECURITY.ttl` has passed since then — by which point the SDK
-# itself rejects the state as expired (it was minted no later than it was
-# consumed, and the SDK times `exp` on the same wall clock). The size cap is a
+# `_REQUEST_STATE_SECURITY.ttl` has passed since then — by which point
+# `_claim_consent_nonce` itself rejects the state as expired (it was minted no
+# later than it was consumed, and its sealed issuance time is read on the same
+# wall clock). That expiry check is this gate's own, not the SDK's: the SDK
+# checks `exp` when the request ARRIVES, and a gate reached after an awaited
+# preflight (`partner_generate`'s) can redeem the answer past it. The size cap is a
 # MEMORY bound only: it never evicts a live nonce, so a full cache refuses the
 # claim (the gate asks afresh) rather than forget one that could be replayed.
 _CONSUMED_CONSENT_NONCES: OrderedDict[str, float] = OrderedDict()
@@ -5148,16 +5151,29 @@ _CONSUMED_CONSENT_NONCES_MAX = 4096
 _CONSUMED_CONSENT_LOCK = threading.Lock()
 
 
-def _consent_state(key: str, message: str, nonce: str) -> str:
-    """The `request_state` one prompt mints: the gate, the prompt text, a nonce.
+def _consent_state(key: str, message: str, suffix: str) -> str:
+    """The `request_state` one prompt mints: the gate, the prompt text, a suffix.
 
     The message digest is what ties an answer to the question a person actually
     SAW: every gated prompt names what it authorizes (the model, the packs, the
     version, the exposed address), so a retry whose prompt would read differently
-    no longer matches the state its answer came back with.
+    no longer matches the state its answer came back with. The ``suffix`` is
+    ``<issued>:<nonce>`` when minting (:func:`_mint_consent_state`) and empty when
+    building the prefix a retry's state must start with.
     """
     digest = hashlib.sha256(message.encode("utf-8", "surrogatepass")).hexdigest()
-    return f"{_CONSENT_STATE_PREFIX}:{key}:{digest}:{nonce}"
+    return f"{_CONSENT_STATE_PREFIX}:{key}:{digest}:{suffix}"
+
+
+def _mint_consent_state(key: str, message: str) -> str:
+    """A fresh prompt's state, carrying its issuance time and a one-use nonce.
+
+    The issuance time rides INSIDE the sealed state, so the SDK authenticates it
+    along with everything else; it is floored to whole seconds, which can only
+    make a state look older (fail closed), never younger.
+    """
+    issued = int(time.time())
+    return _consent_state(key, message, f"{issued}:{secrets.token_urlsafe(16)}")
 
 
 def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
@@ -5165,20 +5181,33 @@ def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
 
     False — the answer is ignored and the gate asks afresh — when the state is
     absent (an answer attached to a first call nobody was prompted on), minted
-    for another gate or another prompt text, already consumed, or the consumed
-    set is full of nonces still inside the state TTL.
+    for another gate or another prompt text, older than the state TTL, already
+    consumed, or the consumed set is full of nonces still inside the state TTL.
+
+    The age check runs HERE, at redemption, before any pruning: the SDK rejects an
+    expired state only when the request arrives, so a replay admitted just inside
+    the TTL could otherwise reach this gate after its consumed nonce was pruned
+    and run a second time on one approval.
     """
     state = getattr(ctx, "request_state", None)
     if not isinstance(state, str):
         return False
     expected = _consent_state(key, message, "")
-    nonce = state[len(expected) :]
-    if not state.startswith(expected) or not nonce:
+    if not state.startswith(expected):
+        return False
+    issued_text, _, nonce = state[len(expected) :].partition(":")
+    if not issued_text.isdigit() or not nonce:
         return False
     now = time.time()
+    ttl = _REQUEST_STATE_SECURITY.ttl
+    # `>=` matches the pruning horizon below: a nonce is pruned once `ttl` has
+    # passed since it was consumed, and it was minted no later than that, so any
+    # replay of a pruned nonce is already refused here.
+    if now - int(issued_text) >= ttl:
+        return False
     with _CONSUMED_CONSENT_LOCK:
         # Insertion order is consumption order, so the expired entries lead.
-        horizon = now - _REQUEST_STATE_SECURITY.ttl
+        horizon = now - ttl
         while _CONSUMED_CONSENT_NONCES:
             oldest, consumed_at = next(iter(_CONSUMED_CONSENT_NONCES.items()))
             if consumed_at > horizon:
@@ -5222,7 +5251,7 @@ def _consent_via_input_required(
                 requested_schema=render_elicitation_schema(schema),
             )
         )
-        state = _consent_state(key, message, secrets.token_urlsafe(16))
+        state = _mint_consent_state(key, message)
         raise _ElicitationInputRequired(
             types.InputRequiredResult(
                 input_requests={key: request}, request_state=state

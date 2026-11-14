@@ -571,6 +571,42 @@ def test_consumed_nonce_is_forgotten_only_after_the_state_ttl(
     assert nonce not in server._CONSUMED_CONSENT_NONCES
 
 
+def test_expired_consent_is_refused_at_redemption(patched_streamed_run, monkeypatch):
+    """A state past the TTL is refused by the gate itself, not only by the SDK.
+
+    The SDK checks expiry when the request arrives; a gate reached after an
+    awaited preflight redeems later. Mint at t0, consume at t0+1, and a replay
+    reaching the gate past the TTL — after its consumed nonce was pruned — must
+    re-ask, not run a second time on the one approval.
+    """
+    calls = patched_streamed_run()
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES", server.OrderedDict())
+    clock = [1_000_000.0]
+    monkeypatch.setattr(server.time, "time", lambda: clock[0])
+    ttl = server._REQUEST_STATE_SECURITY.ttl
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    clock[0] += 1
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    assert len(calls) == 1
+
+    clock[0] += ttl + 1  # the consumed nonce is now prunable
+    replay = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(pending)
+    )
+
+    assert isinstance(replay, types.InputRequiredResult)
+    assert len(calls) == 1
+    # An expired answer never reaches the consumed set or the pruning pass.
+    unanswered = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    clock[0] += ttl
+    refused = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(unanswered)
+    )
+    assert isinstance(refused, types.InputRequiredResult)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     ("answer", "match"),
     [
