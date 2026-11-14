@@ -23,7 +23,9 @@ the fixture catalogue and the rationale behind it.
   plain-JSON *async* path (`_run_comfy_async`): same spawn and real `StreamReader` pipes as
   `patched_stream`, but parses the capture once at the end, not line-by-line. `hang=True`
   leaves the pipes OPEN so the child never finishes; `kill()` closes them (the process-group
-  kill, so a post-kill drain reaches EOF), records `killed`, and fires `on_spawn(cmd)`.
+  kill, so a post-kill drain reaches EOF), records `killed`, and fires `on_spawn(cmd)`. A
+  LIST `stdout` scripts repeated spawns (spawn `n` gets entry `n`, the last repeats) for a
+  poll loop like `job("wait")`'s.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool for async

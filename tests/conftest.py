@@ -900,7 +900,19 @@ def patched_async_run(monkeypatch):
     path) — same hook, same firing point as :func:`_canonical_run`'s: once the
     child has actually started, after the ``raises`` check, because a spawn that
     never returned wrote nothing either.
+
+    ``stdout`` may also be a LIST, for a caller that spawns repeatedly and needs a
+    different reply each time (``job(action="wait")``'s poll loop): spawn ``n``
+    gets entry ``n`` (each encoded as above), and the last entry repeats once the
+    script runs out.
     """
+
+    def _encode(out):
+        if out is None:
+            return ""
+        if isinstance(out, dict):
+            return json.dumps(out)
+        return out
 
     def setup(
         stdout=None,
@@ -911,14 +923,15 @@ def patched_async_run(monkeypatch):
         raises=None,
         on_spawn=None,
     ) -> list[_FakeAsyncRunProc]:
-        if stdout is None:
-            stdout = ""
-        if isinstance(stdout, dict):
-            stdout = json.dumps(stdout)
-        # Rebound because the inner fake's own `stdout=` kwarg (the PIPE sentinel
+        script = (
+            [_encode(out) for out in stdout]
+            if isinstance(stdout, list)
+            else [_encode(stdout)]
+        )
+        # Rebound because the inner fake's own `stderr=` kwarg (the PIPE sentinel
         # `server` passes) shadows the name — same reason `_canonical_run` keeps a
         # `canned_*` pair.
-        canned_stdout, canned_stderr = stdout, stderr
+        canned_stderr = stderr
         procs: list[_FakeAsyncRunProc] = []
 
         async def fake_exec(
@@ -931,7 +944,7 @@ def patched_async_run(monkeypatch):
                 on_spawn(list(cmd))
             proc = _FakeAsyncRunProc(
                 list(cmd),
-                stdout=canned_stdout,
+                stdout=script[min(len(procs), len(script) - 1)],
                 stderr=canned_stderr,
                 returncode=returncode,
                 hang=hang,

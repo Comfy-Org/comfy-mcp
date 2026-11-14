@@ -6470,13 +6470,17 @@ async def _poll_until_terminal_async(
         await asyncio.sleep(min(_POLL_INTERVAL, remaining))
 
 
-# Stdout bound for the async ``jobs status`` polls. `_run_comfy_async` keeps
-# only the TRAILING bytes, so this has to be comfortably larger than the biggest
-# envelope `jobs status` can produce — a many-output job, or a failed one whose
-# `error` carries a full Python traceback — or the JSON loses its head and
-# parses as nothing. Far below `upload_file`'s 4 MiB: a status payload does not
-# scale with caller input the way a staged batch does.
-_JOB_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
+# Stdout bound for the async ``jobs status`` polls: effectively NONE.
+# `_run_comfy_async` keeps only the TRAILING bytes, and nothing bounds how big a
+# `jobs status` envelope can get — a many-output job, or a failed one whose
+# `error` carries a full Python traceback — so any finite cap is a guess that,
+# once exceeded, cuts the JSON's head off and turns the job's real (often
+# terminal) status into "comfy-cli returned no JSON". Retaining it whole is what
+# the synchronous `_run_comfy` (`communicate()`) always did for these polls; the
+# tail bound exists for the long-lived, chatty children (a multi-GB download's
+# progress text), not for a short child that prints one envelope and exits. A
+# full-range slice of `bytes` returns the object itself, so this costs no copy.
+_JOB_STATUS_STDOUT_MAX_CHARS = sys.maxsize
 
 
 def _job_status_sync(prompt_id: str) -> Any:
@@ -6500,13 +6504,13 @@ async def _job_status_async(
     timeouts. ``timeout`` is required, not defaulted, because a poll that is
     carved out of somebody else's budget must never quietly inherit a 60s one.
 
-    ``stdout_cap`` is widened for the same reason ``upload_file`` widens it:
+    ``stdout_cap`` is lifted (see :data:`_JOB_STATUS_STDOUT_MAX_CHARS`):
     :func:`_run_comfy_async` keeps only the TRAILING
-    :data:`_STDERR_MAX_CHARS` of stdout, and a ``jobs status`` envelope scales
-    with the job — every output file, and a failed run's whole traceback under
-    ``error``. Losing its opening brace to the tail makes it unparseable, so
-    both diagnostic callers would silently drop a status they did in fact
-    receive, which is the one thing a diagnosis must not do.
+    :data:`_STDERR_MAX_CHARS` of stdout by default, and a ``jobs status``
+    envelope scales with the job — every output file, and a failed run's whole
+    traceback under ``error``. Losing its opening brace to the tail makes it
+    unparseable, so both diagnostic callers would silently drop a status they
+    did in fact receive, which is the one thing a diagnosis must not do.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     return await _run_comfy_async(
@@ -6540,8 +6544,10 @@ async def _job_wait_async(prompt_id: str, timeout_seconds: float) -> Any:
     Runs on the async poll twin rather than the thread pool so a client that
     disconnects, or ``notifications/cancelled`` on a 3600s wait, reaps the
     in-flight ``comfy jobs status`` child instead of orphaning it — see
-    :func:`_poll_until_terminal_async`. ``stdout_cap`` is widened exactly as
-    :func:`_job_status_async` widens it, for the same reason.
+    :func:`_poll_until_terminal_async`. ``stdout_cap`` is lifted exactly as
+    :func:`_job_status_async` lifts it, for the same reason — the terminal poll
+    is the one whose envelope is biggest, and the one a wait cannot afford to
+    lose.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)

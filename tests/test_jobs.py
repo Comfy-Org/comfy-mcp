@@ -518,21 +518,14 @@ def test_cap_traceback_tail_hard_truncates_single_oversized_frame():
 # --- action="wait" --------------------------------------------------------------
 
 
-def test_job_wait_returns_terminal_status(monkeypatch):
-    statuses = iter(
+def test_job_wait_returns_terminal_status(patched_async_run, monkeypatch):
+    procs = patched_async_run(
         [
-            {"status": "running"},
-            {"status": "running"},
-            {"status": "completed", "outputs": ["/tmp/gen.png"]},
+            envelope(data={"status": "running"}),
+            envelope(data={"status": "running"}),
+            envelope(data={"status": "completed", "outputs": ["/tmp/gen.png"]}),
         ]
     )
-    calls: list[tuple] = []
-
-    async def fake_run(*args, **kwargs):
-        calls.append(args)
-        return next(statuses)
-
-    monkeypatch.setattr(server, "_run_comfy_async", fake_run)
     monkeypatch.setattr(server, "_POLL_INTERVAL", 0.0)
 
     result = asyncio.run(
@@ -540,31 +533,52 @@ def test_job_wait_returns_terminal_status(monkeypatch):
     )
 
     assert result == {"status": "completed", "outputs": ["/tmp/gen.png"]}
-    assert calls[0] == ("jobs", "status", "pid")
-    assert len(calls) == 3
+    assert [p.cmd[4:] for p in procs] == [["jobs", "status", "pid"]] * 3
 
 
-def test_job_wait_times_out_cleanly(monkeypatch):
-    async def fake_run(*a, **k):
-        return {"status": "running"}
+def test_job_wait_times_out_cleanly(patched_async_run, monkeypatch):
+    """A job still running at the bound returns `timed_out` with its last status.
 
-    monkeypatch.setattr(server, "_run_comfy_async", fake_run)
-    monkeypatch.setattr(server, "_POLL_INTERVAL", 0.0)
+    Driven by a REAL (short) bound rather than a fake `time.monotonic()`: the
+    poll now runs through `_run_comfy_async`'s `asyncio.wait_for`, whose deadline
+    reads the same process-global clock, so a fake that jumps 10s per read would
+    fire every poll's own timeout instead of exercising the caller's bound.
+    """
+    procs = patched_async_run(envelope(data={"status": "running"}))
+    monkeypatch.setattr(server, "_POLL_INTERVAL", 0.01)
 
-    clock = {"t": 0.0}
+    result = asyncio.run(
+        server.job(action="wait", prompt_id="pid", timeout_seconds=0.2)
+    )
 
-    def fake_monotonic():
-        now = clock["t"]
-        clock["t"] += 10.0
-        return now
+    assert result == {"timed_out": True, "status": {"status": "running"}}
+    assert len(procs) >= 2  # it re-polled until the bound, not just once
 
-    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+def test_job_wait_parses_an_envelope_larger_than_any_tail_bound(patched_async_run):
+    """A terminal `jobs status` envelope bigger than the async runner's tail
+    bounds still parses, instead of losing its head and reading as "no JSON".
+
+    `_run_comfy_async` keeps only the TRAILING bytes of stdout by default; the
+    synchronous `_run_comfy` this wait used to run retained the whole envelope.
+    Nothing bounds a `jobs status` payload (a many-output job, a failed run's
+    whole traceback), so the terminal poll — the one the wait exists to return —
+    must not be truncated. Sized well past both the default
+    `_STDERR_MAX_CHARS` and the 1 MiB cap the wait briefly carried.
+    """
+    traceback = ["frame " + "x" * 1000 for _ in range(3 * 1024)]  # ~3 MiB
+    status = {
+        "status": "error",
+        "error": {"exception_message": "boom", "traceback": traceback},
+    }
+    patched_async_run(envelope(data=status))
 
     result = asyncio.run(
         server.job(action="wait", prompt_id="pid", timeout_seconds=25.0)
     )
 
-    assert result == {"timed_out": True, "status": {"status": "running"}}
+    assert len(json.dumps(result)) > 2 * 1024 * 1024
+    assert result == status
 
 
 # --- R1: default timeouts (wait=25.0, watch=600.0) ------------------------------
@@ -635,14 +649,13 @@ def test_job_wait_clamps_an_oversized_timeout(monkeypatch, oversized):
 
 
 @pytest.mark.parametrize("bad", [float("nan"), 0.0, -1.0])
-def test_job_wait_rejects_a_non_positive_or_nan_timeout(monkeypatch, bad):
-    async def fake_run(*args, **kwargs):
-        raise AssertionError("job(action='wait') polled with an invalid timeout")
-
-    monkeypatch.setattr(server, "_run_comfy_async", fake_run)
+def test_job_wait_rejects_a_non_positive_or_nan_timeout(patched_async_run, bad):
+    procs = patched_async_run(envelope(data={"status": "running"}))
 
     with pytest.raises(server.ComfyCliError, match="timeout_seconds"):
         asyncio.run(server.job(action="wait", prompt_id="pid", timeout_seconds=bad))
+
+    assert procs == []  # refused before any `jobs status` child was spawned
 
 
 def test_poll_until_terminal_always_polls_at_least_once(monkeypatch):
@@ -854,13 +867,13 @@ def test_poll_until_terminal_reraises_a_non_timeout_poll_failure(monkeypatch):
         )
 
 
-def test_job_wait_sleeps_the_shared_poll_interval(monkeypatch):
-    statuses = iter([{"status": "running"}, {"status": "completed"}])
-
-    async def fake_run(*a, **k):
-        return next(statuses)
-
-    monkeypatch.setattr(server, "_run_comfy_async", fake_run)
+def test_job_wait_sleeps_the_shared_poll_interval(patched_async_run, monkeypatch):
+    patched_async_run(
+        [
+            envelope(data={"status": "running"}),
+            envelope(data={"status": "completed"}),
+        ]
+    )
 
     slept: list[float] = []
 
