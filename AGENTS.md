@@ -74,6 +74,16 @@ The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
 handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
 
+The third is the **MCP Apps output viewer** (`output_viewer`): a `ui://comfy-mcp/output-viewer`
+HTML resource, built as an `Apps()` extension and handed to `MCPServer(..., extensions=[...])`,
+with `_meta.ui.resourceUri` stamped on `fetch_outputs` and `preview_media` ONLY. An Apps host
+renders those tools' output inline; it adds NO product behavior — the resource and its pointer
+are advertised unconditionally, so a non-Apps host ignores `_meta.ui` and still gets the same
+text/image `content` the tools already return. The document renders the host-delivered tool
+result with `data:` URLs and `textContent` only — no `fetch`, no `tools/call`, no socket, no
+`file://`/loopback URL — so it needs no CSP widening past the ext-apps default. Same guardrail:
+this is a protocol surface comfy-cli can't express, not a derived verdict.
+
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` — differ where
 the engine's own shape differs, and those differences are load-bearing: `comfy generate`
 always spends, so it always prompts and honors `spend.auto_confirm`, while `comfy
@@ -100,7 +110,7 @@ included (`nodes` can take a saved `object_info`); `preview_media` returns comfy
 ## Module layout
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the `--json-stream`
-machinery, the spend-consent plumbing) and every `@mcp.tool()`. Ten **leaf** modules sit
+machinery, the spend-consent plumbing) and every `@mcp.tool()`. Eleven **leaf** modules sit
 under it — none imports `server`, so the dependency edges only ever point one way.
 
 Who owns what, per module: [`docs/agents/module-layout.md`](docs/agents/module-layout.md).
