@@ -481,6 +481,7 @@ def test_run_template_input_required_retry_with_approve_runs(patched_streamed_ru
     ctx = _FakeCtx(
         protocol_version=_INPUT_REQUIRED,
         input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
     )
     _run_template(
         "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=ctx
@@ -512,7 +513,11 @@ def test_run_template_input_required_refusal_spawns_no_child(
     [key] = pending.input_requests
     responses = {key if k == "__key__" else k: v for k, v in answer.items()}
 
-    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED, input_responses=responses)
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses=responses,
+        request_state=pending.request_state,
+    )
     if not responses:
         # No answer for this gate's key: the gate asks again rather than running.
         result = _run_template("api_seedance", confirm_spend=True, ctx=ctx)

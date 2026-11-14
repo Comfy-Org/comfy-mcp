@@ -328,3 +328,47 @@ def test_in_process_handshake_records_both_protocol_versions():
     )
     # Tools are discoverable on every revision (the gated ones among them).
     assert all(count > 0 for _, count in recorded.values())
+
+
+@pytest.mark.parametrize("answer", ["approve", "refuse"])
+def test_a_gated_tool_asks_a_real_2026_client_end_to_end(patched_plain_run, answer):
+    """Drive `install_node` through the REAL `Client` on 2026-07-28.
+
+    The unit tests force `supports_elicitation=True` on a double; this proves the
+    real modern path records the client's declared elicitation capability, so the
+    gate reaches the person (the callback) instead of silently dropping to the
+    agent-asserted `confirm_install` fallback — and that the SDK's sealed
+    `request_state` round-trips so the retry's answer is actually honored.
+    """
+    calls = patched_plain_run(0, stderr="done")
+    asked: list[str] = []
+
+    async def _on_elicit(context, params):
+        asked.append(params.message)
+        return types.ElicitResult(
+            action="accept", content={"approve": answer == "approve"}
+        )
+
+    async def _drive():
+        async with Client(
+            server.mcp,
+            mode=server._INPUT_REQUIRED_PROTOCOL,
+            elicitation_callback=_on_elicit,
+        ) as client:
+            assert client.protocol_version == server._INPUT_REQUIRED_PROTOCOL
+            return await client.call_tool(
+                "install_node", {"names": ["comfyui-impact-pack"]}
+            )
+
+    result = asyncio.run(_drive())
+
+    assert len(asked) == 1
+    assert "comfyui-impact-pack" in asked[0]
+    # The `comfy env` manager probe runs on each round; only the install matters.
+    installs = [c["cmd"] for c in calls if "install" in c["cmd"]]
+    if answer == "approve":
+        assert not result.is_error
+        assert len(installs) == 1
+    else:
+        assert result.is_error
+        assert installs == []

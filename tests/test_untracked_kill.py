@@ -34,6 +34,7 @@ import asyncio
 
 import pytest
 from conftest import envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -257,7 +258,11 @@ def test_a_foreign_command_line_cannot_redress_the_prompt(clash):
 # --- refusals: nothing is killed, and the error says what is on the port -----
 
 
-def test_input_required_transport_fails_the_kill_gate_closed(clash):
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize("volunteered_answer", [False, True])
+def test_input_required_transport_fails_the_kill_gate_closed(
+    clash, confirm, volunteered_answer
+):
     """2026-07-28 cannot round-trip THIS gate — it fires after the stop half.
 
     Every other gate on 2026-07-28 carries its question out as the tool's
@@ -269,13 +274,24 @@ def test_input_required_transport_fails_the_kill_gate_closed(clash):
     """
     state = clash([_dry_run()])
     ctx = _FakeCtx(protocol_version="2026-07-28")
+    if volunteered_answer:
+        # A client cannot pre-approve a prompt this server never issued: an
+        # accept on the gate's key (with any state) is not even read.
+        key = server._consent_channel_key(server._KILL_UNTRACKED_APPROVAL_WORDING)
+        ctx.input_responses = {
+            key: types.ElicitResult(action="accept", content={"approve": True})
+        }
+        ctx.request_state = "anything"
 
     with pytest.raises(server.ComfyCliError) as excinfo:
-        _restart(ctx=ctx)
+        _restart(confirm_kill_untracked=confirm, ctx=ctx)
 
     message = str(excinfo.value)
     assert _PORT_TAKEN in message
     assert "comfy stop --port 8188" in message  # the terminal escape hatch
+    # No retry can ever ask, so the guidance must not send the agent round it.
+    assert "call restart_comfyui again" not in message
+    assert "Retrying restart_comfyui will not change that" in message
     assert ctx.elicitations == []  # no back-channel prompt was attempted
     # The identity was read, but nothing was killed or relaunched.
     assert state["runs"] == [("stop", "--port", "8188", "--dry-run")]

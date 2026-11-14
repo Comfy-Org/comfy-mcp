@@ -400,6 +400,7 @@ def test_input_required_retry_with_approve_launches(patched_run, drive, extra_ar
     ctx = _FakeCtx(
         protocol_version=_INPUT_REQUIRED,
         input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
     )
     assert drive(extra_args, ctx=ctx) == {"pid": 5}
 

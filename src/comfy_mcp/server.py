@@ -63,12 +63,14 @@ import asyncio
 import contextlib
 import errno
 import functools
+import hashlib
 import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -76,7 +78,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -85,7 +88,7 @@ import anyio.to_thread
 from mcp import types
 from mcp.server.elicitation import render_elicitation_schema
 from mcp.server.mcpserver import Context, Image, MCPServer
-from mcp_types.version import is_version_at_least
+from mcp.types.version import is_version_at_least
 from pydantic import BaseModel, Field
 
 from . import (
@@ -5062,6 +5065,13 @@ def _consent_channel_key(wording: _ApprovalWording) -> str:
     leave it empty (that is what holds them out of the pre-authorization
     mechanism) and no two spend gates ever fire in one call, so the subject is a
     safe fallback there.
+
+    The key only ROUTES an answer; it never authorizes one. It is a fixed
+    constant any client can fill in, so an answer counts only alongside the
+    ``request_state`` the prompt minted (:func:`_claim_consent_nonce`), which the
+    SDK binds to the tool and its arguments and which carries the prompt text's
+    digest — a ``run_template`` "yes" on ``"spend"`` cannot unlock a
+    ``partner_generate`` call, because that call never echoes its state.
     """
     return wording.consent_token or wording.subject
 
@@ -5108,39 +5118,99 @@ def _consent_from_outcome(
     )
 
 
+# Prefix of every `request_state` a consent prompt mints. The SDK's
+# `RequestStateBoundary` (installed by `MCPServer` by default) seals that value
+# and binds it to the tool name and its arguments, and only ever hands a handler
+# plaintext THIS server minted — so a state the server never issued, or one
+# minted for a call with different arguments, never reaches the gate at all.
+_CONSENT_STATE_PREFIX = "comfy-mcp/consent/v1"
+
+# Nonces of consent prompts already answered, so one prompt's answer is honored
+# ONCE: a client replaying a sealed state plus its "yes" (inside the SDK's TTL)
+# gets a fresh prompt instead of a second run on the first approval. Bounded —
+# an answer older than this many prompts is long past the SDK's state TTL anyway.
+_CONSUMED_CONSENT_NONCES: OrderedDict[str, None] = OrderedDict()
+_CONSUMED_CONSENT_NONCES_MAX = 4096
+_CONSUMED_CONSENT_LOCK = threading.Lock()
+
+
+def _consent_state(key: str, message: str, nonce: str) -> str:
+    """The `request_state` one prompt mints: the gate, the prompt text, a nonce.
+
+    The message digest is what ties an answer to the question a person actually
+    SAW: every gated prompt names what it authorizes (the model, the packs, the
+    version, the exposed address), so a retry whose prompt would read differently
+    no longer matches the state its answer came back with.
+    """
+    digest = hashlib.sha256(message.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{_CONSENT_STATE_PREFIX}:{key}:{digest}:{nonce}"
+
+
+def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
+    """Whether this retry's `request_state` answers THIS prompt, first time.
+
+    False — the answer is ignored and the gate asks afresh — when the state is
+    absent (an answer attached to a first call nobody was prompted on), minted
+    for another gate or another prompt text, or already consumed.
+    """
+    state = getattr(ctx, "request_state", None)
+    if not isinstance(state, str):
+        return False
+    expected = _consent_state(key, message, "")
+    nonce = state[len(expected) :]
+    if not state.startswith(expected) or not nonce:
+        return False
+    with _CONSUMED_CONSENT_LOCK:
+        if nonce in _CONSUMED_CONSENT_NONCES:
+            return False
+        _CONSUMED_CONSENT_NONCES[nonce] = None
+        while len(_CONSUMED_CONSENT_NONCES) > _CONSUMED_CONSENT_NONCES_MAX:
+            _CONSUMED_CONSENT_NONCES.popitem(last=False)
+    return True
+
+
 def _consent_via_input_required(
     ctx: Context, message: str, schema: type, wording: _ApprovalWording
 ) -> bool:
     """Elicit on ``>= 2026-07-28``, where ``ctx.elicit()`` has no back-channel.
 
-    First round (no matching answer on ``ctx.input_responses``): raise
+    First round (no answer this server asked for): raise
     :class:`_ElicitationInputRequired` carrying the
     :class:`~mcp.types.InputRequiredResult` the gated tool returns, so the client
     is asked by RETRYING the call. The ``requested_schema`` is rendered by the
     SDK's own :func:`render_elicitation_schema`, the same one ``ctx.elicit()``
     sends, so the prompt a client sees is identical across the two transports.
 
-    Resume round (the answer is present): read the client's ``ElicitResult`` and
-    judge it with the same :func:`_consent_from_outcome` the back-channel path
-    uses. ``getattr``/``isinstance`` throughout, because a non-conforming client's
-    content must fail closed, never crash.
+    Resume round: an answer counts only when the retry echoes the
+    ``request_state`` this prompt minted (:func:`_claim_consent_nonce`) — never
+    on the ``input_responses`` key alone, which is a fixed per-gate constant any
+    client can fill in on a first call. Anything else is "not asked yet" and
+    re-asks. A claimed answer is judged by the same :func:`_consent_from_outcome`
+    the back-channel path uses. ``getattr``/``Mapping`` throughout, because a
+    non-conforming client's content must fail closed, never crash.
     """
     key = _consent_channel_key(wording)
     responses = getattr(ctx, "input_responses", None)
-    answer = responses.get(key) if isinstance(responses, dict) else None
-    if answer is None:
+    answer = responses.get(key) if isinstance(responses, Mapping) else None
+    if answer is None or not _claim_consent_nonce(ctx, key, message):
         request = types.ElicitRequest(
             params=types.ElicitRequestFormParams(
                 message=message,
                 requested_schema=render_elicitation_schema(schema),
             )
         )
+        state = _consent_state(key, message, secrets.token_urlsafe(16))
         raise _ElicitationInputRequired(
-            types.InputRequiredResult(input_requests={key: request}, request_state=key)
+            types.InputRequiredResult(
+                input_requests={key: request}, request_state=state
+            )
         )
-    action = getattr(answer, "action", None)
-    content = getattr(answer, "content", None)
-    approved = content.get("approve", False) if isinstance(content, dict) else False
+    if isinstance(answer, Mapping):
+        action, content = answer.get("action"), answer.get("content")
+    else:
+        action = getattr(answer, "action", None)
+        content = getattr(answer, "content", None)
+    approved = content.get("approve", False) if isinstance(content, Mapping) else False
     return _consent_from_outcome(action, approved, wording)
 
 
@@ -7942,6 +8012,7 @@ def _untracked_server_guidance(
     extra_args: list[str] | None = None,
     listener: _UntrackedListener | None = None,
     refusal: str = "",
+    retry_can_ask: bool = True,
 ) -> str:
     """Explain a port clash that followed a stop with nothing recorded to stop.
 
@@ -7961,7 +8032,8 @@ def _untracked_server_guidance(
       confirmation prompt on a retry, or running ``comfy stop --port <p>``
       directly. ``refusal`` says why this call did not, and is the only part
       that varies between a decline, an unanswered prompt, and a client that
-      could not be asked.
+      could not be asked. ``retry_can_ask=False`` drops the retry route where
+      no retry could ever prompt (``refusal`` then names the terminal one).
     """
     suggested = _ALT_PORT_SUGGESTION
     if _requested_port(extra_args) == suggested:
@@ -7984,13 +8056,17 @@ def _untracked_server_guidance(
             f"Either stop it the way you started it and retry, or {alongside}"
         )
     trailer = f"{refusal} " if refusal else ""
+    recycle = (
+        "To recycle that server, call restart_comfyui again and approve the "
+        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        if retry_can_ask
+        else ""
+    )
     return (
         f"Port {listener.port} is held by pid {listener.pid}, which comfy-cli "
         f"identified as a ComfyUI it did not start: `{listener.display_cmdline()}`. "
         "That is why there was nothing for the restart to stop and the fresh launch "
-        f"then hit the occupied port. {trailer}"
-        "To recycle that server, call restart_comfyui again and approve the "
-        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        f"then hit the occupied port. {trailer}{recycle}"
         f"Otherwise {alongside}"
     )
 
@@ -8327,6 +8403,10 @@ class _KillDecision(NamedTuple):
 
     approved: bool
     reason: str
+    #: Whether calling ``restart_comfyui`` again can raise the prompt. False only
+    #: where no retry ever could (the ``>= 2026-07-28`` transport), so the
+    #: guidance names the terminal route alone instead of a loop.
+    retry_can_ask: bool = True
 
 
 async def _elicit_kill_untracked_consent(
@@ -8375,7 +8455,27 @@ async def _resolve_kill_untracked_consent(
     errors (an unanswered prompt, a client that errored) are folded into
     ``reason`` instead, so every refusal — decline included — surfaces as the
     enriched guidance error rather than three differently-shaped failures.
+
+    On the ``>= 2026-07-28`` transport it refuses OUTRIGHT, before any
+    capability check or answer is read: that transport asks by returning the
+    question and re-running the call on a retry, but this gate fires mid-sequence
+    on the restart's worker thread, after the stop half — there is no result to
+    carry a question out on, and no prompt is ever issued. So an
+    ``input_responses`` answer the client attached is ignored (nobody was asked
+    it), ``confirm_kill_untracked`` is not a substitute for the human the
+    capable client could otherwise reach, and the reason names the terminal
+    route rather than a retry that can never succeed.
     """
+    if _uses_input_required(ctx):
+        return _KillDecision(
+            False,
+            "This MCP protocol revision cannot raise a confirmation prompt from "
+            "inside a restart already in progress, so nothing was asked and pid "
+            f"{listener.pid} is still running. Retrying restart_comfyui will "
+            "not change that; stop it from a terminal with `comfy stop --port "
+            f"{listener.port}` if the USER wants it stopped, then retry.",
+            retry_can_ask=False,
+        )
     if _client_elicitation_support(ctx) is not False:
         try:
             approved = await _elicit_kill_untracked_consent(ctx, listener)
@@ -8511,6 +8611,7 @@ def _offer_untracked_kill(
     port = _kill_target_port(extra_args)
     listener = None
     refusal = ""
+    retry_can_ask = True
     if kill_approver is not None and port is not None:
         if not _remote_target_configured():
             listener = _verified_untracked_listener(port)
@@ -8519,8 +8620,10 @@ def _offer_untracked_kill(
         if decision.approved:
             return _recycle_untracked_server(clash, extra_args, listener)
         refusal = decision.reason
+        retry_can_ask = decision.retry_can_ask
+    guidance = _untracked_server_guidance(extra_args, listener, refusal, retry_can_ask)
     raise ComfyCliError(
-        f"{clash}\n\n{_untracked_server_guidance(extra_args, listener, refusal)}",
+        f"{clash}\n\n{guidance}",
         code=clash.code,
         no_envelope=clash.no_envelope,
         returncode=clash.returncode,
