@@ -7290,13 +7290,15 @@ def _render_output_media(
 # `description` field), so this stays reader prose rather than an internal
 # cross-reference. For maintainers: that's `target._TARGET_AWARE_SUBCOMMANDS`
 # (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
-# being made below.
+# being made below. Not idempotent: `comfy download` never overwrites — a repeat
+# into the same `out_dir` writes a collision-suffixed copy (`name.1.ext`) — which
+# is also why it is not destructive.
 @mcp.tool(
     meta=output_viewer.TOOL_META,
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
-        idempotentHint=True,
+        idempotentHint=False,
         openWorldHint=False,
     ),
 )

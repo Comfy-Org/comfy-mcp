@@ -37,7 +37,7 @@ _EXPECTED = {
     "job": (False, True, False, False, None),
     "system_stats": (True, False, True, False, None),
     "free_memory": (False, True, True, False, None),
-    "fetch_outputs": (False, False, True, False, None),
+    "fetch_outputs": (False, False, False, False, None),
     "launch_comfyui": (False, False, False, False, None),
     "stop_comfyui": (False, True, True, False, None),
     "restart_comfyui": (False, True, False, False, None),
