@@ -403,6 +403,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Templates your install can't run](#templates-your-install-cant-run)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
+- [ComfyUI Desktop and the Windows portable package](#comfyui-desktop-and-the-windows-portable-package)
 - [Which address variable do I want?](#which-address-variable-do-i-want)
 - [Project anchoring](#project-anchoring)
 - [Tools](#tools)
@@ -874,6 +875,37 @@ effect, rather than the version alone.
 
 **Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port` flag →
 `COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.
+
+## ComfyUI Desktop and the Windows portable package
+
+`comfy install` creates a comfy-cli workspace. ComfyUI Desktop (the Electron app) and the Windows
+portable package (`ComfyUI_windows_portable`) are installs you may already be running. Reach the
+one that is up through the address and workspace settings below.
+
+**ComfyUI Desktop.** The app defaults to `127.0.0.1` and port 8000; check the port the app
+shows. This server's unset default is `127.0.0.1:8188`. Set
+`COMFY_LOCAL_URL` to `http://127.0.0.1:<that port>` in the MCP client `env` block, beside
+`COMFY_BIN`, as in [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address).
+Confirm the URL `server_info` reports. `launch_comfyui`, `stop_comfyui`, and `restart_comfyui`
+start and stop the ComfyUI process comfy-cli itself launched. Start and quit Desktop from the app.
+
+**Windows portable.** `run_nvidia_gpu.bat` runs the package's embedded Python
+(`python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build`) and passes no
+`--port`. ComfyUI's own default listen port is 8188, the same default this server uses, so with
+the bat's server on 8188 the address variables can stay unset. Start that copy with the bat.
+`launch_comfyui` starts the ComfyUI in the comfy-cli workspace.
+
+**Where model downloads go.** comfy-cli 1.25 and newer can save a `download_model` that omits
+`relative_path` into the folder the running server scans, when comfy-cli reaches that server on a
+loopback address: `COMFY_LOCAL_URL`, or `127.0.0.1:8188` when that variable is unset. Older
+comfy-cli, including this server's 1.14.0 floor, writes the comfy-cli workspace. Point that
+workspace at the install whose `models` directory should receive the file with
+`comfy set-default <ComfyUI directory>`, or set `COMFY_PROJECT` to that absolute path. For the
+portable package the directory is `ComfyUI_windows_portable\ComfyUI` — the tree the bat launches,
+whose `models\checkpoints` the portable package tells you to fill.
+
+Install `comfy-mcp` and `comfy-cli` with the Python the MCP client will run. When `comfy` is off
+that client's `PATH`, set `COMFY_BIN` to its absolute path.
 
 ## Which address variable do I want?
 
