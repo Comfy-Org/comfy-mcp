@@ -12,15 +12,20 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 The server now introduces itself, and a few answers that used to look finished
 were not. `comfy-mcp --help` and `--version` print instead of exiting with no
 output, and the MCP `initialize` handshake reports the installed package
-version. Node search can tell a free node from a paid partner node, an agent
-can read the credit balance without leaving the client, and image, video, and
-audio outputs can come back as an inline preview. Minor rather than patch:
+version. Node search can tell a free node from a paid partner node,
+`billing_status` is wired to `comfy cloud status` — no tagged comfy-cli
+release has that verb yet — and image, video, and audio outputs can come
+back as an inline preview. Minor rather than patch:
 several tool responses gain fields, and `launch_comfyui` / `restart_comfyui`
 stop acting on the local server when a remote ComfyUI is configured.
 
-The comfy-cli floor stays **>= 1.14.0**. `job(action="watch")` is the exception:
-it needs comfy-cli >= 1.16.0, and a server-wide raise would refuse every other
-tool on an install where only watch is broken.
+The comfy-cli floor stays **>= 1.14.0**. Two verbs sit beside that floor
+rather than under it. `job(action="watch")` needs comfy-cli >= 1.16.0, and a
+server-wide raise would refuse every other tool on an install where only
+watch is broken. `billing_status` is the other caveat: `comfy cloud status`
+is newer than every tagged comfy-cli release, so a current install returns
+`unsupported: true` instead of a balance. The message names no version to
+upgrade to, because there is not one yet.
 
 ### Added
 
@@ -29,9 +34,12 @@ tool on an install where only watch is broken.
   version, then exit 0, so a first install is distinguishable from a process
   that started, read nothing, and left. (#228)
 - **`billing_status`.** One read-only passthrough of `comfy cloud status`:
-  remaining credits, plan, and how many jobs can run at once. It does not
-  spend and it does not prompt. A comfy-cli that predates the verb returns
-  `unsupported: true` with the balance fields null. (#250)
+  remaining credits, plan, and how many jobs can run at once, once the
+  engine has the verb. It does not spend and it does not prompt. No tagged
+  comfy-cli release includes that verb yet, so on a current install the
+  call returns `unsupported: true` with the balance fields null. That is
+  the common result today, not a rare degrade, and the message names no
+  version to upgrade to. (#250)
 - **`preview_media`.** Wraps `comfy preview` and returns comfy-cli's metadata
   plus an optional bounded inline PNG — an image thumbnail, a video contact
   sheet, or an audio waveform — so an agent can look at video and audio that
