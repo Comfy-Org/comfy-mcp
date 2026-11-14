@@ -5403,7 +5403,7 @@ def partner_model_schema(model: str) -> Any:
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=True,
     )

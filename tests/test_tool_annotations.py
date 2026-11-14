@@ -31,7 +31,7 @@ _EXPECTED = {
     "generate_image": (False, False, False, True, None),
     "list_partner_models": (True, False, True, False, None),
     "partner_model_schema": (True, False, True, False, None),
-    "partner_generate": (False, False, False, True, None),
+    "partner_generate": (False, True, False, True, None),
     "emit_partner_workflow": (False, True, True, False, None),
     "run_template": (False, False, False, True, None),
     "job": (False, True, False, False, None),
