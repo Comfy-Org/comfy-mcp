@@ -4153,7 +4153,7 @@ async def auth_login() -> Any:
         readOnlyHint=False,
         destructiveHint=False,
         idempotentHint=False,
-        openWorldHint=False,
+        openWorldHint=True,
     )
 )
 async def run_workflow(
@@ -4462,7 +4462,7 @@ def _t2i_config() -> tuple[str, str, str]:
         readOnlyHint=False,
         destructiveHint=False,
         idempotentHint=False,
-        openWorldHint=False,
+        openWorldHint=True,
     )
 )
 async def generate_image(
@@ -5569,7 +5569,7 @@ def _require_emit_workflow_capability() -> None:
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=True,
         openWorldHint=False,
     )
@@ -7215,7 +7215,7 @@ def _preview_image_path(data: Any) -> str | None:
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=True,
         openWorldHint=False,
     )
@@ -10719,7 +10719,7 @@ def get_template(name: str, check_local: bool = True) -> Any:
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=True,
         openWorldHint=True,
     )
@@ -11376,7 +11376,7 @@ def nodes(
         readOnlyHint=True,
         destructiveHint=False,
         idempotentHint=True,
-        openWorldHint=False,
+        openWorldHint=True,
     )
 )
 def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
@@ -11655,7 +11655,7 @@ def _parse_deps_manifest(out_path: str, plain: Any) -> dict:
         readOnlyHint=True,
         destructiveHint=False,
         idempotentHint=True,
-        openWorldHint=False,
+        openWorldHint=True,
     )
 )
 async def workflow_deps(workflow_path: str) -> Any:
@@ -12451,8 +12451,8 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
+        destructiveHint=True,
+        idempotentHint=False,
         openWorldHint=True,
     )
 )
@@ -12862,7 +12862,7 @@ _UPLOAD_STDOUT_MAX_CHARS = 4 * 1024 * 1024
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=False,
     )
@@ -13336,7 +13336,7 @@ def set_workflow_slot(
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=True,
         openWorldHint=False,
     )
