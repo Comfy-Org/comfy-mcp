@@ -519,7 +519,7 @@ def test_fetch_template_argv_and_returns_abspath(patched_run, tmp_path):
 def test_fetch_template_checks_the_configured_catalog(
     monkeypatch, patched_run, tmp_path
 ):
-    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
+    monkeypatch.setenv("COMFYUI_HOST", "localhost")
     monkeypatch.setenv("COMFYUI_PORT", "9001")
     calls = patched_run(envelope(data={"valid": True, "errors": []}))
     out = tmp_path / "flux.json"
@@ -532,7 +532,7 @@ def test_fetch_template_checks_the_configured_catalog(
         "--workflow",
         str(out),
         "--host",
-        "gpu.example",
+        "localhost",
         "--port",
         "9001",
     ]
@@ -547,11 +547,11 @@ def test_fetch_template_checks_the_configured_catalog(
         ({}, []),
         (
             {"COMFYUI_URL": "http://gpu.example:9001"},
-            ["--host", "gpu.example", "--port", "9001"],
+            [],
         ),
         (
             {"COMFYUI_HOST": "[2001:db8::1]", "COMFYUI_PORT": "9002"},
-            ["--host", "2001:db8::1", "--port", "9002"],
+            [],
         ),
         (
             {"COMFYUI_HOST": "127.0.0.1"},
@@ -602,8 +602,10 @@ def test_template_repair_guidance_follows_the_checked_target(
         assert check["reason"] == "check_unavailable"
         assert "runnable" not in check
         assert "cql_no_graph" in summary
-        if target_env:
-            assert "Start ComfyUI on the configured remote target" in summary
+        if target_flags:
+            assert "Start ComfyUI on the configured target" in summary
+        elif target_env:
+            assert "Start ComfyUI locally using your usual launch method" in summary
         else:
             assert summary.split("Details: ", 1)[0] == (
                 "could not check this template against your ComfyUI install "
@@ -617,9 +619,14 @@ def test_template_repair_guidance_follows_the_checked_target(
         assert check["runnable"] is False
         assert check["error_count"] == 1
         assert check["errors"] == ["node 12: missing Foo"]
-        if target_env:
+        if target_flags:
             assert (
-                "Update ComfyUI and its custom nodes on the configured remote target"
+                "Update ComfyUI and its custom nodes on the configured target"
+                in summary
+            )
+        elif target_env:
+            assert (
+                "Update ComfyUI and its custom nodes locally using your usual update method"
                 in summary
             )
         else:
@@ -633,6 +640,25 @@ def test_template_repair_guidance_follows_the_checked_target(
     if target_env:
         assert "launch_comfyui" not in summary
         assert "update_comfyui" not in summary
+
+
+@pytest.mark.parametrize("tool", ["fetch", "get"])
+def test_template_local_success_does_not_validate_remote_target(
+    monkeypatch, patched_run, tmp_path, tool
+):
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(envelope(data={"valid": True, "errors": []}))
+    result = (
+        server.fetch_template("flux_dev", str(tmp_path / "flux.json"))
+        if tool == "fetch"
+        else server.get_template("flux_dev")
+    )
+    check = result["local_check"]
+    assert check["checked"] is True
+    assert check["runnable"] is True
+    assert "configured non-loopback target was not checked" in check["summary"]
+    assert "comfy-cli's local catalog" in check["summary"]
+    assert all("--host" not in call["cmd"] for call in calls)
 
 
 @pytest.mark.parametrize("url", ["https://gpu.example", "http://[2001:db8::1"])

@@ -63,7 +63,7 @@ def test_nodes_search_is_the_default_action(patched_run):
     ],
 )
 def test_nodes_use_the_configured_catalog(monkeypatch, patched_run, kwargs, cli_args):
-    monkeypatch.setenv("COMFYUI_URL", "http://[2001:db8::1]:9001")
+    monkeypatch.setenv("COMFYUI_URL", "http://[::1]:9001")
     data = {"mode": "exact", "paths": []}
     calls = patched_run(envelope(data=data))
 
@@ -76,7 +76,7 @@ def test_nodes_use_the_configured_catalog(monkeypatch, patched_run, kwargs, cli_
         "nodes",
         *cli_args,
         "--host",
-        "2001:db8::1",
+        "::1",
         "--port",
         "9001",
     ]

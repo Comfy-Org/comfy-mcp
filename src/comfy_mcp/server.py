@@ -10315,7 +10315,7 @@ def _unchecked(summary: str, reason: str) -> dict:
 
 
 def _local_template_check(workflow_path: str) -> dict:
-    """Cross-check a fetched template against the target ComfyUI's ``object_info``.
+    """Cross-check a template against the local or loopback target's ``object_info``.
 
     The gallery is served fresh from ``Comfy-Org/workflow_templates`` while the
     user's ComfyUI is whatever they installed, so a template can legitimately
@@ -10333,7 +10333,19 @@ def _local_template_check(workflow_path: str) -> dict:
     stops the comparison from happening — no ComfyUI running, so no
     ``object_info`` — comes back ``checked: False`` rather than a denial.
     """
-    remote_target = _remote_target_configured()
+    try:
+        explicit_catalog_target = target._catalog_target() is not None
+    except ComfyCliError:
+        # The validation call below reports malformed configuration. Do not
+        # suggest local repair for a check that could not choose its target.
+        explicit_catalog_target = True
+    local_catalog_fallback = not explicit_catalog_target and _remote_target_configured()
+    catalog_note = (
+        " The configured non-loopback target was not checked; "
+        "this uses comfy-cli's local catalog."
+        if local_catalog_fallback
+        else ""
+    )
     try:
         result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
     except ComfyCliError as exc:
@@ -10344,9 +10356,13 @@ def _local_template_check(workflow_path: str) -> dict:
         result = exc.data
         if _validation_report(result) is None:
             start_hint = (
-                "on the configured remote target"
-                if remote_target
-                else "with `launch_comfyui`"
+                "on the configured target"
+                if explicit_catalog_target
+                else (
+                    "locally using your usual launch method"
+                    if local_catalog_fallback
+                    else "with `launch_comfyui`"
+                )
             )
             return _unchecked(
                 "could not check this template against your ComfyUI install "
@@ -10354,7 +10370,7 @@ def _local_template_check(workflow_path: str) -> dict:
                 f"running). The template was still written. Start ComfyUI {start_hint}, "
                 "then re-check with "
                 "`validate_workflow(workflow_path=...)`. "
-                f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}",
+                f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}" + catalog_note,
                 "check_unavailable",
             )
 
@@ -10363,7 +10379,7 @@ def _local_template_check(workflow_path: str) -> dict:
         return _unchecked(
             "could not check this template against your ComfyUI install: "
             "`comfy validate` returned an unexpected payload, so its output "
-            "shape may have drifted. The template was still written.",
+            "shape may have drifted. The template was still written." + catalog_note,
             "unexpected_payload",
         )
 
@@ -10387,7 +10403,8 @@ def _local_template_check(workflow_path: str) -> dict:
             "could not check this template against your ComfyUI install: this "
             "comfy-cli did not convert the template's UI-format graph, so no "
             "node was actually compared against the live catalog. Upgrade "
-            "comfy-cli for a real check. The template was still written.",
+            "comfy-cli for a real check. The template was still written."
+            + catalog_note,
             "workflow_not_converted",
         )
 
@@ -10399,7 +10416,13 @@ def _local_template_check(workflow_path: str) -> dict:
         )
     else:
         update_hint = (
-            "on the configured remote target" if remote_target else "(`update_comfyui`)"
+            "on the configured target"
+            if explicit_catalog_target
+            else (
+                "locally using your usual update method"
+                if local_catalog_fallback
+                else "(`update_comfyui`)"
+            )
         )
         summary = (
             f"{len(validation_errors)} problem(s): this template needs a node "
@@ -10417,7 +10440,7 @@ def _local_template_check(workflow_path: str) -> dict:
     check = {
         "checked": True,
         "runnable": report["valid"],
-        "summary": summary,
+        "summary": summary + catalog_note,
         "error_count": len(validation_errors),
         "errors": [
             _finding_line(e) for e in validation_errors[:_TEMPLATE_CHECK_MAX_FINDINGS]
@@ -10952,7 +10975,7 @@ def nodes(
 ) -> Any:
     """Search, inspect, or graph-walk a node catalog.
 
-    Wraps `comfy nodes` at the configured target (incl. custom nodes).
+    Wraps `comfy nodes` using the local/loopback catalog (incl. custom nodes).
     `action`:
     - "search" (default) -> `nodes search <query>`: find a class name by
       keyword. Case-insensitive, word-order-independent token match over

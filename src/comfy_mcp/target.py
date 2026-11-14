@@ -2,7 +2,7 @@
 
 Leaf module over :mod:`comfy_mcp.errors` and :mod:`comfy_mcp.textutil`: it owns
 everything about pointing target-aware tools (``run_workflow``, ``run_template``,
-``generate_image``, the ``jobs``/``upload``/``nodes``/``validate`` verbs) at a
+``generate_image``, the ``jobs``/``upload`` verbs) at a
 ComfyUI running ELSEWHERE via ``COMFYUI_URL`` / ``COMFYUI_HOST`` (+ optional ``COMFYUI_PORT``)
 instead of the implicit local default — resolution (:func:`_comfy_target`),
 the ``--host``/``--port`` forward (:func:`_with_target`), userinfo/credential
@@ -12,7 +12,7 @@ redaction on the way back to the client (:func:`_redact_config_url`,
 LOCAL-only tools (``system_stats`` / ``free_memory``) attach so an agent does
 not gate a remote run on local numbers (:func:`_annotate_comfy_target`,
 :func:`_target_provenance_suffix`, :func:`_with_target_provenance`). Nothing
-here imports ``server``.
+here imports ``server``. Node discovery and validation only forward loopback targets.
 
 Everything here is private and reached as ``target._name`` — there is no
 public name in this module.
@@ -20,6 +20,7 @@ public name in this module.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Any
 from urllib.parse import urlparse
@@ -61,8 +62,8 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
 # run``, ``comfy run-template``, every ``comfy jobs`` subcommand, ``comfy
 # upload``, ``comfy nodes`` and ``comfy validate`` — every verb that submits or
-# reads a job, stages its inputs, or checks its node catalog must agree on the server it is
-# talking to. ``run`` / ``jobs`` / ``upload`` are the set comfy-cli's
+# reads a job or stages its inputs must agree on the server it is talking to.
+# Catalog verbs forward only loopback targets, as explained below. ``run`` / ``jobs`` / ``upload`` are the set comfy-cli's
 # ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
 # options and resolves them through that module's own ``resolve_host_port``
 # (``comfy_cli/command/templates.py``), it is just missing from that docstring's
@@ -123,12 +124,10 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 #     machine wrote at submit (which records absolute ``/view`` URLs on the
 #     remote) instead of asking a server — see ``fetch_outputs``.
 #
-# ``nodes`` / ``validate`` accept both options in comfy-cli >= 1.14.0 (this
-# server's floor). Forward them too so live discovery and pre-flight checks,
-# including fetch_template/get_template's validate call, inspect the same
-# catalog that a later run will use. Template fetching itself stays local.
-# Forwarding is a no-op for the local default regardless, so unconfigured
-# behavior is unchanged for every tool.
+# ``nodes`` / ``validate`` accept both options at the 1.14.0 floor, but in
+# ``--where local`` mode comfy-cli refuses non-loopback object_info fetches.
+# Forward only an explicit loopback target for these catalog verbs. Other hosts
+# retain the existing local catalog behavior until upstream supports them.
 _TARGET_AWARE_SUBCOMMANDS = frozenset(
     {"run", "run-template", "jobs", "upload", "nodes", "validate"}
 )
@@ -341,6 +340,32 @@ def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
     }
 
 
+def _catalog_target() -> tuple[str, int, str] | None:
+    """Resolve a catalog target only when it is a literal loopback host.
+
+    Never resolve DNS or change comfy-cli's local-mode SSRF policy. Hostnames
+    other than localhost, including names that happen to resolve locally, keep
+    comfy-cli's default catalog. Malformed configuration still raises.
+    """
+    resolved = _comfy_target()
+    if resolved is None:
+        return None
+    host = resolved[0]
+    if host.lower() == "localhost":
+        return resolved
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    # IPv4-mapped and scoped IPv6 spellings are not the literal ::1 contract.
+    loopback = (
+        address.is_loopback
+        if address.version == 4
+        else address == ipaddress.IPv6Address("::1")
+    )
+    return resolved if loopback else None
+
+
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
@@ -364,7 +389,7 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     # breaking the "local behavior unchanged" contract.
     if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
         return args
-    target = _comfy_target()
+    target = _catalog_target() if args[0] in {"nodes", "validate"} else _comfy_target()
     if target is None:
         return args
     host, port, _source = target

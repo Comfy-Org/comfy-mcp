@@ -43,53 +43,52 @@ def test_target_none_when_unset():
     assert target._comfy_target() is None
 
 
-def test_validation_uses_the_configured_catalog(monkeypatch, patched_run):
-    monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
-    monkeypatch.setenv("COMFYUI_PORT", "9001")
-    report = {"valid": True, "errors": []}
-    calls = patched_run(envelope(data=report))
-
-    assert server.validate_workflow("workflow.json") == report
-    assert calls[0]["cmd"][4:] == [
-        "validate",
-        "--workflow",
-        "workflow.json",
-        "--host",
-        "gpu.example",
-        "--port",
-        "9001",
-    ]
-
-
+@pytest.mark.parametrize("tool", ["nodes", "validate"])
+@pytest.mark.parametrize("source", ["url", "host"])
+@pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize(
-    ("tool", "kwargs", "cli_args"),
+    "host, forwarded",
     [
-        (server.nodes, {"action": "types"}, ["nodes", "types"]),
-        (
-            server.validate_workflow,
-            {"workflow_path": "workflow.json"},
-            ["validate", "--workflow", "workflow.json"],
-        ),
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("127.0.0.1", True),
+        ("127.42.0.2", True),
+        ("127.255.255.255", True),
+        ("::1", True),
+        ("0:0:0:0:0:0:0:1", True),
+        ("gpu.example", False),
+        ("localhost.example", False),
+        ("192.0.2.1", False),
+        ("2001:db8::1", False),
+        ("::ffff:127.0.0.1", False),
+        ("127.0.0.1.example", False),
+        ("127.1", False),
     ],
-    ids=("nodes", "validation"),
 )
-def test_saved_catalog_option_composes_with_the_configured_target(
-    monkeypatch, patched_run, tool, kwargs, cli_args
+def test_catalog_target_is_loopback_only(
+    monkeypatch, patched_run, tool, source, saved, host, forwarded
 ):
-    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    report = {"valid": True, "errors": []}
-    calls = patched_run(envelope(data=report))
-
-    assert tool(**kwargs, object_info_path="catalog.json") == report
-    assert calls[0]["cmd"][4:] == [
-        *cli_args,
-        "--input",
-        "catalog.json",
-        "--host",
-        "gpu.example",
-        "--port",
-        "9001",
-    ]
+    """Catalog verbs retain local fallback for non-loopback targets without DNS."""
+    bracketed = f"[{host}]" if ":" in host else host
+    if source == "url":
+        monkeypatch.setenv("COMFYUI_URL", f"http://{bracketed}:8000")
+    else:
+        monkeypatch.setenv("COMFYUI_HOST", bracketed)
+        monkeypatch.setenv("COMFYUI_PORT", "8000")
+    data = {"valid": True, "errors": []}
+    calls = patched_run(envelope(data=data))
+    kwargs = {"object_info_path": "catalog.json"} if saved else {}
+    if tool == "nodes":
+        assert server.nodes(action="types", **kwargs) == data
+        args = ["nodes", "types"]
+    else:
+        assert server.validate_workflow("workflow.json", **kwargs) == data
+        args = ["validate", "--workflow", "workflow.json"]
+    if saved:
+        args += ["--input", "catalog.json"]
+    if forwarded:
+        args += ["--host", host.lower() if source == "url" else host, "--port", "8000"]
+    assert calls[0]["cmd"] == [server.COMFY_BIN, "--json", "--where", "local", *args]
 
 
 @pytest.mark.parametrize("tool", [server.nodes, server.validate_workflow])
