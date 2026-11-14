@@ -82,6 +82,7 @@ from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import anyio.to_thread
+import pydantic_core
 from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
@@ -3369,7 +3370,7 @@ def _freshness_report() -> Any:
 
 
 @mcp.tool()
-def server_info() -> Any:
+def server_info() -> dict[str, Any]:
     """Report the local ComfyUI/comfy-cli environment and verify compatibility.
 
     Wraps ``comfy env``. Call this first to confirm a local ComfyUI is up before
@@ -4127,7 +4128,7 @@ async def run_workflow(
     timeout_seconds: float = 110.0,
     confirm_spend: bool = False,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a ComfyUI workflow JSON on the ComfyUI this server targets.
 
     That is this machine unless ``COMFYUI_URL``/``COMFYUI_HOST`` points the
@@ -5337,7 +5338,7 @@ async def partner_generate(
     out_path: str | None = None,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a hosted PARTNER model (Flux / Ideogram / DALL·E / Recraft / …) — SPENDS CREDITS.
 
     Wraps ``comfy generate <model> [--param=value]…``. Runs entirely on the
@@ -6012,7 +6013,7 @@ async def run_template(
     wait: bool = True,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a gallery template — fetch, fill params, execute.
 
     Wraps ``comfy run-template <name> [--param=KEY=VALUE]…`` (fetches the
@@ -6643,7 +6644,7 @@ async def job(
     prompt_id: str = "",
     timeout_seconds: float | None = None,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Inspect, wait on, watch, or cancel a submitted job — one action per call.
 
     Wraps the `comfy jobs` family. `action`:
@@ -7038,6 +7039,32 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     return selected
 
 
+def _inline_image_result(
+    data: dict[str, Any], images: list[Image]
+) -> types.CallToolResult:
+    """Carry the download metadata as BOTH ``structuredContent`` and a JSON text
+    block, with the inline images as image content blocks after it.
+
+    ``fetch_outputs`` publishes an ``outputSchema`` (``dict[str, Any]``), so its
+    ``inline_images`` branch — which also hands back MCP images — cannot return a
+    bare ``[data, *images]`` list: the SDK would validate that list against the
+    dict schema and fail the call. Building the ``CallToolResult`` here keeps the
+    metadata dict as the structured payload the schema advertises while the images
+    ride alongside it in ``content``, where a viewer reads them. The text block is
+    serialized identically to the SDK's own unstructured conversion
+    (``pydantic_core.to_json(..., indent=2)``), so the metadata reads the same
+    whether or not images were inlined.
+    """
+    text = types.TextContent(
+        type="text",
+        text=pydantic_core.to_json(data, fallback=str, indent=2).decode(),
+    )
+    return types.CallToolResult(
+        content=[text, *(image.to_image_content() for image in images)],
+        structured_content=data,
+    )
+
+
 # The docstring below says "not in _TARGET_AWARE_SUBCOMMANDS" without a module
 # qualifier deliberately: tool docstrings are protocol-visible (the `tools/list`
 # `description` field), so this stays reader prose rather than an internal
@@ -7050,7 +7077,7 @@ def fetch_outputs(
     out_dir: str,
     url_only: bool = False,
     inline_images: bool = False,
-) -> Any:
+) -> dict[str, Any]:
     """Download a completed job's output files into ``out_dir``.
 
     Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
@@ -7091,7 +7118,7 @@ def fetch_outputs(
         return data
     paths = _select_inline_images(_collect_output_images(data, preview_dir))
     images = [Image(path=path) for path in paths]
-    return [data, *images]
+    return _inline_image_result(data, images)
 
 
 def _preview_image_path(data: Any) -> str | None:
@@ -12221,7 +12248,7 @@ async def download_model(
     filename: str | None = None,
     wait: bool = True,
     timeout_seconds: float = 110.0,
-) -> Any:
+) -> dict[str, Any]:
     """Download a model file into the LOCAL ComfyUI models dir, by URL.
 
     Wraps ``comfy model download --url <url> [--relative-path <path>]
@@ -12517,7 +12544,7 @@ def download(
     action: str = "status",
     download_id: str = "",
     timeout_seconds: float | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Track a transfer already started by download_model; does NOT start one.
 
     Wraps `comfy model download-status`/`download-cancel`. `action`:

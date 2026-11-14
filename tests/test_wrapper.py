@@ -5956,19 +5956,34 @@ def test_update_comfyui_invalid_target_does_not_take_the_lock(patched_run):
 _FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
 
 
+def _inline_parts(result):
+    """Split a ``fetch_outputs(inline_images=True)`` result into its parts.
+
+    The inline branch now hands back a ``CallToolResult`` (so the download
+    metadata can ride as ``structuredContent`` while the images stay image
+    content blocks) rather than the old ``[metadata, Image...]`` list. Returns
+    ``(metadata_dict, [ImageContent, ...])``: the metadata is ``structuredContent``
+    (identical to the old ``result[0]``), and the image blocks are the ``image``
+    entries after the leading JSON text block.
+    """
+    assert isinstance(result, server.types.CallToolResult)
+    assert result.content[0].type == "text"  # metadata JSON leads, as before
+    images = [c for c in result.content if c.type == "image"]
+    return result.structured_content, images
+
+
 def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path):
-    """inline_images=True returns [metadata, Image...] for each downloaded image."""
+    """inline_images=True carries metadata as structuredContent + an image block each."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
     patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert isinstance(result, list)
-    assert result[0] == {"downloaded": ["gen.png"]}  # metadata preserved first
-    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    metadata, images = _inline_parts(result)
+    assert metadata == {"downloaded": ["gen.png"]}  # metadata preserved as structured
     assert len(images) == 1
 
-    content = images[0].to_image_content()
+    content = images[0]
     assert content.type == "image"
     assert content.mime_type == "image/png"
     import base64
@@ -5994,9 +6009,9 @@ def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
     # writes there), so it is inlined.
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    _, images = _inline_parts(result)
     assert len(images) == 1
-    assert images[0].to_image_content().mime_type == "image/jpeg"
+    assert images[0].mime_type == "image/jpeg"
 
 
 def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
@@ -6023,7 +6038,8 @@ def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
-    assert not any(isinstance(r, server.Image) for r in result)
+    _, images = _inline_parts(result)
+    assert not images
 
 
 def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
@@ -6043,12 +6059,12 @@ def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    _, images = _inline_parts(result)
     assert len(images) == 1
     import base64
 
     # the out_dir copy, never the CWD decoy
-    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+    assert base64.b64decode(images[0].data) == _FAKE_PNG
 
 
 @pytest.mark.parametrize(
@@ -6089,12 +6105,12 @@ def test_fetch_outputs_inline_images_uses_the_download_cwd(
 
     assert calls[0]["cwd"] == (str(project) if project_set else None)
     assert calls[0]["cmd"][4:] == ["download", "pid", "-o", out_dir]
-    assert result[0] == data
-    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    metadata, images = _inline_parts(result)
+    assert metadata == data
     assert len(images) == 1
     import base64
 
-    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+    assert base64.b64decode(images[0].data) == _FAKE_PNG
 
 
 def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
@@ -6126,7 +6142,7 @@ def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    _, images = _inline_parts(result)
     assert len(images) == server._INLINE_IMAGE_MAX_COUNT
 
 
@@ -6147,7 +6163,7 @@ def test_fetch_outputs_inline_images_caps_aggregate_bytes(
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    _, images = _inline_parts(result)
     # first (7B) fits; second would push to 14B > 10B budget -> stop.
     assert len(images) == 1
 
@@ -6165,8 +6181,9 @@ def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tm
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert result[0] == {"downloaded": ["notes.txt", "ghost.png"]}
-    assert not any(isinstance(r, server.Image) for r in result)  # neither qualifies
+    metadata, images = _inline_parts(result)
+    assert metadata == {"downloaded": ["notes.txt", "ghost.png"]}
+    assert not images  # neither qualifies
 
 
 def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
