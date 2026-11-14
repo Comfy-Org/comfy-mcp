@@ -265,6 +265,7 @@ Against PR 1894, PR 2005, and cloud `main` on 2026-11-14. PR 2005 only shares th
 ### Still to change
 
 - Negotiate auto-load with the host. The viewer currently auto-loads on every completed `wait_for_job`. If the host requires approval for an app-initiated call, show Load and send `get_output({prompt_id})` only after that approval.
+- Refresh on a legacy `results` or `outputs` result sends `{prompt_id}` today, which re-mints page one even when a later page is shown. Offer Refresh only on an `items` result, sending its `offset` when it is not 0.
 - On a response that opts into `items`, set `url` to the play URL and `download_url` to the shortlink. Set `offset` on a page past the first, so Refresh re-mints that page. Do not also copy those URL strings into `results` or `outputs`. If the payload would pass 40,000 characters, omit `items` and stay on the legacy arrays.
 
 ## Non-goals
