@@ -139,17 +139,21 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
 
   var lastHeight = -1;
   function reportSize() {{
-    var height = document.documentElement.scrollHeight;
+    // Measure the body's own box (content + its padding), not the root's
+    // scroll height: the root never reports less than the iframe viewport, so
+    // once a host grows the frame from this number it could never shrink back.
+    var height = Math.ceil(document.body.getBoundingClientRect().height);
     if (height === lastHeight) {{ return; }}
     lastHeight = height;
     notify("ui/notifications/size-changed", {{ height: height }});
   }}
 
   // Media decodes asynchronously (even from a `data:` URL), so the height
-  // reported right after `render()` misses it; re-report on every resize.
+  // reported right after `render()` misses it; re-report on every resize of
+  // the measured body, growing or shrinking (e.g. a narrowed panel).
   // The per-element load listeners below cover a host without ResizeObserver.
   if (typeof ResizeObserver === "function") {{
-    new ResizeObserver(reportSize).observe(document.documentElement);
+    new ResizeObserver(reportSize).observe(document.body);
   }}
 
   function clear() {{

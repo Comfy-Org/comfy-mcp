@@ -105,7 +105,11 @@ def test_bridge_acknowledges_teardown_and_reports_late_resizes():
     html = output_viewer.OUTPUT_VIEWER_HTML
     teardown = html[html.index('method === "ui/resource-teardown"') :]
     assert "reply(msg.id" in teardown[: teardown.index("return;")]
-    assert "new ResizeObserver(reportSize)" in html
+    assert "new ResizeObserver(reportSize).observe(document.body)" in html
+    # The root's scrollHeight is floored at the viewport, so a frame the host
+    # grew from it could never shrink; the measurement is the body's own box.
+    assert "document.body.getBoundingClientRect().height" in html
+    assert "scrollHeight" not in html
     assert (
         'addEventListener(tag === "img" ? "load" : "loadedmetadata", reportSize)'
         in html
