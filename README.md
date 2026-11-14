@@ -895,14 +895,19 @@ start and stop the ComfyUI process comfy-cli itself launched. Start and quit Des
 the bat's server on 8188 the address variables can stay unset. Start that copy with the bat.
 `launch_comfyui` starts the ComfyUI in the comfy-cli workspace.
 
-**Where model downloads go.** comfy-cli 1.25 and newer can save a `download_model` that omits
-`relative_path` into the folder the running server scans, when comfy-cli reaches that server on a
-loopback address: `COMFY_LOCAL_URL`, or `127.0.0.1:8188` when that variable is unset. Older
-comfy-cli, including this server's 1.14.0 floor, writes the comfy-cli workspace. Point that
-workspace at the install whose `models` directory should receive the file with
-`comfy set-default <ComfyUI directory>`, or set `COMFY_PROJECT` to that absolute path. For the
-portable package the directory is `ComfyUI_windows_portable\ComfyUI` — the tree the bat launches,
-whose `models\checkpoints` the portable package tells you to fill.
+**Where model downloads go.** comfy-cli 1.25 and newer can save a CivitAI or Hugging Face
+`download_model` that omits `relative_path` into the folder the running server scans for that
+model type, when comfy-cli reaches that server on a loopback address: `COMFY_LOCAL_URL`, or
+`127.0.0.1:8188` when that variable is unset. A plain file URL has no model type, so that call
+saves under the workspace `models` directory. Older comfy-cli, including this server's 1.14.0
+floor, writes the comfy-cli workspace for every download. For the portable package, point that
+workspace at `ComfyUI_windows_portable\ComfyUI` with `comfy set-default` or `COMFY_PROJECT`. That
+is the tree the bat launches, and its `models\checkpoints` is where the package tells you to put
+checkpoints. Desktop creates a `models` directory in the install folder you chose and records it
+in `extra_models_config.yaml` in the app's user-data directory (`base_path` plus
+`download_model_base: models`, and a second root when you imported models from another install).
+A file that landed in the comfy-cli workspace is a different directory; move it into that
+`models` folder, or into a path the yaml lists.
 
 Install `comfy-mcp` and `comfy-cli` with the Python the MCP client will run. When `comfy` is off
 that client's `PATH`, set `COMFY_BIN` to its absolute path.
