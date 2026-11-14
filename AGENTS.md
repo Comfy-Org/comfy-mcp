@@ -74,7 +74,23 @@ The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
 handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
 
-The third is the **MCP Apps output viewer** (`output_viewer`): a `ui://comfy-mcp/output-viewer`
+The third is the static **tool annotations** every `@mcp.tool()` carries
+(`types.ToolAnnotations`: `readOnlyHint` / `destructiveHint` / `idempotentHint` /
+`openWorldHint`, plus a `title` where the bare name is opaque — `which` / `discover` /
+`nodes`). They are `tools/list` metadata comfy-cli can't express, so a host stops confirming
+on the spec's destructive/open-world DEFAULTS before a harmless read like `server_info`. No
+product behavior — the hints DESCRIBE each passthrough, they don't gate it (the per-call
+confirmation above is the gate): `openWorldHint` is true only where comfy-cli reaches the
+open internet / Comfy Cloud / a partner API / a registry, NOT the local ComfyUI process or
+filesystem (so `search_models`, a LOCAL-install read, is closed-world while `download_model`,
+an arbitrary-URL fetch, is open-world) — a ComfyUI the user points `COMFYUI_URL`/`HOST` at
+still counts as "the ComfyUI process", and a tool that MAY reach out (a partner node, a
+cold-cache registry or gallery fetch) is open-world. Multi-mode tools annotate for their
+worst action: `job` / `download` for `cancel`, and every tool that can replace a file at a
+caller-chosen path (`out_path` / `out_dir` / `overwrite=True`) is destructive. The pinned classification lives in `tests/test_tool_annotations.py` — add
+a new tool's row there with the tool.
+
+The fourth is the **MCP Apps output viewer** (`output_viewer`): a `ui://comfy-mcp/output-viewer`
 HTML resource, built as an `Apps()` extension and handed to `MCPServer(..., extensions=[...])`,
 with `_meta.ui.resourceUri` stamped on `fetch_outputs` and `preview_media` ONLY. An Apps host
 renders those tools' output inline; it adds NO product behavior — the resource and its pointer
