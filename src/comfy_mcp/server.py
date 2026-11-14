@@ -65,6 +65,7 @@ import contextlib
 import errno
 import functools
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -212,6 +213,43 @@ def _resumable_consent(fn):
             return await fn(*args, **kwargs)
         except _ElicitationInputRequired as pending:
             return pending.result
+
+    return wrapper
+
+
+def _as_object(payload: Any) -> Any:
+    """Hand back ``payload`` as the object an ``outputSchema`` tool must return.
+
+    A ``dict`` (and a prebuilt ``CallToolResult``) passes through untouched; any
+    other shape — a list, ``None``, a scalar — is kept verbatim under ``data``,
+    the spelling ``_with_cancel_verdict`` already uses for a non-object reply.
+    """
+    if isinstance(payload, (dict, types.CallToolResult)):
+        return payload
+    return {"data": payload}
+
+
+def _object_payload(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Make a ``-> dict[str, Any]`` tool's reply satisfy its own ``outputSchema``.
+
+    The SDK validates a structured tool's return value against that schema AFTER
+    the tool ran, and ``_run_comfy`` returns the envelope's ``data`` unchanged —
+    so a ``null`` or list payload would turn a call that already spent credits,
+    cancelled a job, or finished a download into a validation-error failure the
+    agent is invited to retry. Wrapping every exit here, below ``@mcp.tool()``,
+    keeps that guarantee in one place instead of at each tool's return sites.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(await fn(*args, **kwargs))
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(fn(*args, **kwargs))
 
     return wrapper
 
@@ -3445,7 +3483,8 @@ def _freshness_report() -> Any:
 
 
 @mcp.tool()
-def server_info() -> Any:
+@_object_payload
+def server_info() -> dict[str, Any]:
     """Report the local ComfyUI/comfy-cli environment and verify compatibility.
 
     Wraps ``comfy env``. Call this first to confirm a local ComfyUI is up before
@@ -4198,13 +4237,14 @@ async def auth_login() -> Any:
 
 @mcp.tool()
 @_resumable_consent
+@_object_payload
 async def run_workflow(
     workflow_path: str,
     wait: bool = True,
     timeout_seconds: float = 110.0,
     confirm_spend: bool = False,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a ComfyUI workflow JSON on the ComfyUI this server targets.
 
     That is this machine unless ``COMFYUI_URL``/``COMFYUI_HOST`` points the
@@ -5616,6 +5656,7 @@ def partner_model_schema(model: str) -> Any:
 
 @mcp.tool()
 @_resumable_consent
+@_object_payload
 async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
@@ -5623,7 +5664,7 @@ async def partner_generate(
     out_path: str | None = None,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a hosted PARTNER model (Flux / Ideogram / DALL·E / Recraft / …) — SPENDS CREDITS.
 
     Wraps ``comfy generate <model> [--param=value]…``. Runs entirely on the
@@ -6292,6 +6333,7 @@ async def _run_template_exec(
 # CLI that lacks it.
 @mcp.tool()
 @_resumable_consent
+@_object_payload
 async def run_template(
     name: str,
     params: dict[str, Any] | None = None,
@@ -6299,7 +6341,7 @@ async def run_template(
     wait: bool = True,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a gallery template — fetch, fill params, execute.
 
     Wraps ``comfy run-template <name> [--param=KEY=VALUE]…`` (fetches the
@@ -6925,12 +6967,13 @@ _JOB_ACTIONS_TAKING_TIMEOUT = ("wait", "watch")
 
 
 @mcp.tool()
+@_object_payload
 async def job(
     action: str = "status",
     prompt_id: str = "",
     timeout_seconds: float | None = None,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Inspect, wait on, watch, or cancel a submitted job — one action per call.
 
     Wraps the `comfy jobs` family. `action`:
@@ -7466,12 +7509,13 @@ def _render_output_media(
 # (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
 # being made below.
 @mcp.tool(meta=output_viewer.TOOL_META)
+@_object_payload
 def fetch_outputs(
     prompt_id: str,
     out_dir: str,
     url_only: bool = False,
     inline_images: bool = False,
-) -> Any:
+) -> dict[str, Any]:
     """Download a completed job's output files into ``out_dir``.
 
     Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
@@ -7513,17 +7557,23 @@ def fetch_outputs(
         return data
     blocks, records = _render_output_media(_collect_output_media(data, preview_dir))
     # A `CallToolResult` is how this verb carries BOTH content blocks and a
-    # `structuredContent` manifest — a bare list return produces only the former.
-    # `fetch_outputs` returns `Any`, so the SDK validates no output schema and
-    # passes this through unchanged (see `convert_result`).
+    # `structuredContent` payload — a bare list return produces only the former.
+    # The SDK passes a returned `CallToolResult` through unchanged (see
+    # `convert_result`), so this branch builds the object its `dict[str, Any]`
+    # `outputSchema` advertises itself: the download metadata — wrapped by
+    # `_as_object` exactly as `_object_payload` wraps the plain return — plus the
+    # `media` manifest. The text block keeps the metadata alone, verbatim.
+    metadata = _as_object(data)
     content: list[types.ContentBlock] = [
         types.TextContent(
             type="text",
-            text=json.dumps(data, indent=2, default=str, ensure_ascii=False),
+            text=json.dumps(metadata, indent=2, default=str, ensure_ascii=False),
         ),
         *blocks,
     ]
-    return types.CallToolResult(content=content, structured_content={"media": records})
+    return types.CallToolResult(
+        content=content, structured_content={**metadata, "media": records}
+    )
 
 
 def _preview_image_path(data: Any) -> str | None:
@@ -12685,13 +12735,14 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
 
 
 @mcp.tool()
+@_object_payload
 async def download_model(
     url: str,
     relative_path: str | None = None,
     filename: str | None = None,
     wait: bool = True,
     timeout_seconds: float = 110.0,
-) -> Any:
+) -> dict[str, Any]:
     """Download a model file into the LOCAL ComfyUI models dir, by URL.
 
     Wraps ``comfy model download --url <url> [--relative-path <path>]
@@ -12983,11 +13034,12 @@ _DOWNLOAD_ACTION_VERB = {
 
 
 @mcp.tool()
+@_object_payload
 def download(
     action: str = "status",
     download_id: str = "",
     timeout_seconds: float | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Track a transfer already started by download_model; does NOT start one.
 
     Wraps `comfy model download-status`/`download-cancel`. `action`:
