@@ -56,7 +56,8 @@ The host delivers the tool result to the iframe. `url` is the play source: a `da
 The viewer picks one array:
 
 - `contract_version` is 1 and `items` is an array: render `items`, and do not also render `results` or `outputs`.
-- Otherwise render `results` when that array is present, or `outputs` when that array is present. This is cloud's published agent API.
+- `contract_version` is absent, or it is 1 and `items` is not an array: render `results` when that array is present, or `outputs` when that array is present. This is cloud's published agent API.
+- `contract_version` is any other number: show the text from `content` and render no media. This wins over `results` and `outputs`, so a future version is not drawn with the version-1 arrays.
 - `isError` is true, or none of those arrays is present: show the text from `content` and render no media. An empty chosen array is a finished result with nothing to show.
 
 `results` and `outputs` stay the agent-facing records. `items` is a versioned viewer shape a server may add later. It does not replace those arrays. Putting the same URL strings in both arrays counts them twice toward cloud's 40,000-character ceiling, so a server opts in only by sending `items` without copying those URL strings into `results` or `outputs` in the same payload. If that copy would not fit, the server omits `items` and the viewer stays on the legacy array.
@@ -179,7 +180,7 @@ A local video past the cap has no `url`. The text block carries the absolute pat
 
 When the client advertised `io.modelcontextprotocol/ui` with MIME `text/html;profile=mcp-app`, cloud may append one line saying the viewer is showing the media and not to paste signed storage URLs. The line is extra. It does not remove the shortlink or the command. Other hosts get today's text unchanged.
 
-A `contract_version` the HTML does not understand still leaves this text in place. The iframe shows that text only. It does not read version-1 names such as `filename` or `size_bytes`, and it does not guess a media element. An `items` value that is not an array does not opt in. The viewer then uses `results` or `outputs` when one of those arrays is present.
+A `contract_version` other than 1 still leaves this text in place. The iframe shows that text only, including when `results` or `outputs` is also present. It does not read version-1 names such as `filename` or `size_bytes`, and it does not guess a media element. When `contract_version` is absent or 1, an `items` value that is not an array does not opt in, and the viewer uses `results` or `outputs` when one of those arrays is present.
 
 ## Security
 
@@ -232,7 +233,7 @@ When a media element fails to load, the viewer replaces it with "Preview unavail
 
 Cloud may point `wait_for_job` at the same viewer. That result is status, not media. When the status says the job completed, the iframe may call `tools/call` for `get_output` with exactly `{prompt_id}`. The call is read-only: no `save_to_disk`, no `confirm`, no other tool. Local does not do this.
 
-Auto-load is not a hardcoded constant. If the host requires approval before an app-initiated `tools/call`, the viewer shows a Load control and sends `get_output` only after the host allows it. If the host does not require that approval, the viewer may call immediately. Cloud's viewer currently auto-loads on every completion; that flag has to follow the host instead.
+Auto-load is not a hardcoded constant. The 2026-01-26 apps spec says a host may hold a view message for user approval, and `HostCapabilities` has no field that reports that policy. When the viewer cannot tell whether this host will forward `tools/call` without asking, it shows Load and sends `get_output` only after that control. When it knows the host forwards the call without approval, it may call immediately. Cloud's viewer currently auto-loads on every completion; that flag has to follow the host instead.
 
 ## Versioning
 
