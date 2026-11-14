@@ -72,6 +72,7 @@ The viewer picks one array:
   "required": ["contract_version", "items"],
   "properties": {
     "contract_version": { "const": 1 },
+    "offset": { "type": "integer", "minimum": 0 },
     "items": {
       "type": "array",
       "items": { "$ref": "#/$defs/mediaItem" }
@@ -99,14 +100,15 @@ The viewer picks one array:
         "size_bytes": { "type": "integer", "minimum": 0 },
         "prompt_id": { "type": "string", "minLength": 1 },
         "job_id": { "type": "string", "minLength": 1 },
-        "url_omitted": { "type": "boolean" }
+        "url_omitted": { "type": "boolean" },
+        "image_block": { "const": true }
       }
     }
   }
 }
 ```
 
-Extra properties are allowed. On a legacy entry the viewer also reads `inline_url`. `url` is optional. Absent means this object does not carry a play URL. An `image` item with no `url` may still have bytes in a paired `ImageContent` block, described below. With neither a play URL nor a paired block, the bytes are not in the result. `url_omitted: true` means the server dropped the URL to fit the character ceiling. The viewer then ignores `url`, `download_url`, and `inline_url` on that entry and shows the text that says how to ask again. The flag stays; a server does not delete it in favor of a missing `url` alone.
+Extra properties are allowed. On a legacy entry the viewer also reads `inline_url`. `url` is optional. Absent means this object does not carry a play URL. `image_block: true` means this item's bytes travel in a paired `ImageContent` block, described below; it is set only on an item with no `url`. With neither a play URL nor `image_block`, the bytes are not in the result. `offset` on the result is the page offset the call was made with; a paged cloud `get_output` result sets it, and absent means 0. `url_omitted: true` means the server dropped the URL to fit the character ceiling. The viewer then ignores `url`, `download_url`, and `inline_url` on that entry and shows the text that says how to ask again. The flag stays; a server does not delete it in favor of a missing `url` alone.
 
 `download_url` is optional and is never the media `src`. `size_bytes` is optional. It is the media length, never the base64 length, and never `0` standing in for unknown. A `data:` URL includes it, because the server measured the file. Omit it when the length was not measured (`fetch_outputs(url_only=True)`, a cloud URL with no known object size, a `getsize` failure). `prompt_id` is the job id when the file belongs to a job. On a batch entry, `job_id` is an alias: if `prompt_id` is absent and `job_id` is a non-empty string, the viewer uses `job_id`. `preview_media` of a path that is not a job output omits both. `kind` is the server's classification on an `items` entry; the viewer does not sniff the filename there. A legacy entry with no `kind` is classified from its filename extension, which is what cloud does today. Version 1 renders `image`, `video`, and `audio` as those elements, and `3d` as a filename row. Any other non-empty `kind` is a filename row too.
 
@@ -173,10 +175,10 @@ A local video past the cap has no `url`. The text block carries the absolute pat
 
 `content[]` stays the complete result for hosts that ignore `_meta.ui`, and for the model.
 
-- Local text keeps today's metadata, including on-disk paths, and does not contain `data:` URLs. An image that already travels as `ImageContent` stays that block for hosts without Apps, and its item omits `url`. Paths stay, because the next tool call needs them. A `data:` URL for video or audio lives only on `items[].url`. The server does not also pretty-print `structuredContent` into a text block.
+- Local text keeps today's metadata, including on-disk paths, and does not contain `data:` URLs. An image that already travels as `ImageContent` stays that block for hosts without Apps, and its item omits `url` and sets `image_block: true`. Paths stay, because the next tool call needs them. A `data:` URL for video or audio lives only on `items[].url`. The server does not also pretty-print `structuredContent` into a text block.
 - Cloud text keeps today's link and download command, including an `/api/s/<id>` shortlink when one was minted.
 
-`ImageContent` blocks pair with items in order. Walk `items` from the start. Each item with `kind` `image` and no `url` takes the next image block. An item that has a `url`, or whose `kind` is not `image`, takes none, so a video or an omitted file cannot shift the next image onto the wrong card. The block's `mimeType` and base64 `data` become `data:{mimeType};base64,{data}`, then the same checks as a `url`. If the number of such items and the number of image blocks differ, the viewer shows the text and does not pair a leftover block with a later item.
+`ImageContent` blocks pair with items in order. Walk `items` from the start. Each item with `image_block: true` takes the next image block. Any other item takes none, so a video, an item with a `url`, or an image past the inline cap (no `url`, no `image_block`) cannot shift the next image onto the wrong card. Nine image outputs with eight inlined therefore pair eight blocks with the eight marked items, and the ninth shows as not inlined. The block's `mimeType` and base64 `data` become `data:{mimeType};base64,{data}`, then the same checks as a `url`. If the number of `image_block` items and the number of image blocks differ, the viewer shows the text and does not pair a leftover block with a later item.
 
 When the client advertised `io.modelcontextprotocol/ui` with MIME `text/html;profile=mcp-app`, cloud may append one line saying the viewer is showing the media and not to paste signed storage URLs. The line is extra. It does not remove the shortlink or the command. Other hosts get today's text unchanged.
 
@@ -227,11 +229,11 @@ Cloud keeps its character ceiling for `https` results: `MAX_GET_OUTPUT_RESULT_CH
 
 Cloud mints two kinds of `https` media URL. A shortlink (`/api/s/<id>`) lasts about 5 minutes. A signed `storage.googleapis.com` URL lasts about 6 hours. Those are the lifetimes the cloud server mints today.
 
-When a media element fails to load, the viewer replaces it with "Preview unavailable" through `textContent`. It does not `fetch` a replacement. On cloud, the iframe may call `get_output` with only `{prompt_id}` (the read-only call below), which re-mints the links. The model does the same when the person or the viewer says the link expired: call `get_output` again, with `offset` when the text names one. Do not reuse a URL past the lifetime above, and do not paste the signed query into the reply.
+When a media element fails to load, the viewer replaces it with "Preview unavailable" through `textContent`. It does not `fetch` a replacement. On cloud, the iframe may call `get_output` with `{prompt_id}`, plus `offset` when the displayed result carries a non-zero `offset` (the read-only call below), which re-mints the links on the page it is showing. A legacy `results` or `outputs` result carries no `offset`, so the viewer cannot tell its page and offers Refresh there only when the text names no next page; otherwise it shows the text, and the model refreshes with the `offset` the text names. The model does the same when the person or the viewer says the link expired: call `get_output` again, with `offset` when the text names one. Do not reuse a URL past the lifetime above, and do not paste the signed query into the reply.
 
 ## Cloud `wait_for_job` exception
 
-Cloud may point `wait_for_job` at the same viewer. That result is status, not media. When the status says the job completed, the iframe may call `tools/call` for `get_output` with exactly `{prompt_id}`. The call is read-only: no `save_to_disk`, no `confirm`, no other tool. Local does not do this.
+Cloud may point `wait_for_job` at the same viewer. That result is status, not media. When the status says the job completed, the iframe may call `tools/call` for `get_output` with exactly `{prompt_id}`. Refresh after a media error may add the displayed page's `offset`, and nothing else. The call is read-only: no `save_to_disk`, no `confirm`, no other tool. Local does not do this.
 
 Auto-load is not a hardcoded constant. The 2026-01-26 apps spec says a host may hold a view message for user approval, and `HostCapabilities` has no field that reports that policy. When the viewer cannot tell whether this host will forward `tools/call` without asking, it shows Load and sends `get_output` only after that control. When it knows the host forwards the call without approval, it may call immediately. Cloud's viewer currently auto-loads on every completion; that flag has to follow the host instead.
 
@@ -255,7 +257,7 @@ Against PR 1894, PR 2005, and cloud `main` on 2026-11-14. PR 2005 only shares th
 - `url_omitted: true` stays the character-ceiling signal. Do not delete the flag.
 - A batch entry may keep `job_id`. The viewer accepts it as `prompt_id`.
 - `size_bytes` stays omitted when the length is unknown, including when only `width` and `height` are known. Do not emit `0` for unknown.
-- `wait_for_job` may keep `_meta.ui`. The read-only `get_output({prompt_id})` call from the iframe stays, including Refresh after a media error.
+- `wait_for_job` may keep `_meta.ui`. The read-only `get_output({prompt_id})` call from the iframe stays, including Refresh after a media error, which also sends the displayed page's `offset` when it is not 0.
 - Filename extensions may keep classifying legacy entries. `kind` and `mime_type` are required only on an opted-in `items` entry.
 - Security pins stay: no `fetch`, no `innerHTML`, text through `textContent`, no `connectDomains`, and the `chatgpt` profile stays resource-free. The upload widget, catalog picker, run-settings panel, and the iterate buttons stay outside this contract.
 - `resourceDomains` stay this session's public API origin and the storage host those URLs redirect to (`https://storage.googleapis.com` today, or a narrower bucket origin when the server knows it). Do not add another environment's origin.
@@ -263,7 +265,7 @@ Against PR 1894, PR 2005, and cloud `main` on 2026-11-14. PR 2005 only shares th
 ### Still to change
 
 - Negotiate auto-load with the host. The viewer currently auto-loads on every completed `wait_for_job`. If the host requires approval for an app-initiated call, show Load and send `get_output({prompt_id})` only after that approval.
-- On a response that opts into `items`, set `url` to the play URL and `download_url` to the shortlink. Do not also copy those URL strings into `results` or `outputs`. If the payload would pass 40,000 characters, omit `items` and stay on the legacy arrays.
+- On a response that opts into `items`, set `url` to the play URL and `download_url` to the shortlink. Set `offset` on a page past the first, so Refresh re-mints that page. Do not also copy those URL strings into `results` or `outputs`. If the payload would pass 40,000 characters, omit `items` and stay on the legacy arrays.
 
 ## Non-goals
 
