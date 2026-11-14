@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 from conftest import envelope
 
@@ -62,8 +63,23 @@ def test_a_long_tail_catalog_tool_stays_text_only():
     ``search_templates`` is one of the long-tail tools the ticket leaves as text,
     so its absence of an ``outputSchema`` is the control that proves the structured
     set was opted in deliberately rather than applied server-wide.
+
+    What "no output schema" looks like depends on the interpreter, not on this
+    server: on Python 3.11+ ``typing.Any`` is a class with no type hints, so the
+    SDK derives nothing for ``-> Any``; on 3.10 it is not a class, so the SDK
+    falls through to its generic branch and wraps it as ``{"result": Any}``.
+    Either way the tool carries none of the opted-in object payload schema.
     """
-    assert _tools_by_name()["search_templates"].output_schema is None
+    schema = _tools_by_name()["search_templates"].output_schema
+    if sys.version_info >= (3, 11):
+        assert schema is None
+    else:
+        assert schema == {
+            "properties": {"result": {"title": "Result"}},
+            "required": ["result"],
+            "title": "search_templatesOutput",
+            "type": "object",
+        }
 
 
 def test_job_call_returns_structured_content_equal_to_the_payload(patched_run):
