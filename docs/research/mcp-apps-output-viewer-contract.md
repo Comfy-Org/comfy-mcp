@@ -38,7 +38,7 @@ Cloud substitutes its own URI. Local registers with `mcp.server.apps.Apps`: `add
 
 ## Tools that carry `_meta.ui`
 
-A tool carries the URI when a successful result's `structuredContent` is the object below. Every other tool leaves `_meta.ui` unset.
+A tool carries the URI when its success payload uses the object below. Every other tool leaves `_meta.ui` unset. The metadata is part of tool registration, so a failed call still opens the viewer.
 
 | Server | Tools |
 | --- | --- |
@@ -47,11 +47,13 @@ A tool carries the URI when a successful result's `structuredContent` is the obj
 
 `run_workflow`, `run_template`, and `partner_generate` return a job. The model then calls `fetch_outputs`. Cloud `wait_for_job` returns status, not media items, so it does not carry the viewer. `visibility` stays omitted, so these tools stay model-visible. This contract adds no app-only tool.
 
-Register the resource for every profile that registers those tools, except cloud's `chatgpt` profile, which stays resource-free. Do not hide the resource from other hosts based on the Apps extension. `resources/list` stays stable for a process.
+Register the resource for every profile that registers those tools. Cloud's `chatgpt` profile is the exception: it registers no resource, and `get_output` and `get_batch_output` omit `_meta.ui` there. Do not hide the resource from other hosts based on the Apps extension. `resources/list` stays stable for a process.
 
 ## Result payload
 
-The host delivers the tool result to the iframe. The viewer reads `structuredContent.items` and nothing else. `url`, when present, is a `data:` URL (local bytes) or an `https` URL (cloud). Each server emits only the form it can host. Keys are snake_case, like the rest of both tool payloads.
+The host delivers the tool result to the iframe. The viewer reads `structuredContent.items`. `url`, when present, is a `data:` URL (local bytes) or an `https` URL (cloud). Each server emits only the form it can host. Keys are snake_case, like the rest of both tool payloads.
+
+When `isError` is true, or when `structuredContent.items` is absent, the viewer shows the text from `content` and renders no media. An empty `items` array is a finished result with nothing to show: the same text, and no media element.
 
 ```json
 {
@@ -72,7 +74,7 @@ The host delivers the tool result to the iframe. The viewer reads `structuredCon
     "mediaItem": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["mime_type", "kind", "filename", "size_bytes", "prompt_id"],
+      "required": ["mime_type", "kind", "filename", "size_bytes"],
       "properties": {
         "url": {
           "anyOf": [
@@ -84,7 +86,7 @@ The host delivers the tool result to the iframe. The viewer reads `structuredCon
           ]
         },
         "mime_type": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["image", "video", "audio", "3d"] },
+        "kind": { "type": "string", "minLength": 1 },
         "filename": { "type": "string", "minLength": 1 },
         "size_bytes": { "type": "integer", "minimum": 0 },
         "prompt_id": { "type": "string", "minLength": 1 }
@@ -94,22 +96,22 @@ The host delivers the tool result to the iframe. The viewer reads `structuredCon
 }
 ```
 
-Extra properties are allowed and ignored, so a server can keep a warning or a batch count beside `items` during a transition. `url` is optional: absent means the bytes are not in the result. `size_bytes` is the media length, never the base64 length. For a `data:` URL it is the decoded length and it counts toward the cap below. `prompt_id` is the job id, repeated on every item so a batch card can name its own job. `kind` is the server's classification; the viewer does not sniff the filename. `3d` is a filename row in version 1: it is not assigned to `img`, `video`, or `audio`.
+Extra properties are allowed and ignored, so a server can keep a warning or a batch count beside `items` during a transition. `url` is optional: absent means the bytes are not in the result. `size_bytes` is the media length, never the base64 length. For a `data:` URL it is the decoded length and it counts toward the cap below. `prompt_id` is the job id when the file belongs to a job, repeated on every item of that job so a batch card can name its own. `preview_media` of a path that is not a job output omits it. A supplied `prompt_id` is a non-empty string. `kind` is the server's classification; the viewer does not sniff the filename. Version 1 renders `image`, `video`, and `audio` as those elements, and `3d` as a filename row. Any other non-empty `kind` is a filename row too, so adding one stays on this version.
 
 `image`, `video`, and `audio` with a valid `url` become that element. `src` is set only after the string matches the schema, the `data:` media type matches `mime_type`, and an `https` origin is in that server's `resourceDomains`. Local declares none, so local HTML does not assign an `https` `src`.
 
-Local, one inlined PNG from `fetch_outputs`. `preview_media` uses the same item for the contact sheet or waveform PNG it writes:
+Local, one inlined PNG from `fetch_outputs`. `preview_media` uses the same item for the contact sheet or waveform PNG it writes, and omits `prompt_id` when that file is not a job output:
 
 ```json
 {
   "contract_version": 1,
   "items": [
     {
-      "url": "data:image/png;base64,iVBORw0KGgo=",
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC",
       "mime_type": "image/png",
       "kind": "image",
       "filename": "ComfyUI_00001_.png",
-      "size_bytes": 2048,
+      "size_bytes": 69,
       "prompt_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
     }
   ]
@@ -155,7 +157,7 @@ A local video past the cap has no `url`. The text block carries the absolute pat
 
 `content[]` stays the complete result for hosts that ignore `_meta.ui`, and for the model.
 
-- Local text keeps today's metadata, including on-disk paths. `inline_images=True` and `preview_media` may still append `ImageContent` under the cap. The Apps object does not replace those blocks. Paths stay, because the next tool call needs them.
+- Local text keeps today's metadata, including on-disk paths. An image that already travels as `ImageContent` stays that block for hosts without Apps. The matching item omits `url`, and the viewer builds the `data:` URL from the image block. Paths stay, because the next tool call needs them.
 - Cloud text keeps today's link and download command, including an `/api/s/<id>` shortlink when one was minted.
 
 When the client advertised `io.modelcontextprotocol/ui` with MIME `text/html;profile=mcp-app`, cloud may append one line saying the viewer is showing the media and not to paste signed storage URLs. The line is extra. It does not remove the shortlink or the command. Other hosts get today's text unchanged.
@@ -170,7 +172,7 @@ The document is one self-contained HTML string.
 - `img`, `video`, and `audio` `src` is set only from a `url` that passed the checks above.
 - The bridge sends `ui/initialize` at protocol `2026-01-26`, then `ui/notifications/initialized`, then `ui/notifications/size-changed`. It handles `tool-result`, `host-context-changed` (`color-scheme`), and `ui/resource-teardown`.
 - Messages go to `window.parent` and are accepted only when `event.source` is `window.parent`.
-- Download may call `ui/open-link` only with an `https` URL the server already treats as user-facing. Local has none. Cloud's is an `/api/s/<id>` shortlink with an empty query or exactly `?raw=1`. A signed storage URL may be the media `src` and is not passed to `ui/open-link`.
+- Download may call `ui/open-link` only when `url` itself is an `https` URL the server already treats as user-facing. Local has none. Cloud's is an `/api/s/<id>` shortlink with an empty query or exactly `?raw=1`. When `url` is a signed storage URL, the viewer plays it and offers no Download button. The shortlink or save command stays in the text. There is no second URL field.
 
 The document contains no `fetch`, `XMLHttpRequest`, `WebSocket`, `innerHTML`, `insertAdjacentHTML`, `document.write`, or `eval`. It makes no `tools/call`. It requests no camera, microphone, geolocation, or clipboard permission, and it does not load `file://` or loopback.
 
@@ -181,23 +183,21 @@ CSP on the resource `_meta.ui` and on `resources/read`:
 | Local | omitted | omitted |
 | Cloud | omitted | `https://storage.googleapis.com`, the session's public API origin, `https://cloud.comfy.org`, `https://stagingcloud.comfy.org` |
 
-Omitted local CSP is the apps default: `img-src` and `media-src` allow `'self'` and `data:`, and `connect-src` is `'none'`. The host template also allows `data:` when `resourceDomains` is set, so cloud can ignore a `data:` URL without a CSP change. No `frameDomains`, no `permissions`, no dedicated sandbox `domain`.
+Local omits `ui.csp` entirely. The spec's restrictive default then allows `img-src` and `media-src` of `'self'` and `data:`, and sets `connect-src 'none'`. A present `csp` object with `connectDomains` omitted is a different case: the field text says that means no connections, while the spec's CSP template yields `connect-src 'self'`. Do not treat a missing `connectDomains` key inside a present `csp` object as `connect-src 'none'`. The document itself opens no connection, whichever reading the host implements. The host template also allows `data:` when `resourceDomains` is set, so cloud can ignore a `data:` URL without a CSP change. No `frameDomains`, no `permissions`, no dedicated sandbox `domain`.
 
 The host renders the HTML in a sandboxed iframe. Web hosts use the spec's outer sandbox proxy plus an inner frame. Inline script depends on the default `script-src 'self' 'unsafe-inline'`. The view assumes no other permission.
 
 ## Size limits
 
-`_INLINE_IMAGE_MAX_BYTES` is 16 MiB of raw file bytes and `_INLINE_IMAGE_MAX_COUNT` is 8. Both already bound `fetch_outputs(inline_images=True)` and `preview_media`. Video and audio that join the inline result use this same budget.
-
-For `data:` URLs in one tool result:
+`_INLINE_IMAGE_MAX_BYTES` is 16 MiB of raw file bytes and `_INLINE_IMAGE_MAX_COUNT` is 8. Both already bound `fetch_outputs(inline_images=True)` and `preview_media`. Video and audio that join the inline result use this same budget. It is one budget for the whole tool result. `ImageContent` and a `data:` URL of the same file are not both sent, and that file counts once.
 
 | Bound | Value | What counts |
 | --- | --- | --- |
-| One item | 16 MiB | that item's `size_bytes` |
-| The result | 16 MiB | sum of `size_bytes` over items that have a `data:` URL |
-| The result | 8 items | items that have a `data:` URL |
+| One item | 16 MiB | that file's raw byte length |
+| The result | 16 MiB | sum of raw bytes over `ImageContent` blocks and items that have a `data:` URL |
+| The result | 8 items | those blocks and `data:` items, each file once |
 
-`https` items do not count. A `data:` item over 16 MiB, one that would push the sum over 16 MiB, or a ninth `data:` item is emitted without `url`, in order, stopping at the first item that would break a bound. The on-disk file is unchanged. The text names the path and the size.
+`https` items do not count. A file over 16 MiB, one that would push the sum over 16 MiB, or a ninth inlined file is emitted without `url` and without an `ImageContent` block, in order, stopping at the first file that would break a bound. The on-disk file is unchanged. The text names the path and the size.
 
 Base64 expands the wire size by about 4/3, so a full 16 MiB inline is on the order of 22 MiB of JSON. A host that truncates the tool result can drop the URL. The text fallback remains, and a missing or truncated `url` is shown as not inlined.
 
@@ -217,11 +217,11 @@ Against PR 1894, PR 2005, and cloud `main` on 2026-11-14. PR 2005 only shares th
 
 1. **Keep** `ui://comfy-cloud/output-viewer`. The authority stays `comfy-cloud`.
 2. **Read `structuredContent.items`** and require `contract_version === 1`. Stop selecting `results[]` for `get_output` and `outputs[]` for `get_batch_output`. Batch `summary`, `failed`, and `pending` may stay as extra fields; the media loop does not read them.
-3. **Emit** `url`, `mime_type`, `kind`, `filename`, `size_bytes`, and `prompt_id`. Stop classifying with the extension maps (`png`, `jpg`, `mp4`, `mp3`, …). `kind` is `image`, `video`, `audio`, or `3d`. `mime_type` is an IANA type. The outputs-map key (`images`, `gifs`, …) and `file.type` (`output` / `temp`) are not MIME types; copy neither into `mime_type`.
-4. **One `url`, `https` only.** Stop evaluating `inline_url ?? url`, and stop accepting `http:`. The media `src` is `url`. Download still uses `ui/open-link` only for an `/api/s/<id>` shortlink with an empty query or exactly `?raw=1`. A signed `https://storage.googleapis.com` URL may be `url` when that is what should play.
-5. **`prompt_id` on every item.** `get_output` copies the job id onto each item. `get_batch_output` stores each entry's job id in `prompt_id` (today's `job_id`).
+3. **Emit** `url` when the bytes are in the result, plus `mime_type`, `kind`, `filename`, `size_bytes`, and `prompt_id` when a job is known. Stop classifying with the extension maps (`png`, `jpg`, `mp4`, `mp3`, …). Version 1 renders `image`, `video`, and `audio`, and shows `3d` and any other `kind` as a filename row. `mime_type` is an IANA type. The outputs-map key (`images`, `gifs`, …) and `file.type` (`output` / `temp`) are not MIME types; copy neither into `mime_type`.
+4. **One `url`, `https` only.** Stop evaluating `inline_url ?? url`, and stop accepting `http:`. The media `src` is `url`. Download uses `ui/open-link` only when that `url` is an `/api/s/<id>` shortlink with an empty query or exactly `?raw=1`. A signed `https://storage.googleapis.com` URL may be `url` when that is what should play, and then the card has no Download button. The shortlink stays in the text. Do not add a second URL field.
+5. **`prompt_id` when the file belongs to a job.** `get_output` copies the job id onto each item. `get_batch_output` stores each entry's job id in `prompt_id` (today's `job_id`). Omit it when no job is known.
 6. **`size_bytes` on every item**, from a length the server already trusts. Today's payload has `saved_bytes` only after a disk save, plus `width` and `height`. Pixel size is not a byte length.
-7. **Drop `url` instead of setting `url_omitted: true`.** When the 40,000-character ceiling or the 25-file page removes a download URL, the item stays, without `url`, and still has `mime_type`, `kind`, `filename`, `size_bytes`, and `prompt_id`. The text note and the offset redirect stay.
+7. **Drop `url` instead of setting `url_omitted: true`.** When the 40,000-character ceiling or the 25-file page removes a download URL, the item stays, without `url`, and still has `mime_type`, `kind`, `filename`, `size_bytes`, and `prompt_id` when a job is known. The text note and the offset redirect stay.
 8. **Attach the URI only on `get_output` and `get_batch_output`.** `main` also sets it on `wait_for_job`, and the view calls `tools/call` `get_output` when that status says completed, and again from Refresh. PR 1894 left `wait_for_job` alone and made no tool call. The conforming view renders the pushed result and does not call a tool. A finished wait stays a status line; the model calls `get_output`.
 9. **Reject a `url` that fails the schema** before setting `src` (`http:`, `javascript:`, `file:`). Cloud does not emit `data:`. A media element that fails to load still becomes "Preview unavailable" through `textContent`.
 10. **Keep the security pins:** no `fetch`, no `innerHTML`, no `connectDomains`, text via `textContent`, `chatgpt` resource-free. The upload widget, catalog picker, run-settings panel, and the iterate buttons are other apps. They stay outside this contract and do not change `items`.
