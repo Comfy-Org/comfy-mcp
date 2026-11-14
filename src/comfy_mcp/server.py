@@ -2104,7 +2104,13 @@ def _unwrap_envelope(
 def _last_json_object(stdout: str) -> dict | None:
     """Return the last JSON object on stdout, preferring a ``type==envelope`` one."""
     best: dict | None = None
-    for raw in stdout.splitlines():
+    # NDJSON lines end at a real newline (`\n` or `\r\n`). `str.splitlines()`
+    # also breaks on U+2028, U+2029, U+0085 and the other Unicode line
+    # boundaries. Those are legal inside a JSON string — the MiniMax H3
+    # image-to-video template's prompt ends in U+2028 — so splitting on them
+    # cut one envelope into two fragments and the caller reported "returned
+    # no JSON" for a line that parses.
+    for raw in re.split(r"\r?\n", stdout):
         line = raw.strip()
         if not line:
             continue
