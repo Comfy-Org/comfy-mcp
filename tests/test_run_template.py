@@ -474,8 +474,12 @@ def test_run_template_input_required_retry_with_approve_runs(patched_streamed_ru
     calls = patched_streamed_run()
     # Replay what the client sends on the retry — the answer keyed as the first
     # round asked for it.
+    # The retry repeats the first round's arguments exactly: the SDK binds the
+    # sealed state to them, so an approval never covers a changed call.
     first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
-    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    pending = _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=first
+    )
     [key] = pending.input_requests
 
     ctx = _FakeCtx(
@@ -489,6 +493,82 @@ def test_run_template_input_required_retry_with_approve_runs(patched_streamed_ru
 
     assert "--allow-spend" in calls[0]["cmd"]
     assert ctx.elicitations == []
+
+
+def _approved_retry(pending):
+    [key] = pending.input_requests
+    return _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+        request_state=pending.request_state,
+    )
+
+
+def test_run_template_input_required_answer_is_honored_once(patched_streamed_run):
+    """Replaying one prompt's sealed state + "yes" asks afresh, not a second run."""
+    calls = patched_streamed_run()
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    replay = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(pending)
+    )
+
+    assert isinstance(replay, types.InputRequiredResult)
+    assert len(calls) == 1
+
+
+def test_consumed_nonce_survives_a_full_cache(patched_streamed_run, monkeypatch):
+    """The size cap never forgets a nonce still inside the request-state TTL.
+
+    Count-based eviction would drop the oldest consumed nonce once the cache
+    filled — declined answers fill it too — and re-admit a replay of its sealed
+    state, still valid to the SDK, as a second run on one approval.
+    """
+    calls = patched_streamed_run()
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES", server.OrderedDict())
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES_MAX", 2)
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    for _ in range(3):  # overflow the cap with fresh, separately answered prompts
+        other = _run_template("api_seedance", confirm_spend=True, ctx=first)
+        _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(other))
+
+    replay = _run_template(
+        "api_seedance", confirm_spend=True, ctx=_approved_retry(pending)
+    )
+
+    assert isinstance(replay, types.InputRequiredResult)
+    assert pending.request_state.rsplit(":", 1)[1] in server._CONSUMED_CONSENT_NONCES
+    # Only the two answers that fit ran; the overflow fails closed (asks afresh).
+    assert len(calls) == 2
+
+
+def test_consumed_nonce_is_forgotten_only_after_the_state_ttl(
+    patched_streamed_run, monkeypatch
+):
+    """Retention follows the policy's TTL: expired nonces are pruned, live ones kept."""
+    patched_streamed_run()
+    monkeypatch.setattr(server, "_CONSUMED_CONSENT_NONCES", server.OrderedDict())
+    clock = [1_000_000.0]
+    monkeypatch.setattr(server.time, "time", lambda: clock[0])
+    ttl = server._REQUEST_STATE_SECURITY.ttl
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(pending))
+    [nonce] = server._CONSUMED_CONSENT_NONCES
+
+    clock[0] += ttl - 1  # still inside the TTL: retained across a new claim
+    other = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(other))
+    assert nonce in server._CONSUMED_CONSENT_NONCES
+
+    clock[0] += 2  # past the TTL: the SDK rejects the state now, so it is pruned
+    third = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    _run_template("api_seedance", confirm_spend=True, ctx=_approved_retry(third))
+    assert nonce not in server._CONSUMED_CONSENT_NONCES
 
 
 @pytest.mark.parametrize(

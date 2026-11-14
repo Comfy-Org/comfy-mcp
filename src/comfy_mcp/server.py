@@ -87,7 +87,7 @@ from urllib.parse import urlparse
 import anyio.to_thread
 from mcp import types
 from mcp.server.elicitation import render_elicitation_schema
-from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.server.mcpserver import Context, Image, MCPServer, RequestStateSecurity
 from mcp.types.version import is_version_at_least
 from pydantic import BaseModel, Field
 
@@ -139,10 +139,19 @@ def _server_version() -> str:
 # unversioned server answers `initialize` with `"serverInfo": {"name":
 # "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
 # correlate a bug report against.
+#
+# The request-state policy is the SDK's own default (`ephemeral()`: a
+# process-local key, 600s TTL), built here only so the consent gates can READ the
+# TTL their sealed `request_state` lives for — `_claim_consent_nonce` must remember
+# a consumed nonce for at least that long, and deriving it from the policy in use
+# means a changed TTL cannot silently outlive that memory.
+_REQUEST_STATE_SECURITY = RequestStateSecurity.ephemeral()
+
 mcp = MCPServer(
     "comfy-mcp",
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
+    request_state_security=_REQUEST_STATE_SECURITY,
 )
 
 
@@ -5127,9 +5136,14 @@ _CONSENT_STATE_PREFIX = "comfy-mcp/consent/v1"
 
 # Nonces of consent prompts already answered, so one prompt's answer is honored
 # ONCE: a client replaying a sealed state plus its "yes" (inside the SDK's TTL)
-# gets a fresh prompt instead of a second run on the first approval. Bounded —
-# an answer older than this many prompts is long past the SDK's state TTL anyway.
-_CONSUMED_CONSENT_NONCES: OrderedDict[str, None] = OrderedDict()
+# gets a fresh prompt instead of a second run on the first approval. Each nonce
+# maps to the wall-clock time it was consumed and is forgotten only once
+# `_REQUEST_STATE_SECURITY.ttl` has passed since then — by which point the SDK
+# itself rejects the state as expired (it was minted no later than it was
+# consumed, and the SDK times `exp` on the same wall clock). The size cap is a
+# MEMORY bound only: it never evicts a live nonce, so a full cache refuses the
+# claim (the gate asks afresh) rather than forget one that could be replayed.
+_CONSUMED_CONSENT_NONCES: OrderedDict[str, float] = OrderedDict()
 _CONSUMED_CONSENT_NONCES_MAX = 4096
 _CONSUMED_CONSENT_LOCK = threading.Lock()
 
@@ -5151,7 +5165,8 @@ def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
 
     False — the answer is ignored and the gate asks afresh — when the state is
     absent (an answer attached to a first call nobody was prompted on), minted
-    for another gate or another prompt text, or already consumed.
+    for another gate or another prompt text, already consumed, or the consumed
+    set is full of nonces still inside the state TTL.
     """
     state = getattr(ctx, "request_state", None)
     if not isinstance(state, str):
@@ -5160,12 +5175,20 @@ def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
     nonce = state[len(expected) :]
     if not state.startswith(expected) or not nonce:
         return False
+    now = time.time()
     with _CONSUMED_CONSENT_LOCK:
+        # Insertion order is consumption order, so the expired entries lead.
+        horizon = now - _REQUEST_STATE_SECURITY.ttl
+        while _CONSUMED_CONSENT_NONCES:
+            oldest, consumed_at = next(iter(_CONSUMED_CONSENT_NONCES.items()))
+            if consumed_at > horizon:
+                break
+            del _CONSUMED_CONSENT_NONCES[oldest]
         if nonce in _CONSUMED_CONSENT_NONCES:
             return False
-        _CONSUMED_CONSENT_NONCES[nonce] = None
-        while len(_CONSUMED_CONSENT_NONCES) > _CONSUMED_CONSENT_NONCES_MAX:
-            _CONSUMED_CONSENT_NONCES.popitem(last=False)
+        if len(_CONSUMED_CONSENT_NONCES) >= _CONSUMED_CONSENT_NONCES_MAX:
+            return False
+        _CONSUMED_CONSENT_NONCES[nonce] = now
     return True
 
 
