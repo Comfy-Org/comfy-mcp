@@ -16,6 +16,7 @@ manual check, noted in the PR.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from conftest import envelope
 
@@ -72,6 +73,43 @@ def test_html_has_no_network_or_unsafe_dom_access():
     html = output_viewer.OUTPUT_VIEWER_HTML
     present = [token for token in _FORBIDDEN_HTML_TOKENS if token in html]
     assert not present, f"viewer HTML must not contain {present}"
+
+
+def test_initialize_request_carries_the_required_bridge_fields():
+    """``ui/initialize`` sends ``appInfo`` + ``appCapabilities``, not just the version.
+
+    The 2026-01-26 bridge contract requires all three; a schema-validating host
+    rejects a request missing either and never delivers the tool result.
+    """
+    html = output_viewer.OUTPUT_VIEWER_HTML
+    info = output_viewer._APP_INFO
+    assert set(info) == {"name", "version"} and all(info.values())
+    assert f"var APP_INFO = {json.dumps(info)};" in html
+    init = html[html.index('method: "ui/initialize"') :]
+    params = init[: init.index("});")]
+    for field in ("appInfo: APP_INFO", "appCapabilities: {}", "protocolVersion"):
+        assert field in params
+
+
+def test_bridge_follows_handshake_order_and_trusts_only_the_host():
+    """``initialized`` waits for the id-matched response; other frames are ignored."""
+    html = output_viewer.OUTPUT_VIEWER_HTML
+    kickoff = html[html.index("// Kick off the handshake.") :]
+    assert "ui/notifications/initialized" not in kickoff
+    assert "msg.id === reqId" in html
+    assert "event.source !== window.parent" in html
+
+
+def test_bridge_acknowledges_teardown_and_reports_late_resizes():
+    """Teardown gets a JSON-RPC reply; media load / ResizeObserver re-report height."""
+    html = output_viewer.OUTPUT_VIEWER_HTML
+    teardown = html[html.index('method === "ui/resource-teardown"') :]
+    assert "reply(msg.id" in teardown[: teardown.index("return;")]
+    assert "new ResizeObserver(reportSize)" in html
+    assert (
+        'addEventListener(tag === "img" ? "load" : "loadedmetadata", reportSize)'
+        in html
+    )
 
 
 def test_meta_ui_is_set_on_exactly_the_two_result_tools():

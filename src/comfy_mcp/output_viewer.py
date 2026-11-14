@@ -1,7 +1,7 @@
 """The MCP Apps inline output viewer (``ui://comfy-mcp/output-viewer``).
 
-A leaf module — it imports the MCP SDK and the standard library, never
-``server`` — that owns the one UI resource this server ships. ``server`` builds
+A leaf module — it imports the MCP SDK, the standard library and the ``cli``
+leaf (for the release version), never ``server`` — that owns the one UI resource this server ships. ``server`` builds
 the :class:`~mcp.server.apps.Apps` extension from :func:`build_apps`, passes it
 to ``MCPServer(..., extensions=[...])``, and stamps :data:`TOOL_META` onto the
 two result tools (``fetch_outputs``, ``preview_media``) so an Apps-capable host
@@ -31,7 +31,11 @@ sandbox past what it uses. See :func:`build_apps`.
 
 from __future__ import annotations
 
+import json
+
 from mcp.server.apps import APP_MIME_TYPE, Apps
+
+from . import cli
 
 # The resource URI the two result tools point at via ``_meta.ui.resourceUri``.
 # The ``ui://`` scheme is what the SDK (and hosts) key the extension off; the
@@ -58,11 +62,20 @@ TOOL_META = {"ui": {"resourceUri": OUTPUT_VIEWER_URI}}
 # so the viewer is independent of that; this is the UI bridge's own version.
 _UI_PROTOCOL_VERSION = "2026-01-26"
 
+# The `appInfo` the viewer sends in `ui/initialize` — required by the bridge
+# contract alongside `appCapabilities`, so a schema-validating host accepts the
+# handshake. The version is the installed release, the same string the server
+# reports as `serverInfo.version`.
+_APP_INFO = {"name": "comfy-mcp-output-viewer", "version": cli._version()}
+
 # The self-contained document. It speaks the ext-apps postMessage bridge:
-# announces `ui/initialize` at the protocol version above, then
-# `ui/notifications/initialized`; handles the `tool-result` delivery, the
-# `host-context-changed` theme signal, and `ui/resource-teardown`; and reports
-# its height with `ui/notifications/size-changed`. It never calls a tool, never
+# announces `ui/initialize` at the protocol version above, then sends
+# `ui/notifications/initialized` only once the id-matched response arrives;
+# ignores any message not posted by the host window; handles the `tool-result` delivery, the
+# `host-context-changed` theme signal, and `ui/resource-teardown` (acknowledged
+# with an empty result); and reports its height with
+# `ui/notifications/size-changed`, again whenever the content resizes (media
+# decodes after it is inserted). It never calls a tool, never
 # fetches, and never touches `innerHTML` — DOM text goes through `textContent`
 # and media through `data:` URLs, so the default CSP is all it needs.
 #
@@ -103,8 +116,10 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
 (function () {{
   "use strict";
   var PROTOCOL_VERSION = {_UI_PROTOCOL_VERSION!r};
+  var APP_INFO = {json.dumps(_APP_INFO)};
   var root = document.getElementById("root");
   var reqId = 0;
+  var initialized = false;
 
   function post(message) {{
     // The iframe origin is opaque under the sandbox, so target "*"; the host
@@ -118,10 +133,23 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
     post({{ jsonrpc: "2.0", method: method, params: params || {{}} }});
   }}
 
+  function reply(id, result) {{
+    post({{ jsonrpc: "2.0", id: id, result: result || {{}} }});
+  }}
+
+  var lastHeight = -1;
   function reportSize() {{
-    notify("ui/notifications/size-changed", {{
-      height: document.documentElement.scrollHeight
-    }});
+    var height = document.documentElement.scrollHeight;
+    if (height === lastHeight) {{ return; }}
+    lastHeight = height;
+    notify("ui/notifications/size-changed", {{ height: height }});
+  }}
+
+  // Media decodes asynchronously (even from a `data:` URL), so the height
+  // reported right after `render()` misses it; re-report on every resize.
+  // The per-element load listeners below cover a host without ResizeObserver.
+  if (typeof ResizeObserver === "function") {{
+    new ResizeObserver(reportSize).observe(document.documentElement);
   }}
 
   function clear() {{
@@ -158,6 +186,7 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
     var el = document.createElement(tag);
     el.className = "media";
     if (tag !== "img") {{ el.controls = true; }}
+    el.addEventListener(tag === "img" ? "load" : "loadedmetadata", reportSize);
     el.src = dataUrl;
     parent.appendChild(el);
     return true;
@@ -166,8 +195,11 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
   function renderImageBlock(block) {{
     var item = document.createElement("div");
     item.className = "item";
-    renderMedia(item, block.mimeType || "image/png", imageDataUrl(block));
+    if (!renderMedia(item, block.mimeType || "image/png", imageDataUrl(block))) {{
+      return false;
+    }}
     root.appendChild(item);
+    return true;
   }}
 
   function renderFileRecord(file) {{
@@ -195,8 +227,8 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
     var content = (result && result.content) || [];
     var i;
     for (i = 0; i < content.length; i++) {{
-      if (content[i] && content[i].type === "image") {{
-        renderImageBlock(content[i]);
+      if (content[i] && content[i].type === "image" &&
+          renderImageBlock(content[i])) {{
         rendered++;
       }}
     }}
@@ -215,9 +247,11 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
   }}
 
   function applyTheme(context) {{
-    var theme = context && context.theme;
-    // Explicit light/dark wins; anything else falls back to the CSS default
-    // (`color-scheme: light dark`), which already follows the host.
+    // A context update carries only the fields that changed: leave the scheme
+    // alone when it has no `theme`. Explicit light/dark wins; any other theme
+    // falls back to the CSS default (`color-scheme: light dark`).
+    if (!context || !("theme" in context)) {{ return; }}
+    var theme = context.theme;
     if (theme === "light" || theme === "dark") {{
       document.documentElement.style.colorScheme = theme;
     }} else {{
@@ -235,6 +269,9 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
   }}
 
   window.addEventListener("message", function (event) {{
+    // Only the host window speaks the bridge; a sibling frame holding this
+    // window's proxy must not be able to spoof or wipe the preview.
+    if (event.source !== window.parent) {{ return; }}
     var msg = event.data;
     if (!msg || typeof msg !== "object") {{ return; }}
     var method = msg.method;
@@ -250,12 +287,29 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
     }}
     if (method === "ui/resource-teardown") {{
       clear();
+      // A request, not a notification: the host awaits this acknowledgement.
+      if (msg.id !== undefined) {{ reply(msg.id, {{}}); }}
+      return;
+    }}
+    if (method === "ping" && msg.id !== undefined) {{
+      reply(msg.id, {{}});
       return;
     }}
     // The `ui/initialize` response: id-matched, may carry initial render data
-    // and host context.
-    if (msg.id !== undefined && msg.result) {{
+    // and host context. `initialized` is sent only after it, per the bridge's
+    // handshake order; an error reply is shown rather than leaving a blank panel.
+    if (method === undefined && msg.id === reqId && !initialized) {{
+      if (msg.error) {{
+        clear();
+        addText(root, "empty", "Preview unavailable: " +
+          String(msg.error.message || "host rejected the viewer."));
+        reportSize();
+        return;
+      }}
+      if (!msg.result) {{ return; }}
+      initialized = true;
       applyTheme(msg.result.hostContext);
+      notify("ui/notifications/initialized", {{}});
       var initial = extractToolResult(msg.result);
       if (initial) {{ render(initial); }}
     }}
@@ -267,9 +321,12 @@ OUTPUT_VIEWER_HTML = f"""<!doctype html>
     jsonrpc: "2.0",
     id: reqId,
     method: "ui/initialize",
-    params: {{ protocolVersion: PROTOCOL_VERSION }}
+    params: {{
+      appInfo: APP_INFO,
+      appCapabilities: {{}},
+      protocolVersion: PROTOCOL_VERSION
+    }}
   }});
-  notify("ui/notifications/initialized", {{}});
   reportSize();
 }})();
 </script>

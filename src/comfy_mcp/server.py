@@ -130,21 +130,23 @@ def _server_version() -> str:
     return cli._version()
 
 
-# `version` is passed explicitly because the SDK does not infer one: it defaults
-# to `""` and `Server.server_info` hands that straight to the client, so an
-# unversioned server answers `initialize` with `"serverInfo": {"name":
-# "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
-# correlate a bug report against.
 # The MCP Apps inline output viewer (`output_viewer`). Registering the `ui://`
 # resource is the one capability that genuinely lives here rather than in
 # comfy-cli — an MCP protocol surface comfy-cli cannot express — so it is built
 # here and handed to the server as an extension. The resource and its tool
 # pointer are advertised UNCONDITIONALLY: a host that never negotiated the
 # extension ignores `_meta.ui` and shows the tool's existing text/image content,
-# so this is strictly additive. The SDK refuses to construct the server if a
-# tool's `_meta.ui.resourceUri` has no registered resource, so the viewer and
-# its pointer are validated at import rather than drifting apart silently.
+# so this is strictly additive. The pointer is stamped via `@mcp.tool(meta=...)`,
+# not `Apps.tool`, so the SDK's own dangling-URI check never sees it;
+# `test_meta_ui_is_set_on_exactly_the_two_result_tools` pins it to the
+# registered resource instead.
 _apps = output_viewer.build_apps()
+
+# `version` is passed explicitly because the SDK does not infer one: it defaults
+# to `""` and `Server.server_info` hands that straight to the client, so an
+# unversioned server answers `initialize` with `"serverInfo": {"name":
+# "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
+# correlate a bug report against.
 mcp = MCPServer(
     "comfy-mcp",
     version=_server_version(),
