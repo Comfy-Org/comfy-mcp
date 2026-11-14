@@ -74,6 +74,19 @@ The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
 handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
 
+The third is the static **tool annotations** every `@mcp.tool()` carries
+(`types.ToolAnnotations`: `readOnlyHint` / `destructiveHint` / `idempotentHint` /
+`openWorldHint`, plus a `title` where the bare name is opaque — `which` / `discover` /
+`nodes`). They are `tools/list` metadata comfy-cli can't express, so a host stops confirming
+on the spec's destructive/open-world DEFAULTS before a harmless read like `server_info`. No
+product behavior — the hints DESCRIBE each passthrough, they don't gate it (the per-call
+confirmation above is the gate): `openWorldHint` is true only where comfy-cli reaches the
+open internet / Comfy Cloud / a partner API / a registry, NOT the local ComfyUI process or
+filesystem (so `search_models`, a LOCAL-install read, is closed-world while `download_model`,
+an arbitrary-URL fetch, is open-world), and `job` / `download` annotate for their worst
+(`cancel`) action. The pinned classification lives in `tests/test_tool_annotations.py` — add
+a new tool's row there with the tool.
+
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` — differ where
 the engine's own shape differs, and those differences are load-bearing: `comfy generate`
 always spends, so it always prompts and honors `spend.auto_confirm`, while `comfy
