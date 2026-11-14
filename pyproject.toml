@@ -11,13 +11,18 @@ license = "AGPL-3.0-or-later OR LicenseRef-Comfy-Commercial"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Comfy Org" }]
 dependencies = [
-    # >= 2 because that is where `mcp.server.mcpserver` exists: the SDK's 2.0.0
-    # DELETED `mcp.server.fastmcp` outright — no shim, no deprecation window —
-    # and this server's single SDK import (`from mcp.server.mcpserver import
-    # Context, Image, MCPServer`, server.py) resolves on 2.x only. On 1.x it is
-    # an ImportError that takes the whole suite down at conftest collection
-    # rather than at any one test. (Historical floors this supersedes: >= 1.10
-    # for elicitation, >= 1.14 to survive `ctx: Context | None` tool parameters.)
+    # >= 2.3 because that is the first release exporting `mcp.server.apps`
+    # (`Apps`, `add_html_resource`, `client_supports_apps`), which `output_viewer`
+    # imports to register the MCP Apps inline output viewer and which `server`
+    # hands to `MCPServer(..., extensions=[...])`. The underlying floor is still
+    # 2.0.0's: that is where `mcp.server.mcpserver` exists — the SDK's 2.0.0
+    # DELETED `mcp.server.fastmcp` outright, no shim, no deprecation window, and
+    # this server's SDK import (`from mcp.server.mcpserver import Context, Image,
+    # MCPServer`, server.py) resolves on 2.x only. On an `mcp` without
+    # `mcp.server.apps` it is an ImportError that takes the whole suite down at
+    # conftest collection rather than at any one test. (Historical floors this
+    # supersedes: >= 1.10 for elicitation, >= 1.14 to survive `ctx: Context |
+    # None` tool parameters, >= 2 for the `mcpserver` module.)
     #
     # < 3 for the same reason the `< 2` cap existed before this port: a major
     # release must arrive as a reviewable Dependabot PR, not as unrelated PRs'
@@ -35,7 +40,7 @@ dependencies = [
     # `requires-python = ">=3.10"` above still holds: `mcp` 2.0.0 and
     # `mcp-types` 2.0.0 both declare `Requires-Python: >=3.10`, so the major
     # bump did not raise the floor out from under the 3.10 CI leg.
-    "mcp>=2,<3",
+    "mcp>=2.3,<3",
     # Already an mcp dependency; declared explicitly because this server now
     # imports it directly for the elicitation response schema.
     "pydantic>=2",

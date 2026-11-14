@@ -93,6 +93,7 @@ from . import (
     errors,
     failure_log,
     instructions,
+    output_viewer,
     params,
     target,
     tcc,
@@ -134,10 +135,21 @@ def _server_version() -> str:
 # unversioned server answers `initialize` with `"serverInfo": {"name":
 # "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
 # correlate a bug report against.
+# The MCP Apps inline output viewer (`output_viewer`). Registering the `ui://`
+# resource is the one capability that genuinely lives here rather than in
+# comfy-cli — an MCP protocol surface comfy-cli cannot express — so it is built
+# here and handed to the server as an extension. The resource and its tool
+# pointer are advertised UNCONDITIONALLY: a host that never negotiated the
+# extension ignores `_meta.ui` and shows the tool's existing text/image content,
+# so this is strictly additive. The SDK refuses to construct the server if a
+# tool's `_meta.ui.resourceUri` has no registered resource, so the viewer and
+# its pointer are validated at import rather than drifting apart silently.
+_apps = output_viewer.build_apps()
 mcp = MCPServer(
     "comfy-mcp",
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
+    extensions=[_apps],
 )
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
@@ -7044,7 +7056,7 @@ def _select_inline_images(paths: list[str]) -> list[str]:
 # cross-reference. For maintainers: that's `target._TARGET_AWARE_SUBCOMMANDS`
 # (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
 # being made below.
-@mcp.tool()
+@mcp.tool(meta=output_viewer.TOOL_META)
 def fetch_outputs(
     prompt_id: str,
     out_dir: str,
@@ -7107,7 +7119,7 @@ def _preview_image_path(data: Any) -> str | None:
     return resolved if os.path.isfile(resolved) else None
 
 
-@mcp.tool()
+@mcp.tool(meta=output_viewer.TOOL_META)
 def preview_media(
     media_path: str,
     out_path: str = "",
