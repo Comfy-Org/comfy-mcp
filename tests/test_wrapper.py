@@ -6226,12 +6226,13 @@ def test_fetch_outputs_inlines_audio_as_audio_content(patched_run, tmp_path):
     assert "data_url" not in record  # bytes ride in the AudioContent block
 
 
-def test_fetch_outputs_inlines_video_as_data_url(patched_run, tmp_path):
-    """A small video that fits has its bytes as a base64 data URL on the record.
+def test_fetch_outputs_records_video_as_path_only(patched_run, tmp_path):
+    """Even a small video is a path-only record — never a block, never a data URL.
 
-    MCP has no video content block, so the video is NEVER an image/audio block —
-    its on-disk path and size are in structuredContent, with a data URL when it
-    fits the budget. (Acceptance: image bytes are only ever the contact sheet.)
+    MCP has no video content block, and a base64 data URL in structuredContent
+    reaches the agent's context as text, so the video's on-disk path, type and
+    size are recorded and its bytes stay on disk. (Acceptance: image bytes are
+    only ever the contact sheet.)
     """
     clip = b"\x00\x00\x00\x18ftypmp42fake-video"
     (tmp_path / "clip.mp4").write_bytes(clip)
@@ -6241,32 +6242,54 @@ def test_fetch_outputs_inlines_video_as_data_url(patched_run, tmp_path):
 
     assert not _image_blocks(result) and not _audio_blocks(result)
     [record] = _media_records(result)
-    assert record["inline"] is True
+    assert record["inline"] is False
     assert record["media_type"] == "video/mp4"
     assert record["bytes"] == len(clip)
     assert record["path"].endswith("clip.mp4")
-    import base64
-
-    prefix = "data:video/mp4;base64,"
-    assert record["data_url"].startswith(prefix)
-    assert base64.b64decode(record["data_url"][len(prefix) :]) == clip
+    assert "data_url" not in record
 
 
-def test_fetch_outputs_oversized_video_is_a_path_only_record(
+def test_fetch_outputs_oversized_first_file_is_a_path_only_record(
     patched_run, tmp_path, monkeypatch
 ):
-    """A file past the byte budget is a ResourceLink-style record — path/type/size only."""
+    """A FIRST file past the byte budget is still refused inline — no first-file pass.
+
+    It becomes a ResourceLink-style record (path/type/size only), and a later
+    file that fits the budget is still inlined.
+    """
     monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 4)
-    (tmp_path / "big.webm").write_bytes(b"a much larger clip than the budget")
-    patched_run(envelope(data={"downloaded": ["big.webm"]}))
+    (tmp_path / "big.wav").write_bytes(b"a much larger clip than the budget")
+    (tmp_path / "s.png").write_bytes(b"1234")
+    patched_run(envelope(data={"downloaded": ["big.wav", "s.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert not _image_blocks(result) and not _audio_blocks(result)
-    [record] = _media_records(result)
-    # The FIRST file is always allowed (even over-budget), matching the image cap.
-    assert record["inline"] is True
-    assert record["media_type"] == "video/webm"
+    assert not _audio_blocks(result)
+    assert len(_image_blocks(result)) == 1
+    big, small = _media_records(result)
+    assert big["inline"] is False and big["media_type"] == "audio/wav"
+    assert "data_url" not in big
+    assert small["inline"] is True
+
+
+def test_fetch_outputs_kind_follows_the_resolved_file(patched_run, tmp_path):
+    """A media-named symlink to a non-media file is dropped, not inlined as an image."""
+    (tmp_path / "notes.txt").write_bytes(b"hello")
+    (tmp_path / "gen.png").symlink_to(tmp_path / "notes.txt")
+    patched_run(envelope(data={"downloaded": ["gen.png"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _image_blocks(result)
+    assert _media_records(result) == []
+
+
+def test_read_b64_refuses_a_file_that_changed_size(tmp_path):
+    """A file no longer the budgeted size is not inlined (nor read in full)."""
+    path = tmp_path / "grew.png"
+    path.write_bytes(b"12345678")
+    assert server._read_b64(str(path), 8) is not None
+    assert server._read_b64(str(path), 4) is None
 
 
 def test_fetch_outputs_shared_budget_records_the_overflow(

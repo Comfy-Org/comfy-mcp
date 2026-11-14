@@ -6955,14 +6955,14 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 _INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 # Audio/video outputs ComfyUI saves. Audio that fits the budget rides back as an
-# MCP ``AudioContent`` block; video has no MCP content type, so a small clip is a
-# base64 data URL on its ``structuredContent`` record instead. Both — and any file
-# past the budget — always get a manifest record so the on-disk copy is reachable
-# even when its bytes are not base64'd.
+# MCP ``AudioContent`` block; video has no MCP content type, so it is always a
+# path-only ``structuredContent`` record. Both — and any file past the budget —
+# always get a manifest record so the on-disk copy is reachable even when its
+# bytes are not base64'd.
 _INLINE_AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus")
 _INLINE_VIDEO_SUFFIXES = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v")
 
-# Explicit, OS-independent media types for the manifest + any data URL (stdlib
+# Explicit, OS-independent media types for the manifest and inline blocks (stdlib
 # ``mimetypes`` varies by host and this payload is protocol-visible).
 _MEDIA_TYPES = {
     ".png": "image/png",
@@ -6990,7 +6990,9 @@ _MEDIA_TYPES = {
 # ``_EXCEPTION_TEXT_MAX_CHARS``): a big batch or high-res render must not force an
 # unbounded allocation / blow the agent's context. The on-disk copies in
 # ``out_dir`` are untouched — only the inline preview is capped. The cap is one
-# shared budget across images, audio and video (see ``_render_output_media``).
+# shared budget across images and audio (see ``_render_output_media``); a video
+# is never inlined, since MCP has no video content type and a base64 data URL in
+# ``structuredContent`` lands in the agent's context as text.
 _INLINE_IMAGE_MAX_COUNT = 8
 _INLINE_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 
@@ -7056,6 +7058,9 @@ def _collect_output_media(data: Any, out_dir: str) -> list[tuple[str, str]]:
         # real file INSIDE out_dir. Containment is what neutralizes the CWD
         # shadow (a bare "gen.png" resolves to CWD/gen.png, outside out_dir, so
         # it's rejected in favor of the out_dir copy) and the `../` traversal.
+        # The kind is re-read off the RESOLVED path, so a `gen.png` symlink to a
+        # non-media file is dropped and the block type always matches the
+        # manifest's media type.
         for candidate in (
             value,
             os.path.join(out_dir, value),
@@ -7063,7 +7068,9 @@ def _collect_output_media(data: Any, out_dir: str) -> list[tuple[str, str]]:
         ):
             real = os.path.realpath(candidate)
             if _is_within(out_root, real) and os.path.isfile(real):
-                resolved.setdefault(real, kind)
+                real_kind = _media_kind(real)
+                if real_kind is not None:
+                    resolved.setdefault(real, real_kind)
                 break
     return list(resolved.items())
 
@@ -7093,13 +7100,20 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     return selected
 
 
-def _read_b64(path: str) -> str | None:
-    """Base64 of ``path``'s bytes, or None if it can't be read (on-disk copy stands)."""
+def _read_b64(path: str, size: int) -> str | None:
+    """Base64 of ``path``'s ``size`` bytes, or None if unreadable or no longer ``size``.
+
+    Reads at most ``size + 1`` bytes, so a file that grew after it was sized
+    against the budget is refused rather than read in full (on-disk copy stands).
+    """
     try:
         with open(path, "rb") as handle:
-            return base64.b64encode(handle.read()).decode()
+            raw = handle.read(size + 1)
     except OSError:
         return None
+    if len(raw) != size:
+        return None
+    return base64.b64encode(raw).decode()
 
 
 def _render_output_media(
@@ -7108,17 +7122,18 @@ def _render_output_media(
     """Split collected media into inline content blocks and a ``structuredContent`` manifest.
 
     One shared budget (``_INLINE_IMAGE_MAX_COUNT`` files, ``_INLINE_IMAGE_MAX_BYTES``
-    aggregate raw bytes) spans every kind, so a leading large file can't starve
-    the rest — each file is inlined only while both bounds still hold. EVERY file
-    gets a manifest record (on-disk path, media type, byte size, ``inline`` flag),
-    which is what lifts the path out of the metadata JSON. What rides inline
-    differs by kind: an image/audio clip that fits comes back as an MCP content
-    block (its bytes there, not duplicated on the record); a video that fits has
-    no MCP content type, so its bytes ride as a base64 data URL ON the record;
-    anything that doesn't fit is a path-only, ResourceLink-style record the client
-    reads off disk. The content block's media type is the manifest's, so the two
-    never disagree. The caps are preserved exactly — the 9th image, or the file
-    that would cross the byte budget, is recorded rather than inlined.
+    aggregate raw bytes) spans images and audio, so a leading large file can't
+    starve the rest — each file is inlined only while both bounds still hold,
+    the first file included. EVERY file gets a manifest record (on-disk path,
+    media type, byte size, ``inline`` flag), which is what lifts the path out of
+    the metadata JSON. An image/audio clip that fits comes back as an MCP content
+    block (its bytes there, not duplicated on the record); a video is always a
+    path-only, ResourceLink-style record — MCP has no video content type, and a
+    data URL in ``structuredContent`` would reach the agent's context as text —
+    as is anything that doesn't fit. The content block's media type is the
+    manifest's, so the two never disagree. The caps are preserved exactly — the
+    9th image, or the file that would cross the byte budget, is recorded rather
+    than inlined.
     """
     blocks: list[types.ContentBlock] = []
     records: list[dict[str, Any]] = []
@@ -7136,12 +7151,12 @@ def _render_output_media(
             "bytes": size,
             "inline": False,
         }
-        # First file is always allowed (even if it alone exceeds the byte cap),
-        # matching `_select_inline_images`; later ones stop at either bound.
-        fits = count < _INLINE_IMAGE_MAX_COUNT and (
-            count == 0 or total + size <= _INLINE_IMAGE_MAX_BYTES
+        fits = (
+            kind != "video"
+            and count < _INLINE_IMAGE_MAX_COUNT
+            and total + size <= _INLINE_IMAGE_MAX_BYTES
         )
-        encoded = _read_b64(path) if fits else None
+        encoded = _read_b64(path, size) if fits else None
         if encoded is not None:
             record["inline"] = True
             count += 1
@@ -7150,12 +7165,10 @@ def _render_output_media(
                 blocks.append(
                     types.ImageContent(type="image", data=encoded, mime_type=media_type)
                 )
-            elif kind == "audio":
+            else:
                 blocks.append(
                     types.AudioContent(type="audio", data=encoded, mime_type=media_type)
                 )
-            else:  # video — no MCP content type, so it rides as a data URL
-                record["data_url"] = f"data:{media_type};base64,{encoded}"
         records.append(record)
     return blocks, records
 
@@ -7183,8 +7196,8 @@ def fetch_outputs(
     ``prompt_id`` to output URLs. An unknown local id has no record.
 
     ``inline_images=True`` adds bounded MCP media (images, small audio) plus a
-    ``structuredContent`` manifest of every output's path/type/size; a small video
-    rides as a data URL there, over-cap files as path-only records. Disk uncapped.
+    ``structuredContent`` manifest of every output's path/type/size; video and
+    over-cap files are path-only records (``preview_media`` renders a video).
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
@@ -7218,7 +7231,10 @@ def fetch_outputs(
     # `fetch_outputs` returns `Any`, so the SDK validates no output schema and
     # passes this through unchanged (see `convert_result`).
     content: list[types.ContentBlock] = [
-        types.TextContent(type="text", text=json.dumps(data, indent=2, default=str)),
+        types.TextContent(
+            type="text",
+            text=json.dumps(data, indent=2, default=str, ensure_ascii=False),
+        ),
         *blocks,
     ]
     return types.CallToolResult(content=content, structured_content={"media": records})
