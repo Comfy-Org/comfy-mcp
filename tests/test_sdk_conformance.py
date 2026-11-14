@@ -23,6 +23,7 @@ module-level double defines one of these methods without being listed.
 """
 
 import ast
+import asyncio
 import inspect
 import pathlib
 
@@ -36,8 +37,12 @@ import test_run_workflow_spend
 import test_switch_version
 import test_untracked_kill
 import test_update_consent
+from mcp import types
+from mcp.client import Client
 from mcp.server.mcpserver import Context
 from mcp.server.session import ServerSession
+
+from comfy_mcp import server
 
 _TESTS_DIR = pathlib.Path(__file__).parent
 
@@ -235,3 +240,91 @@ def test_the_progress_keywords_bind_to_the_real_report_progress():
     """The progress pump sends all three by keyword — `progress=` included."""
     signature = inspect.signature(Context.report_progress)
     signature.bind(object(), progress=0.5, total=1.0, message="half")
+
+
+# --- the 2026-07-28 input-required call shape -------------------------------
+#
+# From 2026-07-28 there is no back-channel for `elicitation/create`, so a consent
+# gate carries its question out as the tool's `InputRequiredResult` and reads the
+# answer off `ctx.input_responses` when the client retries. These pin the exact
+# SDK surface `_elicit_approval` reaches for on that path, the same way the elicit
+# tests above pin the back-channel one — a renamed property or a changed
+# `InputRequiredResult` shape must fail HERE, not as a paid call that never asks.
+
+
+def test_context_exposes_the_input_required_properties():
+    """`_elicit_approval` reads these by name; a rename must fail loudly here."""
+    for name in ("protocol_version", "input_responses", "request_state"):
+        assert isinstance(getattr(Context, name), property), name
+
+
+def test_the_production_path_builds_a_valid_input_required_result():
+    """`_consent_via_input_required`'s first round yields a wire-valid result.
+
+    Driving the real helper (no context answers) proves the `ElicitRequest` it
+    nests validates against the installed SDK and surfaces as
+    `resultType: "input_required"` — the shape the gated tools return verbatim.
+    """
+
+    class _Approve(server.BaseModel):
+        approve: bool = False
+
+    # The helper reads only `input_responses`; `None` is the first (unanswered) round.
+    ctx = type("Ctx", (), {"input_responses": None})()
+    with pytest.raises(server._ElicitationInputRequired) as excinfo:
+        server._consent_via_input_required(
+            ctx, "spend?", _Approve, server._SPEND_APPROVAL_WORDING
+        )
+    result = excinfo.value.result
+    # Re-validate through the SDK model, as the wire codec would.
+    reparsed = types.InputRequiredResult.model_validate(
+        result.model_dump(by_alias=True)
+    )
+    assert reparsed.result_type == "input_required"
+    [request] = reparsed.input_requests.values()
+    assert isinstance(request, types.ElicitRequest)
+    assert request.params.message == "spend?"
+    assert request.params.requested_schema["properties"]["approve"]["type"] == "boolean"
+
+
+def test_co_firing_gates_answer_on_distinct_channels():
+    """`restart_comfyui` raises the network gate then the kill gate in one call.
+
+    A shared `input_responses` key would let the kill gate read the network gate's
+    "yes" as its own and stop a server nobody approved — so the two keys must
+    differ. This is the one pair that can fire within a single `tools/call`.
+    """
+    network = server._consent_channel_key(server._NETWORK_APPROVAL_WORDING)
+    kill = server._consent_channel_key(server._KILL_UNTRACKED_APPROVAL_WORDING)
+    assert network != kill
+
+
+def test_in_process_handshake_records_both_protocol_versions():
+    """Smoke test: drive `server/discover` + `initialize` in process, per revision.
+
+    The high-level client's `auto` mode probes `server/discover` and the `legacy`
+    mode forces the `initialize` handshake; both return a negotiated version, and
+    the server identifies itself with the release `_server_version` reports. A
+    version pin adopts 2026-07-28 directly. This exercises the real handshake
+    against the real `MCPServer` — the surface the input-required branch keys on —
+    without a transport.
+    """
+
+    async def _drive():
+        recorded = {}
+        for mode in ("auto", "legacy", server._INPUT_REQUIRED_PROTOCOL):
+            async with Client(server.mcp, mode=mode) as client:
+                tools = await client.list_tools()
+                recorded[mode] = (client.protocol_version, len(tools.tools))
+                if client.server_info is not None:
+                    assert client.server_info.version == server._server_version()
+        return recorded
+
+    recorded = asyncio.run(_drive())
+    assert recorded["legacy"][0] == "2025-11-25"
+    assert recorded["auto"][0] == server._INPUT_REQUIRED_PROTOCOL
+    assert (
+        recorded[server._INPUT_REQUIRED_PROTOCOL][0] == server._INPUT_REQUIRED_PROTOCOL
+    )
+    # Tools are discoverable on every revision (the gated ones among them).
+    assert all(count > 0 for _, count in recorded.values())

@@ -31,6 +31,7 @@ import json
 
 import pytest
 from conftest import _OK_STREAM, _RecordingCtx, envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -38,6 +39,16 @@ from mcp.server.elicitation import (
 )
 
 from comfy_mcp import server
+
+# The negotiated protocol revision on which `ctx.elicit()` has no back-channel, so
+# the spend prompt must round-trip through the tool result (see
+# `server._INPUT_REQUIRED_PROTOCOL`).
+_INPUT_REQUIRED = "2026-07-28"
+
+
+def _answer(action, approve=False):
+    """One `ElicitResult` as it arrives on `ctx.input_responses` on the retry round."""
+    return types.ElicitResult(action=action, content={"approve": approve})
 
 
 def _run_template(*args, **kwargs):
@@ -74,12 +85,26 @@ class _FakeCtx:
     would be pretending the two are separate objects.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+        input_responses=None,
+        request_state=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
         self.progress: list[dict] = []
+        # The 2026-07-28 input-required transport: a negotiated version and the
+        # client's retry answers, read by `_elicit_approval` instead of `elicit`.
+        # Left `None` (the default) this fake is the handshake transport unchanged.
+        self.protocol_version = protocol_version
+        self.input_responses = input_responses
+        self.request_state = request_state
 
     async def report_progress(self, progress, total=None, message=None):
         self.progress.append({"progress": progress, "total": total, "message": message})
@@ -402,6 +427,111 @@ def test_run_template_falls_back_to_confirm_spend_when_client_cannot_elicit(
 
     assert ctx.elicitations == []
     assert "--allow-spend" in calls[0]["cmd"]
+
+
+def test_run_template_handshake_version_still_elicits(patched_streamed_run):
+    """A negotiated 2025-11-25 keeps the back-channel `elicitation/create`."""
+    calls = patched_streamed_run()
+    ctx = _FakeCtx(action="accept", approve=True, protocol_version="2025-11-25")
+
+    _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=ctx
+    )
+
+    assert len(ctx.elicitations) == 1
+    assert "--allow-spend" in calls[0]["cmd"]
+
+
+# --- the 2026-07-28 input-required transport --------------------------------
+#
+# Once the client negotiates 2026-07-28 there is no back-channel for
+# `elicitation/create`, so the spend prompt is carried out as the tool's
+# `InputRequiredResult` and answered when the client RETRIES the call. The gate's
+# fail-closed verdict is identical to the handshake path's.
+
+
+def test_run_template_input_required_first_round_asks_via_the_result(
+    patched_streamed_run,
+):
+    """2026-07-28, no answer yet: return `input_required`, send no `elicitation/create`."""
+    calls = patched_streamed_run()
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED, input_responses=None)
+
+    result = _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+
+    assert isinstance(result, types.InputRequiredResult)
+    assert result.result_type == "input_required"
+    # The question rides the result, keyed for this gate; nothing was spent.
+    [(key, request)] = result.input_requests.items()
+    assert isinstance(request, types.ElicitRequest)
+    assert "SPENDS Comfy credits" in request.params.message
+    assert ctx.elicitations == []
+    assert calls == []
+
+
+def test_run_template_input_required_retry_with_approve_runs(patched_streamed_run):
+    """The retry carries the client's `approve` answer: the run is unlocked."""
+    calls = patched_streamed_run()
+    # Replay what the client sends on the retry — the answer keyed as the first
+    # round asked for it.
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    [key] = pending.input_requests
+
+    ctx = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={key: _answer("accept", approve=True)},
+    )
+    _run_template(
+        "api_seedance", params={"prompt": "a cat"}, confirm_spend=True, ctx=ctx
+    )
+
+    assert "--allow-spend" in calls[0]["cmd"]
+    assert ctx.elicitations == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "match"),
+    [
+        ({"__key__": _answer("decline")}, "spend not confirmed"),  # said no
+        ({"__key__": _answer("cancel")}, "did not present"),  # dismissed
+        (
+            {"__key__": _answer("accept", approve=False)},
+            "spend not confirmed",
+        ),  # no yes
+        ({}, None),  # answered a DIFFERENT question — still unanswered here
+    ],
+)
+def test_run_template_input_required_refusal_spawns_no_child(
+    patched_streamed_run, answer, match
+):
+    """Decline, cancel, a yes-less accept, or a missing answer all spend nothing."""
+    calls = patched_streamed_run()
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_template("api_seedance", confirm_spend=True, ctx=first)
+    [key] = pending.input_requests
+    responses = {key if k == "__key__" else k: v for k, v in answer.items()}
+
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED, input_responses=responses)
+    if not responses:
+        # No answer for this gate's key: the gate asks again rather than running.
+        result = _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+        assert isinstance(result, types.InputRequiredResult)
+    else:
+        with pytest.raises(server.ComfyCliError, match=match):
+            _run_template("api_seedance", confirm_spend=True, ctx=ctx)
+    assert calls == []
+
+
+def test_run_template_free_run_is_never_asked_on_input_required(patched_streamed_run):
+    """`confirm_spend=False` cannot spend, so even 2026-07-28 raises no question."""
+    calls = patched_streamed_run()
+    ctx = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+
+    _run_template("image_flux2", params={"prompt": "a cat"}, ctx=ctx)
+
+    assert "--allow-spend" not in calls[0]["cmd"]
+    assert ctx.elicitations == []
 
 
 def test_run_template_does_not_consult_the_generate_auto_confirm(
