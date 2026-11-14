@@ -150,6 +150,18 @@ Check these before upgrading. The floor is unchanged; the verbs below are not.
   vulnerability reporting is not enabled here, so `SECURITY.md` no longer
   offers that form. The issue chooser's security contact link opens the same
   policy. (#308, fixes #295)
+- **ComfyUI Desktop and the Windows portable package.** The README only
+  described a comfy-cli workspace on `127.0.0.1:8188`. It now says how to
+  point this server at Desktop — the app defaults to port 8000, so set
+  `COMFY_LOCAL_URL` — and at `ComfyUI_windows_portable`. A comfy-cli
+  background server still outranks 8188. `restart_comfyui` asks before
+  killing an untracked listener on a taken port, which can be Desktop's
+  server or the portable one. `comfy set-default` on the portable tree makes
+  that tree the workspace for launch and node installs too, and those use
+  the Python comfy-cli resolves rather than `python_embeded`. A plain file
+  URL still downloads into the workspace `models` directory; a typed CivitAI
+  or Hugging Face download on comfy-cli 1.25 or newer can follow the running
+  server's model folder. (#309, fixes #258)
 
 ### Internal
 
