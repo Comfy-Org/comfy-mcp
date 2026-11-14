@@ -5949,31 +5949,57 @@ def test_update_comfyui_invalid_target_does_not_take_the_lock(patched_run):
     server._UPDATE_LOCK.release()
 
 
-# --- fetch_outputs inline image return -------------------------------------
+# --- fetch_outputs inline media return -------------------------------------
 
 # A few bytes standing in for a PNG — Image just base64-encodes the file, it
 # does not decode/validate the pixels, so any bytes exercise the round-trip.
 _FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
 
 
+def _image_blocks(result):
+    """The ``ImageContent`` blocks of a ``fetch_outputs`` CallToolResult."""
+    return [c for c in result.content if isinstance(c, server.types.ImageContent)]
+
+
+def _audio_blocks(result):
+    """The ``AudioContent`` blocks of a ``fetch_outputs`` CallToolResult."""
+    return [c for c in result.content if isinstance(c, server.types.AudioContent)]
+
+
+def _media_records(result):
+    """The ``structuredContent`` media manifest of a ``fetch_outputs`` CallToolResult."""
+    return result.structured_content["media"]
+
+
+def _metadata(result):
+    """The envelope dict, decoded from the CallToolResult's leading text block."""
+    import json
+
+    return json.loads(result.content[0].text)
+
+
 def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path):
-    """inline_images=True returns [metadata, Image...] for each downloaded image."""
+    """inline_images=True returns a CallToolResult: metadata text + one ImageContent."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
     patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert isinstance(result, list)
-    assert result[0] == {"downloaded": ["gen.png"]}  # metadata preserved first
-    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    assert isinstance(result, server.types.CallToolResult)
+    assert _metadata(result) == {"downloaded": ["gen.png"]}  # metadata preserved first
+    images = _image_blocks(result)
     assert len(images) == 1
 
-    content = images[0].to_image_content()
+    content = images[0]
     assert content.type == "image"
     assert content.mime_type == "image/png"
     import base64
 
     assert base64.b64decode(content.data) == _FAKE_PNG  # the real file bytes
+    # The manifest surfaces the on-disk path alongside the inlined bytes.
+    [record] = _media_records(result)
+    assert record["inline"] is True and record["media_type"] == "image/png"
+    assert record["bytes"] == len(_FAKE_PNG) and "data_url" not in record
 
 
 def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
@@ -5994,18 +6020,19 @@ def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
     # writes there), so it is inlined.
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    images = _image_blocks(result)
     assert len(images) == 1
-    assert images[0].to_image_content().mime_type == "image/jpeg"
+    assert images[0].mime_type == "image/jpeg"
 
 
 def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
     patched_run, tmp_path
 ):
-    """A real image referenced by the data but living OUTSIDE out_dir is not inlined.
+    """A real image referenced by the data but living OUTSIDE out_dir is not surfaced.
 
     comfy download only writes into out_dir, so an absolute/`..` path escaping it
-    is an input reference or a traversal, never a file this job produced.
+    is an input reference or a traversal, never a file this job produced — so it
+    is neither inlined NOR listed in the manifest.
     """
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -6023,7 +6050,8 @@ def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
-    assert not any(isinstance(r, server.Image) for r in result)
+    assert not _image_blocks(result)
+    assert _media_records(result) == []
 
 
 def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
@@ -6043,12 +6071,12 @@ def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    images = _image_blocks(result)
     assert len(images) == 1
     import base64
 
     # the out_dir copy, never the CWD decoy
-    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+    assert base64.b64decode(images[0].data) == _FAKE_PNG
 
 
 @pytest.mark.parametrize(
@@ -6089,15 +6117,15 @@ def test_fetch_outputs_inline_images_uses_the_download_cwd(
 
     assert calls[0]["cwd"] == (str(project) if project_set else None)
     assert calls[0]["cmd"][4:] == ["download", "pid", "-o", out_dir]
-    assert result[0] == data
-    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    assert _metadata(result) == data
+    images = _image_blocks(result)
     assert len(images) == 1
     import base64
 
-    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+    assert base64.b64decode(images[0].data) == _FAKE_PNG
 
 
-def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
+def test_fetch_outputs_url_only_returns_no_inline_media(patched_run, tmp_path):
     """url_only downloads no bytes, so inline_images can't surface stale out_dir files."""
     # A stale image from a prior run whose basename the emitted URL echoes.
     (tmp_path / "old.png").write_bytes(_FAKE_PNG)
@@ -6113,12 +6141,12 @@ def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
         "pid", str(tmp_path), url_only=True, inline_images=True
     )
 
-    # Bare envelope data — no [data, Image...] wrapping, no stale file inlined.
+    # Bare envelope data — no CallToolResult wrapping, no stale file surfaced.
     assert result == {"urls": ["http://localhost:8188/view/old.png"]}
 
 
 def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
-    """No more than _INLINE_IMAGE_MAX_COUNT images are inlined, however many exist."""
+    """No more than _INLINE_IMAGE_MAX_COUNT images are inlined; the rest are records."""
     names = [f"g{i}.png" for i in range(server._INLINE_IMAGE_MAX_COUNT + 5)]
     for name in names:
         (tmp_path / name).write_bytes(_FAKE_PNG)
@@ -6126,8 +6154,14 @@ def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    images = _image_blocks(result)
     assert len(images) == server._INLINE_IMAGE_MAX_COUNT
+    # Every image is still in the manifest; the ones past the cap as path-only
+    # records (the 9th image is refused inline, not dropped).
+    records = _media_records(result)
+    assert len(records) == len(names)
+    assert sum(1 for r in records if r["inline"]) == server._INLINE_IMAGE_MAX_COUNT
+    assert all("data_url" not in r for r in records)
 
 
 def test_fetch_outputs_inline_images_caps_aggregate_bytes(
@@ -6147,13 +6181,16 @@ def test_fetch_outputs_inline_images_caps_aggregate_bytes(
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
-    # first (7B) fits; second would push to 14B > 10B budget -> stop.
+    images = _image_blocks(result)
+    # first (7B) fits; the others would push past the 10B budget -> recorded only.
     assert len(images) == 1
+    records = _media_records(result)
+    assert len(records) == 3
+    assert sum(1 for r in records if r["inline"]) == 1
 
 
-def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tmp_path):
-    """Non-image outputs and dangling references yield no inline images."""
+def test_fetch_outputs_inline_images_skips_non_media_and_missing(patched_run, tmp_path):
+    """Non-media outputs and dangling references yield no inline media and no records."""
     (tmp_path / "notes.txt").write_bytes(b"hello")
     patched_run(
         {
@@ -6165,8 +6202,117 @@ def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tm
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert result[0] == {"downloaded": ["notes.txt", "ghost.png"]}
-    assert not any(isinstance(r, server.Image) for r in result)  # neither qualifies
+    assert _metadata(result) == {"downloaded": ["notes.txt", "ghost.png"]}
+    assert not _image_blocks(result)  # neither qualifies
+    assert _media_records(result) == []
+
+
+def test_fetch_outputs_inlines_audio_as_audio_content(patched_run, tmp_path):
+    """A small audio clip rides back as an AudioContent block, plus a manifest record."""
+    (tmp_path / "voice.wav").write_bytes(b"RIFFfake-wav")
+    patched_run(envelope(data={"downloaded": ["voice.wav"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    audio = _audio_blocks(result)
+    assert len(audio) == 1
+    assert audio[0].type == "audio" and audio[0].mime_type == "audio/wav"
+    import base64
+
+    assert base64.b64decode(audio[0].data) == b"RIFFfake-wav"
+    assert not _image_blocks(result)  # audio is never an image block
+    [record] = _media_records(result)
+    assert record["inline"] is True and record["media_type"] == "audio/wav"
+    assert "data_url" not in record  # bytes ride in the AudioContent block
+
+
+def test_fetch_outputs_records_video_as_path_only(patched_run, tmp_path):
+    """Even a small video is a path-only record — never a block, never a data URL.
+
+    MCP has no video content block, and a base64 data URL in structuredContent
+    reaches the agent's context as text, so the video's on-disk path, type and
+    size are recorded and its bytes stay on disk. (Acceptance: image bytes are
+    only ever the contact sheet.)
+    """
+    clip = b"\x00\x00\x00\x18ftypmp42fake-video"
+    (tmp_path / "clip.mp4").write_bytes(clip)
+    patched_run(envelope(data={"downloaded": ["clip.mp4"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _image_blocks(result) and not _audio_blocks(result)
+    [record] = _media_records(result)
+    assert record["inline"] is False
+    assert record["media_type"] == "video/mp4"
+    assert record["bytes"] == len(clip)
+    assert record["path"].endswith("clip.mp4")
+    assert "data_url" not in record
+
+
+def test_fetch_outputs_oversized_first_file_is_a_path_only_record(
+    patched_run, tmp_path, monkeypatch
+):
+    """A FIRST file past the byte budget is still refused inline — no first-file pass.
+
+    It becomes a ResourceLink-style record (path/type/size only), and a later
+    file that fits the budget is still inlined.
+    """
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 4)
+    (tmp_path / "big.wav").write_bytes(b"a much larger clip than the budget")
+    (tmp_path / "s.png").write_bytes(b"1234")
+    patched_run(envelope(data={"downloaded": ["big.wav", "s.png"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _audio_blocks(result)
+    assert len(_image_blocks(result)) == 1
+    big, small = _media_records(result)
+    assert big["inline"] is False and big["media_type"] == "audio/wav"
+    assert "data_url" not in big
+    assert small["inline"] is True
+
+
+def test_fetch_outputs_kind_follows_the_resolved_file(patched_run, tmp_path):
+    """A media-named symlink to a non-media file is dropped, not inlined as an image."""
+    (tmp_path / "notes.txt").write_bytes(b"hello")
+    (tmp_path / "gen.png").symlink_to(tmp_path / "notes.txt")
+    patched_run(envelope(data={"downloaded": ["gen.png"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _image_blocks(result)
+    assert _media_records(result) == []
+
+
+def test_read_b64_refuses_a_file_that_changed_size(tmp_path):
+    """A file no longer the budgeted size is not inlined (nor read in full)."""
+    path = tmp_path / "grew.png"
+    path.write_bytes(b"12345678")
+    assert server._read_b64(str(path), 8) is not None
+    assert server._read_b64(str(path), 4) is None
+
+
+def test_fetch_outputs_shared_budget_records_the_overflow(
+    patched_run, tmp_path, monkeypatch
+):
+    """Images, audio and video share ONE budget; the overflow becomes path-only records."""
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 10)
+    (tmp_path / "a.png").write_bytes(b"1234567")  # 7B — fits first
+    (tmp_path / "b.wav").write_bytes(b"RIFFwav")  # 7B — would push to 14B
+    (tmp_path / "c.mp4").write_bytes(b"ftypmp4")  # 7B — also over
+    patched_run(
+        envelope(data={"downloaded": ["a.png", "b.wav", "c.mp4"]}),
+    )
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    # One image inlined; audio/video recorded without their bytes.
+    assert len(_image_blocks(result)) == 1
+    assert not _audio_blocks(result)
+    records = _media_records(result)
+    assert len(records) == 3
+    assert sum(1 for r in records if r["inline"]) == 1
+    assert all("data_url" not in r for r in records)
 
 
 def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
@@ -6183,13 +6329,13 @@ def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
 
 
 def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
-    """Without inline_images the bare envelope data is returned (no list wrapping)."""
+    """Without inline_images the bare envelope data is returned (no CallToolResult)."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
     patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path))
 
-    assert result == {"downloaded": ["gen.png"]}  # dict, not a [data, ...] list
+    assert result == {"downloaded": ["gen.png"]}  # dict, not a CallToolResult
 
 
 # --- envelope-terminated read: don't wait on a lingering child ----------------
