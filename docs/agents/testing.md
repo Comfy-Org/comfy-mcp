@@ -32,7 +32,8 @@ blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two async ru
 there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON twin of
 `_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread` worker, so a client
 giving up left the child running; it carries the longest-lived children (foreground `model
-download`, `workflow_deps`, `upload_file`, `job("watch")`'s status polls). Each stream keeps
+download`, `workflow_deps`, `upload_file`, `job("watch")`'s status polls, and `job("wait")`'s
+poll loop — up to 3600s of re-polling that a disconnect now reaps). Each stream keeps
 only a `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 

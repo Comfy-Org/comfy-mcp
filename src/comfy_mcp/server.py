@@ -6310,9 +6310,10 @@ def _poll_until_terminal(
 ) -> Any:
     """Poll ``comfy <args>`` until ``is_terminal`` or ``timeout_seconds`` expires.
 
-    The one bounded-poll loop behind ``job(action="wait")`` (``jobs status``,
-    via :func:`_job_wait_sync`) and :func:`_poll_download` (``model
-    download-status``). Those two ran
+    The bounded-poll loop behind :func:`_poll_download` (``model
+    download-status``), which serves the ``download`` tool and
+    ``download_model``'s background wait. ``job(action="wait")`` runs the
+    cancellable async twin, :func:`_poll_until_terminal_async`; the two ran
     statement-for-statement identical loops and differ only in argv, in the
     terminal predicate, and in the extra keys their timed-out payload carries —
     so the timing rules below hold identically for both, and cannot drift apart.
@@ -6401,6 +6402,74 @@ def _poll_until_terminal(
         time.sleep(min(_POLL_INTERVAL, remaining))
 
 
+async def _poll_until_terminal_async(
+    *args: str,
+    timeout_seconds: float,
+    is_terminal: Callable[[Any], bool],
+    timed_out_extra: dict[str, Any] | None = None,
+    stdout_cap: int | None = None,
+) -> Any:
+    """Cancellable async twin of :func:`_poll_until_terminal`.
+
+    Line-for-line the same bounded-poll contract — the finiteness precondition,
+    the reserved-key guard, the one-poll minimum, the per-poll budget capped to
+    the caller's remaining bound, and the timed-out envelope — but it spawns each
+    poll through :func:`_run_comfy_async` and sleeps with :func:`asyncio.sleep`
+    instead of blocking the thread, so the two MUST stay in step (the sync one is
+    the reference; change both or neither).
+
+    The difference is the whole point and it is about CANCELLATION, the same one
+    :func:`_run_comfy_async` exists for: ``job(action="wait")`` used to run this
+    loop on a worker thread (``anyio.to_thread.run_sync``), where neither a
+    client disconnect nor ``notifications/cancelled`` could reach it — the loop
+    kept re-spawning ``comfy jobs status`` until its full bound (up to
+    :data:`_MAX_WATCH_TIMEOUT` = 3600s) elapsed, with the in-flight child
+    orphaned. Here a cancel lands on the ``await``: mid-poll it propagates out of
+    :func:`_run_comfy_async` only AFTER that runner's ``finally`` has reaped the
+    poll's whole process group, and during the inter-poll sleep it simply ends
+    the loop with no child running. ``stdout_cap`` is forwarded for the reason
+    :func:`_job_status_async` documents: the async runner keeps only the trailing
+    bytes, and a ``jobs status`` envelope scales with the job.
+    """
+    if not math.isfinite(timeout_seconds):
+        raise ComfyCliError(
+            f"invalid timeout_seconds: {timeout_seconds!r} — expected a finite "
+            "number of seconds (clamp with `argv._bounded_timeout` first)."
+        )
+    extra = timed_out_extra or {}
+    reserved = sorted(extra.keys() & {"timed_out", "status"})
+    if reserved:
+        raise ComfyCliError(
+            f"timed_out_extra may not carry reserved keys: {reserved} — they are "
+            "the poll loop's own."
+        )
+    deadline = time.monotonic() + timeout_seconds
+    last: Any = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and last is not None:
+            return {"timed_out": True, **extra, "status": last}
+        try:
+            last = await _run_comfy_async(
+                *args,
+                timeout=min(
+                    _JOB_STATUS_POLL_TIMEOUT,
+                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
+                ),
+                stdout_cap=stdout_cap,
+            )
+        except ComfyCliError as exc:
+            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
+                raise
+            return {"timed_out": True, **extra, "status": last}
+        if is_terminal(last):
+            return last
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"timed_out": True, **extra, "status": last}
+        await asyncio.sleep(min(_POLL_INTERVAL, remaining))
+
+
 # Stdout bound for the async ``jobs status`` polls. `_run_comfy_async` keeps
 # only the TRAILING bytes, so this has to be comfortably larger than the biggest
 # envelope `jobs status` can produce — a many-output job, or a failed one whose
@@ -6456,26 +6525,33 @@ def _job_error_sync(prompt_id: str) -> Any:
     return _execution_error_verdict(prompt_id, status)
 
 
-def _job_wait_sync(prompt_id: str, timeout_seconds: float) -> Any:
-    """``job(action="wait")``'s body — the exact ``wait_for_job`` this replaced.
+async def _job_wait_async(prompt_id: str, timeout_seconds: float) -> Any:
+    """``job(action="wait")``'s body — cancellable, on :func:`_poll_until_terminal_async`.
 
     ``timeout_seconds`` arrives already defaulted (25.0 when the caller passed
     none) but NOT yet bounded — the guard order below (prompt_id, then the
-    bound) matches every other branch's, and matches what ``wait_for_job`` did.
-    "Bounded by design" only holds if the bound itself is bounded. Left raw,
-    `inf` keeps `remaining` positive forever and NaN makes every comparison
-    False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
-    yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
-    `comfy jobs status` until the client gives up. See `argv._bounded_timeout`.
+    bound) matches every other branch's. "Bounded by design" only holds if the
+    bound itself is bounded. Left raw, `inf` keeps `remaining` positive forever
+    and NaN makes every comparison False (so `remaining <= 0` never fires and
+    `min(_POLL_INTERVAL, nan)` yields `_POLL_INTERVAL`) — either way the poll
+    loop re-spawns `comfy jobs status` until the client gives up. See
+    `argv._bounded_timeout`.
+
+    Runs on the async poll twin rather than the thread pool so a client that
+    disconnects, or ``notifications/cancelled`` on a 3600s wait, reaps the
+    in-flight ``comfy jobs status`` child instead of orphaning it — see
+    :func:`_poll_until_terminal_async`. ``stdout_cap`` is widened exactly as
+    :func:`_job_status_async` widens it, for the same reason.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
-    return _poll_until_terminal(
+    return await _poll_until_terminal_async(
         "jobs",
         "status",
         prompt_id,
         timeout_seconds=timeout_seconds,
         is_terminal=_is_terminal,
+        stdout_cap=_JOB_STATUS_STDOUT_MAX_CHARS,
     )
 
 
@@ -6791,14 +6867,12 @@ async def job(
             no_events_hint=_watch_no_events_hint(gate_version),
         )
 
-    # Every other branch is a blocking `subprocess` call or a `time.sleep`
-    # poll loop (up to `_MAX_WATCH_TIMEOUT` = 3600s for "wait") — off-loaded to
-    # a worker thread via `anyio.to_thread.run_sync`, exactly what the SDK
-    # itself does to run a plain `def` tool (`func_metadata.py`), so `job`
+    # The four SHORT blocking branches are a single `subprocess` call each —
+    # off-loaded to a worker thread via `anyio.to_thread.run_sync`, exactly what
+    # the SDK itself does to run a plain `def` tool (`func_metadata.py`), so `job`
     # being `async def` (forced by the "watch" branch above) never wedges the
-    # event loop for the other five. R2 in the job-tool consolidation; mirrors
-    # `_in_generate_pool` / `_GENERATE_EXECUTOR`'s reasoning for
-    # `partner_generate`'s own blocking run.
+    # event loop. R2 in the job-tool consolidation; mirrors `_in_generate_pool` /
+    # `_GENERATE_EXECUTOR`'s reasoning for `partner_generate`'s own blocking run.
     if action == "status":
         return await anyio.to_thread.run_sync(_job_status_sync, prompt_id)
     if action == "error":
@@ -6807,9 +6881,14 @@ async def job(
         return await anyio.to_thread.run_sync(_job_cancel_sync, prompt_id)
     if action == "queue":
         return await anyio.to_thread.run_sync(_job_queue_sync)
-    # action == "wait"
+    # action == "wait": NOT off-loaded. It is a `_MAX_WATCH_TIMEOUT`-long (up to
+    # 3600s) poll loop, and `anyio.to_thread.run_sync`'s cancellation never
+    # reaches the worker — a client that gave up left it re-spawning
+    # `comfy jobs status` for the full bound, with the in-flight child orphaned.
+    # `_job_wait_async` runs the cancellable async twin instead, so a cancel
+    # ends the loop and reaps that child. See `_poll_until_terminal_async`.
     bound = 25.0 if timeout_seconds is None else timeout_seconds
-    return await anyio.to_thread.run_sync(_job_wait_sync, prompt_id, bound)
+    return await _job_wait_async(prompt_id, bound)
 
 
 # `comfy system-stats` and `comfy free` landed in comfy-cli 1.14.0, which is also
@@ -12184,9 +12263,9 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     The blocking half of ``download(action="wait")`` and of ``download_model``'s
     wait path, shared so the two can never disagree about what a bound expiring
     means.
-    Runs on ``_poll_until_terminal``, the same bounded-poll loop
-    ``job(action="wait")`` (:func:`_job_wait_sync`) uses — see it for why each
-    poll is capped to the time left on the caller's bound, why the floor
+    Runs on ``_poll_until_terminal``, whose cancellable async twin
+    (:func:`_poll_until_terminal_async`) ``job(action="wait")`` uses — see it for
+    why each poll is capped to the time left on the caller's bound, why the floor
     exists, and why a poll killed at that cap yields the ``timed_out`` payload
     instead of an error.
 

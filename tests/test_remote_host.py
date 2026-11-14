@@ -720,7 +720,7 @@ def _target_flags(cmd: list[str]) -> list[str]:
 
 @pytest.mark.parametrize("submit_argv", ["generate_image", "run_template"])
 def test_submit_then_job_wait_hit_the_same_server(
-    patched_run, monkeypatch, submit_argv
+    patched_run, patched_async_run, monkeypatch, submit_argv
 ):
     """The end-to-end break: submit and poll must land on the SAME ComfyUI.
 
@@ -732,9 +732,20 @@ def test_submit_then_job_wait_hit_the_same_server(
     `prompt_not_found`. The invariant that has to hold is agreement, so assert
     the two argvs carry the SAME target rather than re-asserting one tool's
     flags.
+
+    The submit runs on the synchronous `_run_comfy` path (`patched_run`); the
+    wait poll now runs on the cancellable `_run_comfy_async` path
+    (`patched_async_run`), so both forwarders have to be stubbed — and the
+    invariant is exactly that `target._with_target` forwards the same target on
+    both spawn paths.
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
-    calls = patched_run(envelope(data={"prompt_id": "p1", "status": "completed"}))
+    submit_calls = patched_run(
+        envelope(data={"prompt_id": "p1", "status": "completed"})
+    )
+    poll_procs = patched_async_run(
+        envelope(data={"prompt_id": "p1", "status": "completed"})
+    )
 
     if submit_argv == "generate_image":
         submitted = asyncio.run(server.generate_image("a cat", wait=False))
@@ -743,10 +754,11 @@ def test_submit_then_job_wait_hit_the_same_server(
     polled = asyncio.run(server.job(action="wait", prompt_id=submitted["prompt_id"]))
 
     assert polled["status"] == "completed"  # no `prompt_not_found`
-    assert calls[0]["cmd"][4] == "run-template"
-    assert calls[1]["cmd"][4:7] == ["jobs", "status", "p1"]
-    assert _target_flags(calls[0]["cmd"]) == ["--host", "gpu.example", "--port", "9001"]
-    assert _target_flags(calls[0]["cmd"]) == _target_flags(calls[1]["cmd"])
+    assert submit_calls[0]["cmd"][4] == "run-template"
+    assert poll_procs[0].cmd[4:7] == ["jobs", "status", "p1"]
+    submit_target = _target_flags(submit_calls[0]["cmd"])
+    assert submit_target == ["--host", "gpu.example", "--port", "9001"]
+    assert submit_target == _target_flags(poll_procs[0].cmd)
 
 
 # --- server_info surfaces the configured target ----------------------------
