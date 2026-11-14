@@ -69,3 +69,21 @@ def test_crlf_delimited_envelopes_still_parse():
         "ok": True,
         "data": {"x": 1},
     }
+
+
+def test_bare_cr_before_an_envelope_still_splits():
+    """A progress redraw's bare ``\\r`` is a line break; U+2028 inside is not.
+
+    ``_run_comfy_async`` decodes raw bytes, so a foreground download's
+    ``100%\\r{envelope}`` reaches this parser without universal-newline
+    translation. A raw ``\\r`` cannot occur unescaped inside a JSON string.
+    """
+    out = (
+        'download 100%\r{"type": "envelope", "ok": true, "data": '
+        '{"prompt": "fade\u2028out"}}\n'
+    )
+    assert _last_json_object(out) == {
+        "type": "envelope",
+        "ok": True,
+        "data": {"prompt": "fade\u2028out"},
+    }

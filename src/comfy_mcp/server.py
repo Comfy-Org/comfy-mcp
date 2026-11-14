@@ -2104,13 +2104,17 @@ def _unwrap_envelope(
 def _last_json_object(stdout: str) -> dict | None:
     """Return the last JSON object on stdout, preferring a ``type==envelope`` one."""
     best: dict | None = None
-    # NDJSON lines end at a real newline (`\n` or `\r\n`). `str.splitlines()`
-    # also breaks on U+2028, U+2029, U+0085 and the other Unicode line
-    # boundaries. Those are legal inside a JSON string — the MiniMax H3
-    # image-to-video template's prompt ends in U+2028 — so splitting on them
-    # cut one envelope into two fragments and the caller reported "returned
-    # no JSON" for a line that parses.
-    for raw in re.split(r"\r?\n", stdout):
+    # Lines end at `\n`, `\r\n`, or a bare `\r`. `str.splitlines()` also breaks
+    # on U+2028, U+2029, U+0085 and the other Unicode line boundaries. Those
+    # are legal inside a JSON string — the MiniMax H3 image-to-video
+    # template's prompt ends in U+2028 — so splitting on them cut one envelope
+    # into two fragments and the caller reported "returned no JSON" for a line
+    # that parses. A bare `\r` still splits: the async path decodes raw bytes,
+    # and a `\r`-redrawn progress line (`100%\r{envelope}\n`) would otherwise
+    # stay glued to the envelope. A raw `\r` cannot appear unescaped inside a
+    # JSON string, so treating it as a break does not reopen that bug.
+    # `\r\n` is matched first so a CRLF pair is one break, not two.
+    for raw in re.split(r"\r\n|\r|\n", stdout):
         line = raw.strip()
         if not line:
             continue
