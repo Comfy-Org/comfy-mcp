@@ -59,10 +59,12 @@ REMOTE_SHARED_MODELS_ENV = "COMFY_MCP_REMOTE_SHARED_MODELS"
 _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
-# run``, ``comfy run-template``, every ``comfy jobs`` subcommand, and ``comfy
-# upload`` — every verb that SUBMITS a job, reads one back, or stages the files
-# a job will read, which is the set that has to agree on which server it is
-# talking to. ``run`` / ``jobs`` / ``upload`` are the set comfy-cli's
+# run``, ``comfy run-template``, every ``comfy jobs`` subcommand, ``comfy
+# upload``, and ``comfy models`` (discovery: ``search`` / ``list-folder`` /
+# ``list-folders``) — every verb that SUBMITS a job, reads one back, stages the
+# files a job will read, or INSPECTS what a job will find already there, which is
+# the set that has to agree on which server it is talking to. ``run`` / ``jobs``
+# / ``upload`` are the set comfy-cli's
 # ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
 # options and resolves them through that module's own ``resolve_host_port``
 # (``comfy_cli/command/templates.py``), it is just missing from that docstring's
@@ -93,6 +95,24 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # ``local_address.resolve_local_host_port``, which honors ``COMFY_LOCAL_URL``
 # for ANY host (it is not loopback-restricted).
 #
+# ``models`` (the discovery leaves ``search`` / ``list-folder`` /
+# ``list-folders``, behind ``search_models``) is here for the INSPECTION analogue
+# of the upload argument: it answers "what models does the install already have?"
+# and, unforwarded, answered it about THIS machine while ``run_workflow``
+# submitted to the remote — custom-pack folders that exist only locally reported
+# as the remote's catalog, so an agent gated a run (or a redundant multi-GB
+# ``download_model``) on the wrong disk. Like ``upload`` it gets an explicit
+# VERSION-SKEW error rather than relying on the verb's age: the ``--host`` /
+# ``--port`` options landed on ``comfy models`` (Comfy-Org/comfy-cli#876) long
+# after the discovery leaves themselves, and newer than ``_MIN_COMFY_CLI``, so a
+# CLI past the fail-OPEN floor guard has the verbs and rejects only the flags.
+# ``search_models`` translates Click's "No such option" into an upgrade
+# instruction and does NOT retry without the flags (a local catalog returned as
+# the remote's is the exact wrong-machine bug this fixes); it is not a dead end
+# either, since the pre-flag ``comfy models`` already resolved its target through
+# ``target.resolve_target``, whose local precedence honors ``COMFY_LOCAL_URL`` —
+# the workaround that error names.
+#
 # ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
 # It backs both ``run_template`` and ``generate_image``, and while it was absent
 # the submit-then-poll flow did not merely run on the wrong box, it could not
@@ -115,7 +135,7 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # hypothetical — for ALL THREE verbs, not just this one.
 #
 # Deliberately NOT forwarded:
-#   * ``env`` / ``download`` / ``templates`` / ``models`` /
+#   * ``env`` / ``download`` / ``templates`` /
 #     ``generate`` / the lifecycle verbs take NO ``--host`` / ``--port`` at all,
 #     so forwarding would error "No such option" — they stay local-only. That is
 #     not always a functional limit: ``download`` still collects a REMOTE job's
@@ -129,7 +149,9 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 #     set a local check cannot see.
 # Forwarding is a no-op for the local default regardless, so unconfigured
 # behavior is unchanged for every tool.
-_TARGET_AWARE_SUBCOMMANDS = frozenset({"run", "run-template", "jobs", "upload"})
+_TARGET_AWARE_SUBCOMMANDS = frozenset(
+    {"run", "run-template", "jobs", "upload", "models"}
+)
 
 
 def _strip_brackets(host: str) -> str:
@@ -343,7 +365,7 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
     The flags are injected into the SUBCOMMAND args (after the ``run`` /
-    ``run-template`` / ``jobs`` / ``upload`` verb), never into the global
+    ``run-template`` / ``jobs`` / ``upload`` / ``models`` verb), never into the global
     ``--json`` / ``--where`` prefix, since ``--host`` / ``--port`` are
     subcommand options. A no-op for the local default (``_comfy_target`` is
     None) and for any subcommand that doesn't accept the flags (see

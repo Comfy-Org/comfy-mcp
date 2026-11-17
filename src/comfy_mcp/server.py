@@ -12422,7 +12422,11 @@ async def workflow_deps(workflow_path: str) -> Any:
     )
 )
 def search_models(query: str = "", folder: str = "") -> Any:
-    """Search / list model files available to the LOCAL ComfyUI install.
+    """Search / list model files available to the targeted ComfyUI install.
+
+    FOLLOWS ``COMFYUI_URL`` / ``COMFYUI_HOST`` like ``run`` / ``jobs`` — reads
+    the REMOTE install's models when set, else byte-identical to before. A
+    comfy-cli too old for ``--host`` on ``comfy models`` RAISES; upgrade it.
 
     Three modes: ``query`` -> ``comfy models search --text <query>``
     (filename match, all folders on v1.14.0+, ``checkpoints`` only below the
@@ -12430,10 +12434,9 @@ def search_models(query: str = "", folder: str = "") -> Any:
     ``comfy models list-folders`` (folder names).
 
     ``query`` tokens match word-order-independently and ignore ``-`` ``_``
-    ``.`` separators, so "sdxl base" finds ``sd_xl_base_1.0.safetensors``.
-    That needs a comfy-cli NEWER than v1.15.0 (Comfy-Org/comfy-cli#684,
-    merged after v1.15.0 was cut); on v1.15.0 and older the whole query is
-    one substring, so search a single word there.
+    ``.`` separators ("sdxl base" finds ``sd_xl_base_1.0.safetensors``) on a
+    comfy-cli newer than v1.15.0; on v1.15.0 and older the whole query is one
+    substring, so search a single word there.
 
     RESPONSE SHAPE DIFFERS BY MODE: ``query`` returns ``{rows: [...]}``,
     ``folder`` returns ``{files: [...]}``. Filenames only — no base-model/
@@ -12464,8 +12467,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # `--out`), where a dash-leading value really is a caller slip and an
         # escape hatch exists. See `argv._reject_option_like`.
         argv._reject_nul("query", query)
-        return _run_comfy("models", "search", "--text", query, timeout=60.0)
-    if folder:
+        args: tuple[str, ...] = ("models", "search", "--text", query)
+    elif folder:
         # `folder` rides as a bare positional, so its leading-dash guard is the
         # mandatory kind. Size runs ahead of it: this is a models-subfolder path,
         # so it takes the same argv-safety CEILING as `download_model`'s
@@ -12490,8 +12493,47 @@ def search_models(query: str = "", folder: str = "") -> Any:
             "folder", folder, expected="a model folder (e.g. 'checkpoints')"
         )
         argv._reject_nul("folder", folder)
-        return _run_comfy("models", "list-folder", folder, timeout=60.0)
-    return _run_comfy("models", "list-folders", timeout=60.0)
+        args = ("models", "list-folder", folder)
+    else:
+        args = ("models", "list-folders")
+    # `_run_comfy` forwards --host/--port itself now that "models" is in
+    # `target._TARGET_AWARE_SUBCOMMANDS`, exactly as it does for `run` / `jobs` /
+    # `upload` (no-op for the local default — the argv is byte-identical to before
+    # "models" was allowlisted, and a bad COMFYUI_URL only bricks the call when a
+    # remote was actually asked for). The single call site is what lets the
+    # version-skew guard below cover all three modes at once.
+    try:
+        return _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        # Version skew, translated the way `upload_file` translates its own: the
+        # `--host` / `--port` options landed on `comfy models` long after the
+        # verb itself, so a comfy-cli below that — reachable only past the
+        # fail-OPEN version guard — has `models search`/`list-folder`/
+        # `list-folders` and rejects just the forwarded flag, with Click's usage
+        # dump (`NoSuchOption`: exit 2, no envelope). `_is_missing_option_error`
+        # is deliberately narrow, so a genuine failure that merely quotes the
+        # phrase keeps its own message. The guard can only fire when `--host` was
+        # actually forwarded, i.e. a remote is configured; with none set there is
+        # no `--host` to reject and this branch is unreachable. Deliberately no
+        # retry without the flags: the caller configured a remote, and listing
+        # THIS machine's catalog instead is precisely the wrong-machine bug the
+        # forward exists to fix — it would "succeed" with a catalog describing a
+        # disk the run never touches.
+        if not clitext._is_missing_option_error(exc, "--host"):
+            raise
+        raise ComfyCliError(
+            "the installed comfy-cli cannot point `comfy models` at a remote "
+            "ComfyUI: it does not accept `--host`, which ships in a comfy-cli "
+            "newer than v1.26.0. Nothing was listed — and the local catalog was "
+            "NOT returned instead, because it describes this machine's disk, not "
+            "the remote the configured target names. Two ways forward: upgrade "
+            'comfy-cli (`update_comfyui(target="cli")`, or `comfy update cli` in '
+            "a terminal) and call this again; or, without upgrading, unset "
+            "COMFYUI_URL / COMFYUI_HOST and set comfy-cli's own "
+            "COMFY_LOCAL_URL=http://<host>:<port> to the same address instead — "
+            "every comfy-cli verb resolves it, `models` discovery included, so "
+            "this reads the remote's catalog."
+        ) from exc
 
 
 # comfy-cli's own terminal set for a background download

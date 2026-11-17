@@ -82,7 +82,7 @@ on the spec's destructive/open-world DEFAULTS before a harmless read like `serve
 product behavior — the hints DESCRIBE each passthrough, they don't gate it (the per-call
 confirmation above is the gate): `openWorldHint` is true only where comfy-cli reaches the
 open internet / Comfy Cloud / a partner API / a registry, NOT the local ComfyUI process or
-filesystem (so `search_models`, a LOCAL-install read, is closed-world while `download_model`,
+filesystem (so `search_models`, a ComfyUI-install read, is closed-world while `download_model`,
 an arbitrary-URL fetch, is open-world) — a ComfyUI the user points `COMFYUI_URL`/`HOST` at
 still counts as "the ComfyUI process", and a tool that MAY reach out (a partner node, a
 cold-cache registry or gallery fetch) is open-world. Multi-mode tools annotate for their
