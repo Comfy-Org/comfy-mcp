@@ -19,6 +19,7 @@ call time), never an import-bound copy.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -198,9 +199,10 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
 
 
 # Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
-# message. ``partner_nodes`` names the offending nodes on a partner-credential
-# failure; keep the set small so a large envelope can't bloat the message.
-_SURFACED_DETAIL_KEYS = ("partner_nodes",)
+# message. Validation failures carry either comfy-cli's ``errors`` list or
+# ComfyUI's ``node_errors`` map; the hint alone cannot identify what to fix.
+# Keep the set small and each value bounded, as with ``partner_nodes``.
+_SURFACED_DETAIL_KEYS = ("partner_nodes", "errors", "node_errors")
 
 # Per-field cap for the rendered error message (mirrors the stderr cap) so a
 # multi-KB `message`/`hint` or a huge `partner_nodes` array can't produce an
@@ -211,11 +213,9 @@ _MAX_ERROR_FIELD_CHARS = 500
 def _render_error_details(details: Any) -> str | None:
     """Render the useful keys of an envelope's ``error.details`` for the message.
 
-    Scrubbed before the cap like every other envelope-derived field
-    :func:`_unwrap_envelope` renders — today ``_SURFACED_DETAIL_KEYS`` is only
-    node names, so it masks nothing in practice, but this string lands in the
-    same client-facing sentence as ``error.message``/``hint`` and a later key
-    added to that tuple should not have to remember to redact separately.
+    Validation details retain node IDs, fields and suggestions as JSON text.
+    Scrub before the cap, as for ``error.message``/``hint``: a diagnostic can
+    quote a credential-bearing URL from the workflow.
     """
     if not isinstance(details, dict):
         return None
@@ -224,8 +224,10 @@ def _render_error_details(details: Any) -> str | None:
         value = details.get(key)
         if not value:
             continue
-        if isinstance(value, (list, tuple)):
+        if key == "partner_nodes" and isinstance(value, (list, tuple)):
             value = ", ".join(str(v) for v in value)
+        elif isinstance(value, (dict, list, tuple)):
+            value = json.dumps(value, ensure_ascii=False)
         rendered = failure_log._scrub_text(str(value))[:_MAX_ERROR_FIELD_CHARS]
         parts.append(f"{key}: {rendered}")
     return "; ".join(parts) if parts else None
