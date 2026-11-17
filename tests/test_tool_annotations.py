@@ -51,6 +51,7 @@ _EXPECTED = {
     "project": (False, False, True, False, None),
     "search_templates": (True, False, True, True, None),
     "get_template": (True, False, True, True, None),
+    "check_template": (True, False, True, True, None),
     "fetch_template": (False, True, True, True, None),
     "nodes": (True, False, True, False, "Search the local node catalog"),
     "node_dependencies": (True, False, True, True, None),

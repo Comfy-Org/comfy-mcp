@@ -10825,6 +10825,7 @@ def search_templates(
     model: str = "",
     provider: str = "",
     exclude_api: bool = False,
+    runnable_only: bool = False,
 ) -> Any:
     """Search the built-in ComfyUI workflow-template gallery.
 
@@ -10858,11 +10859,17 @@ def search_templates(
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
         exclude_api: drop ``API``-tagged rows.
+        runnable_only: keep only templates every weight for which is already on
+            THIS install (``comfy templates ls --runnable``) — comfy-cli's own
+            runnable filter, not a graph inspection here. The FIRST such call
+            fetches each template's workflow to check it, so it is much slower
+            than a plain listing (hence a 300s cap, not 60s). The ``query``
+            narrowing still applies on top of the runnable-filtered rows.
         limit/offset: page results (``limit`` capped at 200).
 
-    Step 1: pick a ``name``, inspect with ``get_template``, then
-    ``fetch_template``. Step 4 — validating before ``run_workflow`` — is
-    MANDATORY via ``local_check``.
+    Step 1: pick a ``name``, inspect with ``get_template`` (and
+    ``check_template`` for a runnable verdict), then ``fetch_template``. Step 4
+    — validating before ``run_workflow`` — is MANDATORY via ``local_check``.
 
     Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
     refresh``. NOT read from the local install.
@@ -10885,7 +10892,11 @@ def search_templates(
             argv._reject_option_like(f"{flag} value", value)
             argv._reject_nul(f"{flag} value", value)
             args += [flag, value]
-    data = _run_comfy(*args, timeout=60.0)
+    if runnable_only:
+        args.append("--runnable")
+    # `--runnable` fetches every candidate's workflow to check it on the first
+    # run (comfy-cli caches after), so it needs the wider cap a cold fetch does.
+    data = _run_comfy(*args, timeout=300.0 if runnable_only else 60.0)
 
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         shape = (
@@ -11343,6 +11354,39 @@ def get_template(name: str, check_local: bool = True) -> Any:
         if check_local
         else _check_not_requested(),
     }
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def check_template(name: str) -> Any:
+    """Say whether THIS install can run a gallery template, before you fetch it.
+
+    Wraps ``comfy templates check <name>``. Step 2.5 of the on-ramp — after
+    ``search_templates``, before ``fetch_template`` — so you can tell the user
+    exactly what to download (or steer them to an API-key flow) BEFORE anything
+    is fetched or run.
+
+    comfy-cli returns the verdict — ``runnable`` (every weight is already on
+    this install), ``missing-models`` (names the missing files and their
+    download URLs, ready to hand the user or feed to ``download_model``),
+    ``api-required`` (a paid hosted node — needs a signed-in account and spends
+    credits, so ``run_template`` fails it CLOSED unless ``confirm_spend=True``),
+    or ``unknown`` (comfy-cli could not decide). The verdict is comfy-cli's own;
+    this is a thin passthrough and adds no logic of its own.
+    """
+    # Bare positional: a leading-dash name is read by comfy-cli as an option
+    # rather than the template to check (argument injection).
+    argv._reject_option_like(
+        "name", name, expected="a template name (e.g. 'image_flux2')"
+    )
+    argv._reject_nul("name", name)
+    return _run_comfy("templates", "check", name, timeout=120.0)
 
 
 @mcp.tool(

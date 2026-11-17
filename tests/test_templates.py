@@ -384,6 +384,40 @@ def test_search_templates_forwards_gallery_filters(patched_run):
     ]
 
 
+def test_search_templates_runnable_only_adds_flag_and_widens_timeout(patched_run):
+    """`runnable_only` appends `--runnable` and gives the slow first fetch 300s."""
+    calls = patched_run(envelope(data=_payload()))
+
+    server.search_templates(runnable_only=True)
+
+    assert calls[0]["cmd"][4:] == ["templates", "ls", "--runnable"]
+    assert calls[0]["timeout"] == 300.0
+
+
+def test_search_templates_without_runnable_only_keeps_default_timeout(patched_run):
+    """The flag is opt-in: a plain listing stays on the 60s cap and omits `--runnable`."""
+    calls = patched_run(envelope(data=_payload()))
+
+    server.search_templates()
+
+    assert "--runnable" not in calls[0]["cmd"]
+    assert calls[0]["timeout"] == 60.0
+
+
+def test_search_templates_runnable_only_still_narrows_by_query(monkeypatch):
+    """`query` filtering applies on top of the runnable-filtered payload.
+
+    comfy-cli does the `--runnable` narrowing server-side; `query` is the
+    client-side free-text pass this tool owns, and it must still run over
+    whatever rows came back.
+    """
+    # `_patch_ls` stands in for the `--runnable` server-side result.
+    _patch_ls(monkeypatch)
+
+    narrowed = server.search_templates("clip", runnable_only=True)
+    assert _names(narrowed) == ["clip_maker"]
+
+
 def test_search_templates_exclude_api(monkeypatch):
     """exclude_api drops every row whose tags include `API` (case-insensitive)."""
     _patch_ls(monkeypatch)
@@ -617,11 +651,50 @@ def test_template_tools_reject_embedded_nul(monkeypatch):
 
     for call in (
         lambda: server.get_template("flux\0dev"),
+        lambda: server.check_template("flux\0dev"),
         lambda: server.fetch_template("flux\0dev", "/tmp/flux.json"),
         lambda: server.fetch_template("flux_dev", "/tmp/f\0.json"),
     ):
         with pytest.raises(server.ComfyCliError, match="embedded NUL"):
             call()
+
+
+def test_check_template_argv_and_passes_verdict_through(patched_run):
+    """Passthrough: `comfy --json --where local templates check <name>`, 120s cap.
+
+    The verdict is comfy-cli's own — a thin passthrough hands the envelope data
+    straight back, adding no logic of its own.
+    """
+    verdict = {
+        "verdict": "missing-models",
+        "missing": [
+            {"name": "flux1-dev.safetensors", "url": "https://x/flux.safetensors"}
+        ],
+    }
+    calls = patched_run(envelope(data=verdict))
+
+    result = server.check_template("flux_dev")
+
+    assert calls[0]["cmd"][1:4] == ["--json", "--where", "local"]  # global flags first
+    assert calls[0]["cmd"][4:] == ["templates", "check", "flux_dev"]
+    assert calls[0]["timeout"] == 120.0
+    assert result == verdict  # handed back untouched
+
+
+def test_check_template_rejects_option_like_name(monkeypatch):
+    """A leading-dash name is refused before any child spawns (argument injection).
+
+    ``name`` is a bare positional on ``templates check``, so comfy-cli would read
+    a dash-leading value as an option rather than the template to check.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.check_template("--help")
 
 
 # --- local_check: does the user's install actually support this template? ----
