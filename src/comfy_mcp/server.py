@@ -12559,13 +12559,16 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # comfy-cli IGNORES a `COMFY_LOCAL_URL` it cannot parse (a stderr warning,
         # then its 127.0.0.1:8188 default) — that silent fallback would list THIS
         # machine's catalog as the remote's, so a host that cannot ride inside a
-        # URL is refused rather than retried.
-        if any(c.isspace() or not c.isprintable() or c in "/@?#[]\\" for c in host):
+        # URL — or an empty one (`COMFYUI_HOST="[]"` strips to "") — is refused
+        # rather than retried.
+        if not host or any(
+            c.isspace() or not c.isprintable() or c in "/@?#[]\\" for c in host
+        ):
             raise ComfyCliError(
                 "the installed comfy-cli cannot point `comfy models` at a remote "
                 "ComfyUI: it does not accept `--host` (that ships in a comfy-cli "
-                "newer than v1.26.0), and the configured host contains whitespace "
-                "or URL-special characters, so it cannot be handed over as "
+                "newer than v1.26.0), and the configured host is empty or contains "
+                "whitespace or URL-special characters, so it cannot be handed over as "
                 "COMFY_LOCAL_URL either. Nothing was listed, and this machine's "
                 "catalog was NOT returned instead. Set COMFYUI_HOST / COMFYUI_URL "
                 "to a plain host name or IP address, or upgrade comfy-cli to a "

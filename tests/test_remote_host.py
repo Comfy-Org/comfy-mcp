@@ -827,16 +827,18 @@ def test_search_models_echoed_caller_phrase_is_not_a_version_gap(
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("host", ["gpu example", "[]"])
 def test_search_models_unretriable_host_is_refused_not_listed_locally(
-    patched_run, monkeypatch
+    patched_run, monkeypatch, host
 ):
     """A host comfy-cli would IGNORE as COMFY_LOCAL_URL is refused, not retried.
 
     comfy-cli drops a COMFY_LOCAL_URL it cannot parse with a warning and falls
     back to 127.0.0.1:8188, which would list THIS machine's catalog as the
-    remote's — so the call fails with nothing listed.
+    remote's — so the call fails with nothing listed. ``"[]"`` strips to an
+    empty host (``http://:8188``), which comfy-cli ignores the same way.
     """
-    monkeypatch.setenv("COMFYUI_HOST", "gpu example")
+    monkeypatch.setenv("COMFYUI_HOST", host)
     calls = patched_run("", returncode=2, stderr=_MODELS_NO_HOST_USAGE)
 
     with pytest.raises(server.ComfyCliError) as excinfo:
