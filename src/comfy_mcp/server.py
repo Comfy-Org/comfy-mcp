@@ -1466,7 +1466,7 @@ def _spawn_failure(
 
 
 def _run_comfy_raw(
-    *args: str, timeout: float | None = None
+    *args: str, timeout: float | None = None, local_url: str | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
     """Run ``comfy --json --where local <args>`` and return the RAW envelope + context.
 
@@ -1476,6 +1476,14 @@ def _run_comfy_raw(
     ``server_info`` reading the versioned ``schema``) can inspect it, or the raw
     ``stdout`` (e.g. the lifecycle-success synthesizer), while :func:`_run_comfy`
     just unwraps it down to ``data``.
+
+    ``local_url`` names the target through comfy-cli's own ``COMFY_LOCAL_URL``
+    instead of the forwarded ``--host`` / ``--port``: set, it goes into the
+    CHILD's environment only (the server's own ``COMFYUI_URL`` and the guards
+    keyed off it are untouched) and the flags are not appended. It exists for
+    the one verb whose flags are newer than this server's floor —
+    ``search_models``' retry on a comfy-cli whose ``comfy models`` rejects
+    ``--host``.
     """
     _require_comfy_bin()
     _check_comfy_version()
@@ -1483,11 +1491,14 @@ def _run_comfy_raw(
     # configured (no-op for the local default; see target._with_target). Reassigning
     # args here means the forwarded flags also appear in the error/timeout
     # context returned below, so a remote failure reports the real invocation.
-    args = target._with_target(args)
+    if local_url is None:
+        args = target._with_target(args)
     # Global flags (--json, --where) MUST precede the subcommand in comfy-cli;
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    if local_url is not None:
+        env["COMFY_LOCAL_URL"] = local_url
     # Anchor the child's cwd to the operator-designated COMFY_PROJECT root, if
     # one is configured (None — the default — is byte-identical to not passing
     # `cwd` at all). Resolved fresh on every call, right before the spawn, so a
@@ -1568,7 +1579,12 @@ def _run_comfy_raw(
     )
 
 
-def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
+def _run_comfy(
+    *args: str,
+    timeout: float | None = None,
+    plain_ok: bool = False,
+    local_url: str | None = None,
+) -> Any:
     """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
 
     comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
@@ -1581,9 +1597,11 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     exit with no JSON is treated as success and a result dict is synthesized
     from the printed text, rather than raising the "returned no JSON" error on
     an action that actually succeeded. A non-zero exit, or a real error
-    envelope, still raises as usual.
+    envelope, still raises as usual. ``local_url`` is :func:`_run_comfy_raw`'s.
     """
-    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw(
+        *args, timeout=timeout, local_url=local_url
+    )
     # A plain_ok command that exits 0 without a *real* envelope is a success
     # (the lifecycle verbs and model download, per the docstring above).
     # `_last_json_object` may return a stray non-envelope JSON line (e.g. a
@@ -3559,9 +3577,11 @@ def server_info() -> dict[str, Any]:
                 "source": source,
                 "note": (
                     "the submit/poll tools target this remote ComfyUI via "
-                    "--host/--port — run_workflow, generate_image, run_template "
-                    "and the jobs/queue tools; the lifecycle, discovery and "
-                    "catalog tools forward no host and describe THIS machine, "
+                    "--host/--port — run_workflow, generate_image, run_template, "
+                    "the jobs/queue tools, upload_file and search_models (the "
+                    "remote's model catalog); the lifecycle tools and the other "
+                    "discovery and catalog tools forward no host and describe "
+                    "THIS machine, "
                     "and so do the env fields above, which are the LOCAL "
                     "comfy-cli install. (fetch_outputs forwards no host either "
                     "but still collects a remote job's files, from the local "
@@ -12422,7 +12442,10 @@ async def workflow_deps(workflow_path: str) -> Any:
     )
 )
 def search_models(query: str = "", folder: str = "") -> Any:
-    """Search / list model files available to the LOCAL ComfyUI install.
+    """Search / list model files available to the targeted ComfyUI install.
+
+    FOLLOWS ``COMFYUI_URL`` / ``COMFYUI_HOST`` like ``run`` / ``jobs`` — reads
+    the REMOTE install's models when set, else byte-identical to before.
 
     Three modes: ``query`` -> ``comfy models search --text <query>``
     (filename match, all folders on v1.14.0+, ``checkpoints`` only below the
@@ -12430,10 +12453,9 @@ def search_models(query: str = "", folder: str = "") -> Any:
     ``comfy models list-folders`` (folder names).
 
     ``query`` tokens match word-order-independently and ignore ``-`` ``_``
-    ``.`` separators, so "sdxl base" finds ``sd_xl_base_1.0.safetensors``.
-    That needs a comfy-cli NEWER than v1.15.0 (Comfy-Org/comfy-cli#684,
-    merged after v1.15.0 was cut); on v1.15.0 and older the whole query is
-    one substring, so search a single word there.
+    ``.`` separators ("sdxl base" finds ``sd_xl_base_1.0.safetensors``) on a
+    comfy-cli newer than v1.15.0; on v1.15.0 and older the whole query is one
+    substring, so search a single word there.
 
     RESPONSE SHAPE DIFFERS BY MODE: ``query`` returns ``{rows: [...]}``,
     ``folder`` returns ``{files: [...]}``. Filenames only — no base-model/
@@ -12464,8 +12486,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # `--out`), where a dash-leading value really is a caller slip and an
         # escape hatch exists. See `argv._reject_option_like`.
         argv._reject_nul("query", query)
-        return _run_comfy("models", "search", "--text", query, timeout=60.0)
-    if folder:
+        args: tuple[str, ...] = ("models", "search", "--text", query)
+    elif folder:
         # `folder` rides as a bare positional, so its leading-dash guard is the
         # mandatory kind. Size runs ahead of it: this is a models-subfolder path,
         # so it takes the same argv-safety CEILING as `download_model`'s
@@ -12490,8 +12512,73 @@ def search_models(query: str = "", folder: str = "") -> Any:
             "folder", folder, expected="a model folder (e.g. 'checkpoints')"
         )
         argv._reject_nul("folder", folder)
-        return _run_comfy("models", "list-folder", folder, timeout=60.0)
-    return _run_comfy("models", "list-folders", timeout=60.0)
+        args = ("models", "list-folder", folder)
+    else:
+        args = ("models", "list-folders")
+    # `_run_comfy` forwards --host/--port itself now that "models" is in
+    # `target._TARGET_AWARE_SUBCOMMANDS`, exactly as it does for `run` / `jobs` /
+    # `upload` (no-op for the local default — the argv is byte-identical to before
+    # "models" was allowlisted). The single call site is what lets the
+    # version-skew retry below cover all three modes at once.
+    try:
+        return _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        # Version skew: the `--host` / `--port` options landed on `comfy models`
+        # (Comfy-Org/comfy-cli#876) in a comfy-cli NEWER than v1.26.0 — well above
+        # `_MIN_COMFY_CLI` — so every supported comfy-cli before it has the
+        # discovery leaves and rejects just the forwarded flag, with Click's usage
+        # dump (`NoSuchOption`: exit 2, no envelope). Those same builds resolve
+        # their target through `resolve_target`, whose local precedence honors
+        # `COMFY_LOCAL_URL` for ANY host (comfy-cli's `local_address`, there since
+        # 1.14.0), so the retry hands the configured target over through that
+        # documented channel instead — in the CHILD's env only, so the server's
+        # own COMFYUI_URL, and the `download_model` / lifecycle guards keyed off
+        # it, stay exactly as configured. What is listed is still the remote's
+        # catalog, comfy-cli's answer; nothing is derived here. Never a retry
+        # with no target at all: this machine's catalog returned as the remote's
+        # is precisely the wrong-machine bug the forward exists to fix.
+        #
+        # `_is_missing_option_error` is deliberately narrow, and the phrase is
+        # discounted when it only appears inside the caller's own `query` /
+        # `folder` (Click can echo an argument back in a usage error), so a
+        # genuine failure keeps its own message. With no remote configured no
+        # `--host` was forwarded, so this branch cannot fire.
+        caller_values = tuple(v for v in (query, folder) if v)
+        if not clitext._is_missing_option_error(
+            exc, "--host"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--host")),
+            *caller_values,
+        ):
+            raise
+        resolved = target._comfy_target()
+        if resolved is None:  # unreachable: no target means no `--host` sent
+            raise
+        host, port, _source = resolved
+        # comfy-cli IGNORES a `COMFY_LOCAL_URL` it cannot parse (a stderr warning,
+        # then its 127.0.0.1:8188 default) — that silent fallback would list THIS
+        # machine's catalog as the remote's, so a host that cannot ride inside a
+        # URL — or an empty one (`COMFYUI_HOST="[]"` strips to "") — is refused
+        # rather than retried.
+        if not host or any(
+            c.isspace() or not c.isprintable() or c in "/@?#[]\\" for c in host
+        ):
+            raise ComfyCliError(
+                "the installed comfy-cli cannot point `comfy models` at a remote "
+                "ComfyUI: it does not accept `--host` (that ships in a comfy-cli "
+                "newer than v1.26.0), and the configured host is empty or contains "
+                "whitespace or URL-special characters, so it cannot be handed over as "
+                "COMFY_LOCAL_URL either. Nothing was listed, and this machine's "
+                "catalog was NOT returned instead. Set COMFYUI_HOST / COMFYUI_URL "
+                "to a plain host name or IP address, or upgrade comfy-cli to a "
+                "release whose `comfy models` accepts `--host`."
+            ) from exc
+        return _run_comfy(
+            *args,
+            timeout=60.0,
+            local_url=f"http://{target._format_target_endpoint(host, port)}",
+        )
 
 
 # comfy-cli's own terminal set for a background download

@@ -74,7 +74,19 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # omits it hands the user a canvas that doesn't say what each step does; and
 # its invented class_types need the `validate_workflow` pointer the existing
 # missing-nodes bullet doesn't cover. Measured ~15,916 after the edit.
-_BUDGET_TOKENS = 15_950
+#
+# 15,950 -> 16,050 for `search_models`'s target-awareness contract (+~60 tokens,
+# the paragraph already trimmed twice against this ceiling). Growth a caller
+# cannot do without, and the same shape as the `launch_comfyui` /
+# `restart_comfyui` refusals above: that `search_models` now FOLLOWS
+# `COMFYUI_URL` / `COMFYUI_HOST` like `run` / `jobs` — reading the REMOTE
+# install's model catalog, and RAISING on a comfy-cli too old to accept the
+# forwarded `--host` rather than silently listing THIS machine's — is not
+# inferable from any other tool's docs, and an agent that does not know it
+# trusts a local catalog as the remote's (the exact wrong-machine bug the
+# forward fixes). The tree was already at ~15,916, so no useful version fit the
+# slack. Measured ~15,986 after the edit, so the next growth is still a decision.
+_BUDGET_TOKENS = 16_050
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
