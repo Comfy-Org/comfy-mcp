@@ -10,6 +10,7 @@ is on PATH). A failure here means comfy-cli moved, not that this repo broke.
 from __future__ import annotations
 
 import shutil
+import subprocess
 
 import pytest
 
@@ -62,4 +63,31 @@ def test_project_init_and_status_round_trip(tmp_path, monkeypatch):
     )
     assert isinstance(status_data.get("recent_runs"), list), (
         f"recent_runs is not a list: {type(status_data.get('recent_runs'))}"
+    )
+
+
+def test_cloud_status_verb_exists_on_the_installed_comfy_cli():
+    """`billing_status`' degrade branch is about a version gap, so prove the gap.
+
+    `comfy-mcp` 0.11.0 shipped documentation, a comment and a test all saying
+    no tagged comfy-cli release had `comfy cloud status` yet. It had shipped 86
+    days earlier, in 1.17.0, and nothing in CI disagreed because nothing asked
+    the binary. This does: a `--help` on the leaf exits 0 while Click exits 2
+    with a usage dump for a verb it cannot find, which is the same signal
+    `clitext._is_missing_verb_error` reads at runtime.
+
+    Failing here means the verb was REMOVED or renamed upstream, which would
+    make the degrade the common path again — exactly the claim this repo got
+    wrong by asserting it in prose.
+    """
+    proc = subprocess.run(  # fixed argv, no shell, no caller input
+        [server.COMFY_BIN, "cloud", "status", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        "`comfy cloud status --help` did not exit 0 — the verb billing_status "
+        f"wraps may be gone (floor {server._MIN_BILLING_COMFY_CLI_STR}). "
+        f"rc={proc.returncode} stderr={proc.stderr[-400:]!r}"
     )

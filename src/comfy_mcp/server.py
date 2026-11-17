@@ -3661,6 +3661,16 @@ def auth_status() -> Any:
 # request itself.
 _BILLING_STATUS_TIMEOUT = 180.0
 
+# `comfy cloud status` is a per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a
+# raise of `_MIN_COMFY_CLI`: every other tool works at 1.14.0, and refusing
+# them all to report a balance would be the worse trade. Unlike watch's it
+# gates nothing — the verb either dispatches or Click refuses it, and the
+# degrade below reads comfy-cli's own answer rather than a version string. It
+# exists so the ONE number a caller below the floor needs is in the message.
+# comfy-cli 1.17.0 (2026-08-22) is where `comfy_cli/cloud/command.py` first
+# registers `status_cmd`; 1.16.0 has the `cloud` group without the leaf.
+_MIN_BILLING_COMFY_CLI_STR = "1.17.0"
+
 # `_run_comfy_async` keeps only the trailing `_STDERR_MAX_CHARS` (64 KiB) of
 # stdout by default, which is the one place its contract is narrower than
 # `_run_comfy`'s unbounded `communicate()`. That bound exists for a multi-GB
@@ -3703,7 +3713,7 @@ async def billing_status() -> Any:
     not something to re-derive from the numbers.
 
     Signed out raises comfy-cli's own error — get the user signed in with
-    ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
+    ``auth_login`` / ``auth_status``. Below comfy-cli 1.17.0,
     degrades to ``{"error", "unsupported": True}`` carrying
     ``balance_confirmed: False`` and the balance fields ``null``, so the rule
     above holds there too.
@@ -3746,12 +3756,16 @@ async def billing_status() -> Any:
         # user can actually act on, and burying them under "your CLI is old"
         # would send them to the wrong fix.
         #
-        # Unlike those two this is NOT an edge path: `cloud status` landed in
-        # comfy-cli AFTER its newest release, so today every install answers
-        # this verb with Click's usage dump and this branch is the common one.
-        # It is expected to become the rare case once the verb ships, which is
-        # why the message names no version floor to go stale — the installed
-        # comfy-cli either has the verb or does not.
+        # This is an edge path, and the comment here said the opposite until
+        # 2026-11-17. `comfy cloud status` shipped in comfy-cli
+        # `_MIN_BILLING_COMFY_CLI_STR` (2026-08-22), nine releases before
+        # 0.11.0 went out saying no tagged release had the verb yet, so on any
+        # install at or above the floor this branch never runs and the degrade
+        # it writes is unreachable. The "names no version floor to go stale"
+        # rule went with that premise: there IS a floor, it is the one number a
+        # user below it needs, and leaving it out told a 1.26.0 install to
+        # upgrade to nothing in particular. Say the version, the way
+        # `_MIN_WATCH_COMFY_CLI_STR` does for `job(action="watch")`.
         #
         # No `clitext._phrase_is_only_the_caller_s` subtraction here (which
         # `list_workflow_notes` needs): this tool takes no arguments, so nothing
@@ -3783,8 +3797,8 @@ async def billing_status() -> Any:
         return {
             "error": (
                 "billing status unavailable: the installed comfy-cli does not "
-                "support 'comfy cloud status' (the verb ships in a comfy-cli "
-                "newer than the one installed here). Nothing was broken by "
+                "support 'comfy cloud status' (the verb ships in comfy-cli "
+                f"{_MIN_BILLING_COMFY_CLI_STR} and newer). Nothing was broken by "
                 # Deliberately about STATE, not about capability: on the
                 # whole-group-missing branch below, sign-in is not available
                 # either, so a blanket "sign-in is unchanged" would contradict

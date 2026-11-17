@@ -7,25 +7,44 @@ behaviour changes, even though that would be a major bump after 1.0 — while th
 project is pre-1.0, minor is the strongest signal available, so read it as
 "check the notes before upgrading".
 
+## Unreleased
+
+### Fixed
+
+- **`billing_status` described a comfy-cli that stopped existing in August.**
+  0.11.0 said in five places — these release notes, the tool docstring, the
+  README tool table, a code comment and a test — that no tagged comfy-cli
+  release had `comfy cloud status` yet, and that its `unsupported: true`
+  degrade was therefore "the common result today". The verb shipped in
+  comfy-cli **1.17.0 on 2026-08-22**, nine releases before 0.11.0 went out
+  (1.26.0 is current), so on any supported install the degrade is unreachable
+  and the message asking the user to upgrade reached only users who were
+  already current. The degrade now names the floor it is about — comfy-cli
+  1.17.0 — the way `job(action="watch")` names 1.16.0, and a scheduled
+  contract test asserts the real binary still has the verb, so the claim
+  cannot go stale again without something failing.
+
 ## 0.11.0
 
 The server now introduces itself, and a few answers that used to look finished
 were not. `comfy-mcp --help` and `--version` print instead of exiting with no
 output, and the MCP `initialize` handshake reports the installed package
 version. Node search can tell a free node from a paid partner node,
-`billing_status` is wired to `comfy cloud status` — no tagged comfy-cli
-release has that verb yet — and image, video, and audio outputs can come
-back as an inline preview. Minor rather than patch:
+`billing_status` is wired to `comfy cloud status` — **corrected
+2026-11-17: that verb shipped in comfy-cli 1.17.0 on 2026-08-22; the
+sentence published here claimed no tagged release had it** — and image,
+video, and audio outputs can come back as an inline preview. Minor rather than patch:
 several tool responses gain fields, and `launch_comfyui` / `restart_comfyui`
 stop acting on the local server when a remote ComfyUI is configured.
 
 The comfy-cli floor stays **>= 1.14.0**. Two verbs sit beside that floor
 rather than under it. `job(action="watch")` needs comfy-cli >= 1.16.0, and a
 server-wide raise would refuse every other tool on an install where only
-watch is broken. `billing_status` is the other caveat: `comfy cloud status`
-is newer than every tagged comfy-cli release, so a current install returns
-`unsupported: true` instead of a balance. The message names no version to
-upgrade to, because there is not one yet.
+watch is broken. `billing_status` is the other caveat: it needs
+comfy-cli >= 1.17.0. **Corrected 2026-11-17** — as published this paragraph
+said the verb was newer than every tagged release and that a current install
+returns `unsupported: true`; 1.17.0 shipped 2026-08-22 and returns a
+balance.
 
 ### Added
 
@@ -35,11 +54,11 @@ upgrade to, because there is not one yet.
   that started, read nothing, and left. (#228)
 - **`billing_status`.** One read-only passthrough of `comfy cloud status`:
   remaining credits, plan, and how many jobs can run at once, once the
-  engine has the verb. It does not spend and it does not prompt. No tagged
-  comfy-cli release includes that verb yet, so on a current install the
-  call returns `unsupported: true` with the balance fields null. That is
-  the common result today, not a rare degrade, and the message names no
-  version to upgrade to. (#250)
+  engine has the verb. It does not spend and it does not prompt.
+  **Corrected 2026-11-17:** `comfy cloud status` shipped in comfy-cli 1.17.0
+  (2026-08-22), so the `unsupported: true` degrade described here is the rare
+  case, not the common one, and the message now names 1.17.0 as the floor.
+  (#250)
 - **`preview_media`.** Wraps `comfy preview` and returns comfy-cli's metadata
   plus an optional bounded inline PNG — an image thumbnail, a video contact
   sheet, or an audio waveform — so an agent can look at video and audio that
