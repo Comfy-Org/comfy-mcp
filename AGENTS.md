@@ -68,7 +68,9 @@ primitive is this repo's job. Project anchoring (`_project_root`, `COMFY_PROJECT
 `project` tool) is the same kind of adaptation: comfy-cli resolves its governing `project/1`
 by walking up from its own process cwd, assuming a persistent shell session an MCP client's
 arbitrary per-call cwd can't provide, so this server passes `cwd=` on its own spawns instead
-— the `status`/`init` verdicts stay entirely comfy-cli's own.
+— the `status`/`init` verdicts stay entirely comfy-cli's own. `search_models`' retry is the
+same kind: a `comfy models` predating `--host` gets the configured target through comfy-cli's
+own `COMFY_LOCAL_URL`, set in that child's env only (`_run_comfy(local_url=…)`).
 
 The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the

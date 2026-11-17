@@ -101,17 +101,16 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # and, unforwarded, answered it about THIS machine while ``run_workflow``
 # submitted to the remote — custom-pack folders that exist only locally reported
 # as the remote's catalog, so an agent gated a run (or a redundant multi-GB
-# ``download_model``) on the wrong disk. Like ``upload`` it gets an explicit
-# VERSION-SKEW error rather than relying on the verb's age: the ``--host`` /
-# ``--port`` options landed on ``comfy models`` (Comfy-Org/comfy-cli#876) long
-# after the discovery leaves themselves, and newer than ``_MIN_COMFY_CLI``, so a
-# CLI past the fail-OPEN floor guard has the verbs and rejects only the flags.
-# ``search_models`` translates Click's "No such option" into an upgrade
-# instruction and does NOT retry without the flags (a local catalog returned as
-# the remote's is the exact wrong-machine bug this fixes); it is not a dead end
-# either, since the pre-flag ``comfy models`` already resolved its target through
-# ``target.resolve_target``, whose local precedence honors ``COMFY_LOCAL_URL`` —
-# the workaround that error names.
+# ``download_model``) on the wrong disk. Unlike ``upload`` its flags are NEWER
+# than ``_MIN_COMFY_CLI``: the ``--host`` / ``--port`` options landed on ``comfy
+# models`` (Comfy-Org/comfy-cli#876) after v1.26.0, long after the discovery
+# leaves themselves, so every supported release has the verbs and rejects only
+# the flags. ``search_models`` therefore retries once on Click's "No such
+# option" by handing the same target to comfy-cli's own ``COMFY_LOCAL_URL`` in
+# the child's env (the pre-flag ``comfy models`` resolves its target through
+# ``resolve_target``, whose local precedence honors it for any host) — never
+# without a target, since a local catalog returned as the remote's is the exact
+# wrong-machine bug this fixes.
 #
 # ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
 # It backs both ``run_template`` and ``generate_image``, and while it was absent
@@ -355,8 +354,8 @@ def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
         "note": (
             "COMFYUI_URL/COMFYUI_HOST is set but malformed, so no remote is "
             "resolved; the submit/poll tools (run_workflow, generate_image, "
-            "run_template and the jobs/queue tools) will raise this same error "
-            "until it is fixed."
+            "run_template, the jobs/queue tools, upload_file and search_models) "
+            "will raise this same error until it is fixed."
         ),
     }
 

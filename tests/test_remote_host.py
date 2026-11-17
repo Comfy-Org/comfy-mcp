@@ -32,7 +32,7 @@ import json
 import subprocess
 
 import pytest
-from conftest import _OK_STREAM, envelope
+from conftest import _OK_STREAM, CliReply, envelope
 
 from comfy_mcp import errors, server, target
 
@@ -725,41 +725,125 @@ def test_search_models_local_default_is_byte_identical(patched_run, kwargs, expe
     assert calls[0]["cmd"][4:] == expected  # no --host/--port
 
 
-def test_search_models_old_comfy_cli_gets_an_upgrade_instruction(
+_MODELS_NO_HOST_USAGE = (
+    "Usage: comfy models search [OPTIONS]\n"
+    "Try 'comfy models search --help' for help.\n\n"
+    "Error: No such option: --host"
+)
+
+
+@pytest.mark.parametrize(
+    "env, expected_url",
+    [
+        ({"COMFYUI_URL": "http://gpu.example:9001"}, "http://gpu.example:9001"),
+        (
+            {"COMFYUI_HOST": "gpu.example", "COMFYUI_PORT": "9001"},
+            "http://gpu.example:9001",
+        ),
+        ({"COMFYUI_URL": "http://[2001:db8::1]:9001"}, "http://[2001:db8::1]:9001"),
+    ],
+)
+def test_search_models_old_comfy_cli_retries_via_comfy_local_url(
+    patched_run, monkeypatch, env, expected_url
+):
+    """A comfy-cli whose `comfy models` predates --host still reads the REMOTE.
+
+    The flags landed on `comfy models` in a comfy-cli newer than v1.26.0, far
+    above this server's floor, so every supported release rejects the forwarded
+    ``--host`` with Click's usage dump (exit 2, no envelope). Those builds
+    resolve their target through ``COMFY_LOCAL_URL``, so the retry hands the
+    configured target over that way: no flags on the argv, the URL in the
+    CHILD's env only — the server's own COMFYUI_URL / _HOST / _PORT are left
+    set, so the download/lifecycle guards keyed off them still fire. Never a
+    flagless retry with no target (this machine's catalog as the remote's).
+    """
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("COMFY_LOCAL_URL", raising=False)
+    calls = patched_run(
+        replies=[
+            CliReply("", returncode=2, stderr=_MODELS_NO_HOST_USAGE),
+            envelope(data={"rows": ["remote_model.safetensors"]}),
+        ]
+    )
+
+    assert server.search_models(query="xl") == {"rows": ["remote_model.safetensors"]}
+
+    assert len(calls) == 2
+    assert "--host" in calls[0]["cmd"]
+    assert "COMFY_LOCAL_URL" not in calls[0]["env"]
+    assert calls[1]["cmd"][4:] == ["models", "search", "--text", "xl"]
+    assert calls[1]["env"]["COMFY_LOCAL_URL"] == expected_url
+    for key, value in env.items():  # the server's own target is untouched
+        assert server.os.environ[key] == value
+    assert "COMFY_LOCAL_URL" not in server.os.environ
+
+
+def test_search_models_retry_failure_surfaces_the_engine_s_error(
     patched_run, monkeypatch
 ):
-    """A comfy-cli without the models --host flag gets an upgrade error, not wrong data.
+    """The retry's own failure is comfy-cli's answer, relayed as-is."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    calls = patched_run(
+        replies=[
+            CliReply("", returncode=2, stderr=_MODELS_NO_HOST_USAGE),
+            CliReply(
+                envelope(
+                    ok=False,
+                    error={"code": "server_not_running", "message": "no server"},
+                ),
+                returncode=1,
+            ),
+        ]
+    )
 
-    The ``--host`` / ``--port`` options landed on ``comfy models`` long after the
-    discovery leaves, so an install past the fail-OPEN version floor has the verb
-    and rejects only the flags, with Click's usage dump (exit 2, no envelope).
-    Returning this machine's catalog instead would be the exact wrong-machine bug
-    the forward fixes, so exactly one spawn happens and it carried the flags.
+    with pytest.raises(server.ComfyCliError, match="no server"):
+        server.search_models(folder="checkpoints")
 
-    It must not read as a DEAD END: such a comfy-cli can still reach the remote
-    via ``COMFY_LOCAL_URL`` (the pre-flag ``comfy models`` resolved its target
-    through ``target.resolve_target``, whose local precedence honors it). The
-    error names that route alongside the upgrade.
+    assert len(calls) == 2
+    assert calls[1]["env"]["COMFY_LOCAL_URL"] == "http://gpu.example:9001"
+
+
+def test_search_models_echoed_caller_phrase_is_not_a_version_gap(
+    patched_run, monkeypatch
+):
+    """A usage error quoting the CALLER's own text is not comfy-cli lacking --host.
+
+    Click can echo an argument back in a usage error; a ``query`` that itself
+    spells "No such option: --host" must not trigger the retry, so the genuine
+    failure passes through and exactly one spawn happens.
     """
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    query = "No such option: --host"
     calls = patched_run(
         "",
         returncode=2,
-        stderr=(
-            "Usage: comfy models search [OPTIONS]\n"
-            "Try 'comfy models search --help' for help.\n\n"
-            "Error: No such option: --host"
-        ),
+        stderr=f"Usage: comfy models search [OPTIONS]\n\nError: bad value {query!r}",
     )
 
-    with pytest.raises(server.ComfyCliError) as excinfo:
-        server.search_models(query="xl")
+    with pytest.raises(server.ComfyCliError):
+        server.search_models(query=query)
 
-    message = str(excinfo.value)
-    assert "comfy update cli" in message
-    assert "COMFY_LOCAL_URL" in message  # the route that works without upgrading
-    assert len(calls) == 1  # it really did try, and did NOT retry locally
-    assert "--host" in calls[0]["cmd"]
+    assert len(calls) == 1
+
+
+def test_search_models_unretriable_host_is_refused_not_listed_locally(
+    patched_run, monkeypatch
+):
+    """A host comfy-cli would IGNORE as COMFY_LOCAL_URL is refused, not retried.
+
+    comfy-cli drops a COMFY_LOCAL_URL it cannot parse with a warning and falls
+    back to 127.0.0.1:8188, which would list THIS machine's catalog as the
+    remote's — so the call fails with nothing listed.
+    """
+    monkeypatch.setenv("COMFYUI_HOST", "gpu example")
+    calls = patched_run("", returncode=2, stderr=_MODELS_NO_HOST_USAGE)
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        server.search_models()
+
+    assert "NOT returned" in str(excinfo.value)
+    assert len(calls) == 1
 
 
 def test_search_models_real_failure_keeps_its_own_message(patched_run, monkeypatch):
@@ -967,6 +1051,11 @@ def test_server_info_reports_remote_target(monkeypatch, patched_run):
     assert result["comfy_target"]["host"] == "gpu.example"
     assert result["comfy_target"]["port"] == 9001
     assert result["comfy_target"]["source"] == "COMFYUI_URL"
+    # `search_models` forwards the target, so the note must not file it under
+    # the tools that describe THIS machine.
+    assert (
+        "search_models (the remote's model catalog)" in (result["comfy_target"]["note"])
+    )
     assert result["running"] is False  # local `comfy env` data still preserved
     assert result["compatibility"]["envelope_schema"] == "envelope/1"
 
@@ -987,6 +1076,7 @@ def test_server_info_reports_malformed_target_as_data(monkeypatch, patched_run):
     result = server.server_info()
 
     assert "error" in result["comfy_target"]
+    assert "search_models" in result["comfy_target"]["note"]  # it raises too
     assert result["running"] is False  # local `comfy env` data still returned
 
 
