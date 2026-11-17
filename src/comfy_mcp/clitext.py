@@ -841,11 +841,13 @@ def _classify_install_result(names: list[str], result: Any) -> dict[str, Any]:
 # (`_resource_verb_upgrade_error`) take no caller text at all; `notes`
 # (`list_workflow_notes`) carries `workflow_path`; `download-status` /
 # `download-cancel` (`_download_verb_unsupported`) carry `download_id`; `node
-# deps` carries `pack` and `registry_id`. Then the OPTION-shaped siblings, which
+# deps` carries `pack` and `registry_id`; `templates check` (`check_template`)
+# carries `name`. Then the OPTION-shaped siblings, which
 # read `_is_missing_option_error` and are in the same set for the same reason:
-# `--registry` (`node_dependencies`) carries those same two values, and
+# `--registry` (`node_dependencies`) carries those same two values,
 # `--background` (`download_model`) carries `url` / `relative_path` /
-# `filename`. The remaining two option sites need no subtraction because their
+# `filename`, and `--runnable` (`search_templates`) carries its four filter
+# values. The remaining two option sites need no subtraction because their
 # values CANNOT spell the phrase, not because nobody supplied them: `--port`
 # (`get_logs`) forwards a `_guard_log_port`-normalized int, and `--version`
 # (`_run_version_switch`) a `_guard_version`-constrained token (`nightly` /

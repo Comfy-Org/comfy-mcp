@@ -418,6 +418,66 @@ def test_search_templates_runnable_only_still_narrows_by_query(monkeypatch):
     assert _names(narrowed) == ["clip_maker"]
 
 
+_NO_RUNNABLE_USAGE = (
+    "Usage: comfy templates ls [OPTIONS]\n"
+    "Try 'comfy templates ls --help' for help.\n"
+    "Error: No such option: --runnable"
+)
+
+
+def test_search_templates_runnable_only_names_a_missing_flag(patched_run):
+    """A comfy-cli without `--runnable` gets an upgrade error, never the unfiltered gallery."""
+    calls = patched_run("", returncode=2, stderr=_NO_RUNNABLE_USAGE)
+
+    with pytest.raises(server.ComfyCliError, match="no `--runnable` filter") as ei:
+        server.search_templates(runnable_only=True)
+
+    assert "pip install -U comfy-cli" in str(ei.value)
+    assert len(calls) == 1  # no unfiltered re-ask
+
+
+def test_search_templates_runnable_only_keeps_a_caller_forged_phrase_raw(patched_run):
+    """A filter value that spells the parser's phrase cannot fake the version gap."""
+    forged = "No such option: --runnable"
+    patched_run("", returncode=2, stderr=f"Error: Invalid value for '--tag': {forged}")
+
+    with pytest.raises(server.ComfyCliError) as ei:
+        server.search_templates(tag=forged, runnable_only=True)
+
+    assert "no `--runnable` filter" not in str(ei.value)
+
+
+def test_search_templates_runnable_only_reports_no_unmatched_words(monkeypatch):
+    """An empty runnable page names no dead words: they may match a non-runnable row."""
+    _patch_ls(monkeypatch)
+
+    result = server.search_templates("zzzz", runnable_only=True)
+
+    assert result["total"] == 0
+    assert "unmatched_query_words" not in result
+    assert "hint" not in result
+
+
+def test_search_templates_runnable_only_notes_a_configured_remote(
+    patched_run, monkeypatch
+):
+    """`comfy templates` takes no --host: the runnable verdict is THIS machine's weights."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    patched_run(envelope(data=_payload()))
+
+    note = server.search_templates(runnable_only=True)["comfy_target_note"]
+
+    assert (note["host"], note["port"], note["source"]) == (
+        "gpu.example",
+        9001,
+        "COMFYUI_URL",
+    )
+    assert "comfy templates" in note["note"]
+    # A plain listing is gallery metadata, not a verdict about any install.
+    patched_run(envelope(data=_payload()))
+    assert "comfy_target_note" not in server.search_templates()
+
+
 def test_search_templates_exclude_api(monkeypatch):
     """exclude_api drops every row whose tags include `API` (case-insensitive)."""
     _patch_ls(monkeypatch)
@@ -695,6 +755,47 @@ def test_check_template_rejects_option_like_name(monkeypatch):
 
     with pytest.raises(server.ComfyCliError, match="leading '-'"):
         server.check_template("--help")
+
+
+def test_check_template_names_a_missing_verb(patched_run):
+    """A comfy-cli without `templates check` gets an upgrade error, not Click's dump."""
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy templates [OPTIONS] COMMAND [ARGS]...\n"
+            "Error: No such command 'check'."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError, match="check_template unavailable"):
+        server.check_template("flux_dev")
+
+
+def test_check_template_relays_other_failures_raw(patched_run):
+    """Any failure but the missing verb keeps comfy-cli's own message."""
+    patched_run(
+        envelope(ok=False, error={"code": "template_not_found", "message": "nope"}),
+        returncode=1,
+    )
+
+    with pytest.raises(server.ComfyCliError) as ei:
+        server.check_template("flux_dev")
+
+    assert "unavailable" not in str(ei.value)
+
+
+def test_check_template_notes_a_configured_remote(patched_run, monkeypatch):
+    """With a remote configured the verdict says it is about THIS machine's weights."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    verdict = {"verdict": "runnable"}
+    patched_run(envelope(data=verdict))
+
+    result = server.check_template("flux_dev")
+
+    assert result["verdict"] == "runnable"
+    assert result["comfy_target_note"]["host"] == "gpu.example"
+    assert "comfy templates" in result["comfy_target_note"]["note"]
 
 
 # --- local_check: does the user's install actually support this template? ----

@@ -566,8 +566,35 @@ def _local_launch_refusal_for_remote_target() -> dict[str, Any] | None:
 
 _COMFY_TARGET_NOTE_KEY = "comfy_target_note"
 
+# The default `note` text — the resource verbs `_annotate_comfy_target` was built for.
+_RESOURCE_TARGET_NOTE = (
+    "this payload describes whichever ComfyUI comfy-cli itself "
+    "targets — `comfy system-stats` / `comfy free` take no "
+    "--host/--port — and NOT necessarily the host/port above, which "
+    "is where the run/job tools submit. The two are the same machine "
+    "when that host resolves to THIS box and different machines "
+    "otherwise; this server does not verify which, so compare them "
+    "before gating a run on these numbers, and ask the user when the "
+    "host is one you cannot place (a loopback host can be a tunnel "
+    "to a remote GPU)."
+)
 
-def _annotate_comfy_target(payload: Any) -> Any:
+# The same divergence for the template runnability verdicts (`check_template`,
+# `search_templates(runnable_only=True)`): `comfy templates` takes no
+# --host/--port, so the weights it checks are the ones in THIS machine's workspace.
+_TEMPLATE_TARGET_NOTE = (
+    "this verdict checks the model files of the ComfyUI workspace comfy-cli "
+    "itself resolves on the machine running this MCP server — `comfy templates` "
+    "takes no --host/--port — and NOT necessarily the host/port above, which is "
+    "where run_template / run_workflow submit. The two are the same install when "
+    "that host resolves to THIS box (or shares its models dir) and different "
+    "installs otherwise; this server does not verify which, so do not tell the "
+    "user to download, or that nothing is missing, until you have settled that, "
+    "and ask the user when the host is one you cannot place."
+)
+
+
+def _annotate_comfy_target(payload: Any, note: str = _RESOURCE_TARGET_NOTE) -> Any:
     """Return *payload* tagged with the configured remote, for a LOCAL-only tool.
 
     ``comfy system-stats`` and ``comfy free`` take no ``--host`` / ``--port``
@@ -615,6 +642,9 @@ def _annotate_comfy_target(payload: Any) -> Any:
     ``system`` and ``devices`` at the top level, and ``comfy free`` returns
     comfy-cli's own ``{"requested": ..., "note": ...}`` — but if one ever
     appeared, the existing value wins: annotation must never clobber engine data.
+
+    *note* is the divergence sentence; it defaults to the resource verbs' text,
+    and the template runnability verdicts pass ``_TEMPLATE_TARGET_NOTE``.
     """
     if not isinstance(payload, dict) or _COMFY_TARGET_NOTE_KEY in payload:
         return payload
@@ -633,17 +663,7 @@ def _annotate_comfy_target(payload: Any) -> Any:
             "host": _redact_target_host(host),
             "port": port,
             "source": source,
-            "note": (
-                "this payload describes whichever ComfyUI comfy-cli itself "
-                "targets — `comfy system-stats` / `comfy free` take no "
-                "--host/--port — and NOT necessarily the host/port above, which "
-                "is where the run/job tools submit. The two are the same machine "
-                "when that host resolves to THIS box and different machines "
-                "otherwise; this server does not verify which, so compare them "
-                "before gating a run on these numbers, and ask the user when the "
-                "host is one you cannot place (a loopback host can be a tunnel "
-                "to a remote GPU)."
-            ),
+            "note": note,
         },
     }
 

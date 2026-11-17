@@ -95,7 +95,9 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # `missing-models` / `api-required` / `unknown`, and that `api-required` is the
 # same paid-node gate `run_template` enforces) is the agent contract, not
 # inferable from any other tool's docs. Measured ~16,294 after it (42 tool
-# docstrings), so the next growth is still a decision.
+# docstrings); the review round's caveats (`runnable` is weights only, a remote
+# target gets a `comfy_target_note`) took it to ~16,342 within the same ceiling,
+# so the next growth is still a decision.
 _BUDGET_TOKENS = 16_350
 
 

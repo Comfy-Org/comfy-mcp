@@ -10861,10 +10861,10 @@ def search_templates(
         exclude_api: drop ``API``-tagged rows.
         runnable_only: keep only templates every weight for which is already on
             THIS install (``comfy templates ls --runnable``) — comfy-cli's own
-            runnable filter, not a graph inspection here. The FIRST such call
-            fetches each template's workflow to check it, so it is much slower
-            than a plain listing (hence a 300s cap, not 60s). The ``query``
-            narrowing still applies on top of the runnable-filtered rows.
+            runnable filter. Weights only — step-4 validation is still
+            MANDATORY. The FIRST such call is slow (300s cap, not 60s).
+            ``query`` still narrows on top, without ``unmatched_query_words``.
+            A remote target adds a ``comfy_target_note``.
         limit/offset: page results (``limit`` capped at 200).
 
     Step 1: pick a ``name``, inspect with ``get_template`` (and
@@ -10872,7 +10872,7 @@ def search_templates(
     — validating before ``run_workflow`` — is MANDATORY via ``local_check``.
 
     Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
-    refresh``. NOT read from the local install.
+    refresh``. NOT read from the local install (``runnable_only`` aside).
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -10896,7 +10896,37 @@ def search_templates(
         args.append("--runnable")
     # `--runnable` fetches every candidate's workflow to check it on the first
     # run (comfy-cli caches after), so it needs the wider cap a cold fetch does.
-    data = _run_comfy(*args, timeout=300.0 if runnable_only else 60.0)
+    try:
+        data = _run_comfy(*args, timeout=300.0 if runnable_only else 60.0)
+    except ComfyCliError as exc:
+        # The flag is newer than this server's comfy-cli floor. Say so by name
+        # rather than relay Click's usage dump — and never fall back to the
+        # unfiltered gallery, which would answer "runnable" with rows that are
+        # not. Narrow as at every option site: the parser's own phrase, minus
+        # any copy a caller forged through a filter value.
+        if (
+            not runnable_only
+            or not clitext._is_missing_option_error(exc, "--runnable")
+            or clitext._phrase_is_only_the_caller_s(
+                exc,
+                clitext._MISSING_OPTION_RE_TEMPLATE.format(
+                    option=re.escape("--runnable")
+                ),
+                tag,
+                type,
+                model,
+                provider,
+            )
+        ):
+            raise
+        raise ComfyCliError(
+            "search_templates(runnable_only=True) unavailable: the installed "
+            "comfy-cli's `templates ls` has no `--runnable` filter (it landed "
+            "after comfy-cli 1.26.0); upgrade with `pip install -U comfy-cli`, or "
+            "drop runnable_only and ask `check_template` per template.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
 
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         shape = (
@@ -10937,9 +10967,12 @@ def search_templates(
         if not rows:
             rows = [r for r in candidates if _template_matches(r, q)]
             relaxed = bool(rows)
-        if not rows:
+        if not rows and not runnable_only:
             # Only computed on the empty path, where it is the whole value: a
-            # populated result needs no explanation.
+            # populated result needs no explanation. Not under `runnable_only`:
+            # `candidates` is then only the runnable subset, so a word matching
+            # nothing in it may still match a template whose weights are
+            # missing, and "matched nothing in the gallery" would be false.
             unmatched = _unmatched_template_tokens(candidates, q)
 
     total = len(rows)
@@ -10967,6 +11000,8 @@ def search_templates(
             f"{', '.join(unmatched)}. Drop or reword them and search again — all "
             "query words must match, so each extra word only narrows the result."
         )
+    if runnable_only:
+        return target._annotate_comfy_target(result, target._TEMPLATE_TARGET_NOTE)
     return result
 
 
@@ -11365,12 +11400,11 @@ def get_template(name: str, check_local: bool = True) -> Any:
     )
 )
 def check_template(name: str) -> Any:
-    """Say whether THIS install can run a gallery template, before you fetch it.
+    """Say whether THIS install has a gallery template's weights, before you fetch it.
 
     Wraps ``comfy templates check <name>``. Step 2.5 of the on-ramp — after
     ``search_templates``, before ``fetch_template`` — so you can tell the user
-    exactly what to download (or steer them to an API-key flow) BEFORE anything
-    is fetched or run.
+    what to download (or steer them to an API-key flow) up front.
 
     comfy-cli returns the verdict — ``runnable`` (every weight is already on
     this install), ``missing-models`` (names the missing files and their
@@ -11379,6 +11413,10 @@ def check_template(name: str) -> Any:
     credits, so ``run_template`` fails it CLOSED unless ``confirm_spend=True``),
     or ``unknown`` (comfy-cli could not decide). The verdict is comfy-cli's own;
     this is a thin passthrough and adds no logic of its own.
+
+    A model/API check, NOT validation: ``runnable`` says nothing of custom
+    nodes or input values, so step-4 ``local_check`` is still MANDATORY. It
+    reads THIS machine's weights; a remote target adds a ``comfy_target_note``.
     """
     # Bare positional: a leading-dash name is read by comfy-cli as an option
     # rather than the template to check (argument injection).
@@ -11386,7 +11424,28 @@ def check_template(name: str) -> Any:
         "name", name, expected="a template name (e.g. 'image_flux2')"
     )
     argv._reject_nul("name", name)
-    return _run_comfy("templates", "check", name, timeout=120.0)
+    try:
+        data = _run_comfy("templates", "check", name, timeout=120.0)
+    except ComfyCliError as exc:
+        # The verb is at this server's comfy-cli floor, but that floor fails
+        # OPEN — name the version gap rather than relay Click's usage dump. The
+        # same caller-echo subtraction as every degrade site whose argv carries
+        # caller text.
+        if not clitext._is_missing_verb_error(
+            exc, "check"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_VERB_RE_TEMPLATE.format(verb=re.escape("check")),
+            name,
+        ):
+            raise
+        raise ComfyCliError(
+            "check_template unavailable: the installed comfy-cli has no "
+            f"`comfy templates check` verb. It {_RESOURCE_VERB_UPGRADE_HINT}.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
+    return target._annotate_comfy_target(data, target._TEMPLATE_TARGET_NOTE)
 
 
 @mcp.tool(
