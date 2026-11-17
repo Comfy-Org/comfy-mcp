@@ -11416,7 +11416,7 @@ def check_template(name: str) -> Any:
 
     A model/API check, NOT validation: ``runnable`` says nothing of custom
     nodes or input values, so step-4 ``local_check`` is still MANDATORY. It
-    reads THIS machine's weights; a remote target adds a ``comfy_target_note``.
+    reads comfy-cli's own ComfyUI's weights; a remote target adds a note.
     """
     # Bare positional: a leading-dash name is read by comfy-cli as an option
     # rather than the template to check (argument injection).

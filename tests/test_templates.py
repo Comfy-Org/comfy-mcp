@@ -461,7 +461,7 @@ def test_search_templates_runnable_only_reports_no_unmatched_words(monkeypatch):
 def test_search_templates_runnable_only_notes_a_configured_remote(
     patched_run, monkeypatch
 ):
-    """`comfy templates` takes no --host: the runnable verdict is THIS machine's weights."""
+    """`comfy templates` takes no --host: the runnable verdict is comfy-cli's own resolved ComfyUI."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
     patched_run(envelope(data=_payload()))
 
@@ -786,7 +786,7 @@ def test_check_template_relays_other_failures_raw(patched_run):
 
 
 def test_check_template_notes_a_configured_remote(patched_run, monkeypatch):
-    """With a remote configured the verdict says it is about THIS machine's weights."""
+    """With a remote configured the verdict says it is about comfy-cli's own resolved ComfyUI."""
     monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
     verdict = {"verdict": "runnable"}
     patched_run(envelope(data=verdict))
@@ -796,6 +796,9 @@ def test_check_template_notes_a_configured_remote(patched_run, monkeypatch):
     assert result["verdict"] == "runnable"
     assert result["comfy_target_note"]["host"] == "gpu.example"
     assert "comfy templates" in result["comfy_target_note"]["note"]
+    # comfy-cli resolves that ComfyUI itself, so COMFY_LOCAL_URL can move it
+    # off-box: the note must not pin the verdict on this machine.
+    assert "COMFY_LOCAL_URL" in result["comfy_target_note"]["note"]
 
 
 # --- local_check: does the user's install actually support this template? ----

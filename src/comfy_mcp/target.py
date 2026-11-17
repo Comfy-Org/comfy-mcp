@@ -581,16 +581,18 @@ _RESOURCE_TARGET_NOTE = (
 
 # The same divergence for the template runnability verdicts (`check_template`,
 # `search_templates(runnable_only=True)`): `comfy templates` takes no
-# --host/--port, so the weights it checks are the ones in THIS machine's workspace.
+# --host/--port, so the weights it checks are those of whichever ComfyUI comfy-cli
+# itself resolves (its local default, or a ``COMFY_LOCAL_URL`` that can point off-box).
 _TEMPLATE_TARGET_NOTE = (
-    "this verdict checks the model files of the ComfyUI workspace comfy-cli "
-    "itself resolves on the machine running this MCP server — `comfy templates` "
-    "takes no --host/--port — and NOT necessarily the host/port above, which is "
-    "where run_template / run_workflow submit. The two are the same install when "
-    "that host resolves to THIS box (or shares its models dir) and different "
-    "installs otherwise; this server does not verify which, so do not tell the "
-    "user to download, or that nothing is missing, until you have settled that, "
-    "and ask the user when the host is one you cannot place."
+    "this verdict checks the model list of whichever ComfyUI comfy-cli itself "
+    "resolves — its local default, or COMFY_LOCAL_URL when set (which can name "
+    "another machine) — since `comfy templates` takes no --host/--port; it is "
+    "NOT necessarily the host/port above, which is where run_template / "
+    "run_workflow submit. The two are the same install when both resolve to the "
+    "same ComfyUI (or share a models dir) and different installs otherwise; this "
+    "server does not verify which, so do not tell the user to download, or that "
+    "nothing is missing, until you have settled that, and ask the user when the "
+    "host is one you cannot place."
 )
 
 
