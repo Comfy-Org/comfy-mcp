@@ -86,7 +86,19 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # trusts a local catalog as the remote's (the exact wrong-machine bug the
 # forward fixes). The tree was already at ~15,916, so no useful version fit the
 # slack. Measured ~15,986 after the edit, so the next growth is still a decision.
-_BUDGET_TOKENS = 16_050
+#
+# 16,050 -> 16,350 when `check_template` was added. A whole new TOOL, not
+# docstring growth on an existing one (same shape as the `billing_status` bump
+# above): its description is ~1,050 chars — near the ~1,140-char mean of the 41
+# already here — so there was no version of it that fit the slack left under the
+# prior ceiling. The verdict vocabulary it documents (`runnable` /
+# `missing-models` / `api-required` / `unknown`, and that `api-required` is the
+# same paid-node gate `run_template` enforces) is the agent contract, not
+# inferable from any other tool's docs. Measured ~16,294 after it (42 tool
+# docstrings); the review round's caveats (`runnable` is weights only, a remote
+# target gets a `comfy_target_note`) took it to ~16,342 within the same ceiling,
+# so the next growth is still a decision.
+_BUDGET_TOKENS = 16_350
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
