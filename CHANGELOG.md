@@ -25,8 +25,35 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   unknown id is comfy-cli's own `workflow_slot_invalid`, which lists the ids
   that do exist.
 
+### Changed
+
+- **`run_workflow` asks about credits when the ENGINE says there is something
+  to spend, not when the caller passes `confirm_spend=True`.** The prompt was
+  driven off the argument, so an agent that passed it prophylactically — which
+  the tool description gave it every reason to do — put a credit confirmation
+  in front of every run, including the overwhelming majority that run for free
+  on the user's own ComfyUI. Only comfy-cli can tell a paid graph from a free
+  one, so the run now goes out unflagged first: a partner-free graph is
+  byte-identical without `--allow-spend` and simply runs, while a paid one
+  fails closed with `spend_consent_required` having submitted nothing, and
+  *that* refusal is what raises the prompt. A free workflow is therefore never
+  prompted whatever the caller passed, and consent is still per-call, still
+  never something the model can grant itself, and still asked exactly once per
+  call. Reported in #300. An engine with no interlock — no published release,
+  only a build past the fail-open version check — keeps the up-front prompt,
+  because no refusal will ever arrive to raise it.
+
 ### Fixed
 
+- **The `run_workflow` decline message was wrong about every supported
+  engine.** It told a caller who had just refused a spend not to retry with
+  `confirm_spend=False`, because "`comfy run`'s spend gate is not in a
+  comfy-cli release yet" and the graph would therefore run and spend. The gate
+  shipped in comfy-cli **1.14.0 on 2026-08-04** — which is this server's own
+  enforced floor — so on every install this server will talk to at all, the
+  opposite was true: the graph fails closed and spends nothing. The message now
+  says so, and says it knowing the graph is paid, because the engine has
+  already refused it by the time anyone is asked.
 - **`billing_status` described a comfy-cli that stopped existing in August.**
   0.11.0 said in five places — these release notes, the tool docstring, the
   README tool table, a code comment and a test — that no tagged comfy-cli
