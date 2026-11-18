@@ -506,6 +506,13 @@ _MIN_COMFY_CLI_STR = "1.14.0"
 # Exactly this tuple, not a `major == 0` range: `0.1.0` and `0.0.1` are versions
 # somebody could really have published, and the leniency is meant to cover the
 # placeholder rather than the whole pre-1.0 range.
+#
+# Compared as a PARSED tuple, so the exemption also covers the handful of
+# strings `_parse_version` normalizes to it — `"0.0"` pads to `(0, 0, 0)`, and a
+# four-part `"0.0.0.1"` truncates to it. Deliberate: comfy-cli has never
+# published any of them either, and matching the raw token instead would mean a
+# `"version 0.0"` build is refused while `"version 0.0.0"` is waved through,
+# which is a distinction with no cause behind it.
 _UNSTAMPED_COMFY_CLI = (0, 0, 0)
 
 # The version guard shells out to `comfy --version`; memoize so it runs at most
@@ -2782,7 +2789,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
     Naming an outdated comfy-cli is the whole point when the version is
     UNREADABLE: an install below :data:`_MIN_WATCH_COMFY_CLI` that slipped past
     the gate — which fails OPEN on an unparseable ``--version`` — produces
-    exactly this payload, and this is the only place left to say so. But when
+    exactly this payload, and this is the only place left to say so. It is named
+    as ONE of two open causes rather than as the likely one, because the
+    unreadable-version population is mostly source checkouts of `main`: those
+    are usually NEWER than the floor, so asserting "usually too old" would send
+    the majority of the people who see this line to upgrade a comfy-cli that is
+    already ahead of the one being asked for. But when
     the gate positively VERIFIED the floor, that half is a diagnosis the code
     already knows is false: a job sitting queued behind another, or loading
     models, for the whole 600s default yields zero events on a perfectly modern
@@ -2804,9 +2816,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
             "`timeout_seconds`"
         )
     return (
-        f"{_WATCH_NO_EVENTS_HINT} — this usually means comfy-cli < "
-        f"{_MIN_WATCH_COMFY_CLI_STR} (jobs watch cannot attach as the "
-        "submitting session there)"
+        f"{_WATCH_NO_EVENTS_HINT} — this server could not establish the "
+        "comfy-cli version, so both causes are open: an install below "
+        f"{_MIN_WATCH_COMFY_CLI_STR} (where `jobs watch` cannot attach as the "
+        "submitting session), or a job queued behind another or still loading "
+        'models. Check `comfy --version`, then poll `job(action="status")` or '
+        "watch again with a longer `timeout_seconds`"
     )
 
 
