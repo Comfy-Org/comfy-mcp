@@ -195,11 +195,11 @@ def _comfy_desktop_port_locks_dir() -> Path | None:
     Comfy Desktop (the Electron app) writes one JSON file per port it is
     CURRENTLY bound to, named ``port-<N>.json`` with ``{"pid", "installationName",
     "timestamp"}`` — its own dynamic-port bookkeeping, independent of anything
-    comfy-cli tracks. Locations per Electron's own ``app.getPath("appData")``
-    convention (verified against a live Windows install; macOS/Linux paths
-    follow Electron's documented convention but are unverified here — a
-    maintainer or Mac/Linux tester should confirm before this fallback is
-    trusted cross-platform). Returns None (not a raise) when the platform is
+    comfy-cli tracks. Locations mirror Comfy Desktop's own ``stateDir()``
+    (``src/main/lib/paths.ts``) plus ``writePortLock()`` (``process.ts``):
+    Electron's ``userData`` on Windows and macOS (``Comfy Desktop`` product
+    name; Windows verified against a live Comfy Desktop 1.1.6.0 install), and
+    ``$XDG_STATE_HOME/comfyui-desktop-2`` on Linux. Returns None (not a raise) when the platform is
     unrecognized or the directory does not exist, so a Comfy-Desktop-less
     environment resolves this fallback to "no candidates" rather than erroring
     — the same "byte-identical when nothing applies" contract every other
@@ -213,14 +213,18 @@ def _comfy_desktop_port_locks_dir() -> Path | None:
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support" / "Comfy Desktop"
     elif sys.platform == "linux":
-        # Electron's own `app.getPath("appData")` honors $XDG_CONFIG_HOME on
-        # Linux, falling back to ~/.config only when it is unset — the same
-        # rule this must mirror, or a distro/sandbox with a non-default
-        # XDG_CONFIG_HOME (a common case, e.g. NixOS, Snap's SNAP_USER_DATA
-        # convention) silently never finds a real, running Desktop install.
+        # Unlike Windows/macOS, Comfy Desktop does NOT use Electron's
+        # `userData` on Linux: its `stateDir()` is `$XDG_STATE_HOME` (else
+        # `~/.local/state`) joined with the package name `comfyui-desktop-2`
+        # (the "Comfy Desktop" product name only reaches the path on the
+        # other two platforms). Its `migrateXdgPaths()` also moves the old
+        # `~/.config/Comfy Desktop/port-locks` here and deletes the source,
+        # so the legacy location is deliberately not read. A Desktop build
+        # that predates that migration finds no lock and falls through to
+        # the existing default.
         base = (
-            Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-            / "Comfy Desktop"
+            Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+            / "comfyui-desktop-2"
         )
     else:
         # An unrecognized platform gets no fallback rather than guessing at a

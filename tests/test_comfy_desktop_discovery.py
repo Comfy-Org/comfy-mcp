@@ -52,21 +52,21 @@ _REAL_LOCKS_DIR = target._comfy_desktop_port_locks_dir
     [
         ("darwin", ("Library", "Application Support", "Comfy Desktop", "port-locks")),
         ("win32", ("Comfy Desktop", "port-locks")),
-        ("linux", (".config", "Comfy Desktop", "port-locks")),
+        ("linux", (".local", "state", "comfyui-desktop-2", "port-locks")),
     ],
 )
-def test_locks_dir_mirrors_electron_appdata_convention(
+def test_locks_dir_mirrors_desktop_state_dir_convention(
     monkeypatch, tmp_path, platform, expected
 ):
-    """The per-OS path follows Electron's own ``app.getPath("appData")`` layout."""
+    """The per-OS path follows Comfy Desktop's own ``stateDir()`` layout."""
     monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", _REAL_LOCKS_DIR)
     monkeypatch.setattr(target.sys, "platform", platform)
     monkeypatch.setattr(target.Path, "home", lambda: tmp_path)
     monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
-    # The Linux branch now honors $XDG_CONFIG_HOME (see the dedicated tests
+    # The Linux branch honors $XDG_STATE_HOME (see the dedicated tests
     # below) -- clear it here so this "no override" case is not at the mercy
     # of whatever happens to be set in the test runner's own environment.
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     # Directory must actually exist for the function to return it.
     if platform == "win32":
         d = tmp_path / "AppData" / "Roaming" / "Comfy Desktop" / "port-locks"
@@ -79,7 +79,7 @@ def test_locks_dir_mirrors_electron_appdata_convention(
             / "port-locks"
         )
     else:
-        d = tmp_path / ".config" / "Comfy Desktop" / "port-locks"
+        d = tmp_path / ".local" / "state" / "comfyui-desktop-2" / "port-locks"
     d.mkdir(parents=True)
 
     result = target._comfy_desktop_port_locks_dir()
@@ -107,23 +107,34 @@ def test_locks_dir_none_when_appdata_unset(monkeypatch):
     assert target._comfy_desktop_port_locks_dir() is None
 
 
-def test_locks_dir_honors_xdg_config_home_on_linux(monkeypatch, tmp_path):
-    """Electron's own Linux `appData` resolves $XDG_CONFIG_HOME first, not ~/.config.
+def test_locks_dir_honors_xdg_state_home_on_linux(monkeypatch, tmp_path):
+    """Comfy Desktop's Linux ``stateDir()`` resolves $XDG_STATE_HOME first.
 
-    A distro or sandbox with a non-default XDG_CONFIG_HOME (NixOS, Snap's
-    SNAP_USER_DATA convention, a containerized dev environment) would
-    otherwise never find a real, running Comfy Desktop instance -- silently
-    falling through to the wrong hardcoded default this whole fallback exists
-    to avoid.
+    A distro or sandbox with a non-default XDG_STATE_HOME would otherwise
+    never find a real, running Comfy Desktop instance.
     """
     monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", _REAL_LOCKS_DIR)
     monkeypatch.setattr(target.sys, "platform", "linux")
-    xdg = tmp_path / "custom-xdg-config"
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
-    d = xdg / "Comfy Desktop" / "port-locks"
+    xdg = tmp_path / "custom-xdg-state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
+    d = xdg / "comfyui-desktop-2" / "port-locks"
     d.mkdir(parents=True)
 
     assert target._comfy_desktop_port_locks_dir() == d
+
+
+def test_locks_dir_ignores_legacy_config_location_on_linux(monkeypatch, tmp_path):
+    """Desktop's migrateXdgPaths() empties ~/.config/Comfy Desktop/port-locks.
+
+    A directory left there must not be read as live state.
+    """
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", _REAL_LOCKS_DIR)
+    monkeypatch.setattr(target.sys, "platform", "linux")
+    monkeypatch.setattr(target.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    (tmp_path / ".config" / "Comfy Desktop" / "port-locks").mkdir(parents=True)
+
+    assert target._comfy_desktop_port_locks_dir() is None
 
 
 def test_locks_dir_none_for_an_unrecognized_platform(monkeypatch, tmp_path):
