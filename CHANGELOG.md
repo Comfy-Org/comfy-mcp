@@ -9,6 +9,22 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ## Unreleased
 
+### Added
+
+- **`list_workflow_slots` can answer for one node.** The new `node` parameter
+  forwards `comfy workflow slots --node`, which has existed engine-side since
+  comfy-cli 1.23.0 and was not reachable through this server. On a large graph
+  the unfiltered answer is most of what an agent spends its context on, which is
+  the first thing the reporter of
+  [#303](https://github.com/Comfy-Org/comfy-mcp/issues/303) asked for: "on
+  complex graph too much parameters occured as choice, waste of context". Takes
+  a node id or a subgraph instance id, and a subgraph instance brings every
+  `<id>/<inner>` slot inside it. On comfy-cli below 1.23.0 the call is refused
+  with the version named rather than answered unfiltered, because an agent that
+  believes the filter applied reads a whole graph's slots as one node's. An
+  unknown id is comfy-cli's own `workflow_slot_invalid`, which lists the ids
+  that do exist.
+
 ### Fixed
 
 - **`billing_status` described a comfy-cli that stopped existing in August.**

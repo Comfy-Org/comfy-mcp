@@ -98,7 +98,18 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # docstrings); the review round's caveats (`runnable` is weights only, a remote
 # target gets a `comfy_target_note`) took it to ~16,342 within the same ceiling,
 # so the next growth is still a decision.
-_BUDGET_TOKENS = 16_350
+#
+# 16,350 -> 16,450 when `list_workflow_slots` gained `node`. Docstring growth on
+# an existing tool rather than a new one, so the bar is the one the comment
+# above sets: the three sentences are the agent contract for the parameter
+# (what it selects, the comfy-cli 1.23.0 floor, that below the floor it is
+# REFUSED rather than silently answered unfiltered, and that an unknown id is
+# an error rather than an empty list). None of that is inferable from another
+# tool's docs, and an agent that assumes the filter applied when it did not
+# reads a whole graph's slots as one node's. The tree was already at ~16,337 of
+# 16,350, so no version of it fit the slack. Measured ~16,409 after the edit,
+# so the next growth is still a decision.
+_BUDGET_TOKENS = 16_450
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

@@ -13930,6 +13930,26 @@ def _flag_mispaired_slots(data: Any) -> Any:
     return data
 
 
+# `comfy workflow slots --node` landed in comfy-cli 1.23.0 (`7fd101a`,
+# 2026-10-17, the commit that also made a `get_template`-inserted node
+# addressable by its template id); 1.22.0 and older have the verb and not the
+# option. A per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a raise of
+# `_MIN_COMFY_CLI`: unfiltered `list_workflow_slots` works at 1.14.0, and the
+# filter is an optimization, so refusing every tool over it would be the wrong
+# trade.
+_MIN_SLOT_FILTER_COMFY_CLI = (1, 23, 0)
+_MIN_SLOT_FILTER_COMFY_CLI_STR = "1.23.0"
+
+_SLOT_FILTER_VERSION_ERROR = (
+    f"list_workflow_slots(node=...) requires comfy-cli "
+    f"{_MIN_SLOT_FILTER_COMFY_CLI_STR} or newer: `comfy workflow slots` has no "
+    f"`--node` option before {_MIN_SLOT_FILTER_COMFY_CLI_STR}, and passing one "
+    "makes Click print usage instead of a payload. Upgrade with `pip install "
+    "-U comfy-cli`, or call list_workflow_slots without `node` and filter the "
+    "rows by their `address` prefix."
+)
+
+
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -13938,7 +13958,7 @@ def _flag_mispaired_slots(data: Any) -> Any:
         openWorldHint=False,
     )
 )
-def list_workflow_slots(workflow_path: str) -> Any:
+def list_workflow_slots(workflow_path: str, node: str = "") -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
 
     Wraps ``comfy workflow slots <path>``. A "slot" is a parameter comfy-cli
@@ -13952,13 +13972,45 @@ def list_workflow_slots(workflow_path: str) -> Any:
     alongside plain ``A.name`` for promoted proxy widgets — both come back in
     ``address`` and are set the same way.
 
+    ``node`` narrows the answer to one node's slots — a node id, or a subgraph
+    instance id, which brings every ``<id>/<inner>`` inside it. Needs comfy-cli
+    1.23.0: below that it is REFUSED, not answered unfiltered. An unknown id
+    is an error naming the ids that do exist, not an empty list.
+
     Slots are tweakable PARAMETERS only — Note/MarkdownNote text is not a
     slot; use ``list_workflow_notes`` for that.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
     argv._guard_workflow_path(workflow_path, frontend=True)
-    data = _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    # Why the floor REFUSES rather than dropping the filter: an unfiltered
+    # answer is exactly the context cost `node` was passed to avoid, and a
+    # caller that believes it was applied reads a whole graph's slots as one
+    # node's. The docstring says it is refused; this says why.
+    extra: tuple[str, ...] = ()
+    if node:
+        # Hygiene guards, inside the branch so `node=""` keeps meaning "no
+        # filter" rather than becoming an error (same shape as
+        # `search_models`). `_reject_option_like` applies here for the reason
+        # it applies to a slot ADDR: an address begins with the node id, which
+        # comfy-cli surfaces non-negative, so no reachable id starts with `-`.
+        node = argv._guard_arg_len(
+            "node", argv._reject_option_like("node", argv._reject_nul("node", node))
+        )
+        # Per-VERB floor, read BEFORE the call rather than from the failure:
+        # comfy-cli below 1.23.0 has no `--node` on `workflow slots`, and Click
+        # answers an unknown option with a usage dump on exit 2 and no
+        # envelope, which surfaces as "returned no JSON" instead of naming the
+        # one number the caller needs. The same policy as
+        # `_MIN_WATCH_COMFY_CLI`: fail OPEN on an unreadable version, and
+        # un-latch the memo on the way out so the upgrade this error asks for
+        # takes effect inside the same server process.
+        version = _checked_comfy_version()
+        if version is not None and version < _MIN_SLOT_FILTER_COMFY_CLI:
+            _invalidate_version_cache()
+            raise ComfyCliError(_SLOT_FILTER_VERSION_ERROR)
+        extra = ("--node", node)
+    data = _run_comfy("workflow", "slots", workflow_path, *extra, timeout=60.0)
     return _flag_mispaired_slots(data)
 
 
