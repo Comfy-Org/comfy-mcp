@@ -669,6 +669,76 @@ def test_version_guard_fails_open_on_unparseable_version(monkeypatch):
     assert server._version_checked is True
 
 
+def test_version_guard_fails_open_on_the_unstamped_placeholder(monkeypatch):
+    """comfy-cli's `0.0.0` means "version unknown", so the floor must not refuse it.
+
+    `comfy-cli`'s `pyproject.toml` pins
+    `version = "0.0.0"` until its publish workflow rewrites it from the release
+    tag, so every source install and editable checkout reports `0.0.0` — and
+    `ConfigManager.get_cli_version` returns the same string when the
+    `importlib.metadata` lookup fails outright. `"0.0.0"` parses cleanly, so
+    `(0, 0, 0) < (1, 14, 0)` made this guard fail CLOSED on a build whose version
+    it could not establish, and every tool answered "too old, upgrade" on a
+    checkout that may well have been newer than the floor. The reported
+    workaround was hand-stamping `pyproject.toml` before testing.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", (9, 9, 9))  # a stale read
+    fake, _ = _fake_version("comfy-cli, version 0.0.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+
+    assert server._version_checked is True
+    # Normalized to the SAME unknown every other reader already fails open on,
+    # rather than a second sentinel each of them would have to learn: a per-verb
+    # floor (`job(action="watch")`) reading `(0, 0, 0)` would refuse the build
+    # the server-wide floor just waved through. It must also clear the stale
+    # tuple above, not keep it.
+    assert server._comfy_cli_version is None
+
+
+def test_version_floor_still_refuses_releases_below_it(monkeypatch):
+    """The `0.0.0` exemption is that tuple and nothing around it.
+
+    `0.0.1` and `0.1.0` are versions somebody could really have published, so
+    they stay refusals — the leniency covers comfy-cli's placeholder, not the
+    whole pre-1.0 range, and a guard that stopped enforcing the floor below 1.0
+    would be a worse bug than the one it fixed.
+    """
+    for below in ("0.0.1", "0.1.0", "1.13.0"):
+        monkeypatch.setattr(server, "_version_checked", False)
+        fake, _ = _fake_version(f"comfy-cli, version {below}")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        with pytest.raises(server.ComfyCliError, match=r"too old"):
+            server._check_comfy_version()
+
+    assert server._UNSTAMPED_COMFY_CLI == (0, 0, 0)
+
+
+def test_detect_version_reports_the_unstamped_placeholder_as_unknown(monkeypatch):
+    """The second site the unstamped placeholder reaches: the version report.
+
+    `_detect_comfy_cli_version` parses `--version` on its own, so before the fix
+    an unstamped build (a) published `comfy_cli_version: "0.0.0"` in
+    `server_info` — a version the build does not have — and (b) raised
+    "comfy-cli 0.0.0 is older than the required minimum" for any deployment that
+    set `COMFY_CLI_MIN_VERSION`. Unknown takes the documented warn-and-continue
+    path instead.
+    """
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    fake, _ = _fake_version("comfy-cli, version 0.0.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server._detect_comfy_cli_version() is None
+
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", "1.20.0")
+    report = server._check_comfy_cli_version()  # no raise
+
+    assert report["comfy_cli_version"] is None
+    assert any("could not determine" in w for w in report["warnings"])
+
+
 def test_version_guard_fails_open_when_version_errors(monkeypatch):
     """A `comfy --version` that can't be spawned fails OPEN, not closed —
     and a transient spawn error is NOT latched, so a later call re-checks."""

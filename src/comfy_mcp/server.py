@@ -487,6 +487,27 @@ _STREAM_LINE_LIMIT = 1024 * 1024
 _MIN_COMFY_CLI = (1, 14, 0)
 _MIN_COMFY_CLI_STR = "1.14.0"
 
+# comfy-cli's unstamped placeholder, exempted from the floor above.
+#
+# `comfy-cli`'s `pyproject.toml` carries `version = "0.0.0"` until its publish
+# workflow rewrites it from the release tag, and `ConfigManager.get_cli_version`
+# ALSO returns `"0.0.0"` when the `importlib.metadata` lookup fails outright. So
+# every source install, editable checkout and metadata-less environment reports
+# `0.0.0`, and no comfy-cli release ever has: the value means "this build's
+# version is unknown", never "this build is old".
+#
+# The floor's documented policy is to fail OPEN on a `--version` it cannot
+# positively read as too old. `"0.0.0"` parses cleanly, so `(0, 0, 0) <
+# (1, 14, 0)` made the guard fail CLOSED on exactly the builds whose version it
+# could not establish — every tool refused with "too old, upgrade", on a
+# checkout that may well be NEWER than the floor. The reported workaround was to
+# hand-stamp `pyproject.toml` before testing.
+#
+# Exactly this tuple, not a `major == 0` range: `0.1.0` and `0.0.1` are versions
+# somebody could really have published, and the leniency is meant to cover the
+# placeholder rather than the whole pre-1.0 range.
+_UNSTAMPED_COMFY_CLI = (0, 0, 0)
+
 # The version guard shells out to `comfy --version`; memoize so it runs at most
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
@@ -1047,6 +1068,15 @@ def _probe_comfy_version() -> None:
     version = None
     if proc.returncode == 0:
         version = _parse_version(proc.stdout) or _parse_version(proc.stderr)
+    # An unstamped build reports a version it does not have. Normalized to None
+    # HERE, before the global is written and before the floor compares, so every
+    # reader sees one "unknown" and not two: the server-wide floor below, the
+    # per-verb floors reading `_comfy_cli_version`, and the opt-in
+    # `COMFY_CLI_MIN_VERSION` report all already treat None as fail-OPEN, and a
+    # second sentinel that each of them had to know about is how one of them
+    # ends up refusing a source build on its own.
+    if version == _UNSTAMPED_COMFY_CLI:
+        version = None
     # Recorded UNCONDITIONALLY, and BEFORE the floor check below, which raises
     # WITHOUT latching `_version_checked`: a too-old install the caller retries
     # in the same process re-runs this whole function, and a per-verb floor
@@ -3389,6 +3419,13 @@ def _detect_comfy_cli_version() -> str | None:
     if proc.returncode != 0:
         return None
     parsed = _parse_version(proc.stdout)
+    # Same exemption as the server-wide floor, and this is the SECOND site that
+    # needed it: an unstamped build reported `"0.0.0"` here, so a deployment
+    # setting `COMFY_CLI_MIN_VERSION` raised "comfy-cli 0.0.0 is older than the
+    # required minimum" on it, and `server_info` published a version the build
+    # does not have. None takes the documented "could not determine" path.
+    if parsed == _UNSTAMPED_COMFY_CLI:
+        return None
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
