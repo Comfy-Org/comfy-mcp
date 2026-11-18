@@ -857,10 +857,15 @@ def test_server_info_docstring_teaches_freshness_and_update_commands():
 # contain one. A hedge is a phrase, so requiring whole words costs nothing: the
 # three live offenders this was written for all read "newer than", "landed ...
 # after" and "releases after" as words.
+# The boundary has to sit on BOTH ends of the verb. A leading `\b` alone still
+# matched "shipments after 1.13.0", because `ships?` consumed "ship" and the
+# bounded clause then swallowed "ments " on its way to `after` — so the arm
+# closes with `\b` too. Words that merely CONTAIN a verb ("ownership",
+# "relationship") never needed the trailing one; words that START with it do.
 _HEDGE_RE = re.compile(
     r"(?P<lead>[^.\n]{0,80}?)"
     r"(?:\bnewer than"
-    r"|\b(?:landed|shipped|ships?)[^.]{0,60}?(?:releases\s+)?\bafter"
+    r"|\b(?:landed|shipped|ships?)\b[^.]{0,60}?(?:releases\s+)?\bafter"
     r"|\breleases after)"
     r"\s+(?:comfy-cli\s+)?v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?",
     re.IGNORECASE,
@@ -959,6 +964,10 @@ def test_the_hedge_detector_actually_detects():
     assert _hedged_versions("the airships after 1.13.0 were decommissioned") == []
     assert _hedged_versions("the verb landed thereafter v1.13.0") == []
     assert _hedged_versions("preleases after 1.13.0 are unsupported") == []
+    # A trailing boundary too: the verb must not be the head of a longer word,
+    # which a leading `\b` alone permitted.
+    assert _hedged_versions("shipments after 1.13.0 are unsupported") == []
+    assert _hedged_versions("shipping after v1.13.0 is unaffected") == []
     # ... while the real phrases still fire, mid-sentence and capitalised.
     assert _hedged_versions("it landed, finally, after comfy-cli 1.13.0") == [
         (1, 13, 0)
