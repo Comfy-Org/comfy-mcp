@@ -748,7 +748,7 @@ def test_search_models_old_comfy_cli_retries_via_comfy_local_url(
 ):
     """A comfy-cli whose `comfy models` predates --host still reads the REMOTE.
 
-    The flags landed on `comfy models` in a comfy-cli newer than v1.26.0, far
+    The flags landed on `comfy models` in comfy-cli 1.27.0, far
     above this server's floor, so every supported release rejects the forwarded
     ``--host`` with Click's usage dump (exit 2, no envelope). Those builds
     resolve their target through ``COMFY_LOCAL_URL``, so the retry hands the

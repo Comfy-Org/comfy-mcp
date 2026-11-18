@@ -27,13 +27,35 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ### Fixed
 
+- **Three capability claims named the release that does NOT have the feature.**
+  `search_templates(runnable_only=True)` told a caller its `--runnable` filter
+  "landed after comfy-cli 1.26.0", the `search_models` remote refusal said
+  `--host` "ships in a comfy-cli newer than v1.26.0", and the `search_models`
+  docstring dated token-AND search to "newer than v1.15.0". All three were true
+  when written — the first two had no release at all to point at — and all three
+  made the reader derive the number that matters. comfy-cli **1.27.0** shipped
+  both flags on 2026-11-18 ([#878](https://github.com/Comfy-Org/comfy-cli/pull/878),
+  [#876](https://github.com/Comfy-Org/comfy-cli/pull/876)) and token search has
+  been in **1.16.0** since 2026-08-10
+  ([#684](https://github.com/Comfy-Org/comfy-cli/pull/684)), so each site now
+  names its release, the two degrades name a `pip install --upgrade` bound you
+  can act on, and the floors are constants
+  (`_MIN_RUNNABLE_COMFY_CLI_STR`, `_MIN_MODELS_HOST_COMFY_CLI_STR`) beside
+  `_MIN_WATCH_COMFY_CLI_STR` and `_MIN_BILLING_COMFY_CLI_STR`. The existing
+  hedge guard only failed a claim at or below the **server-wide** floor, so it
+  passed all three; it now fails *any* hedged comfy-cli version, across
+  `server.py`, `target.py` and the README, and sees the shape that hid two of
+  them (a clause between "landed" and "after"). Two contract tests ask the real
+  binary whether the flags are there, because a mocked `NoSuchOption` proves the
+  message's wording and never its version.
+
 - **`billing_status` described a comfy-cli that stopped existing in August.**
   0.11.0 said in five places — these release notes, the tool docstring, the
   README tool table, a code comment and a test — that no tagged comfy-cli
   release had `comfy cloud status` yet, and that its `unsupported: true`
   degrade was therefore "the common result today". The verb shipped in
-  comfy-cli **1.17.0 on 2026-08-22**, nine releases before 0.11.0 went out
-  (1.26.0 is current), so on any supported install the degrade is unreachable
+  comfy-cli **1.17.0 on 2026-08-22**, nine releases before 0.11.0 went out,
+  so on any install at or above this server's floor the degrade is unreachable
   and the message asking the user to upgrade reached only users who were
   already current. The degrade now names the floor it is about — comfy-cli
   1.17.0 — the way `job(action="watch")` names 1.16.0, and a scheduled

@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from conftest import _FakeRunProc, _raises_at_spawn
 
-from comfy_mcp import server
+from comfy_mcp import server, target
 
 # --- envelope-version assertion (_unwrap_envelope) --------------------------
 
@@ -844,10 +844,17 @@ def test_server_info_docstring_teaches_freshness_and_update_commands():
 # sentence fragment in front of the hedge and `_hedged_versions` drops a match
 # whose subject is ComfyUI rather than comfy-cli. A spurious failure here blocks
 # unrelated PRs, so the guard has to be able to tell the two apart.
+# The `landed ... after` arm allows a bounded clause between the verb and
+# "after", because every live offender put one there: "landed on `comfy models`
+# only after comfy-cli v1.26.0" and "landed on ``comfy\n models`` (#876) after
+# v1.26.0" both sailed past an adjacency-only pattern while reading, to a
+# caller, exactly like the hedges it did catch. The clause is capped and stops
+# at a sentence end, so it cannot reach across two separate claims.
 _HEDGE_RE = re.compile(
     r"(?P<lead>[^.\n]{0,80}?)"
-    r"(?:newer than|(?:landed|shipped|ships?)\s+(?:in\s+)?(?:comfy-cli\s+)?"
-    r"(?:releases\s+)?after|releases after)"
+    r"(?:newer than"
+    r"|(?:landed|shipped|ships?)[^.]{0,60}?(?:releases\s+)?after"
+    r"|releases after)"
     r"\s+(?:comfy-cli\s+)?v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?",
     re.IGNORECASE,
 )
@@ -927,6 +934,18 @@ def test_the_hedge_detector_actually_detects():
     assert _hedged_versions("needs comfy-cli newer than 1.13.0 to drive ComfyUI") == [
         (1, 13, 0)
     ]
+    # The two live offenders the adjacency-only pattern could not see: a clause
+    # sits between the verb and "after". Both read, to a caller, exactly like
+    # the hedges above.
+    assert _hedged_versions(
+        "The `--host` options landed on `comfy models` only after comfy-cli v1.26.0"
+    ) == [(1, 26, 0)]
+    assert _hedged_versions(
+        "the options landed on ``comfy models`` (comfy-cli#876) after v1.26.0"
+    ) == [(1, 26, 0)]
+    # The clause stops at a sentence end, so one claim's verb cannot reach the
+    # next claim's version and report a hedge nobody wrote.
+    assert _hedged_versions("the verb shipped in 1.17.0. Upgrade after v1.26.0") == []
 
 
 def test_the_rendered_string_reader_sees_through_concat_and_interpolation():
@@ -948,43 +967,70 @@ def test_the_rendered_string_reader_sees_through_concat_and_interpolation():
     assert "{…}" in "".join(_rendered_strings('y = f"ships after {some_other_var}"'))
 
 
-def test_no_capability_claim_hedges_a_version_the_floor_already_covers():
-    """No docstring may say "you need a comfy-cli newer than X" for X <= floor.
+def test_no_capability_claim_hedges_a_comfy_cli_version_at_all():
+    """No prose here may say "you need a comfy-cli newer than X". Name the release.
 
-    This is the class of staleness a floor raise creates and nothing else
-    catches. Every such sentence was TRUE when written — the verb really did land
-    after the then-current floor — and every one of them silently became either
-    vacuous or false the moment the floor moved to the release carrying the verb.
-    An agent reading "node_dependencies requires a comfy-cli newer than 1.13.0"
-    on a server that refuses to start below 1.14.0 is being told to upgrade to
-    something it already has.
+    This started as a FLOOR-relative guard: a hedge was an offender only when X
+    was at or below `_MIN_COMFY_CLI`, on the reasoning that the floor already
+    guaranteed it. That caught the staleness a floor RAISE creates and missed
+    the larger half of the class, which needs no floor move at all.
 
-    The fix at each site is to name the release that HAS the capability, spelled
-    out rather than interpolated from `_MIN_COMFY_CLI_STR` (which is the FLOOR,
-    so interpolating it re-creates exactly this contradiction), and to say what
-    the degrade really protects against now: a build that slipped past the
-    fail-OPEN version guard, or a dependency outside comfy-cli.
+    A hedge names the newest release that does NOT have the capability, so it is
+    only ever honest while no release has it — and upstream, not this repo,
+    decides when that stops being true. Three lived examples, all true the day
+    they were written:
 
-    Two passes, because the offenders come in two shapes. The RAW source pass
-    covers prose that is literally in the file — comments and docstrings, which
-    the parser does not reassemble. The RENDERED pass (`_rendered_strings`)
-    covers the shape that actually ships to a caller: a degrade message built
-    from adjacent literals with the floor interpolated, which the raw pass is
-    structurally blind to (no digits in the source, and the phrase split across
-    the concatenation seam). Without the second pass this test asserted only
-    that nobody typed the contradiction by hand.
+    * "`--runnable` landed after 1.26.0" was the only thing sayable while the
+      flag was unreleased. comfy-cli 1.27.0 shipped it on 2026-11-18 and the
+      sentence became a riddle: the degrade told a 1.27.0 user to
+      `pip install -U comfy-cli` when they already had the flag, and told a
+      1.20.0 user to upgrade without saying how far.
+    * "`--host` on `comfy models` ships in a comfy-cli newer than v1.26.0" went
+      the same way on the same release.
+    * "token search works on a comfy-cli newer than v1.15.0" was never wrong,
+      but it makes the reader derive 1.16.0 from a number that is not it.
+
+    So the rule is now absolute, and that is also what makes it cheap to obey:
+    a floor has a release number, and `_MIN_WATCH_COMFY_CLI_STR`,
+    `_MIN_BILLING_COMFY_CLI_STR`, `_MIN_SLOT_FILTER_COMFY_CLI_STR`,
+    `_MIN_RUNNABLE_COMFY_CLI_STR` and `_MIN_MODELS_HOST_COMFY_CLI_STR` are
+    where the per-verb ones live. Spell it out or interpolate one of those —
+    never `_MIN_COMFY_CLI_STR`, which is the server-wide floor and re-creates
+    the vacuous-claim bug this test was originally written for.
+
+    Three surfaces, because the offenders were spread across all three and a
+    sweep of one file reported clean while two others carried the same sentence.
+    `server.py` gets both a RAW pass (comments and docstrings, which the parser
+    does not reassemble) and a RENDERED pass (`_rendered_strings`, for a degrade
+    message built from adjacent literals with a constant interpolated, which the
+    raw pass is structurally blind to). `target.py` and `README.md` are prose
+    only, so the raw pass is the whole check there. The README is located from
+    this file rather than from the package, the way `test_failure_log` and
+    `test_address_env_docs` already do it, so an editable install cannot point
+    the sweep at a directory with no README and pass by reading nothing.
     """
-    source = Path(server.__file__).read_text(encoding="utf-8")
-    hedged = _hedged_versions(source)
-    for rendered in _rendered_strings(source):
-        hedged.extend(_hedged_versions(rendered))
-    offenders = [v for v in hedged if v <= server._MIN_COMFY_CLI]
+    surfaces: list[tuple[str, str]] = []
+    for module in (server, target):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        surfaces.append((Path(module.__file__).name, source))
+    readme = Path(__file__).resolve().parent.parent / "README.md"
+    assert readme.is_file(), f"README.md not beside the test suite: {readme}"
+    surfaces.append(("README.md", readme.read_text(encoding="utf-8")))
+
+    offenders: list[str] = []
+    for name, source in surfaces:
+        hedged = list(_hedged_versions(source))
+        if name.endswith(".py"):
+            for rendered in _rendered_strings(source):
+                hedged.extend(_hedged_versions(rendered))
+        offenders.extend(f"{name}: {'.'.join(map(str, v))}" for v in hedged)
+
     assert offenders == [], (
-        f"{len(offenders)} capability claim(s) in server.py hedge a comfy-cli "
-        f"version at or below the {server._MIN_COMFY_CLI_STR} floor "
-        f"({', '.join('.'.join(map(str, v)) for v in offenders)}) — the floor "
-        "already guarantees it, so the sentence is vacuous or false. Name the "
-        "release that carries the capability instead."
+        f"{len(offenders)} capability claim(s) hedge a comfy-cli version "
+        f"({', '.join(offenders)}). A hedge names the release that does NOT "
+        "have the capability, so it expires the moment upstream ships one that "
+        "does — and nothing here notices. Name the release that carries it, or "
+        "interpolate the per-verb floor constant for it."
     )
 
 
