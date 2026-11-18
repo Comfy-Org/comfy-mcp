@@ -14,6 +14,7 @@ dependency. These lock in the runtime checks that guard it:
 from __future__ import annotations
 
 import ast
+import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -850,11 +851,17 @@ def test_server_info_docstring_teaches_freshness_and_update_commands():
 # v1.26.0" both sailed past an adjacency-only pattern while reading, to a
 # caller, exactly like the hedges it did catch. The clause is capped and stops
 # at a sentence end, so it cannot reach across two separate claims.
+# Every arm is anchored on a word boundary. Without one the verbs match inside a
+# longer word — `ships?` fires on "airships", `after` on "thereafter" — and this
+# guard's failure mode is a RED CI on an unrelated PR whose prose happened to
+# contain one. A hedge is a phrase, so requiring whole words costs nothing: the
+# three live offenders this was written for all read "newer than", "landed ...
+# after" and "releases after" as words.
 _HEDGE_RE = re.compile(
     r"(?P<lead>[^.\n]{0,80}?)"
-    r"(?:newer than"
-    r"|(?:landed|shipped|ships?)[^.]{0,60}?(?:releases\s+)?after"
-    r"|releases after)"
+    r"(?:\bnewer than"
+    r"|\b(?:landed|shipped|ships?)[^.]{0,60}?(?:releases\s+)?\bafter"
+    r"|\breleases after)"
     r"\s+(?:comfy-cli\s+)?v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?",
     re.IGNORECASE,
 )
@@ -946,6 +953,17 @@ def test_the_hedge_detector_actually_detects():
     # The clause stops at a sentence end, so one claim's verb cannot reach the
     # next claim's version and report a hedge nobody wrote.
     assert _hedged_versions("the verb shipped in 1.17.0. Upgrade after v1.26.0") == []
+    # Whole words only. A verb matched inside a longer word turns this guard
+    # into a red CI on prose that hedges nothing, which is the one failure mode
+    # a lint like this cannot afford -- the next author's fix is to delete it.
+    assert _hedged_versions("the airships after 1.13.0 were decommissioned") == []
+    assert _hedged_versions("the verb landed thereafter v1.13.0") == []
+    assert _hedged_versions("preleases after 1.13.0 are unsupported") == []
+    # ... while the real phrases still fire, mid-sentence and capitalised.
+    assert _hedged_versions("it landed, finally, after comfy-cli 1.13.0") == [
+        (1, 13, 0)
+    ]
+    assert _hedged_versions("Releases after 1.13.0 carry it") == [(1, 13, 0)]
 
 
 def test_the_rendered_string_reader_sees_through_concat_and_interpolation():
@@ -1049,6 +1067,35 @@ def test_the_spelled_out_upgrade_hints_name_a_release_the_floor_guarantees():
         assert "1.14.0" in hint
         assert _MIN_STR_INTERPOLATION_LEAKED not in hint
         assert _hedged_versions(hint) == []
+
+
+def test_the_token_search_floor_constant_is_the_docstring_s_only_source():
+    """`_MIN_MODELS_TOKEN_SEARCH_COMFY_CLI_STR` is read by prose, so pin the prose.
+
+    The other four per-verb floors are interpolated into a degrade message, so a
+    stale one shows up as a wrong sentence at runtime. This one has no degrade to
+    live in: token-AND search fails SOFT -- a narrower match, no error -- so the
+    only place the number is stated is the `search_models` docstring, and a
+    constant nothing reads is a constant nothing keeps honest. Flagged in review
+    on comfy-mcp PR 325 as simply unused; deleting it would have been the smaller
+    change and the wrong one, because the number would then live only in prose,
+    which is the drift this whole module exists to catch.
+
+    A docstring cannot interpolate, so the direction is reversed: the constant
+    stays the source and this test is what makes it load-bearing. If the floor
+    moves, this fails and names the sentence to edit.
+    """
+    floor = server._MIN_MODELS_TOKEN_SEARCH_COMFY_CLI_STR
+    doc = inspect.getdoc(server.search_models) or ""
+    assert f"comfy-cli {floor} and newer" in doc, (
+        f"the search_models docstring must date token-AND search to {floor}, the "
+        "release that carries it, in the words this test pins -- otherwise "
+        "`_MIN_MODELS_TOKEN_SEARCH_COMFY_CLI_STR` is read by nothing and stops "
+        f"being the source of the number. Docstring says: {doc[:400]!r}"
+    )
+    # And the sentence must not be a hedge, which is the failure the floor
+    # constant was introduced to retire.
+    assert _hedged_versions(doc) == []
 
 
 def test_the_degrade_messages_name_the_release_that_carries_their_verb():

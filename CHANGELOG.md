@@ -45,9 +45,13 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   hedge guard only failed a claim at or below the **server-wide** floor, so it
   passed all three; it now fails *any* hedged comfy-cli version, across
   `server.py`, `target.py` and the README, and sees the shape that hid two of
-  them (a clause between "landed" and "after"). Two contract tests ask the real
-  binary whether the flags are there, because a mocked `NoSuchOption` proves the
-  message's wording and never its version.
+  them (a clause between "landed" and "after"), on whole words only so a verb
+  inside a longer word cannot fail CI on prose that hedges nothing. Two contract
+  tests ask the real binary whether the flags are there, because a mocked
+  `NoSuchOption` proves the message's wording and never its version. The
+  token-search floor has no degrade to live in -- that path fails soft, with a
+  narrower match and no error -- so its constant is pinned to the `search_models`
+  docstring by a test instead, which is what keeps the number in one place.
 
 - **`billing_status` described a comfy-cli that stopped existing in August.**
   0.11.0 said in five places — these release notes, the tool docstring, the
@@ -55,7 +59,7 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   release had `comfy cloud status` yet, and that its `unsupported: true`
   degrade was therefore "the common result today". The verb shipped in
   comfy-cli **1.17.0 on 2026-08-22**, nine releases before 0.11.0 went out,
-  so on any install at or above this server's floor the degrade is unreachable
+  so on any install at or above **1.17.0** the degrade is unreachable
   and the message asking the user to upgrade reached only users who were
   already current. The degrade now names the floor it is about — comfy-cli
   1.17.0 — the way `job(action="watch")` names 1.16.0, and a scheduled
