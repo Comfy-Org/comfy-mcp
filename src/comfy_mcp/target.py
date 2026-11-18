@@ -269,6 +269,9 @@ def _pid_is_alive(pid: Any) -> bool:
     except ProcessLookupError:
         return False
     except (PermissionError, OSError):
+        # EPERM means the process exists but is not ours, so it is alive. This
+        # matches Comfy Desktop's own liveness check, and erring toward alive
+        # only falls through to the existing default target.
         return True
     return True
 
