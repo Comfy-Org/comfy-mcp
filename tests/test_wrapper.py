@@ -2935,6 +2935,83 @@ def test_fetch_outputs_wraps_comfy_download(patched_run):
     assert calls[0]["env"]["COMFY_WHERE"] == "local"
 
 
+def test_fetch_outputs_omitted_out_dir_passes_no_dash_o(patched_run):
+    """No `out_dir` means no `-o`, so comfy-cli resolves the destination.
+
+    This tool used to REQUIRE `out_dir`, which made it stricter than the
+    command it wraps: `comfy download` resolves a project-aware default, and a
+    caller who had configured one still had to name a path on every call. The
+    passthrough is to leave the option off the argv entirely rather than to
+    reproduce comfy-cli's resolution here.
+    """
+    calls = patched_run(envelope(data={"files": []}))
+
+    server.fetch_outputs("pid")
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]
+    assert cmd[4:] == ["download", "pid"]
+    assert "-o" not in cmd
+
+
+@pytest.mark.parametrize("bad_id", ["--help", "-o", "", "p\x001"])
+def test_fetch_outputs_omitted_out_dir_still_guards_the_prompt_id(no_spawn, bad_id):
+    """Skipping the `out_dir` guards must not skip the id's.
+
+    The leading-dash case is the one that got sharper rather than softer: with
+    no `-o` on the argv, a dash-led id is now the FIRST option-shaped token
+    comfy-cli sees.
+    """
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        server.fetch_outputs(bad_id)
+
+
+def test_fetch_outputs_scopes_inline_media_to_the_reported_dir(patched_run, tmp_path):
+    """With no `out_dir`, the manifest is scoped by the payload's own `out_dir`.
+
+    comfy-cli reports the directory it resolved and wrote to, and has carried
+    that field since 1.14.0 — this server's floor — so the inline manifest is
+    read off the payload instead of guessing at a default this server does not
+    own.
+    """
+    written = tmp_path / "resolved"
+    written.mkdir()
+    (written / "gen.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    patched_run(
+        envelope(
+            data={
+                "out_dir": str(written),
+                "files": [{"path": str(written / "gen.png")}],
+            }
+        )
+    )
+
+    result = server.fetch_outputs("pid", inline_images=True)
+
+    media = result.structured_content["media"]
+    assert [os.path.basename(entry["path"]) for entry in media] == ["gen.png"]
+
+
+def test_fetch_outputs_inline_media_skipped_when_the_dir_is_unknowable(
+    patched_run, tmp_path, monkeypatch
+):
+    """No `out_dir` argument and none in the payload: return metadata, not a guess.
+
+    `_collect_output_media` needs a containing directory to reject a same-named
+    file in this process's CWD, so with nothing to scope to the honest result is
+    the download's own metadata rather than a manifest built against the wrong
+    directory.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "gen.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    patched_run(envelope(data={"files": [{"path": "gen.png"}]}))
+
+    result = server.fetch_outputs("pid", inline_images=True)
+
+    # The plain payload, not a `CallToolResult` carrying a media manifest.
+    assert result == {"files": [{"path": "gen.png"}]}
+
+
 def test_fetch_outputs_url_only_appends_flag(patched_run):
     """url_only=True adds --url-only so comfy emits URLs without downloading bytes."""
     calls = patched_run(envelope(data={"urls": []}))

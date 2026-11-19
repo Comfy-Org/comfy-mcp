@@ -9,6 +9,25 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ## Unreleased
 
+### Changed
+
+- **`fetch_outputs` no longer requires `out_dir`.** Omit it and `-o` is left
+  off the argv entirely, so comfy-cli resolves the destination it already knows
+  how to resolve. This tool was stricter than the command it wraps: a caller
+  with a configured download directory still had to name a path on every call,
+  and an LLM caller has to invent one — which is what the reporter of
+  [#304](https://github.com/Comfy-Org/comfy-mcp/issues/304) asked to stop doing
+  ("llm model do not assure the path, it should be made programmatically").
+  Passing `out_dir` is unchanged, including both of its input guards. With
+  `inline_images=True` the media manifest is now scoped by the directory
+  comfy-cli reports in its own payload rather than by one recomputed here; with
+  no parameter and no reported directory there is nothing to scope to, so the
+  download's metadata is returned without a manifest instead of one built
+  against the wrong directory. Full effect needs
+  [comfy-cli#1158](https://github.com/Comfy-Org/comfy-cli/pull/1158), whose
+  absence leaves `comfy download`'s own default shadowing its project-aware
+  resolver.
+
 ### Added
 
 - **`list_workflow_slots` can answer for one node.** The new `node` parameter
