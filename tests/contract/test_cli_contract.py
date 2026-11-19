@@ -91,3 +91,66 @@ def test_cloud_status_verb_exists_on_the_installed_comfy_cli():
         f"wraps may be gone (floor {server._MIN_BILLING_COMFY_CLI_STR}). "
         f"rc={proc.returncode} stderr={proc.stderr[-400:]!r}"
     )
+
+
+def test_templates_ls_advertises_the_runnable_filter():
+    """`search_templates(runnable_only=True)` names a floor, so prove the floor.
+
+    This points the OPPOSITE way to the `cloud status` check above. That one
+    guards against a verb being removed; this one guards against a floor claim
+    that was never true. The `--runnable` degrade used to say the filter "landed
+    after comfy-cli 1.26.0" — correct while nothing carried it, and a riddle
+    once 1.27.0 did. Naming 1.27.0 instead is only worth doing if something
+    checks it, and nothing mocked can: the unit suite asserts the message a
+    SYNTHETIC `NoSuchOption` produces, which is true whatever version is named.
+
+    The workflow installs the newest released comfy-cli, so a failure here means
+    either the flag never shipped where this repo says it did, or upstream took
+    it away — and both make the degrade the common path, which is exactly the
+    claim the repo got wrong by asserting it in prose.
+    """
+    proc = subprocess.run(  # fixed argv, no shell, no caller input
+        [server.COMFY_BIN, "templates", "ls", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"`comfy templates ls --help` did not exit 0: rc={proc.returncode} "
+        f"stderr={proc.stderr[-400:]!r}"
+    )
+    assert "--runnable" in proc.stdout, (
+        "`comfy templates ls` does not advertise `--runnable`, which this repo "
+        f"says comfy-cli {server._MIN_RUNNABLE_COMFY_CLI_STR} and newer carry "
+        "(search_templates(runnable_only=True) wraps it). "
+        f"--help stdout={proc.stdout[-400:]!r}"
+    )
+
+
+def test_models_search_advertises_the_host_forward():
+    """`search_models`' remote mode names a floor too, and the stakes are higher.
+
+    The version-skew retry exists because `comfy models` once rejected the
+    forwarded `--host`. Its refusal message now names comfy-cli
+    `_MIN_MODELS_HOST_COMFY_CLI_STR` as the release that accepts it. If that is
+    wrong, the failure is not cosmetic: the whole point of forwarding the flag
+    is that an unforwarded `comfy models` answers "what models are installed?"
+    about THIS machine while `run_workflow` submits to the remote, so an agent
+    gates a run — or a redundant multi-GB `download_model` — on the wrong disk.
+    """
+    proc = subprocess.run(  # fixed argv, no shell, no caller input
+        [server.COMFY_BIN, "models", "search", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"`comfy models search --help` did not exit 0: rc={proc.returncode} "
+        f"stderr={proc.stderr[-400:]!r}"
+    )
+    assert "--host" in proc.stdout, (
+        "`comfy models search` does not advertise `--host`, which this repo "
+        f"says comfy-cli {server._MIN_MODELS_HOST_COMFY_CLI_STR} and newer "
+        "carry — without it search_models answers about the wrong machine. "
+        f"--help stdout={proc.stdout[-400:]!r}"
+    )

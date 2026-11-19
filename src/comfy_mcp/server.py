@@ -10922,6 +10922,17 @@ def _unmatched_template_tokens(rows: list[dict], query_lower: str) -> list[str]:
     return [t for t in tokens if not any(word.startswith(t) for word in vocabulary)]
 
 
+# `comfy templates ls --runnable` landed in comfy-cli 1.27.0 (`6d1f7f3e`,
+# Comfy-Org/comfy-cli#878, released 2026-11-18). When `runnable_only` was built
+# no tagged release carried the flag, so the degrade could only say "after
+# 1.26.0" — a hedge, and hedges expire silently the moment upstream ships. One
+# did, so the release has a number now and the message says it. Per-verb, like
+# `_MIN_WATCH_COMFY_CLI`: `runnable_only` is one optional argument of one tool,
+# so raising the server-wide `_MIN_COMFY_CLI` for it would refuse every other
+# tool on an install where only this filter is missing.
+_MIN_RUNNABLE_COMFY_CLI_STR = "1.27.0"
+
+
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -11035,9 +11046,11 @@ def search_templates(
             raise
         raise ComfyCliError(
             "search_templates(runnable_only=True) unavailable: the installed "
-            "comfy-cli's `templates ls` has no `--runnable` filter (it landed "
-            "after comfy-cli 1.26.0); upgrade with `pip install -U comfy-cli`, or "
-            "drop runnable_only and ask `check_template` per template.",
+            "comfy-cli's `templates ls` has no `--runnable` filter, which "
+            f"comfy-cli {_MIN_RUNNABLE_COMFY_CLI_STR} and newer carry; upgrade "
+            'with `pip install --upgrade "comfy-cli>='
+            f'{_MIN_RUNNABLE_COMFY_CLI_STR}"`, or drop runnable_only and ask '
+            "`check_template` per template.",
             no_envelope=exc.no_envelope,
             returncode=exc.returncode,
         ) from exc
@@ -12650,6 +12663,21 @@ async def workflow_deps(workflow_path: str) -> Any:
     return manifest
 
 
+# `--host` / `--port` landed on `comfy models` in comfy-cli 1.27.0 (`5f381e57`,
+# Comfy-Org/comfy-cli#876, released 2026-11-18), and token-AND
+# separator-insensitive `models search --text` in 1.16.0 (`ed47611b`,
+# Comfy-Org/comfy-cli#684). Both were first written up against the release
+# BELOW them — 1.26.0 and 1.15.0 — because the flag had no release at all yet
+# and the search change was being contrasted with what came before. That shape
+# is not durable: it names the release that does NOT have the capability, so a
+# caller has to know what shipped next to act on it, and the `--host` one
+# became answerable the moment 1.27.0 went out. Both are per-verb and fail SOFT
+# (a retry and a narrower search), never a refusal, so neither belongs in
+# `_MIN_COMFY_CLI`.
+_MIN_MODELS_HOST_COMFY_CLI_STR = "1.27.0"
+_MIN_MODELS_TOKEN_SEARCH_COMFY_CLI_STR = "1.16.0"
+
+
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -12670,8 +12698,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
     ``comfy models list-folders`` (folder names).
 
     ``query`` tokens match word-order-independently and ignore ``-`` ``_``
-    ``.`` separators ("sdxl base" finds ``sd_xl_base_1.0.safetensors``) on a
-    comfy-cli newer than v1.15.0; on v1.15.0 and older the whole query is one
+    ``.`` separators ("sdxl base" finds ``sd_xl_base_1.0.safetensors``) on
+    comfy-cli 1.16.0 and newer; below that the whole query is one contiguous
     substring, so search a single word there.
 
     RESPONSE SHAPE DIFFERS BY MODE: ``query`` returns ``{rows: [...]}``,
@@ -12741,8 +12769,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
         return _run_comfy(*args, timeout=60.0)
     except ComfyCliError as exc:
         # Version skew: the `--host` / `--port` options landed on `comfy models`
-        # (Comfy-Org/comfy-cli#876) in a comfy-cli NEWER than v1.26.0 — well above
-        # `_MIN_COMFY_CLI` — so every supported comfy-cli before it has the
+        # (Comfy-Org/comfy-cli#876) in `_MIN_MODELS_HOST_COMFY_CLI_STR` — well
+        # above `_MIN_COMFY_CLI` — so every supported comfy-cli below it has the
         # discovery leaves and rejects just the forwarded flag, with Click's usage
         # dump (`NoSuchOption`: exit 2, no envelope). Those same builds resolve
         # their target through `resolve_target`, whose local precedence honors
@@ -12783,13 +12811,14 @@ def search_models(query: str = "", folder: str = "") -> Any:
         ):
             raise ComfyCliError(
                 "the installed comfy-cli cannot point `comfy models` at a remote "
-                "ComfyUI: it does not accept `--host` (that ships in a comfy-cli "
-                "newer than v1.26.0), and the configured host is empty or contains "
+                "ComfyUI: it does not accept `--host` (which comfy-cli "
+                f"{_MIN_MODELS_HOST_COMFY_CLI_STR} and newer carry), and the "
+                "configured host is empty or contains "
                 "whitespace or URL-special characters, so it cannot be handed over as "
                 "COMFY_LOCAL_URL either. Nothing was listed, and this machine's "
                 "catalog was NOT returned instead. Set COMFYUI_HOST / COMFYUI_URL "
-                "to a plain host name or IP address, or upgrade comfy-cli to a "
-                "release whose `comfy models` accepts `--host`."
+                "to a plain host name or IP address, or upgrade comfy-cli "
+                f'(`pip install --upgrade "comfy-cli>={_MIN_MODELS_HOST_COMFY_CLI_STR}"`).'
             ) from exc
         return _run_comfy(
             *args,
