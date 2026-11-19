@@ -1746,7 +1746,15 @@ def test_the_no_events_hint_names_the_version_when_it_is_unknown(
 ):
     """The fail-OPEN case is the one the version half of the hint exists for: an
     install the gate could not identify may well be the too-old one, and this is
-    the only place left to say so."""
+    the only place left to say so.
+
+    It must say so as ONE of two open causes, not as the likely one. Source
+    checkouts of `main` are most of the unreadable-version population — and all
+    of it, now that comfy-cli's unstamped `0.0.0` is read as unknown rather than
+    refused — and those are usually NEWER than the watch floor. A hint that said
+    "usually means comfy-cli < 1.16.0" would send the majority of the people who
+    see it to upgrade a comfy-cli already ahead of the one being asked for.
+    """
     _patch_jobs_status(monkeypatch, {"status": "running"})
     blocking_stream([])
     _patch_comfy_version(monkeypatch, "comfy-cli, version unreleased-dev")
@@ -1756,7 +1764,30 @@ def test_the_no_events_hint_names_the_version_when_it_is_unknown(
     )
 
     assert server._comfy_cli_version is None
-    assert "comfy-cli < 1.16.0" in result["hint"]
+    hint = result["hint"]
+    # the too-old cause is still named, with the floor's own version string
+    assert server._MIN_WATCH_COMFY_CLI_STR in hint
+    # and so is the other one, so neither is presented as the diagnosis
+    assert "queued behind another or still loading" in hint
+    assert "could not establish" in hint
+    assert "usually means" not in hint
+
+
+def test_the_no_events_hint_is_the_same_for_an_unstamped_build(
+    monkeypatch, blocking_stream
+):
+    """An unstamped `0.0.0` checkout reaches this hint now, and must read the
+    same as any other unreadable version — one unknown, not two."""
+    _patch_jobs_status(monkeypatch, {"status": "running"})
+    blocking_stream([])
+    _patch_comfy_version(monkeypatch, "comfy-cli, version 0.0.0")
+
+    result = asyncio.run(
+        server.job(action="watch", prompt_id="pid", timeout_seconds=0.25)
+    )
+
+    assert server._comfy_cli_version is None
+    assert "could not establish" in result["hint"]
 
 
 @pytest.mark.parametrize(
