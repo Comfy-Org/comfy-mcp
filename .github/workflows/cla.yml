@@ -94,3 +94,53 @@ jobs:
 
           custom-allsigned-prcomment: |
             ✅ All contributors have signed the CLA. Thank you! This PR is ready to be merged.
+
+      # The action clears the required `cla-assistant` check by RE-RUNNING the
+      # pull_request_target run that produced it. GitHub's retry API refuses a
+      # run older than 30 days, and the action logs that refusal without
+      # failing, so on an older PR a valid signature leaves the required check
+      # red forever and the job still reports success. Seen on #284: the
+      # author signed 60 days after opening, the action logged "All
+      # contributors have signed the CLA" and then
+      #   Error occurred when re-running the workflow: HttpError: Unable to
+      #   retry this workflow run because it was created over a month ago
+      # and `cla-assistant` stayed at its September failure. `recheck` hits the
+      # same wall, `reopened` is not a trigger here, and the CLA Check ruleset
+      # has no bypass actors, so there was no route to green but a new push.
+      #
+      # So write the status on the PR head directly, which is what the
+      # `statuses: write` permission above is for. The condition mirrors this
+      # workflow's own rule rather than re-deriving the action's: every
+      # non-author committer is allowlisted in the step above, so the PR author
+      # is the only signature this repo asks for.
+      - name: Set cla-assistant on the PR head when the retry window has closed
+        if: >
+          github.event_name == 'issue_comment' && github.event.issue.pull_request && (
+            github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read and agree to the Contributor License Agreement'
+          )
+        env:
+          # comfy-cla is a public repo, so the repo-scoped token can read the
+          # signature store. The PAT the action needs is for WRITING it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_AUTHOR: ${{ github.event.issue.user.login }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          head_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .head.sha)
+          signed=$(gh api repos/comfy-org/comfy-cla/contents/signatures/cla.json --jq .content \
+            | base64 -d \
+            | jq -r --arg a "${PR_AUTHOR}" \
+                '[.signedContributors[]? | select((.name // "" | ascii_downcase) == ($a | ascii_downcase))] | length')
+          if [ "${signed}" -eq 0 ]; then
+            echo "${PR_AUTHOR} has no signature on file -- leaving cla-assistant as it is"
+            exit 0
+          fi
+          echo "${PR_AUTHOR} is in the signature store; setting cla-assistant success on ${head_sha}"
+          gh api -X POST "repos/${REPO}/statuses/${head_sha}" \
+            -f state=success \
+            -f context=cla-assistant \
+            -f description="CLA signed by ${PR_AUTHOR}" \
+            -f target_url="${RUN_URL}"
