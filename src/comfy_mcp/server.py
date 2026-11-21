@@ -4339,9 +4339,13 @@ async def run_workflow(
         confirm_spend: SOME workflows (partner-API nodes from
             ``emit_partner_workflow``, or an ``API``-tagged template) spend
             credits. Passing True costs a FREE workflow nothing: the run is
-            tried unflagged first, so the user is prompted only once the
-            engine refuses the graph for want of consent. False leaves a paid
-            graph to fail closed (``spend_consent_required``, nothing spent).
+            tried unflagged first, so a client that supports MCP elicitation
+            prompts the user only once the engine refuses the graph for want
+            of consent. A client that cannot elicit gets no prompt, and there
+            True is the only consent there is: set it ONLY when the user has
+            actually agreed to spend — never merely to clear an error. False
+            leaves a paid graph to fail closed (``spend_consent_required``,
+            nothing spent).
 
     Gotchas:
         - A source build past the fail-open floor check may lack the engine

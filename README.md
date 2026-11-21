@@ -699,8 +699,12 @@ inside the verb itself, so a comfy-cli that has the verb has the gate.
 
 ### Workflows that spend — `run_workflow`
 
-`run_workflow` takes the same `confirm_spend` argument, and it is still per-call, still never
-something the model can grant itself, and still unaffected by `comfy generate consent always`.
+`run_workflow` takes the same `confirm_spend` argument, and it is still per-call and still
+unaffected by `comfy generate consent always`. On a client that supports MCP elicitation it is
+still never something the model can grant itself. On one that cannot elicit there is no prompt to
+raise, so the caller's `confirm_spend=True` is the only consent there is — the same fallback
+`partner_generate` has, and the reason this tool's description says to set it only when the user
+has actually agreed to spend.
 **What differs from `run_template` is when you are asked, and it is the more important half.**
 
 `confirm_spend` says what *you* would allow. It says nothing about whether the graph in front of

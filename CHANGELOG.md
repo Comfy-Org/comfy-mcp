@@ -37,11 +37,15 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   byte-identical without `--allow-spend` and simply runs, while a paid one
   fails closed with `spend_consent_required` having submitted nothing, and
   *that* refusal is what raises the prompt. A free workflow is therefore never
-  prompted whatever the caller passed, and consent is still per-call, still
-  never something the model can grant itself, and still asked exactly once per
-  call. Reported in #300. An engine with no interlock — no published release,
-  only a build past the fail-open version check — keeps the up-front prompt,
-  because no refusal will ever arrive to raise it.
+  prompted whatever the caller passed, and consent is still per-call and still
+  asked exactly once per call. On a client that supports MCP elicitation it is
+  still never something the model can grant itself. On one that cannot elicit
+  there is no prompt to raise, so `confirm_spend=True` is the only consent
+  there is and the tool description says to set it only when the user has
+  actually agreed — unchanged by this release, and the same fallback
+  `partner_generate` documents. Reported in #300. An engine with no interlock
+  — no published release, only a build past the fail-open version check —
+  keeps the up-front prompt, because no refusal will ever arrive to raise it.
 
 ### Fixed
 
