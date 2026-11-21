@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -409,6 +410,19 @@ class _FakeRunProc:
         self.returncode = -9
 
 
+class CliReply(NamedTuple):
+    """One sequenced ``replies`` entry carrying its OWN exit status and stderr.
+
+    A bare stdout body or exception shares the fixture-wide ``returncode`` /
+    ``stderr``; this is for the fallback whose first call must fail the way
+    Click fails (exit 2, usage dump, no envelope) and whose retry succeeds.
+    """
+
+    stdout: Any = ""
+    returncode: int = 0
+    stderr: str = ""
+
+
 def _canonical_run(
     calls: list[dict], *, stdout, returncode, stderr, raises, on_spawn, replies=None
 ):
@@ -441,7 +455,7 @@ def _canonical_run(
     child has actually started — after the spawn-time ``raises`` check — because
     a ``Popen`` that never returned wrote nothing either.
     """
-    canned_stdout, canned_stderr = stdout, stderr
+    canned_stdout, canned_stderr, canned_returncode = stdout, stderr, returncode
     pending = iter(replies) if replies is not None else None
 
     def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session, cwd):
@@ -456,6 +470,7 @@ def _canonical_run(
         }
         calls.append(record)
         current_stdout, current_raises = canned_stdout, raises
+        current_stderr, current_returncode = canned_stderr, canned_returncode
         if pending is not None:
             try:
                 reply = next(pending)
@@ -463,6 +478,9 @@ def _canonical_run(
                 raise AssertionError(
                     f"unexpected extra comfy-cli call: {cmd}"
                 ) from None
+            if isinstance(reply, CliReply):
+                current_stderr, current_returncode = reply.stderr, reply.returncode
+                reply = reply.stdout
             if isinstance(reply, BaseException):
                 current_stdout, current_raises = "", reply
             else:
@@ -477,8 +495,8 @@ def _canonical_run(
             cmd,
             record,
             stdout=current_stdout,
-            stderr=canned_stderr,
-            returncode=returncode,
+            stderr=current_stderr,
+            returncode=current_returncode,
             raises=current_raises,
         )
 
@@ -502,8 +520,9 @@ def patched_run(monkeypatch):
     * ``on_spawn`` — a callable handed the spawned argv, for a verb whose real
       output is a FILE rather than stdout (``node deps-in-workflow`` writes to
       its ``--output`` path). See :func:`_canonical_run`.
-    * ``replies`` — stdout bodies or exceptions consumed once per spawn. Use it
-      when a compatibility fallback must receive different successive answers.
+    * ``replies`` — stdout bodies or exceptions consumed once per spawn (or a
+      :class:`CliReply` for one with its own exit status/stderr). Use it when a
+      compatibility fallback must receive different successive answers.
 
     ``calls`` is the live list every invocation is recorded into, for the exact
     argv assertions this suite is built on.

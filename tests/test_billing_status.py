@@ -173,10 +173,12 @@ def test_billing_status_relays_the_unconfirmed_copy_verbatim(patched_async_run):
 def test_billing_status_degrades_without_the_verb(patched_async_run):
     """A comfy-cli predating `cloud status` reads as a version gap, not a break.
 
-    Today this is the common path, not the rare one: the verb landed in
-    comfy-cli after its most recent release. Relaying Click's raw usage dump
-    would read as a broken MCP server, so it degrades to the `unsupported`
-    shape `_freshness_report` established and names the upgrade.
+    The rare path, not the common one: the verb shipped in comfy-cli 1.17.0 on
+    2026-08-22, so only an install below that floor gets here. This docstring
+    said the opposite until 2026-11-17. Relaying Click's raw usage dump would
+    read as a broken MCP server, so it degrades to the `unsupported` shape
+    `_freshness_report` established and names the upgrade — including the
+    version to upgrade TO, which a caller below the floor cannot infer.
     """
     patched_async_run(
         "",
@@ -191,6 +193,10 @@ def test_billing_status_degrades_without_the_verb(patched_async_run):
     # Actionable: names both the MCP tool and the terminal command.
     assert 'update_comfyui(target="cli")' in result["error"]
     assert "comfy update cli" in result["error"]
+    # ...and the floor, so "upgrade" names a target. Omitting it was the
+    # 0.11.0 defect: the message told installs that already had the verb to
+    # upgrade to nothing in particular.
+    assert server._MIN_BILLING_COMFY_CLI_STR in result["error"]
     # Says what still works instead of dead-ending on the denial.
     assert "auth_status" in result["error"]
     # None of the raw wrapper/CLI text leaks through.
@@ -346,12 +352,18 @@ def test_billing_status_cancellation_kills_the_child(patched_async_run):
     assert procs[0].killed is True
 
 
-def test_billing_status_degrade_names_no_version_floor(patched_async_run):
-    """The upgrade message must not pin a release number that would go stale.
+def test_billing_status_degrade_names_the_verbs_floor_not_the_servers(
+    patched_async_run,
+):
+    """The upgrade message pins the floor the VERB needs, and only that one.
 
-    `cloud status` is not yet in a tagged comfy-cli, so there is no shipped
-    version to name — and inventing one would tell users to upgrade to a
-    release that does not carry the verb. The install either has it or does not.
+    Inverted 2026-11-17. As written this test asserted the message named no
+    version at all, on the premise that `cloud status` was in no tagged
+    comfy-cli — it shipped in 1.17.0 on 2026-08-22, so the message was telling
+    already-current users to upgrade to nothing in particular. What must still
+    not appear is the SERVER-wide floor (`_MIN_COMFY_CLI_STR`, 1.14.0): an
+    install at 1.14.0 clears that one and still lacks the verb, so naming it
+    here would send a caller to a release that cannot answer.
     """
     patched_async_run(
         "",
@@ -361,7 +373,7 @@ def test_billing_status_degrade_names_no_version_floor(patched_async_run):
 
     error = _billing_status()["error"]
 
-    assert "1.1" not in error  # no `1.14.0`-shaped floor smuggled in
+    assert server._MIN_BILLING_COMFY_CLI_STR in error
     assert server._MIN_COMFY_CLI_STR not in error
 
 

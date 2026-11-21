@@ -384,6 +384,100 @@ def test_search_templates_forwards_gallery_filters(patched_run):
     ]
 
 
+def test_search_templates_runnable_only_adds_flag_and_widens_timeout(patched_run):
+    """`runnable_only` appends `--runnable` and gives the slow first fetch 300s."""
+    calls = patched_run(envelope(data=_payload()))
+
+    server.search_templates(runnable_only=True)
+
+    assert calls[0]["cmd"][4:] == ["templates", "ls", "--runnable"]
+    assert calls[0]["timeout"] == 300.0
+
+
+def test_search_templates_without_runnable_only_keeps_default_timeout(patched_run):
+    """The flag is opt-in: a plain listing stays on the 60s cap and omits `--runnable`."""
+    calls = patched_run(envelope(data=_payload()))
+
+    server.search_templates()
+
+    assert "--runnable" not in calls[0]["cmd"]
+    assert calls[0]["timeout"] == 60.0
+
+
+def test_search_templates_runnable_only_still_narrows_by_query(monkeypatch):
+    """`query` filtering applies on top of the runnable-filtered payload.
+
+    comfy-cli does the `--runnable` narrowing server-side; `query` is the
+    client-side free-text pass this tool owns, and it must still run over
+    whatever rows came back.
+    """
+    # `_patch_ls` stands in for the `--runnable` server-side result.
+    _patch_ls(monkeypatch)
+
+    narrowed = server.search_templates("clip", runnable_only=True)
+    assert _names(narrowed) == ["clip_maker"]
+
+
+_NO_RUNNABLE_USAGE = (
+    "Usage: comfy templates ls [OPTIONS]\n"
+    "Try 'comfy templates ls --help' for help.\n"
+    "Error: No such option: --runnable"
+)
+
+
+def test_search_templates_runnable_only_names_a_missing_flag(patched_run):
+    """A comfy-cli without `--runnable` gets an upgrade error, never the unfiltered gallery."""
+    calls = patched_run("", returncode=2, stderr=_NO_RUNNABLE_USAGE)
+
+    with pytest.raises(server.ComfyCliError, match="no `--runnable` filter") as ei:
+        server.search_templates(runnable_only=True)
+
+    assert "pip install -U comfy-cli" in str(ei.value)
+    assert len(calls) == 1  # no unfiltered re-ask
+
+
+def test_search_templates_runnable_only_keeps_a_caller_forged_phrase_raw(patched_run):
+    """A filter value that spells the parser's phrase cannot fake the version gap."""
+    forged = "No such option: --runnable"
+    patched_run("", returncode=2, stderr=f"Error: Invalid value for '--tag': {forged}")
+
+    with pytest.raises(server.ComfyCliError) as ei:
+        server.search_templates(tag=forged, runnable_only=True)
+
+    assert "no `--runnable` filter" not in str(ei.value)
+
+
+def test_search_templates_runnable_only_reports_no_unmatched_words(monkeypatch):
+    """An empty runnable page names no dead words: they may match a non-runnable row."""
+    _patch_ls(monkeypatch)
+
+    result = server.search_templates("zzzz", runnable_only=True)
+
+    assert result["total"] == 0
+    assert "unmatched_query_words" not in result
+    assert "hint" not in result
+
+
+def test_search_templates_runnable_only_notes_a_configured_remote(
+    patched_run, monkeypatch
+):
+    """`comfy templates` takes no --host: the runnable verdict is comfy-cli's own resolved ComfyUI."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    patched_run(envelope(data=_payload()))
+
+    note = server.search_templates(runnable_only=True)["comfy_target_note"]
+
+    assert (note["host"], note["port"], note["source"]) == (
+        "gpu.example",
+        9001,
+        "COMFYUI_URL",
+    )
+    assert "comfy templates" in note["note"]
+    # A plain listing is gallery metadata, not a verdict about any install.
+    patched_run(envelope(data=_payload()))
+    assert "comfy_target_note" not in server.search_templates()
+
+
 def test_search_templates_exclude_api(monkeypatch):
     """exclude_api drops every row whose tags include `API` (case-insensitive)."""
     _patch_ls(monkeypatch)
@@ -617,11 +711,94 @@ def test_template_tools_reject_embedded_nul(monkeypatch):
 
     for call in (
         lambda: server.get_template("flux\0dev"),
+        lambda: server.check_template("flux\0dev"),
         lambda: server.fetch_template("flux\0dev", "/tmp/flux.json"),
         lambda: server.fetch_template("flux_dev", "/tmp/f\0.json"),
     ):
         with pytest.raises(server.ComfyCliError, match="embedded NUL"):
             call()
+
+
+def test_check_template_argv_and_passes_verdict_through(patched_run):
+    """Passthrough: `comfy --json --where local templates check <name>`, 120s cap.
+
+    The verdict is comfy-cli's own — a thin passthrough hands the envelope data
+    straight back, adding no logic of its own.
+    """
+    verdict = {
+        "verdict": "missing-models",
+        "missing": [
+            {"name": "flux1-dev.safetensors", "url": "https://x/flux.safetensors"}
+        ],
+    }
+    calls = patched_run(envelope(data=verdict))
+
+    result = server.check_template("flux_dev")
+
+    assert calls[0]["cmd"][1:4] == ["--json", "--where", "local"]  # global flags first
+    assert calls[0]["cmd"][4:] == ["templates", "check", "flux_dev"]
+    assert calls[0]["timeout"] == 120.0
+    assert result == verdict  # handed back untouched
+
+
+def test_check_template_rejects_option_like_name(monkeypatch):
+    """A leading-dash name is refused before any child spawns (argument injection).
+
+    ``name`` is a bare positional on ``templates check``, so comfy-cli would read
+    a dash-leading value as an option rather than the template to check.
+    """
+
+    def boom(*a, **k):
+        raise AssertionError("no comfy-cli child may be spawned")
+
+    monkeypatch.setattr(server, "_run_comfy", boom)
+
+    with pytest.raises(server.ComfyCliError, match="leading '-'"):
+        server.check_template("--help")
+
+
+def test_check_template_names_a_missing_verb(patched_run):
+    """A comfy-cli without `templates check` gets an upgrade error, not Click's dump."""
+    patched_run(
+        "",
+        returncode=2,
+        stderr=(
+            "Usage: comfy templates [OPTIONS] COMMAND [ARGS]...\n"
+            "Error: No such command 'check'."
+        ),
+    )
+
+    with pytest.raises(server.ComfyCliError, match="check_template unavailable"):
+        server.check_template("flux_dev")
+
+
+def test_check_template_relays_other_failures_raw(patched_run):
+    """Any failure but the missing verb keeps comfy-cli's own message."""
+    patched_run(
+        envelope(ok=False, error={"code": "template_not_found", "message": "nope"}),
+        returncode=1,
+    )
+
+    with pytest.raises(server.ComfyCliError) as ei:
+        server.check_template("flux_dev")
+
+    assert "unavailable" not in str(ei.value)
+
+
+def test_check_template_notes_a_configured_remote(patched_run, monkeypatch):
+    """With a remote configured the verdict says it is about comfy-cli's own resolved ComfyUI."""
+    monkeypatch.setenv("COMFYUI_URL", "http://gpu.example:9001")
+    verdict = {"verdict": "runnable"}
+    patched_run(envelope(data=verdict))
+
+    result = server.check_template("flux_dev")
+
+    assert result["verdict"] == "runnable"
+    assert result["comfy_target_note"]["host"] == "gpu.example"
+    assert "comfy templates" in result["comfy_target_note"]["note"]
+    # comfy-cli resolves that ComfyUI itself, so COMFY_LOCAL_URL can move it
+    # off-box: the note must not pin the verdict on this machine.
+    assert "COMFY_LOCAL_URL" in result["comfy_target_note"]["note"]
 
 
 # --- local_check: does the user's install actually support this template? ----

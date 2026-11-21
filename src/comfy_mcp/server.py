@@ -487,6 +487,34 @@ _STREAM_LINE_LIMIT = 1024 * 1024
 _MIN_COMFY_CLI = (1, 14, 0)
 _MIN_COMFY_CLI_STR = "1.14.0"
 
+# comfy-cli's unstamped placeholder, exempted from the floor above.
+#
+# `comfy-cli`'s `pyproject.toml` carries `version = "0.0.0"` until its publish
+# workflow rewrites it from the release tag, and `ConfigManager.get_cli_version`
+# ALSO returns `"0.0.0"` when the `importlib.metadata` lookup fails outright. So
+# every source install, editable checkout and metadata-less environment reports
+# `0.0.0`, and no comfy-cli release ever has: the value means "this build's
+# version is unknown", never "this build is old".
+#
+# The floor's documented policy is to fail OPEN on a `--version` it cannot
+# positively read as too old. `"0.0.0"` parses cleanly, so `(0, 0, 0) <
+# (1, 14, 0)` made the guard fail CLOSED on exactly the builds whose version it
+# could not establish — every tool refused with "too old, upgrade", on a
+# checkout that may well be NEWER than the floor. The reported workaround was to
+# hand-stamp `pyproject.toml` before testing.
+#
+# Exactly this tuple, not a `major == 0` range: `0.1.0` and `0.0.1` are versions
+# somebody could really have published, and the leniency is meant to cover the
+# placeholder rather than the whole pre-1.0 range.
+#
+# Compared as a PARSED tuple, so the exemption also covers the handful of
+# strings `_parse_version` normalizes to it — `"0.0"` pads to `(0, 0, 0)`, and a
+# four-part `"0.0.0.1"` truncates to it. Deliberate: comfy-cli has never
+# published any of them either, and matching the raw token instead would mean a
+# `"version 0.0"` build is refused while `"version 0.0.0"` is waved through,
+# which is a distinction with no cause behind it.
+_UNSTAMPED_COMFY_CLI = (0, 0, 0)
+
 # The version guard shells out to `comfy --version`; memoize so it runs at most
 # once per process (it sits on the hot path of every _run_comfy call).
 _version_checked = False
@@ -1047,6 +1075,15 @@ def _probe_comfy_version() -> None:
     version = None
     if proc.returncode == 0:
         version = _parse_version(proc.stdout) or _parse_version(proc.stderr)
+    # An unstamped build reports a version it does not have. Normalized to None
+    # HERE, before the global is written and before the floor compares, so every
+    # reader sees one "unknown" and not two: the server-wide floor below, the
+    # per-verb floors reading `_comfy_cli_version`, and the opt-in
+    # `COMFY_CLI_MIN_VERSION` report all already treat None as fail-OPEN, and a
+    # second sentinel that each of them had to know about is how one of them
+    # ends up refusing a source build on its own.
+    if version == _UNSTAMPED_COMFY_CLI:
+        version = None
     # Recorded UNCONDITIONALLY, and BEFORE the floor check below, which raises
     # WITHOUT latching `_version_checked`: a too-old install the caller retries
     # in the same process re-runs this whole function, and a per-verb floor
@@ -1466,7 +1503,7 @@ def _spawn_failure(
 
 
 def _run_comfy_raw(
-    *args: str, timeout: float | None = None
+    *args: str, timeout: float | None = None, local_url: str | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
     """Run ``comfy --json --where local <args>`` and return the RAW envelope + context.
 
@@ -1476,6 +1513,14 @@ def _run_comfy_raw(
     ``server_info`` reading the versioned ``schema``) can inspect it, or the raw
     ``stdout`` (e.g. the lifecycle-success synthesizer), while :func:`_run_comfy`
     just unwraps it down to ``data``.
+
+    ``local_url`` names the target through comfy-cli's own ``COMFY_LOCAL_URL``
+    instead of the forwarded ``--host`` / ``--port``: set, it goes into the
+    CHILD's environment only (the server's own ``COMFYUI_URL`` and the guards
+    keyed off it are untouched) and the flags are not appended. It exists for
+    the one verb whose flags are newer than this server's floor —
+    ``search_models``' retry on a comfy-cli whose ``comfy models`` rejects
+    ``--host``.
     """
     _require_comfy_bin()
     _check_comfy_version()
@@ -1483,11 +1528,14 @@ def _run_comfy_raw(
     # configured (no-op for the local default; see target._with_target). Reassigning
     # args here means the forwarded flags also appear in the error/timeout
     # context returned below, so a remote failure reports the real invocation.
-    args = target._with_target(args)
+    if local_url is None:
+        args = target._with_target(args)
     # Global flags (--json, --where) MUST precede the subcommand in comfy-cli;
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    if local_url is not None:
+        env["COMFY_LOCAL_URL"] = local_url
     # Anchor the child's cwd to the operator-designated COMFY_PROJECT root, if
     # one is configured (None — the default — is byte-identical to not passing
     # `cwd` at all). Resolved fresh on every call, right before the spawn, so a
@@ -1568,7 +1616,12 @@ def _run_comfy_raw(
     )
 
 
-def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
+def _run_comfy(
+    *args: str,
+    timeout: float | None = None,
+    plain_ok: bool = False,
+    local_url: str | None = None,
+) -> Any:
     """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
 
     comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
@@ -1581,9 +1634,11 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     exit with no JSON is treated as success and a result dict is synthesized
     from the printed text, rather than raising the "returned no JSON" error on
     an action that actually succeeded. A non-zero exit, or a real error
-    envelope, still raises as usual.
+    envelope, still raises as usual. ``local_url`` is :func:`_run_comfy_raw`'s.
     """
-    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw(
+        *args, timeout=timeout, local_url=local_url
+    )
     # A plain_ok command that exits 0 without a *real* envelope is a success
     # (the lifecycle verbs and model download, per the docstring above).
     # `_last_json_object` may return a stray non-envelope JSON line (e.g. a
@@ -2734,7 +2789,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
     Naming an outdated comfy-cli is the whole point when the version is
     UNREADABLE: an install below :data:`_MIN_WATCH_COMFY_CLI` that slipped past
     the gate — which fails OPEN on an unparseable ``--version`` — produces
-    exactly this payload, and this is the only place left to say so. But when
+    exactly this payload, and this is the only place left to say so. It is named
+    as ONE of two open causes rather than as the likely one, because the
+    unreadable-version population is mostly source checkouts of `main`: those
+    are usually NEWER than the floor, so asserting "usually too old" would send
+    the majority of the people who see this line to upgrade a comfy-cli that is
+    already ahead of the one being asked for. But when
     the gate positively VERIFIED the floor, that half is a diagnosis the code
     already knows is false: a job sitting queued behind another, or loading
     models, for the whole 600s default yields zero events on a perfectly modern
@@ -2756,9 +2816,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
             "`timeout_seconds`"
         )
     return (
-        f"{_WATCH_NO_EVENTS_HINT} — this usually means comfy-cli < "
-        f"{_MIN_WATCH_COMFY_CLI_STR} (jobs watch cannot attach as the "
-        "submitting session there)"
+        f"{_WATCH_NO_EVENTS_HINT} — this server could not establish the "
+        "comfy-cli version, so both causes are open: an install below "
+        f"{_MIN_WATCH_COMFY_CLI_STR} (where `jobs watch` cannot attach as the "
+        "submitting session), or a job queued behind another or still loading "
+        'models. Check `comfy --version`, then poll `job(action="status")` or '
+        "watch again with a longer `timeout_seconds`"
     )
 
 
@@ -3371,6 +3434,13 @@ def _detect_comfy_cli_version() -> str | None:
     if proc.returncode != 0:
         return None
     parsed = _parse_version(proc.stdout)
+    # Same exemption as the server-wide floor, and this is the SECOND site that
+    # needed it: an unstamped build reported `"0.0.0"` here, so a deployment
+    # setting `COMFY_CLI_MIN_VERSION` raised "comfy-cli 0.0.0 is older than the
+    # required minimum" on it, and `server_info` published a version the build
+    # does not have. None takes the documented "could not determine" path.
+    if parsed == _UNSTAMPED_COMFY_CLI:
+        return None
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
@@ -3559,9 +3629,11 @@ def server_info() -> dict[str, Any]:
                 "source": source,
                 "note": (
                     "the submit/poll tools target this remote ComfyUI via "
-                    "--host/--port — run_workflow, generate_image, run_template "
-                    "and the jobs/queue tools; the lifecycle, discovery and "
-                    "catalog tools forward no host and describe THIS machine, "
+                    "--host/--port — run_workflow, generate_image, run_template, "
+                    "the jobs/queue tools, upload_file and search_models (the "
+                    "remote's model catalog); the lifecycle tools and the other "
+                    "discovery and catalog tools forward no host and describe "
+                    "THIS machine, "
                     "and so do the env fields above, which are the LOCAL "
                     "comfy-cli install. (fetch_outputs forwards no host either "
                     "but still collects a remote job's files, from the local "
@@ -3641,6 +3713,16 @@ def auth_status() -> Any:
 # request itself.
 _BILLING_STATUS_TIMEOUT = 180.0
 
+# `comfy cloud status` is a per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a
+# raise of `_MIN_COMFY_CLI`: every other tool works at 1.14.0, and refusing
+# them all to report a balance would be the worse trade. Unlike watch's it
+# gates nothing — the verb either dispatches or Click refuses it, and the
+# degrade below reads comfy-cli's own answer rather than a version string. It
+# exists so the ONE number a caller below the floor needs is in the message.
+# comfy-cli 1.17.0 (2026-08-22) is where `comfy_cli/cloud/command.py` first
+# registers `status_cmd`; 1.16.0 has the `cloud` group without the leaf.
+_MIN_BILLING_COMFY_CLI_STR = "1.17.0"
+
 # `_run_comfy_async` keeps only the trailing `_STDERR_MAX_CHARS` (64 KiB) of
 # stdout by default, which is the one place its contract is narrower than
 # `_run_comfy`'s unbounded `communicate()`. That bound exists for a multi-GB
@@ -3683,7 +3765,7 @@ async def billing_status() -> Any:
     not something to re-derive from the numbers.
 
     Signed out raises comfy-cli's own error — get the user signed in with
-    ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
+    ``auth_login`` / ``auth_status``. Below comfy-cli 1.17.0,
     degrades to ``{"error", "unsupported": True}`` carrying
     ``balance_confirmed: False`` and the balance fields ``null``, so the rule
     above holds there too.
@@ -3726,12 +3808,16 @@ async def billing_status() -> Any:
         # user can actually act on, and burying them under "your CLI is old"
         # would send them to the wrong fix.
         #
-        # Unlike those two this is NOT an edge path: `cloud status` landed in
-        # comfy-cli AFTER its newest release, so today every install answers
-        # this verb with Click's usage dump and this branch is the common one.
-        # It is expected to become the rare case once the verb ships, which is
-        # why the message names no version floor to go stale — the installed
-        # comfy-cli either has the verb or does not.
+        # This is an edge path, and the comment here said the opposite until
+        # 2026-11-17. `comfy cloud status` shipped in comfy-cli
+        # `_MIN_BILLING_COMFY_CLI_STR` (2026-08-22), nine releases before
+        # 0.11.0 went out saying no tagged release had the verb yet, so on any
+        # install at or above the floor this branch never runs and the degrade
+        # it writes is unreachable. The "names no version floor to go stale"
+        # rule went with that premise: there IS a floor, it is the one number a
+        # user below it needs, and leaving it out told a 1.26.0 install to
+        # upgrade to nothing in particular. Say the version, the way
+        # `_MIN_WATCH_COMFY_CLI_STR` does for `job(action="watch")`.
         #
         # No `clitext._phrase_is_only_the_caller_s` subtraction here (which
         # `list_workflow_notes` needs): this tool takes no arguments, so nothing
@@ -3763,8 +3849,8 @@ async def billing_status() -> Any:
         return {
             "error": (
                 "billing status unavailable: the installed comfy-cli does not "
-                "support 'comfy cloud status' (the verb ships in a comfy-cli "
-                "newer than the one installed here). Nothing was broken by "
+                "support 'comfy cloud status' (the verb ships in comfy-cli "
+                f"{_MIN_BILLING_COMFY_CLI_STR} and newer). Nothing was broken by "
                 # Deliberately about STATE, not about capability: on the
                 # whole-group-missing branch below, sign-in is not available
                 # either, so a blanket "sign-in is unchanged" would contradict
@@ -7545,6 +7631,30 @@ def _media_type(path: str) -> str:
     )
 
 
+def _download_dest(data: Any, out_dir: str | None) -> str | None:
+    """Resolve the directory ``comfy download`` wrote to, for media scoping.
+
+    comfy-cli's download payload carries ``out_dir`` as an already-resolved
+    absolute path, and has since **1.14.0** — this server's own floor
+    (``_MIN_COMFY_CLI``) — so this needs no per-verb version gate and is read
+    rather than recomputed. It is the only answer available when the caller
+    omitted the parameter and comfy-cli chose the directory itself.
+
+    The fallback matters only when the payload lacks the field: with a
+    caller-supplied ``out_dir`` it reproduces the previous behaviour, matching
+    the download child's cwd before it ran (the MCP client's cwd may hold a
+    stale, same-named output directory). With no parameter and no field there is
+    nothing to resolve, so this returns ``None`` and the caller skips inlining.
+    """
+    if isinstance(data, dict):
+        reported = data.get("out_dir")
+        if isinstance(reported, str) and reported:
+            return os.path.realpath(reported)
+    if out_dir is None:
+        return None
+    return os.path.realpath(os.path.join(_project_root() or os.curdir, out_dir))
+
+
 def _collect_output_media(data: Any, out_dir: str) -> list[tuple[str, str]]:
     """Resolve media files referenced by ``comfy download``'s data to on-disk paths.
 
@@ -7693,6 +7803,21 @@ def _render_output_media(
 # being made below. Not idempotent: `comfy download` never overwrites — a repeat
 # into the same `out_dir` writes a collision-suffixed copy (`name.1.ext`) — which
 # is also why it is not destructive.
+#
+# `out_dir` is optional because comfy-cli already resolves a project-aware
+# default and this tool required the parameter anyway, which made the wrapper
+# stricter than the command it wraps: a caller who had configured a download
+# directory once still had to name a path on every call, and an LLM caller has
+# to invent one. Omitting the parameter leaves `-o` off the argv rather than
+# reproducing comfy-cli's resolution here — the thin-wrapper reading of the
+# same request (Comfy-Org/comfy-mcp#304), where an `AUTO_DOWNLOAD_PATH` this
+# server interpreted itself would have been the wrong shape. Full effect needs
+# Comfy-Org/comfy-cli#1158: below it, `comfy download`'s own `--out-dir`
+# default is the literal `./outputs`, which shadows the resolver, so omitting
+# `-o` lands files relative to this server's spawn directory (`COMFY_PROJECT`
+# when set) rather than at the configured default. That is already an
+# improvement on a path the model guessed, and it becomes the configured
+# default the moment #1158 ships.
 @mcp.tool(
     meta=output_viewer.TOOL_META,
     annotations=types.ToolAnnotations(
@@ -7705,14 +7830,18 @@ def _render_output_media(
 @_object_payload
 def fetch_outputs(
     prompt_id: str,
-    out_dir: str,
+    out_dir: str | None = None,
     url_only: bool = False,
     inline_images: bool = False,
 ) -> dict[str, Any]:
     """Download a completed job's output files into ``out_dir``.
 
-    Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
+    Wraps ``comfy download <prompt_id> --where local [-o <out_dir>]``.
     ``url_only=True`` emits URLs without downloading.
+
+    Omit ``out_dir`` and comfy-cli picks it: the project's ``outputs/``, its
+    configured default, or ``./outputs``; the returned ``out_dir`` names where
+    it wrote.
 
     Remote jobs work although ``download`` is not in
     ``_TARGET_AWARE_SUBCOMMANDS``: the submitting run's local state file maps
@@ -7730,16 +7859,13 @@ def fetch_outputs(
     # here — `-o` takes a value, so comfy-cli reads even a dash-led one as this
     # option's argument, and a relative path is legitimate input. Size runs
     # ahead of the NUL refusal for the ordering reason `argv._guard_arg_len` gives.
-    argv._guard_arg_len("out_dir", out_dir)
-    out_dir = argv._reject_nul("out_dir", out_dir)
-    preview_dir = out_dir
-    if inline_images and not url_only:
-        # Match the download child's cwd before it runs; the MCP client's cwd
-        # may contain a stale, same-named output directory.
-        preview_dir = os.path.realpath(
-            os.path.join(_project_root() or os.curdir, out_dir)
-        )
-    args = ["download", prompt_id, "-o", out_dir]
+    # Both guards are skipped when the parameter is absent: there is no string to
+    # bound, and `-o` is then not on the argv at all.
+    args = ["download", prompt_id]
+    if out_dir is not None:
+        argv._guard_arg_len("out_dir", out_dir)
+        out_dir = argv._reject_nul("out_dir", out_dir)
+        args += ["-o", out_dir]
     if url_only:
         args.append("--url-only")
     data = _run_comfy(*args, timeout=300.0)
@@ -7747,6 +7873,14 @@ def fetch_outputs(
     # — short-circuit rather than let basename matching surface stale files from
     # a previous run into ``out_dir`` (which would contradict the docstring).
     if not inline_images or url_only:
+        return data
+    preview_dir = _download_dest(data, out_dir)
+    if preview_dir is None:
+        # Nothing to scope the manifest to. `_collect_output_media` requires a
+        # containing directory to reject a same-named file in this process's CWD
+        # (see its docstring), and guessing comfy-cli's resolution here would
+        # duplicate a default this server deliberately does not own. The download
+        # itself succeeded, so return its metadata rather than failing the call.
         return data
     blocks, records = _render_output_media(_collect_output_media(data, preview_dir))
     # A `CallToolResult` is how this verb carries BOTH content blocks and a
@@ -10812,6 +10946,7 @@ def search_templates(
     model: str = "",
     provider: str = "",
     exclude_api: bool = False,
+    runnable_only: bool = False,
 ) -> Any:
     """Search the built-in ComfyUI workflow-template gallery.
 
@@ -10845,14 +10980,20 @@ def search_templates(
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
         exclude_api: drop ``API``-tagged rows.
+        runnable_only: keep only templates every weight for which is already on
+            THIS install (``comfy templates ls --runnable``) — comfy-cli's own
+            runnable filter. Weights only — step-4 validation is still
+            MANDATORY. The FIRST such call is slow (300s cap, not 60s).
+            ``query`` still narrows on top, without ``unmatched_query_words``.
+            A remote target adds a ``comfy_target_note``.
         limit/offset: page results (``limit`` capped at 200).
 
-    Step 1: pick a ``name``, inspect with ``get_template``, then
-    ``fetch_template``. Step 4 — validating before ``run_workflow`` — is
-    MANDATORY via ``local_check``.
+    Step 1: pick a ``name``, inspect with ``get_template`` (and
+    ``check_template`` for a runnable verdict), then ``fetch_template``. Step 4
+    — validating before ``run_workflow`` — is MANDATORY via ``local_check``.
 
     Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
-    refresh``. NOT read from the local install.
+    refresh``. NOT read from the local install (``runnable_only`` aside).
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -10872,7 +11013,41 @@ def search_templates(
             argv._reject_option_like(f"{flag} value", value)
             argv._reject_nul(f"{flag} value", value)
             args += [flag, value]
-    data = _run_comfy(*args, timeout=60.0)
+    if runnable_only:
+        args.append("--runnable")
+    # `--runnable` fetches every candidate's workflow to check it on the first
+    # run (comfy-cli caches after), so it needs the wider cap a cold fetch does.
+    try:
+        data = _run_comfy(*args, timeout=300.0 if runnable_only else 60.0)
+    except ComfyCliError as exc:
+        # The flag is newer than this server's comfy-cli floor. Say so by name
+        # rather than relay Click's usage dump — and never fall back to the
+        # unfiltered gallery, which would answer "runnable" with rows that are
+        # not. Narrow as at every option site: the parser's own phrase, minus
+        # any copy a caller forged through a filter value.
+        if (
+            not runnable_only
+            or not clitext._is_missing_option_error(exc, "--runnable")
+            or clitext._phrase_is_only_the_caller_s(
+                exc,
+                clitext._MISSING_OPTION_RE_TEMPLATE.format(
+                    option=re.escape("--runnable")
+                ),
+                tag,
+                type,
+                model,
+                provider,
+            )
+        ):
+            raise
+        raise ComfyCliError(
+            "search_templates(runnable_only=True) unavailable: the installed "
+            "comfy-cli's `templates ls` has no `--runnable` filter (it landed "
+            "after comfy-cli 1.26.0); upgrade with `pip install -U comfy-cli`, or "
+            "drop runnable_only and ask `check_template` per template.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
 
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         shape = (
@@ -10913,9 +11088,12 @@ def search_templates(
         if not rows:
             rows = [r for r in candidates if _template_matches(r, q)]
             relaxed = bool(rows)
-        if not rows:
+        if not rows and not runnable_only:
             # Only computed on the empty path, where it is the whole value: a
-            # populated result needs no explanation.
+            # populated result needs no explanation. Not under `runnable_only`:
+            # `candidates` is then only the runnable subset, so a word matching
+            # nothing in it may still match a template whose weights are
+            # missing, and "matched nothing in the gallery" would be false.
             unmatched = _unmatched_template_tokens(candidates, q)
 
     total = len(rows)
@@ -10943,6 +11121,8 @@ def search_templates(
             f"{', '.join(unmatched)}. Drop or reword them and search again — all "
             "query words must match, so each extra word only narrows the result."
         )
+    if runnable_only:
+        return target._annotate_comfy_target(result, target._TEMPLATE_TARGET_NOTE)
     return result
 
 
@@ -11330,6 +11510,63 @@ def get_template(name: str, check_local: bool = True) -> Any:
         if check_local
         else _check_not_requested(),
     }
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def check_template(name: str) -> Any:
+    """Say whether THIS install has a gallery template's weights, before you fetch it.
+
+    Wraps ``comfy templates check <name>``. Step 2.5 of the on-ramp — after
+    ``search_templates``, before ``fetch_template`` — so you can tell the user
+    what to download (or steer them to an API-key flow) up front.
+
+    comfy-cli returns the verdict — ``runnable`` (every weight is already on
+    this install), ``missing-models`` (names the missing files and their
+    download URLs, ready to hand the user or feed to ``download_model``),
+    ``api-required`` (a paid hosted node — needs a signed-in account and spends
+    credits, so ``run_template`` fails it CLOSED unless ``confirm_spend=True``),
+    or ``unknown`` (comfy-cli could not decide). The verdict is comfy-cli's own;
+    this is a thin passthrough and adds no logic of its own.
+
+    A model/API check, NOT validation: ``runnable`` says nothing of custom
+    nodes or input values, so step-4 ``local_check`` is still MANDATORY. It
+    reads comfy-cli's own ComfyUI's weights; a remote target adds a note.
+    """
+    # Bare positional: a leading-dash name is read by comfy-cli as an option
+    # rather than the template to check (argument injection).
+    argv._reject_option_like(
+        "name", name, expected="a template name (e.g. 'image_flux2')"
+    )
+    argv._reject_nul("name", name)
+    try:
+        data = _run_comfy("templates", "check", name, timeout=120.0)
+    except ComfyCliError as exc:
+        # The verb is at this server's comfy-cli floor, but that floor fails
+        # OPEN — name the version gap rather than relay Click's usage dump. The
+        # same caller-echo subtraction as every degrade site whose argv carries
+        # caller text.
+        if not clitext._is_missing_verb_error(
+            exc, "check"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_VERB_RE_TEMPLATE.format(verb=re.escape("check")),
+            name,
+        ):
+            raise
+        raise ComfyCliError(
+            "check_template unavailable: the installed comfy-cli has no "
+            f"`comfy templates check` verb. It {_RESOURCE_VERB_UPGRADE_HINT}.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
+    return target._annotate_comfy_target(data, target._TEMPLATE_TARGET_NOTE)
 
 
 @mcp.tool(
@@ -12429,7 +12666,10 @@ async def workflow_deps(workflow_path: str) -> Any:
     )
 )
 def search_models(query: str = "", folder: str = "") -> Any:
-    """Search / list model files available to the LOCAL ComfyUI install.
+    """Search / list model files available to the targeted ComfyUI install.
+
+    FOLLOWS ``COMFYUI_URL`` / ``COMFYUI_HOST`` like ``run`` / ``jobs`` — reads
+    the REMOTE install's models when set, else byte-identical to before.
 
     Three modes: ``query`` -> ``comfy models search --text <query>``
     (filename match, all folders on v1.14.0+, ``checkpoints`` only below the
@@ -12437,10 +12677,9 @@ def search_models(query: str = "", folder: str = "") -> Any:
     ``comfy models list-folders`` (folder names).
 
     ``query`` tokens match word-order-independently and ignore ``-`` ``_``
-    ``.`` separators, so "sdxl base" finds ``sd_xl_base_1.0.safetensors``.
-    That needs a comfy-cli NEWER than v1.15.0 (Comfy-Org/comfy-cli#684,
-    merged after v1.15.0 was cut); on v1.15.0 and older the whole query is
-    one substring, so search a single word there.
+    ``.`` separators ("sdxl base" finds ``sd_xl_base_1.0.safetensors``) on a
+    comfy-cli newer than v1.15.0; on v1.15.0 and older the whole query is one
+    substring, so search a single word there.
 
     RESPONSE SHAPE DIFFERS BY MODE: ``query`` returns ``{rows: [...]}``,
     ``folder`` returns ``{files: [...]}``. Filenames only — no base-model/
@@ -12471,8 +12710,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # `--out`), where a dash-leading value really is a caller slip and an
         # escape hatch exists. See `argv._reject_option_like`.
         argv._reject_nul("query", query)
-        return _run_comfy("models", "search", "--text", query, timeout=60.0)
-    if folder:
+        args: tuple[str, ...] = ("models", "search", "--text", query)
+    elif folder:
         # `folder` rides as a bare positional, so its leading-dash guard is the
         # mandatory kind. Size runs ahead of it: this is a models-subfolder path,
         # so it takes the same argv-safety CEILING as `download_model`'s
@@ -12497,8 +12736,73 @@ def search_models(query: str = "", folder: str = "") -> Any:
             "folder", folder, expected="a model folder (e.g. 'checkpoints')"
         )
         argv._reject_nul("folder", folder)
-        return _run_comfy("models", "list-folder", folder, timeout=60.0)
-    return _run_comfy("models", "list-folders", timeout=60.0)
+        args = ("models", "list-folder", folder)
+    else:
+        args = ("models", "list-folders")
+    # `_run_comfy` forwards --host/--port itself now that "models" is in
+    # `target._TARGET_AWARE_SUBCOMMANDS`, exactly as it does for `run` / `jobs` /
+    # `upload` (no-op for the local default — the argv is byte-identical to before
+    # "models" was allowlisted). The single call site is what lets the
+    # version-skew retry below cover all three modes at once.
+    try:
+        return _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        # Version skew: the `--host` / `--port` options landed on `comfy models`
+        # (Comfy-Org/comfy-cli#876) in a comfy-cli NEWER than v1.26.0 — well above
+        # `_MIN_COMFY_CLI` — so every supported comfy-cli before it has the
+        # discovery leaves and rejects just the forwarded flag, with Click's usage
+        # dump (`NoSuchOption`: exit 2, no envelope). Those same builds resolve
+        # their target through `resolve_target`, whose local precedence honors
+        # `COMFY_LOCAL_URL` for ANY host (comfy-cli's `local_address`, there since
+        # 1.14.0), so the retry hands the configured target over through that
+        # documented channel instead — in the CHILD's env only, so the server's
+        # own COMFYUI_URL, and the `download_model` / lifecycle guards keyed off
+        # it, stay exactly as configured. What is listed is still the remote's
+        # catalog, comfy-cli's answer; nothing is derived here. Never a retry
+        # with no target at all: this machine's catalog returned as the remote's
+        # is precisely the wrong-machine bug the forward exists to fix.
+        #
+        # `_is_missing_option_error` is deliberately narrow, and the phrase is
+        # discounted when it only appears inside the caller's own `query` /
+        # `folder` (Click can echo an argument back in a usage error), so a
+        # genuine failure keeps its own message. With no remote configured no
+        # `--host` was forwarded, so this branch cannot fire.
+        caller_values = tuple(v for v in (query, folder) if v)
+        if not clitext._is_missing_option_error(
+            exc, "--host"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--host")),
+            *caller_values,
+        ):
+            raise
+        resolved = target._comfy_target()
+        if resolved is None:  # unreachable: no target means no `--host` sent
+            raise
+        host, port, _source = resolved
+        # comfy-cli IGNORES a `COMFY_LOCAL_URL` it cannot parse (a stderr warning,
+        # then its 127.0.0.1:8188 default) — that silent fallback would list THIS
+        # machine's catalog as the remote's, so a host that cannot ride inside a
+        # URL — or an empty one (`COMFYUI_HOST="[]"` strips to "") — is refused
+        # rather than retried.
+        if not host or any(
+            c.isspace() or not c.isprintable() or c in "/@?#[]\\" for c in host
+        ):
+            raise ComfyCliError(
+                "the installed comfy-cli cannot point `comfy models` at a remote "
+                "ComfyUI: it does not accept `--host` (that ships in a comfy-cli "
+                "newer than v1.26.0), and the configured host is empty or contains "
+                "whitespace or URL-special characters, so it cannot be handed over as "
+                "COMFY_LOCAL_URL either. Nothing was listed, and this machine's "
+                "catalog was NOT returned instead. Set COMFYUI_HOST / COMFYUI_URL "
+                "to a plain host name or IP address, or upgrade comfy-cli to a "
+                "release whose `comfy models` accepts `--host`."
+            ) from exc
+        return _run_comfy(
+            *args,
+            timeout=60.0,
+            local_url=f"http://{target._format_target_endpoint(host, port)}",
+        )
 
 
 # comfy-cli's own terminal set for a background download
@@ -13733,6 +14037,26 @@ def _flag_mispaired_slots(data: Any) -> Any:
     return data
 
 
+# `comfy workflow slots --node` landed in comfy-cli 1.23.0 (`7fd101a`,
+# 2026-10-17, the commit that also made a `get_template`-inserted node
+# addressable by its template id); 1.22.0 and older have the verb and not the
+# option. A per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a raise of
+# `_MIN_COMFY_CLI`: unfiltered `list_workflow_slots` works at 1.14.0, and the
+# filter is an optimization, so refusing every tool over it would be the wrong
+# trade.
+_MIN_SLOT_FILTER_COMFY_CLI = (1, 23, 0)
+_MIN_SLOT_FILTER_COMFY_CLI_STR = "1.23.0"
+
+_SLOT_FILTER_VERSION_ERROR = (
+    f"list_workflow_slots(node=...) requires comfy-cli "
+    f"{_MIN_SLOT_FILTER_COMFY_CLI_STR} or newer: `comfy workflow slots` has no "
+    f"`--node` option before {_MIN_SLOT_FILTER_COMFY_CLI_STR}, and passing one "
+    "makes Click print usage instead of a payload. Upgrade with `pip install "
+    "-U comfy-cli`, or call list_workflow_slots without `node` and filter the "
+    "rows by their `address` prefix."
+)
+
+
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -13741,7 +14065,7 @@ def _flag_mispaired_slots(data: Any) -> Any:
         openWorldHint=False,
     )
 )
-def list_workflow_slots(workflow_path: str) -> Any:
+def list_workflow_slots(workflow_path: str, node: str = "") -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
 
     Wraps ``comfy workflow slots <path>``. A "slot" is a parameter comfy-cli
@@ -13755,13 +14079,45 @@ def list_workflow_slots(workflow_path: str) -> Any:
     alongside plain ``A.name`` for promoted proxy widgets — both come back in
     ``address`` and are set the same way.
 
+    ``node`` narrows the answer to one node's slots — a node id, or a subgraph
+    instance id, which brings every ``<id>/<inner>`` inside it. Needs comfy-cli
+    1.23.0: below that it is REFUSED, not answered unfiltered. An unknown id
+    is an error naming the ids that do exist, not an empty list.
+
     Slots are tweakable PARAMETERS only — Note/MarkdownNote text is not a
     slot; use ``list_workflow_notes`` for that.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
     argv._guard_workflow_path(workflow_path, frontend=True)
-    data = _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    # Why the floor REFUSES rather than dropping the filter: an unfiltered
+    # answer is exactly the context cost `node` was passed to avoid, and a
+    # caller that believes it was applied reads a whole graph's slots as one
+    # node's. The docstring says it is refused; this says why.
+    extra: tuple[str, ...] = ()
+    if node:
+        # Hygiene guards, inside the branch so `node=""` keeps meaning "no
+        # filter" rather than becoming an error (same shape as
+        # `search_models`). `_reject_option_like` applies here for the reason
+        # it applies to a slot ADDR: an address begins with the node id, which
+        # comfy-cli surfaces non-negative, so no reachable id starts with `-`.
+        node = argv._guard_arg_len(
+            "node", argv._reject_option_like("node", argv._reject_nul("node", node))
+        )
+        # Per-VERB floor, read BEFORE the call rather than from the failure:
+        # comfy-cli below 1.23.0 has no `--node` on `workflow slots`, and Click
+        # answers an unknown option with a usage dump on exit 2 and no
+        # envelope, which surfaces as "returned no JSON" instead of naming the
+        # one number the caller needs. The same policy as
+        # `_MIN_WATCH_COMFY_CLI`: fail OPEN on an unreadable version, and
+        # un-latch the memo on the way out so the upgrade this error asks for
+        # takes effect inside the same server process.
+        version = _checked_comfy_version()
+        if version is not None and version < _MIN_SLOT_FILTER_COMFY_CLI:
+            _invalidate_version_cache()
+            raise ComfyCliError(_SLOT_FILTER_VERSION_ERROR)
+        extra = ("--node", node)
+    data = _run_comfy("workflow", "slots", workflow_path, *extra, timeout=60.0)
     return _flag_mispaired_slots(data)
 
 

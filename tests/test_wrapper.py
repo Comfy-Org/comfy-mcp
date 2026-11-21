@@ -669,6 +669,76 @@ def test_version_guard_fails_open_on_unparseable_version(monkeypatch):
     assert server._version_checked is True
 
 
+def test_version_guard_fails_open_on_the_unstamped_placeholder(monkeypatch):
+    """comfy-cli's `0.0.0` means "version unknown", so the floor must not refuse it.
+
+    `comfy-cli`'s `pyproject.toml` pins
+    `version = "0.0.0"` until its publish workflow rewrites it from the release
+    tag, so every source install and editable checkout reports `0.0.0` — and
+    `ConfigManager.get_cli_version` returns the same string when the
+    `importlib.metadata` lookup fails outright. `"0.0.0"` parses cleanly, so
+    `(0, 0, 0) < (1, 14, 0)` made this guard fail CLOSED on a build whose version
+    it could not establish, and every tool answered "too old, upgrade" on a
+    checkout that may well have been newer than the floor. The reported
+    workaround was hand-stamping `pyproject.toml` before testing.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", (9, 9, 9))  # a stale read
+    fake, _ = _fake_version("comfy-cli, version 0.0.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+
+    assert server._version_checked is True
+    # Normalized to the SAME unknown every other reader already fails open on,
+    # rather than a second sentinel each of them would have to learn: a per-verb
+    # floor (`job(action="watch")`) reading `(0, 0, 0)` would refuse the build
+    # the server-wide floor just waved through. It must also clear the stale
+    # tuple above, not keep it.
+    assert server._comfy_cli_version is None
+
+
+def test_version_floor_still_refuses_releases_below_it(monkeypatch):
+    """The `0.0.0` exemption is that tuple and nothing around it.
+
+    `0.0.1` and `0.1.0` are versions somebody could really have published, so
+    they stay refusals — the leniency covers comfy-cli's placeholder, not the
+    whole pre-1.0 range, and a guard that stopped enforcing the floor below 1.0
+    would be a worse bug than the one it fixed.
+    """
+    for below in ("0.0.1", "0.1.0", "1.13.0"):
+        monkeypatch.setattr(server, "_version_checked", False)
+        fake, _ = _fake_version(f"comfy-cli, version {below}")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        with pytest.raises(server.ComfyCliError, match=r"too old"):
+            server._check_comfy_version()
+
+    assert server._UNSTAMPED_COMFY_CLI == (0, 0, 0)
+
+
+def test_detect_version_reports_the_unstamped_placeholder_as_unknown(monkeypatch):
+    """The second site the unstamped placeholder reaches: the version report.
+
+    `_detect_comfy_cli_version` parses `--version` on its own, so before the fix
+    an unstamped build (a) published `comfy_cli_version: "0.0.0"` in
+    `server_info` — a version the build does not have — and (b) raised
+    "comfy-cli 0.0.0 is older than the required minimum" for any deployment that
+    set `COMFY_CLI_MIN_VERSION`. Unknown takes the documented warn-and-continue
+    path instead.
+    """
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    fake, _ = _fake_version("comfy-cli, version 0.0.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server._detect_comfy_cli_version() is None
+
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", "1.20.0")
+    report = server._check_comfy_cli_version()  # no raise
+
+    assert report["comfy_cli_version"] is None
+    assert any("could not determine" in w for w in report["warnings"])
+
+
 def test_version_guard_fails_open_when_version_errors(monkeypatch):
     """A `comfy --version` that can't be spawned fails OPEN, not closed —
     and a transient spawn error is NOT latched, so a later call re-checks."""
@@ -2933,6 +3003,83 @@ def test_fetch_outputs_wraps_comfy_download(patched_run):
     assert cmd[1:4] == ["--json", "--where", "local"]  # global --where pins local
     assert cmd[4:] == ["download", "pid", "-o", "/tmp/out"]  # mapped subcommand
     assert calls[0]["env"]["COMFY_WHERE"] == "local"
+
+
+def test_fetch_outputs_omitted_out_dir_passes_no_dash_o(patched_run):
+    """No `out_dir` means no `-o`, so comfy-cli resolves the destination.
+
+    This tool used to REQUIRE `out_dir`, which made it stricter than the
+    command it wraps: `comfy download` resolves a project-aware default, and a
+    caller who had configured one still had to name a path on every call. The
+    passthrough is to leave the option off the argv entirely rather than to
+    reproduce comfy-cli's resolution here.
+    """
+    calls = patched_run(envelope(data={"files": []}))
+
+    server.fetch_outputs("pid")
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]
+    assert cmd[4:] == ["download", "pid"]
+    assert "-o" not in cmd
+
+
+@pytest.mark.parametrize("bad_id", ["--help", "-o", "", "p\x001"])
+def test_fetch_outputs_omitted_out_dir_still_guards_the_prompt_id(no_spawn, bad_id):
+    """Skipping the `out_dir` guards must not skip the id's.
+
+    The leading-dash case is the one that got sharper rather than softer: with
+    no `-o` on the argv, a dash-led id is now the FIRST option-shaped token
+    comfy-cli sees.
+    """
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        server.fetch_outputs(bad_id)
+
+
+def test_fetch_outputs_scopes_inline_media_to_the_reported_dir(patched_run, tmp_path):
+    """With no `out_dir`, the manifest is scoped by the payload's own `out_dir`.
+
+    comfy-cli reports the directory it resolved and wrote to, and has carried
+    that field since 1.14.0 — this server's floor — so the inline manifest is
+    read off the payload instead of guessing at a default this server does not
+    own.
+    """
+    written = tmp_path / "resolved"
+    written.mkdir()
+    (written / "gen.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    patched_run(
+        envelope(
+            data={
+                "out_dir": str(written),
+                "files": [{"path": str(written / "gen.png")}],
+            }
+        )
+    )
+
+    result = server.fetch_outputs("pid", inline_images=True)
+
+    media = result.structured_content["media"]
+    assert [os.path.basename(entry["path"]) for entry in media] == ["gen.png"]
+
+
+def test_fetch_outputs_inline_media_skipped_when_the_dir_is_unknowable(
+    patched_run, tmp_path, monkeypatch
+):
+    """No `out_dir` argument and none in the payload: return metadata, not a guess.
+
+    `_collect_output_media` needs a containing directory to reject a same-named
+    file in this process's CWD, so with nothing to scope to the honest result is
+    the download's own metadata rather than a manifest built against the wrong
+    directory.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "gen.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    patched_run(envelope(data={"files": [{"path": "gen.png"}]}))
+
+    result = server.fetch_outputs("pid", inline_images=True)
+
+    # The plain payload, not a `CallToolResult` carrying a media manifest.
+    assert result == {"files": [{"path": "gen.png"}]}
 
 
 def test_fetch_outputs_url_only_appends_flag(patched_run):
