@@ -12,20 +12,29 @@ lock in the thin passthrough this server adds on top:
    call — the per-call elicitation prompt, or the explicit ``confirm_spend``
    fallback on a client that cannot elicit — on BOTH the streaming ``wait=True``
    path and the ``wait=False`` submit.
-2. A free-by-default run (``confirm_spend=False``) is never prompted at all and
-   never carries the flag.
+2. **The prompt is driven off the ENGINE'S verdict, not off ``confirm_spend``.**
+   The run always goes out unflagged first, so a free graph is never prompted no
+   matter what the caller passed, and the user is asked only once comfy-cli has
+   refused the graph with ``spend_consent_required`` — a refusal that submits
+   nothing. ``confirm_spend=False`` is still never prompted and never flagged.
 3. An agent's own ``confirm_spend=True`` is not a way around the prompt: a
-   decline raises before any child is spawned.
+   decline means no run carrying ``--allow-spend`` is ever spawned.
 4. Consent is resolved ONCE per call, outside the credential retry loop, so a
    transient ``partner_node_requires_credential`` retry re-runs the child and
-   never re-asks the human.
+   never re-asks the human — and a second ``spend_consent_required`` on the
+   consented run is the engine's answer rather than a cue to ask again.
 5. The engine's fail-closed refusal raises rather than reading as a success, is
    NOT retried (``spend_consent_required`` is deterministic), and names the
    offending ``partner_nodes`` from the error envelope.
-6. The flag is forwarded only to a comfy-cli that HAS it. ``comfy run`` predates
-   its gate, so the verb proves nothing and the flag is probed; against an
-   engine without it an approved run still runs, rather than dying on the usage
-   error Click raises for an unknown option.
+6. The flag is forwarded only to a comfy-cli that HAS it. It has shipped since
+   comfy-cli 1.14.0, which is this server's own enforced floor, so a genuinely
+   gateless engine arrives only through the fail-open version check — and that
+   is the one case where the prompt has to be raised up front, because no
+   refusal will ever arrive to raise it. The CAPABILITY PROBE can also report
+   False when it simply could not answer (a `comfy run --help` that errors or
+   will not spawn), so a capable engine reaches that branch too. When it does,
+   the engine's own refusal overrides the probe and the consent already
+   collected is forwarded — never discarded, never asked for twice.
 
 comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 """
@@ -33,10 +42,12 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import pytest
 from conftest import _OK_STREAM, envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -44,6 +55,11 @@ from mcp.server.elicitation import (
 )
 
 from comfy_mcp import server
+
+# The negotiated protocol revision on which `ctx.elicit()` has no back-channel, so
+# the spend prompt must round-trip through the tool result (see
+# `server._INPUT_REQUIRED_PROTOCOL`).
+_INPUT_REQUIRED = "2026-07-28"
 
 
 def _run_workflow(*args, **kwargs):
@@ -75,18 +91,39 @@ class _FakeCtx:
     real ``Context`` serves both.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+        input_responses=None,
+        request_state=None,
+        while_deciding=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
         self.progress: list[dict] = []
+        # The 2026-07-28 input-required transport: a negotiated version and the
+        # client's retry answers, read by `_elicit_approval` instead of `elicit`.
+        # Left `None` (the default) this fake is the handshake transport unchanged.
+        self.protocol_version = protocol_version
+        self.input_responses = input_responses
+        self.request_state = request_state
+        # Called INSIDE `elicit`, i.e. while the human is deciding. The prompt is
+        # the only place in the call where real wall-clock time passes, so it is
+        # the only honest place to model something else writing the graph file.
+        self._while_deciding = while_deciding
 
     async def report_progress(self, progress, total=None, message=None):
         self.progress.append({"progress": progress, "total": total, "message": message})
 
     async def elicit(self, message, schema):
         self.elicitations.append(message)
+        if self._while_deciding is not None:
+            self._while_deciding()
         if self._action == "accept":
             return AcceptedElicitation(data=schema(approve=self._approve))
         if self._action == "decline":
@@ -107,8 +144,9 @@ def allow_spend_capable(monkeypatch):
     engine happens to be installed, so they run against the engine
     ``--allow-spend`` was designed for. That default is a convenience, not a
     blind spot: :func:`server._comfy_run_takes_allow_spend` has its own tests
-    further down, and the incapable engine — every comfy-cli release to date —
-    is covered by the tests that override this fixture.
+    further down, and the incapable engine — no published release, only a build
+    that slips past the fail-open version check — is covered by the tests that
+    override this fixture.
     """
     monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: True)
 
@@ -148,6 +186,58 @@ def streamed_run(patched_stream, monkeypatch):
                     record["cmd"] = procs[-1].cmd
 
         monkeypatch.setattr(server, "_run_comfy_streaming", spy)
+        return calls
+
+    return setup
+
+
+@pytest.fixture
+def refusing_engine(monkeypatch):
+    """``setup(result=…) -> calls`` — a comfy-cli that fails closed, then runs.
+
+    The spend interlock lives in comfy-cli, and this server now reaches its own
+    prompt only THROUGH that interlock: the first run carries no
+    ``--allow-spend`` and is refused with ``spend_consent_required``, and the
+    prompt is raised on that refusal. So every test about the prompt has to
+    model both halves of the exchange, which is what this does — any invocation
+    without the flag refuses, any invocation with it succeeds.
+
+    :func:`patched_stream` cans ONE stdout for every spawn and so cannot express
+    a sequence. Patching the two run entry points directly is the same technique
+    :func:`test_run_workflow_elicits_once_across_credential_retries` already
+    used for the credential retry, and it covers the ``wait=False`` submit
+    (``_run_comfy`` in a thread) and the ``wait=True`` stream
+    (``_run_comfy_streaming``) with one fake, since the policy under test is the
+    same on both.
+
+    ``calls`` is the argv of every invocation in order, so an assertion can say
+    WHICH run carried the flag rather than only that one did.
+    """
+
+    def setup(*, result=None):
+        calls: list[list[str]] = []
+        payload = {"outputs": ["/x.png"]} if result is None else result
+
+        def _answer(args: tuple):
+            calls.append(list(args))
+            if "--allow-spend" not in args:
+                raise server.ComfyCliError(
+                    "comfy run --workflow failed [spend_consent_required]: "
+                    "workflow uses partner-API (paid) nodes; re-run with "
+                    "--allow-spend to consent to spending Comfy credits "
+                    "(partner_nodes: VeoNode)",
+                    code="spend_consent_required",
+                )
+            return payload
+
+        async def fake_stream(*args, **kwargs):
+            return _answer(args)
+
+        def fake_run(*args, **kwargs):
+            return _answer(args)
+
+        monkeypatch.setattr(server, "_run_comfy_streaming", fake_stream)
+        monkeypatch.setattr(server, "_run_comfy", fake_run)
         return calls
 
     return setup
@@ -194,7 +284,7 @@ def test_run_workflow_free_submit_is_never_prompted(patched_run):
 
 
 def test_run_workflow_does_not_consult_the_generate_auto_confirm(
-    streamed_run, monkeypatch
+    refusing_engine, monkeypatch
 ):
     """comfy-cli scopes `spend.auto_confirm` to `comfy generate`.
 
@@ -207,7 +297,7 @@ def test_run_workflow_does_not_consult_the_generate_auto_confirm(
         "_engine_auto_confirms",
         lambda: pytest.fail("run_workflow must not read the generate auto-confirm"),
     )
-    streamed_run()
+    refusing_engine()
     ctx = _FakeCtx()
 
     _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
@@ -215,33 +305,92 @@ def test_run_workflow_does_not_consult_the_generate_auto_confirm(
     assert len(ctx.elicitations) == 1
 
 
-# --- granting consent -------------------------------------------------------
+# --- a free graph is never prompted, whatever the caller passed --------------
 
 
-def test_run_workflow_asks_the_user_before_unlocking_spend(streamed_run):
-    """`confirm_spend=True` is a REQUEST to spend; the human grants it per call."""
+def test_run_workflow_does_not_prompt_a_free_graph_with_confirm_spend_true(
+    streamed_run,
+):
+    """THE regression this policy exists to prevent (comfy-mcp#300).
+
+    `confirm_spend` is the CALLER's permission, not a statement about the graph,
+    and an agent reading this tool's description has every reason to pass it
+    prophylactically — the reporter's harness does exactly that, which put a
+    credit prompt in front of every run of a workflow that cannot spend
+    anything. Only comfy-cli can tell a paid graph from a free one, so the run
+    goes out unflagged first: a partner-free graph is byte-identical without
+    `--allow-spend`, so it simply runs, and the user is never asked.
+    """
     calls = streamed_run()
     ctx = _FakeCtx(action="accept", approve=True)
 
-    _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
+    assert _run_workflow("wf.json", confirm_spend=True, ctx=ctx) == {
+        "outputs": ["/x.png"]
+    }
+
+    assert ctx.elicitations == []  # nothing could be spent, so nothing was asked
+    assert len(calls) == 1
+    assert "--allow-spend" not in calls[0]["cmd"]
+
+
+def test_run_workflow_probes_the_engine_once_when_confirm_spend_is_set(
+    streamed_run, monkeypatch
+):
+    """`confirm_spend=True` costs one `--help` probe, and only that.
+
+    The probe decides which SHAPE of gate this engine has — an interlock to be
+    refused by, or nothing, in which case the prompt has to be raised up front
+    because no refusal will ever arrive. It is skipped entirely when
+    `confirm_spend` is False (see the test below), and a positive answer latches
+    for the process, so the cost is one extra spawn per server, not per run.
+    """
+    probes = {"n": 0}
+
+    def counting_probe():
+        probes["n"] += 1
+        return True
+
+    monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", counting_probe)
+    streamed_run()
+
+    _run_workflow("wf.json", confirm_spend=True)
+
+    assert probes["n"] == 1
+
+
+# --- granting consent, on the engine's refusal ------------------------------
+
+
+def test_run_workflow_asks_the_user_once_the_engine_refuses(refusing_engine):
+    """The engine's fail-closed refusal is what raises the prompt.
+
+    `spend_consent_required` is comfy-cli saying this graph embeds partner-API
+    nodes AND that it submitted nothing — so at the moment the user is asked,
+    the question is real and the answer still costs nothing if it is no.
+    """
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow("wf.json", confirm_spend=True, ctx=ctx) == {
+        "outputs": ["/x.png"]
+    }
 
     assert len(ctx.elicitations) == 1
     assert "wf.json" in ctx.elicitations[0]
     assert "SPENDS Comfy credits" in ctx.elicitations[0]
-    assert calls[0]["cmd"][4:] == [
-        "run",
-        "--workflow",
-        "wf.json",
-        "--wait",
-        "--allow-spend",
+    # The prompt can now state the paid-ness as fact rather than hedging.
+    assert "embeds partner-API nodes" in ctx.elicitations[0]
+    # Two runs: the unflagged one the engine refused, then the one it consented
+    # to. In that order, and the flag only on the second.
+    assert [list(c) for c in calls] == [
+        ["run", "--workflow", "wf.json", "--wait"],
+        ["run", "--workflow", "wf.json", "--wait", "--allow-spend"],
     ]
-    # One context, both jobs: it asked, then reported the run it unlocked.
-    assert ctx.progress
 
 
-def test_run_workflow_forwards_consent_on_the_submit_path(patched_run):
+def test_run_workflow_forwards_consent_on_the_submit_path(refusing_engine):
     """The `wait=False` submit carries the flag too — both branches, one gate."""
-    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+    calls = refusing_engine(result={"prompt_id": "p1"})
     ctx = _FakeCtx(action="accept", approve=True)
 
     assert _run_workflow("wf.json", confirm_spend=True, wait=False, ctx=ctx) == {
@@ -249,30 +398,32 @@ def test_run_workflow_forwards_consent_on_the_submit_path(patched_run):
     }
 
     assert len(ctx.elicitations) == 1
-    assert calls[0]["cmd"][1:4] == ["--json", "--where", "local"]
-    assert calls[0]["cmd"][4:] == ["run", "--workflow", "wf.json", "--allow-spend"]
+    assert calls == [
+        ["run", "--workflow", "wf.json"],
+        ["run", "--workflow", "wf.json", "--allow-spend"],
+    ]
 
 
 def test_run_workflow_falls_back_to_confirm_spend_when_client_cannot_elicit(
-    streamed_run,
+    refusing_engine,
 ):
     """On a client with no elicitation, `confirm_spend` is the documented fallback."""
-    calls = streamed_run()
+    calls = refusing_engine()
     ctx = _FakeCtx(supports_elicitation=False)
 
     _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
 
     assert ctx.elicitations == []
-    assert "--allow-spend" in calls[0]["cmd"]
+    assert "--allow-spend" in calls[-1]
 
 
-def test_run_workflow_forwards_consent_without_any_ctx(streamed_run):
+def test_run_workflow_forwards_consent_without_any_ctx(refusing_engine):
     """No context at all is the same fallback — a direct call cannot be prompted."""
-    calls = streamed_run()
+    calls = refusing_engine()
 
     _run_workflow("wf.json", confirm_spend=True)
 
-    assert "--allow-spend" in calls[0]["cmd"]
+    assert "--allow-spend" in calls[-1]
 
 
 # --- refusing consent -------------------------------------------------------
@@ -286,29 +437,39 @@ def test_run_workflow_forwards_consent_without_any_ctx(streamed_run):
         ("accept", False),  # accepted without actually answering yes
     ],
 )
-def test_run_workflow_declined_spend_spawns_no_child(streamed_run, action, approve):
-    """A refusal is enforced HERE — comfy-cli is never started, nothing is spent."""
-    calls = streamed_run()
+def test_run_workflow_declined_spend_never_reaches_a_paid_run(
+    refusing_engine, action, approve
+):
+    """A refusal is enforced HERE: the only run that happened could not spend.
+
+    The assertion moved with the policy. It used to be "comfy-cli is never
+    started", which is no longer the shape of the exchange — the engine has to
+    be asked before anyone knows there is something to consent to. What must
+    still hold is that no run carrying `--allow-spend` is ever spawned, i.e.
+    exactly one unflagged run, already refused by the engine with nothing
+    submitted.
+    """
+    calls = refusing_engine()
     ctx = _FakeCtx(action=action, approve=approve)
 
     with pytest.raises(server.ComfyCliError, match="spend not confirmed"):
         _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
 
-    assert calls == []
+    assert calls == [["run", "--workflow", "wf.json", "--wait"]]
 
 
-def test_run_workflow_declined_spend_spawns_no_child_on_the_submit_path(patched_run):
-    """Same on `wait=False`: the refusal precedes the submit, not just the stream."""
-    calls = patched_run(envelope(data={"prompt_id": "p1"}))
+def test_run_workflow_declined_spend_never_reaches_a_paid_submit(refusing_engine):
+    """Same on `wait=False`, which is a different spawn with the same policy."""
+    calls = refusing_engine(result={"prompt_id": "p1"})
     ctx = _FakeCtx(action="decline")
 
     with pytest.raises(server.ComfyCliError, match="spend not confirmed"):
         _run_workflow("wf.json", confirm_spend=True, wait=False, ctx=ctx)
 
-    assert calls == []
+    assert calls == [["run", "--workflow", "wf.json"]]
 
 
-def test_run_workflow_confirm_spend_is_not_a_way_around_the_prompt(streamed_run):
+def test_run_workflow_confirm_spend_is_not_a_way_around_the_prompt(refusing_engine):
     """An agent setting `confirm_spend=True` itself does not authorize the spend.
 
     The hole this closes: a host's blanket "always allow this tool" toggle lets
@@ -316,16 +477,46 @@ def test_run_workflow_confirm_spend_is_not_a_way_around_the_prompt(streamed_run)
     authority over the user's credits — the same reason `partner_generate` and
     `run_template` prompt even when it is passed.
     """
-    calls = streamed_run()
+    calls = refusing_engine()
     ctx = _FakeCtx(action="decline")
 
     with pytest.raises(server.ComfyCliError) as excinfo:
         _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
 
-    assert calls == []
+    assert "--allow-spend" not in calls[-1]
     msg = str(excinfo.value)
     assert "Nothing was spent" in msg
-    assert "confirm_spend=False" in msg  # names the free way to run it
+    # And it no longer offers `confirm_spend=False` as a way to run this graph:
+    # the engine has already said it fails closed, so that advice would send the
+    # caller round the same refusal.
+    assert "confirm_spend=False" in msg
+    assert "will fail closed the same way" in msg
+
+
+def test_run_workflow_does_not_re_ask_when_the_engine_refuses_the_consented_run(
+    monkeypatch,
+):
+    """A second `spend_consent_required` is the engine's answer, not a retry cue.
+
+    If the engine refuses a run it was explicitly told to allow, re-prompting
+    would ask the user to re-approve something their approval did not move. One
+    prompt per call, then the error reaches the caller.
+    """
+    calls: list[tuple] = []
+
+    async def always_refuses(*args, **kwargs):
+        calls.append(args)
+        raise server.ComfyCliError("refused anyway", code="spend_consent_required")
+
+    monkeypatch.setattr(server, "_run_comfy_streaming", always_refuses)
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    with pytest.raises(server.ComfyCliError, match="refused anyway"):
+        _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
+
+    assert len(ctx.elicitations) == 1  # asked once, not once per refusal
+    assert len(calls) == 2  # the unflagged run, then the consented one
+    assert "--allow-spend" in calls[1]
 
 
 # --- the engine's fail-closed refusal ---------------------------------------
@@ -419,13 +610,16 @@ def test_run_workflow_spend_refusal_on_the_submit_path(patched_run):
 def test_run_workflow_still_runs_when_the_engine_has_no_gate(streamed_run, monkeypatch):
     """An APPROVED run must still run against a comfy-cli that predates the flag.
 
+    This is also the ONLY path that still prompts up front, and it has to: an
+    engine with no interlock never refuses, so a prompt waiting for a refusal
+    would wait forever and the graph would spend having asked nobody.
+
     `comfy run` is a plain Click command with no `ignore_unknown_options`, so an
     unrecognized `--allow-spend` exits 2 with a usage error and no `envelope/1`
     — which would turn the approval the user just gave into an opaque "returned
-    no JSON" failure on every comfy-cli released so far. Dropping the flag runs
-    the graph exactly as it ran before this argument existed: the human's answer
-    to the prompt is what authorizes the spend, and an engine with no interlock
-    has nothing to engage.
+    no JSON" failure. Dropping the flag runs the graph exactly as it ran before
+    this argument existed: the human's answer to the prompt is what authorizes
+    the spend, and an engine with no interlock has nothing to engage.
     """
     monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: False)
     calls = streamed_run()
@@ -437,6 +631,65 @@ def test_run_workflow_still_runs_when_the_engine_has_no_gate(streamed_run, monke
 
     assert len(ctx.elicitations) == 1  # the human was still asked
     assert "--allow-spend" not in calls[0]["cmd"]  # nothing to forward it to
+
+
+def test_a_mis_probed_engine_honours_the_consent_it_already_collected(
+    refusing_engine, monkeypatch
+):
+    """A capable engine mis-read as gateless must not discard the approval it took.
+
+    `_comfy_run_takes_allow_spend` answers False whenever it CANNOT answer — a
+    `comfy run --help` that exits nonzero, or that cannot be spawned at all —
+    and neither of those says anything about whether the flag exists. So a fully
+    capable comfy-cli can be sent up the no-interlock branch by a `--help`
+    hiccup, which is why that branch is not reachable only through the fail-open
+    version check the way the module docstring above once claimed.
+
+    Then the engine refuses, and the refusal settles it: an engine with no
+    `--allow-spend` has no gate to engage, so it can never emit
+    `spend_consent_required` — it would have run the graph and spent. A refusal
+    in hand therefore PROVES the probe wrong, and the engine is the more
+    authoritative of the two answers.
+
+    The approval is forwarded, not re-raised and not re-asked. Re-raising spent
+    the user's attention, took a yes, and then failed the very run that yes
+    authorized with `spend_consent_required` — told them consent was required
+    moments after they gave it. Re-asking would be the second prompt this whole
+    design exists to avoid. Exactly one prompt, honoured.
+    """
+    monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: False)
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow("wf.json", confirm_spend=True, ctx=ctx) == {
+        "outputs": ["/x.png"]
+    }
+
+    assert len(ctx.elicitations) == 1  # asked once, up front, and never again
+    assert "--allow-spend" not in calls[0]  # the unflagged run that drew the refusal
+    assert "--allow-spend" in calls[1]  # the consent the user had already given
+
+
+def test_a_mis_probed_engine_still_fails_closed_on_a_declined_prompt(
+    refusing_engine, monkeypatch
+):
+    """Honouring an up-front yes must not also honour an up-front no.
+
+    The forwarding above is reached only past
+    `_resolve_workflow_spend_consent`, which RAISES on a decline before any
+    child is spawned. So a declined up-front prompt on the same mis-probed
+    engine never reaches the engine at all, and no run can carry the flag.
+    """
+    monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: False)
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
+
+    assert "spend not confirmed" in str(excinfo.value)
+    assert calls == []  # nothing spawned, so nothing could spend
+    assert len(ctx.elicitations) == 1
 
 
 def test_the_probe_is_skipped_when_no_consent_was_granted(streamed_run, monkeypatch):
@@ -469,7 +722,7 @@ def test_allow_spend_probe_reads_the_help_text(patched_run, monkeypatch):
 def test_allow_spend_probe_is_false_when_the_help_lacks_the_flag(
     patched_run, monkeypatch
 ):
-    """Today's comfy-cli: the verb exists, the flag does not."""
+    """A comfy-cli predating 1.14.0: the verb exists, the flag does not."""
     monkeypatch.setattr(server, "_run_allow_spend_probed", False)
     patched_run("Usage: comfy run [OPTIONS]\n\nOptions:\n  --workflow TEXT\n")
 
@@ -488,9 +741,9 @@ def test_allow_spend_probe_is_false_when_it_cannot_answer(
 ):
     """An unusable engine reads as "no flag" — never as an exception out of consent.
 
-    Reporting False costs a run without the engine interlock, which is the
-    status quo on every current release; raising instead would break a call the
-    user approved because a `--help` spawn hiccuped.
+    Reporting False costs an up-front prompt and a run without the engine
+    interlock; raising instead would break a call the user approved because a
+    `--help` spawn hiccuped.
     """
     monkeypatch.setattr(server, "_run_allow_spend_probed", False)
     patched_run("--allow-spend", **kwargs)
@@ -519,10 +772,12 @@ def test_allow_spend_probe_latches_only_a_positive_answer(patched_run, monkeypat
 def test_run_workflow_elicits_once_across_credential_retries(monkeypatch):
     """The human is asked ONCE per call, however many times the child is retried.
 
-    Consent is resolved before the retry loop, not inside `_attempt`. Resolving
-    it per attempt would re-prompt a user who already answered — up to three
-    prompts for one tool call — and each retry would be a fresh chance to answer
-    differently, which is not a thing consent should have.
+    Consent is resolved outside the credential retry loop, never inside
+    `_attempt`. Resolving it per attempt would re-prompt a user who already
+    answered — up to three prompts for one tool call — and each retry would be a
+    fresh chance to answer differently, which is not a thing consent should
+    have. The loop now runs twice per call (once unflagged, once consented), so
+    this pins the count across BOTH passes.
     """
 
     async def _fast(_seconds):
@@ -534,7 +789,10 @@ def test_run_workflow_elicits_once_across_credential_retries(monkeypatch):
 
     async def fake_stream(*args, **kwargs):
         calls.append(args)
-        if len(calls) < 3:
+        if "--allow-spend" not in args:
+            raise server.ComfyCliError("paid graph", code="spend_consent_required")
+        # Consented: now be transiently broken twice before succeeding.
+        if len(calls) < 4:
             raise server.ComfyCliError(
                 "needs a credential", code="partner_node_requires_credential"
             )
@@ -546,23 +804,24 @@ def test_run_workflow_elicits_once_across_credential_retries(monkeypatch):
     result = _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
 
     assert result == {"outputs": ["/x.png"]}
-    assert len(calls) == 3  # 1 initial + 2 credential retries
+    # 1 unflagged probe run + 1 consented + 2 credential retries.
+    assert len(calls) == 4
     assert len(ctx.elicitations) == 1  # asked once, not once per attempt
-    # And every attempt carried the consent the user granted on the first.
-    assert all("--allow-spend" in argv for argv in calls)
+    # Every attempt after the prompt carried the consent the user granted.
+    assert all("--allow-spend" in argv for argv in calls[1:])
 
 
 # --- the prompt's own hygiene ------------------------------------------------
 
 
-def test_run_workflow_prompt_neutralizes_markdown_in_the_path(streamed_run):
+def test_run_workflow_prompt_neutralizes_markdown_in_the_path(refusing_engine):
     """A caller-supplied path cannot inject markup into the prompt it appears in.
 
     The path rides inside a markdown code span; a backtick in it would close the
     span on a rendering client and let the rest write its own text — including a
     reassuring "this is free" over the SPENDS warning the user is answering.
     """
-    streamed_run()
+    refusing_engine()
     hostile = "wf`.json`\n**this is free**"
     ctx = _FakeCtx(action="accept", approve=True)
 
@@ -578,7 +837,7 @@ def test_run_workflow_prompt_neutralizes_markdown_in_the_path(streamed_run):
     assert "SPENDS Comfy credits" in prompt
 
 
-def test_run_workflow_prompt_keeps_the_filename_of_a_long_path(streamed_run):
+def test_run_workflow_prompt_keeps_the_filename_of_a_long_path(refusing_engine):
     """A path too long for the prompt falls back to its BASENAME, not a prefix.
 
     Truncating the tail of a deep path drops the filename — the only part that
@@ -586,7 +845,7 @@ def test_run_workflow_prompt_keeps_the_filename_of_a_long_path(streamed_run):
     MARKED: an unmarked basename reads as the whole path, so `/tmp/x.json` and
     `~/audited/x.json` would look identical to the user answering the prompt.
     """
-    streamed_run()
+    refusing_engine()
     long_path = "/Users/someone/" + "nested/" * 20 + "the-expensive-one.json"
     ctx = _FakeCtx(action="accept", approve=True)
 
@@ -597,7 +856,7 @@ def test_run_workflow_prompt_keeps_the_filename_of_a_long_path(streamed_run):
     assert long_path not in prompt  # the directory chain was dropped, not the name
 
 
-def test_run_workflow_prompt_marks_a_padded_path_as_elided(streamed_run):
+def test_run_workflow_prompt_marks_a_padded_path_as_elided(refusing_engine):
     """Padding a path past the cap cannot silently hide where the graph came from.
 
     Two graphs with the same filename in different directories render the same
@@ -605,7 +864,7 @@ def test_run_workflow_prompt_marks_a_padded_path_as_elided(streamed_run):
     redundant segments to keep `/tmp` off the prompt. The marker does not
     recover the directory — it tells the user one existed.
     """
-    streamed_run()
+    refusing_engine()
     padded = "/tmp/" + "./" * 45 + "wf.json"
     ctx = _FakeCtx(action="accept", approve=True)
 
@@ -643,3 +902,135 @@ def test_run_workflow_rejects_a_bad_path_without_prompting(streamed_run):
 
     assert ctx.elicitations == []
     assert calls == []
+
+
+# --- the approval is about a GRAPH, not about a path ------------------------
+#
+# `comfy run` re-reads `workflow_path` when the consented run spawns, and the
+# human's decision sits between that read and the one the refusal came from.
+# That window is as long as a person takes, so an approval that travels on the
+# path alone can be spent on bytes nobody was shown — a parallel
+# `emit_partner_workflow` writing the same `out_path` does it without anybody
+# acting in bad faith. The approval is pinned to the file's digest instead, on
+# both transports: re-read in-frame for `ctx.elicit()`'s back-channel, and
+# carried in the prompt text (which keys the `request_state`) for the retry
+# transport, where no local variable survives the round trip.
+
+
+_PAID_GRAPH = '{"1": {"class_type": "VeoNode", "inputs": {"prompt": "a cat"}}}'
+_OTHER_GRAPH = '{"1": {"class_type": "VeoNode", "inputs": {"prompt": "a dog"}}}'
+
+
+def _graph(tmp_path, body=_PAID_GRAPH):
+    path = tmp_path / "wf.json"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def test_a_graph_swapped_while_the_prompt_was_open_is_never_run(
+    refusing_engine, tmp_path
+):
+    """A yes for one graph is not a yes for whatever replaced it.
+
+    The engine refuses, the user is asked, and while they are deciding the file
+    is rewritten. The consented re-run would read the NEW bytes — so the run is
+    refused instead, and nothing is spent on a graph nobody saw.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+    ctx = _FakeCtx(
+        action="accept",
+        approve=True,
+        while_deciding=lambda: open(path, "w", encoding="utf-8").write(_OTHER_GRAPH),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _run_workflow(path, confirm_spend=True, ctx=ctx)
+
+    assert "CHANGED while the spend prompt was open" in str(excinfo.value)
+    assert "Nothing was spent" in str(excinfo.value)
+    # Exactly the unflagged run the engine refused. The flagged one — the only
+    # one that could have cost anything — never happened.
+    assert len(calls) == 1
+    assert "--allow-spend" not in calls[0]
+    assert len(ctx.elicitations) == 1
+
+
+def test_a_graph_that_held_still_runs_and_its_prompt_names_the_digest(
+    refusing_engine, tmp_path
+):
+    """The pin is not a brake on the ordinary case, and it is visible in the prompt.
+
+    The digest is quoted as bare hex rather than in a code span on purpose: the
+    prompt opens exactly two backticks, around the caller-supplied path, and
+    `test_run_workflow_prompt_neutralizes_markdown_in_the_path` asserts that.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow(path, confirm_spend=True, ctx=ctx) == {"outputs": ["/x.png"]}
+
+    digest = hashlib.sha256(_PAID_GRAPH.encode()).hexdigest()
+    assert digest[:12] in ctx.elicitations[0]
+    assert ctx.elicitations[0].count("`") == 2
+    assert "--allow-spend" in calls[1]
+
+
+def test_a_graph_this_process_cannot_read_still_runs(refusing_engine):
+    """An unreadable path digests to `None` and pins on that, quoting nothing.
+
+    Whether a path resolves is comfy-cli's question — it answers it, and this
+    server must not start refusing runs that work today because it could not
+    open the file itself (a relative path resolved by the child, say).
+    """
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow("wf.json", confirm_spend=True, ctx=ctx) == {
+        "outputs": ["/x.png"]
+    }
+
+    assert "sha256" not in ctx.elicitations[0]
+    assert "--allow-spend" in calls[1]
+
+
+def test_a_swapped_graph_is_asked_about_afresh_on_the_retry_transport(
+    refusing_engine, tmp_path
+):
+    """2026-07-28: the answer comes back on a RETRY, so the pin rides the prompt.
+
+    Nothing from the asking round survives into the answering one — the tool is
+    re-entered from the top — so there is no variable left to compare. The
+    digest is in the prompt text, and `_consent_state` keys the sealed state on
+    that text, so a graph that changed under the prompt renders a different
+    question: the nonce claim fails and the human is asked again rather than the
+    first yes being spent on the new bytes.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_workflow(path, confirm_spend=True, ctx=first)
+    assert isinstance(pending, types.InputRequiredResult)
+    [key] = pending.input_requests
+
+    # The writer lands between the rounds, which is where the human's wait is.
+    open(path, "w", encoding="utf-8").write(_OTHER_GRAPH)
+    retry = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={
+            key: types.ElicitResult(action="accept", content={"approve": True})
+        },
+        request_state=pending.request_state,
+    )
+    replay = _run_workflow(path, confirm_spend=True, ctx=retry)
+
+    # Asked afresh, and the new question names the new graph.
+    assert isinstance(replay, types.InputRequiredResult)
+    [(_, request)] = replay.input_requests.items()
+    assert (
+        hashlib.sha256(_OTHER_GRAPH.encode()).hexdigest()[:12] in request.params.message
+    )
+    # Two unflagged runs, one per round, both refused. Neither carried consent.
+    assert all("--allow-spend" not in call for call in calls)

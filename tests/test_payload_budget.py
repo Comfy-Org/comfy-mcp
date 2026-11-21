@@ -99,6 +99,32 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # target gets a `comfy_target_note`) took it to ~16,342 within the same ceiling,
 # so the next growth is still a decision.
 #
+# 16,450 -> 16,600 when `run_workflow`'s `confirm_spend` regained the
+# spend-agreement requirement. Raised for TWO reasons, and the second one is not
+# about this change at all.
+#
+# The change itself: on a client that cannot elicit, `_resolve_optin_spend_consent`
+# returns True with no prompt, so the caller's flag is the only consent that
+# exists. "Set True ONLY when the user has actually agreed — never merely to
+# clear an error" is therefore the agent contract on exactly the path where
+# nobody is asked, it is the line `run_template` and `partner_generate` both
+# already carry, and comfy-mcp#300 is the record of an agent passing the flag
+# prophylactically because the description had invited it. There is no shorter
+# version: it costs 117 chars (~29 tokens) net of moving the `Gotchas` bullet
+# about a gateless source build into a comment, which it belongs in anyway (no
+# parameter selects that branch, so an agent cannot act on it).
+#
+# The reason the raise is 150 and not 30: `main` had already arrived at
+# ~16,449 of 16,450 on its own — one token of headroom — so this ceiling had
+# stopped being a budget and become a tripwire that the NEXT docstring
+# character on ANY pull request would trip, whoever wrote it and whatever it
+# said. A +30 raise would hand that same tripwire straight to the next author.
+# This leaves ~122 tokens, about one parameter description, which is the same
+# order as the +100 below. Measured ~16,478 merged with `main` at 105dca2, so
+# the next growth is still a decision — and the thing to notice if this fires
+# again is whether `main` has eaten the slack rather than whether your own
+# branch did.
+#
 # 16,350 -> 16,450 when `list_workflow_slots` gained `node`. Docstring growth on
 # an existing tool rather than a new one, so the bar is the one the comment
 # above sets: the three sentences are the agent contract for the parameter
@@ -109,7 +135,7 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # reads a whole graph's slots as one node's. The tree was already at ~16,337 of
 # 16,350, so no version of it fit the slack. Measured ~16,409 after the edit,
 # so the next growth is still a decision.
-_BUDGET_TOKENS = 16_450
+_BUDGET_TOKENS = 16_600
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
