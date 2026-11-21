@@ -4400,9 +4400,6 @@ async def run_workflow(
             nothing spent).
 
     Gotchas:
-        - A source build past the fail-open floor check may lack the engine
-          interlock, and so spend without ever refusing; there the prompt is
-          raised up front instead.
         - A workflow requesting a huge allocation can pass validation and then
           crash the whole ComfyUI process on OOM — surfaced as
           connection-loss/timeout, not a node error; ``get_logs`` still reads
@@ -4461,7 +4458,10 @@ async def run_workflow(
     if confirm_spend and not await asyncio.to_thread(_comfy_run_takes_allow_spend):
         # This engine has no interlock, so a paid graph will simply run and
         # spend rather than refusing — the prompt has to come first or it comes
-        # never. `comfy run --allow-spend` has shipped since comfy-cli 1.14.0,
+        # never. Stated here and NOT in the tool docstring: an agent cannot act
+        # on it (there is no parameter that selects this branch), so it is
+        # maintainer rationale and the LLM payload budget is the scarce side —
+        # see `tests/test_payload_budget.py`. `comfy run --allow-spend` has shipped since comfy-cli 1.14.0,
         # which is this server's own enforced floor (`_MIN_COMFY_CLI`), so this
         # branch is reachable only through the fail-open version check: a source
         # build or fork whose `--version` cannot be parsed. Nothing is forwarded
@@ -4536,14 +4536,10 @@ async def run_workflow(
         #
         # Deliberately NOT a loop: `spend_args` being set already means the
         # engine refused a run it had been told to allow, which is the engine's
-        # answer and not something a re-ask could change. `asked_up_front`
-        # means the no-interlock branch already spent the one prompt this call
-        # gets — a mismatch only the fail-open probe can produce, and re-asking
-        # would be the second prompt the whole design exists to avoid.
+        # answer and not something a re-ask could change.
         if (
             exc.code != "spend_consent_required"
             or spend_args
-            or asked_up_front
             # `confirm_spend=False` is the caller declining in advance, so there
             # is nothing to ask: the engine's own refusal names the paid nodes
             # and is the better answer. Checked here as well as inside
@@ -4552,14 +4548,35 @@ async def run_workflow(
             or not confirm_spend
         ):
             raise
-        # Raises `ComfyCliError` on a declined prompt, which is correct to let
-        # out: the engine's refusal already stopped the run.
-        await _resolve_workflow_spend_consent(
-            _display_workflow_path(workflow_path),
-            confirm_spend,
-            ctx,
-            after_refusal=True,
-        )
+        # `asked_up_front` means this call ALREADY has the human's answer, and
+        # the refusal we are holding proves the probe that sent us up front was
+        # wrong: an engine with no `--allow-spend` has no gate, so it can never
+        # emit `spend_consent_required` — it would have run the graph and spent.
+        # So this state is only reachable when a CAPABLE engine was mis-probed
+        # (`_comfy_run_takes_allow_spend` reports False on a `--help` that
+        # errors or cannot be spawned, which says nothing about the flag), and
+        # the engine's refusal is the more authoritative of the two answers.
+        #
+        # Forward the consent we hold rather than raising on it. Raising spent
+        # the user's attention, collected an approval, and then failed the run
+        # it authorized with `spend_consent_required` — telling them consent was
+        # required moments after they gave it. Re-asking would be the second
+        # prompt this design exists to avoid. Neither is needed: exactly one
+        # prompt was raised, it was approved, and this is the run it approved.
+        #
+        # Nothing here can spend unapproved. `asked_up_front` is set only on the
+        # far side of `_resolve_workflow_spend_consent`, which RAISES on a
+        # decline before any child is spawned, so reaching this point means the
+        # answer was yes.
+        if not asked_up_front:
+            # Raises `ComfyCliError` on a declined prompt, which is correct to
+            # let out: the engine's refusal already stopped the run.
+            await _resolve_workflow_spend_consent(
+                _display_workflow_path(workflow_path),
+                confirm_spend,
+                ctx,
+                after_refusal=True,
+            )
         spend_args = ("--allow-spend",)
         return await _run_with_credential_retries()
 
