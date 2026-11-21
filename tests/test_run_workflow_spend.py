@@ -42,10 +42,12 @@ comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import pytest
 from conftest import _OK_STREAM, envelope
+from mcp import types
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -53,6 +55,11 @@ from mcp.server.elicitation import (
 )
 
 from comfy_mcp import server
+
+# The negotiated protocol revision on which `ctx.elicit()` has no back-channel, so
+# the spend prompt must round-trip through the tool result (see
+# `server._INPUT_REQUIRED_PROTOCOL`).
+_INPUT_REQUIRED = "2026-07-28"
 
 
 def _run_workflow(*args, **kwargs):
@@ -84,18 +91,39 @@ class _FakeCtx:
     real ``Context`` serves both.
     """
 
-    def __init__(self, action="accept", approve=True, supports_elicitation=True):
+    def __init__(
+        self,
+        action="accept",
+        approve=True,
+        supports_elicitation=True,
+        protocol_version=None,
+        input_responses=None,
+        request_state=None,
+        while_deciding=None,
+    ):
         self.session = _FakeSession(supports_elicitation)
         self._action = action
         self._approve = approve
         self.elicitations: list[str] = []
         self.progress: list[dict] = []
+        # The 2026-07-28 input-required transport: a negotiated version and the
+        # client's retry answers, read by `_elicit_approval` instead of `elicit`.
+        # Left `None` (the default) this fake is the handshake transport unchanged.
+        self.protocol_version = protocol_version
+        self.input_responses = input_responses
+        self.request_state = request_state
+        # Called INSIDE `elicit`, i.e. while the human is deciding. The prompt is
+        # the only place in the call where real wall-clock time passes, so it is
+        # the only honest place to model something else writing the graph file.
+        self._while_deciding = while_deciding
 
     async def report_progress(self, progress, total=None, message=None):
         self.progress.append({"progress": progress, "total": total, "message": message})
 
     async def elicit(self, message, schema):
         self.elicitations.append(message)
+        if self._while_deciding is not None:
+            self._while_deciding()
         if self._action == "accept":
             return AcceptedElicitation(data=schema(approve=self._approve))
         if self._action == "decline":
@@ -874,3 +902,135 @@ def test_run_workflow_rejects_a_bad_path_without_prompting(streamed_run):
 
     assert ctx.elicitations == []
     assert calls == []
+
+
+# --- the approval is about a GRAPH, not about a path ------------------------
+#
+# `comfy run` re-reads `workflow_path` when the consented run spawns, and the
+# human's decision sits between that read and the one the refusal came from.
+# That window is as long as a person takes, so an approval that travels on the
+# path alone can be spent on bytes nobody was shown — a parallel
+# `emit_partner_workflow` writing the same `out_path` does it without anybody
+# acting in bad faith. The approval is pinned to the file's digest instead, on
+# both transports: re-read in-frame for `ctx.elicit()`'s back-channel, and
+# carried in the prompt text (which keys the `request_state`) for the retry
+# transport, where no local variable survives the round trip.
+
+
+_PAID_GRAPH = '{"1": {"class_type": "VeoNode", "inputs": {"prompt": "a cat"}}}'
+_OTHER_GRAPH = '{"1": {"class_type": "VeoNode", "inputs": {"prompt": "a dog"}}}'
+
+
+def _graph(tmp_path, body=_PAID_GRAPH):
+    path = tmp_path / "wf.json"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def test_a_graph_swapped_while_the_prompt_was_open_is_never_run(
+    refusing_engine, tmp_path
+):
+    """A yes for one graph is not a yes for whatever replaced it.
+
+    The engine refuses, the user is asked, and while they are deciding the file
+    is rewritten. The consented re-run would read the NEW bytes — so the run is
+    refused instead, and nothing is spent on a graph nobody saw.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+    ctx = _FakeCtx(
+        action="accept",
+        approve=True,
+        while_deciding=lambda: open(path, "w", encoding="utf-8").write(_OTHER_GRAPH),
+    )
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _run_workflow(path, confirm_spend=True, ctx=ctx)
+
+    assert "CHANGED while the spend prompt was open" in str(excinfo.value)
+    assert "Nothing was spent" in str(excinfo.value)
+    # Exactly the unflagged run the engine refused. The flagged one — the only
+    # one that could have cost anything — never happened.
+    assert len(calls) == 1
+    assert "--allow-spend" not in calls[0]
+    assert len(ctx.elicitations) == 1
+
+
+def test_a_graph_that_held_still_runs_and_its_prompt_names_the_digest(
+    refusing_engine, tmp_path
+):
+    """The pin is not a brake on the ordinary case, and it is visible in the prompt.
+
+    The digest is quoted as bare hex rather than in a code span on purpose: the
+    prompt opens exactly two backticks, around the caller-supplied path, and
+    `test_run_workflow_prompt_neutralizes_markdown_in_the_path` asserts that.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow(path, confirm_spend=True, ctx=ctx) == {"outputs": ["/x.png"]}
+
+    digest = hashlib.sha256(_PAID_GRAPH.encode()).hexdigest()
+    assert digest[:12] in ctx.elicitations[0]
+    assert ctx.elicitations[0].count("`") == 2
+    assert "--allow-spend" in calls[1]
+
+
+def test_a_graph_this_process_cannot_read_still_runs(refusing_engine):
+    """An unreadable path digests to `None` and pins on that, quoting nothing.
+
+    Whether a path resolves is comfy-cli's question — it answers it, and this
+    server must not start refusing runs that work today because it could not
+    open the file itself (a relative path resolved by the child, say).
+    """
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow("wf.json", confirm_spend=True, ctx=ctx) == {
+        "outputs": ["/x.png"]
+    }
+
+    assert "sha256" not in ctx.elicitations[0]
+    assert "--allow-spend" in calls[1]
+
+
+def test_a_swapped_graph_is_asked_about_afresh_on_the_retry_transport(
+    refusing_engine, tmp_path
+):
+    """2026-07-28: the answer comes back on a RETRY, so the pin rides the prompt.
+
+    Nothing from the asking round survives into the answering one — the tool is
+    re-entered from the top — so there is no variable left to compare. The
+    digest is in the prompt text, and `_consent_state` keys the sealed state on
+    that text, so a graph that changed under the prompt renders a different
+    question: the nonce claim fails and the human is asked again rather than the
+    first yes being spent on the new bytes.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+
+    first = _FakeCtx(protocol_version=_INPUT_REQUIRED)
+    pending = _run_workflow(path, confirm_spend=True, ctx=first)
+    assert isinstance(pending, types.InputRequiredResult)
+    [key] = pending.input_requests
+
+    # The writer lands between the rounds, which is where the human's wait is.
+    open(path, "w", encoding="utf-8").write(_OTHER_GRAPH)
+    retry = _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={
+            key: types.ElicitResult(action="accept", content={"approve": True})
+        },
+        request_state=pending.request_state,
+    )
+    replay = _run_workflow(path, confirm_spend=True, ctx=retry)
+
+    # Asked afresh, and the new question names the new graph.
+    assert isinstance(replay, types.InputRequiredResult)
+    [(_, request)] = replay.input_requests.items()
+    assert (
+        hashlib.sha256(_OTHER_GRAPH.encode()).hexdigest()[:12] in request.params.message
+    )
+    # Two unflagged runs, one per round, both refused. Neither carried consent.
+    assert all("--allow-spend" not in call for call in calls)
