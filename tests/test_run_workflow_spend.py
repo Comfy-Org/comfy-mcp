@@ -27,10 +27,14 @@ lock in the thin passthrough this server adds on top:
    NOT retried (``spend_consent_required`` is deterministic), and names the
    offending ``partner_nodes`` from the error envelope.
 6. The flag is forwarded only to a comfy-cli that HAS it. It has shipped since
-   comfy-cli 1.14.0, which is this server's own enforced floor, so an engine
-   without it is reachable only through the fail-open version check — and that
+   comfy-cli 1.14.0, which is this server's own enforced floor, so a genuinely
+   gateless engine arrives only through the fail-open version check — and that
    is the one case where the prompt has to be raised up front, because no
-   refusal will ever arrive to raise it.
+   refusal will ever arrive to raise it. The CAPABILITY PROBE can also report
+   False when it simply could not answer (a `comfy run --help` that errors or
+   will not spawn), so a capable engine reaches that branch too. When it does,
+   the engine's own refusal overrides the probe and the consent already
+   collected is forwarded — never discarded, never asked for twice.
 
 comfy-cli is mocked throughout: no real ComfyUI, and no real credit spend.
 """
@@ -599,6 +603,65 @@ def test_run_workflow_still_runs_when_the_engine_has_no_gate(streamed_run, monke
 
     assert len(ctx.elicitations) == 1  # the human was still asked
     assert "--allow-spend" not in calls[0]["cmd"]  # nothing to forward it to
+
+
+def test_a_mis_probed_engine_honours_the_consent_it_already_collected(
+    refusing_engine, monkeypatch
+):
+    """A capable engine mis-read as gateless must not discard the approval it took.
+
+    `_comfy_run_takes_allow_spend` answers False whenever it CANNOT answer — a
+    `comfy run --help` that exits nonzero, or that cannot be spawned at all —
+    and neither of those says anything about whether the flag exists. So a fully
+    capable comfy-cli can be sent up the no-interlock branch by a `--help`
+    hiccup, which is why that branch is not reachable only through the fail-open
+    version check the way the module docstring above once claimed.
+
+    Then the engine refuses, and the refusal settles it: an engine with no
+    `--allow-spend` has no gate to engage, so it can never emit
+    `spend_consent_required` — it would have run the graph and spent. A refusal
+    in hand therefore PROVES the probe wrong, and the engine is the more
+    authoritative of the two answers.
+
+    The approval is forwarded, not re-raised and not re-asked. Re-raising spent
+    the user's attention, took a yes, and then failed the very run that yes
+    authorized with `spend_consent_required` — told them consent was required
+    moments after they gave it. Re-asking would be the second prompt this whole
+    design exists to avoid. Exactly one prompt, honoured.
+    """
+    monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: False)
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="accept", approve=True)
+
+    assert _run_workflow("wf.json", confirm_spend=True, ctx=ctx) == {
+        "outputs": ["/x.png"]
+    }
+
+    assert len(ctx.elicitations) == 1  # asked once, up front, and never again
+    assert "--allow-spend" not in calls[0]  # the unflagged run that drew the refusal
+    assert "--allow-spend" in calls[1]  # the consent the user had already given
+
+
+def test_a_mis_probed_engine_still_fails_closed_on_a_declined_prompt(
+    refusing_engine, monkeypatch
+):
+    """Honouring an up-front yes must not also honour an up-front no.
+
+    The forwarding above is reached only past
+    `_resolve_workflow_spend_consent`, which RAISES on a decline before any
+    child is spawned. So a declined up-front prompt on the same mis-probed
+    engine never reaches the engine at all, and no run can carry the flag.
+    """
+    monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", lambda: False)
+    calls = refusing_engine()
+    ctx = _FakeCtx(action="decline")
+
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _run_workflow("wf.json", confirm_spend=True, ctx=ctx)
+
+    assert "spend not confirmed" in str(excinfo.value)
+    assert calls == []  # nothing spawned, so nothing could spend
+    assert len(ctx.elicitations) == 1
 
 
 def test_the_probe_is_skipped_when_no_consent_was_granted(streamed_run, monkeypatch):

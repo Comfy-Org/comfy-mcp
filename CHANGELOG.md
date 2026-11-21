@@ -44,11 +44,26 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   there is and the tool description says to set it only when the user has
   actually agreed — unchanged by this release, and the same fallback
   `partner_generate` documents. Reported in #300. An engine with no interlock
-  — no published release, only a build past the fail-open version check —
-  keeps the up-front prompt, because no refusal will ever arrive to raise it.
+  keeps the up-front prompt, because no refusal will ever arrive to raise it;
+  that is a build past the fail-open version check, or a capability probe that
+  could not answer — see the next entry for what happens when it was wrong.
 
 ### Fixed
 
+- **An approved `run_workflow` spend could be discarded rather than spent.**
+  The `--allow-spend` capability probe answers False whenever it *cannot*
+  answer — a `comfy run --help` that exits nonzero, or that will not spawn —
+  and neither says anything about whether the flag exists. So a `--help` hiccup
+  could send a fully capable comfy-cli up the no-interlock branch, where the
+  user was prompted up front, approved, and then had the run refused anyway
+  with `spend_consent_required`: told consent was required moments after giving
+  it, with the flag they authorized never forwarded. The refusal settles which
+  answer was wrong — an engine lacking the flag has no gate to engage and would
+  have run the graph and spent, so it can never emit that code — and the engine
+  outranks the probe. The consent already in hand is now forwarded instead:
+  exactly one prompt per call, as before, and no new route to spending
+  unapproved, because the up-front prompt raises on a decline before any child
+  is spawned.
 - **The `run_workflow` decline message was wrong about every supported
   engine.** It told a caller who had just refused a spend not to retry with
   `confirm_spend=False`, because "`comfy run`'s spend gate is not in a
