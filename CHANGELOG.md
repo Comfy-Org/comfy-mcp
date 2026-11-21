@@ -9,6 +9,23 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ## Unreleased
 
+### Added
+
+- **Comfy Desktop's port is discovered when nothing is configured.** Comfy
+  Desktop picks its port per launch (it moves off 8000 when that is taken), so
+  the hardcoded `127.0.0.1:8188` default was frequently the wrong ComfyUI. With
+  no `COMFYUI_URL` / `COMFYUI_HOST` and no `COMFY_LOCAL_URL`, the verbs that
+  take `--host`/`--port` (`run`, `run-template`, `jobs`, `upload`, `models`) now
+  follow the port in Desktop's own `port-locks` directory, but only when exactly
+  one lock names a live process. Zero, stale or several live locks resolve to
+  nothing, so behaviour is unchanged from today. Lock files are read from
+  Desktop's own state directory (Windows/macOS: its `Comfy Desktop` user-data
+  folder; Linux: `$XDG_STATE_HOME/comfyui-desktop-2`). A configured address
+  always wins, and a discovered Desktop is never treated as a remote, so
+  `download_model`, `restart_comfyui` and `server_info` behave as they do for a
+  plain local install. `COMFY_LOCAL_URL` is only checked for being set, never
+  parsed.
+
 ### Changed
 
 - **`fetch_outputs` no longer requires `out_dir`.** Omit it and `-o` is left
