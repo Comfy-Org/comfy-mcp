@@ -218,10 +218,11 @@ def _comfy_desktop_port_locks_dir() -> Path | None:
         # `~/.local/state`) joined with the package name `comfyui-desktop-2`
         # (the "Comfy Desktop" product name only reaches the path on the
         # other two platforms). Its `migrateXdgPaths()` also moves the old
-        # `~/.config/Comfy Desktop/port-locks` here and deletes the source,
-        # so the legacy location is deliberately not read. A Desktop build
-        # that predates that migration finds no lock and falls through to
-        # the existing default.
+        # `~/.config/Comfy Desktop/port-locks` here once (only when the state
+        # dir does not exist yet; a failed copy leaves the source in place) and
+        # writes only to the state dir afterwards, so the legacy location is
+        # deliberately not read. A Desktop build that predates that migration
+        # finds no lock and falls through to the existing default.
         base = (
             Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
             / "comfyui-desktop-2"
@@ -269,9 +270,10 @@ def _pid_is_alive(pid: Any) -> bool:
     except ProcessLookupError:
         return False
     except (PermissionError, OSError):
-        # EPERM means the process exists but is not ours, so it is alive. This
-        # matches Comfy Desktop's own liveness check, and erring toward alive
-        # only falls through to the existing default target.
+        # EPERM means the process exists but is not ours, so it is alive, as in
+        # Comfy Desktop's own check. Desktop answers "dead" for every other
+        # error; this answers "alive", which can only push a lock into the
+        # "more than one live candidate, don't guess" path (the safe direction).
         return True
     return True
 
@@ -423,19 +425,9 @@ def _comfy_target() -> tuple[str, int, str] | None:
                 "not select a remote. Set COMFYUI_HOST (or COMFYUI_URL) to "
                 "target a remote ComfyUI."
             )
-        # Neither COMFYUI_URL nor COMFYUI_HOST is set. Before falling back to
-        # comfy-cli's hardcoded 127.0.0.1:8188 default, check whether Comfy
-        # Desktop is running and has a SINGLE live instance recorded in its own
-        # dynamic port-lock bookkeeping (see _discover_comfy_desktop_port) —
-        # Desktop's port is not guaranteed to be 8188, or to be the same port
-        # across relaunches, so the hardcoded default is frequently wrong for
-        # anyone running ComfyUI via the desktop app rather than `comfy launch`.
-        # Silent when it finds nothing or finds more than one candidate: this
-        # is explicitly a "use it only when unambiguous" fallback, never a
-        # guess (see that function's own docstring for why).
-        desktop_port = _discover_comfy_desktop_port()
-        if desktop_port is not None:
-            return "127.0.0.1", desktop_port, _COMFY_DESKTOP_PORT_LOCK_SOURCE
+        # Neither COMFYUI_URL nor COMFYUI_HOST is set: nothing is configured.
+        # Comfy Desktop's port-lock fallback deliberately does NOT live here --
+        # see _forward_target.
         return None
     if not raw_port:
         return _strip_brackets(host), DEFAULT_COMFYUI_PORT, "COMFYUI_HOST"
@@ -510,6 +502,35 @@ def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
     }
 
 
+def _forward_target() -> tuple[str, int, str] | None:
+    """Resolve the ``(host, port, source)`` that ``--host``/``--port`` forwards.
+
+    This is :func:`_comfy_target` (an EXPLICITLY configured target) plus one
+    extra, forwarding-only fallback: Comfy Desktop's single live port-lock. It
+    is deliberately NOT folded into :func:`_comfy_target`, because that function
+    answers "did the operator configure a remote?" and feeds every remote-only
+    guard (``download_model``'s refusal, the restart kill gate, the divergence
+    notes, ``server_info``'s remote banner). A discovered same-machine Desktop is
+    not a configured remote, so it must never trip those.
+
+    The fallback stands down — returning ``None`` so comfy-cli resolves the
+    address itself — whenever the operator already chose a local address with
+    ``COMFY_LOCAL_URL``: ``--host``/``--port`` flags outrank that variable, so
+    forwarding a discovered port would silently retarget a configured session at
+    a different ComfyUI. It also stays silent when discovery is ambiguous (none,
+    stale, or more than one live lock).
+    """
+    explicit = _comfy_target()
+    if explicit is not None:
+        return explicit
+    if os.environ.get("COMFY_LOCAL_URL", "").strip():
+        return None
+    desktop_port = _discover_comfy_desktop_port()
+    if desktop_port is None:
+        return None
+    return "127.0.0.1", desktop_port, _COMFY_DESKTOP_PORT_LOCK_SOURCE
+
+
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
@@ -534,7 +555,7 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     # breaking the "local behavior unchanged" contract.
     if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
         return args
-    target = _comfy_target()
+    target = _forward_target()
     if target is None:
         return args
     host, port, _source = target

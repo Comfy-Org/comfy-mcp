@@ -482,7 +482,8 @@ full cloud tool list, and the slash-command/prompt tables live.
   running — otherwise no `--host`/`--port` is forwarded and comfy-cli resolves its own local
   target the usual way (`COMFY_LOCAL_URL`, then a comfy-cli-launched background server, then its
   hardcoded default `127.0.0.1:8188` — see [Which address variable do I want?](#which-address-variable-do-i-want)).
-  This discovery is a same-machine, submit/job-only fallback: it never touches the **local-only**
+  This discovery is a same-machine fallback for the verbs that take `--host`/`--port` (the submit /
+  job tools and `search_models`): it never touches the **local-only**
   tools (`nodes`, `validate_workflow`, `get_logs`; see [Discovery /
   validation](#driving-a-remote-comfyui)), which keep resolving independently through comfy-cli's
   own rules — so with Comfy Desktop on a non-default port and `COMFY_LOCAL_URL` unset, those
@@ -910,11 +911,15 @@ below (normally the hardcoded default, but not always — see there):
 portable package (`ComfyUI_windows_portable`) are installs you may already be running. Reach the
 one that is up through the address and workspace settings below.
 
-**ComfyUI Desktop.** The app defaults to `127.0.0.1` and port 8000; check the port the app
-shows. This server's unset default is `127.0.0.1:8188`. Set
-`COMFY_LOCAL_URL` to `http://127.0.0.1:<that port>` in the MCP client `env` block, beside
-`COMFY_BIN`, as in [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address).
-Confirm the URL `server_info` reports. `launch_comfyui` and `stop_comfyui` start and stop the
+**ComfyUI Desktop.** The app defaults to `127.0.0.1` and port 8000, and moves to the next free
+port when that one is taken. With nothing configured, the **submit / job** tools and
+`search_models` follow Desktop's current port: they read it from Desktop's own `port-locks`
+directory and match it against a live process, only when exactly one instance is running (see
+[Optional environment variables](#optional-environment-variables)). An address you set yourself
+always wins: `COMFYUI_URL` / `COMFYUI_HOST`, or `COMFY_LOCAL_URL`, which stops the discovery from
+forwarding anything. When discovery finds none or several, comfy-cli resolves its own target as
+[Which address variable do I want?](#which-address-variable-do-i-want) describes. Confirm the URL
+`server_info` reports. `launch_comfyui` and `stop_comfyui` start and stop the
 ComfyUI process comfy-cli itself launched. `restart_comfyui` does that too, and if comfy-cli has
 nothing recorded and the new launch finds the port taken, it names the process listening there
 and asks before killing it (`confirm_kill_untracked` defaults to false, so a decline kills
@@ -962,7 +967,7 @@ different layers. Pick by which one you need; the table is the whole answer.
 
 | | `COMFYUI_URL` (+ `COMFYUI_HOST` / `COMFYUI_PORT`) | `COMFY_LOCAL_URL` |
 | --- | --- | --- |
-| **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never reads it |
+| **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never *interprets* it — its one look is a set-or-unset presence check, so the Comfy Desktop fallback stands down when you set it |
 | **Means** | "a ComfyUI on **another machine** I control" | "the ComfyUI on **this machine** is not on `127.0.0.1:8188`" |
 | **How it acts** | this server forwards `--host` / `--port` to the verbs that accept them | comfy-cli resolves its own target from the environment it inherits |
 | **What it moves** | the **submit / job** tools plus `upload_file` (`run_workflow`, `generate_image`, `run_template`, the `jobs` family, and input staging) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
