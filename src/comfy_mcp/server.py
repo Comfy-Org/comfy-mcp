@@ -4403,6 +4403,52 @@ async def run_workflow(
     # `asked_up_front` covers the one case where there is no refusal to catch.
     spend_args: tuple[str, ...] = ()
     asked_up_front = False
+
+    async def _ask_about_this_graph(*, after_refusal: bool) -> None:
+        """Raise the spend prompt, and hold the answer to the graph it was about.
+
+        The human's decision sits between two reads of a mutable file: the one
+        `comfy run` already made (or, up front, the one it has yet to make) and
+        the one the consented run makes when it spawns. That window has no
+        bound — it is however long a person takes — so a graph swapped inside it
+        would be run under an approval given for different bytes, which a
+        parallel `emit_partner_workflow` writing the same `out_path` can do
+        without anybody acting in bad faith.
+
+        So the approval is pinned to the CONTENTS, on both transports and by two
+        different mechanisms, because neither covers the other:
+
+        * the digest is quoted in the prompt, and the `request_state` a prompt
+          mints is keyed on the prompt text (`_consent_state`). On the resumable
+          transport the answer comes back on a RETRY of the whole tool call, so
+          no local variable survives to compare — but a changed graph renders a
+          different question, so `_claim_consent_nonce` refuses the answer and
+          the human is asked afresh.
+        * re-read here, for `ctx.elicit()`'s back-channel, where the prompt is
+          awaited inside this frame and no retry ever happens.
+
+        An unreadable path digests to `None` and quotes nothing, which still
+        pins: readable-to-unreadable and back both CHANGE the answer. Whether
+        the path resolves is comfy-cli's question and it answers it.
+        """
+        pinned = await asyncio.to_thread(_workflow_graph_digest, workflow_path)
+        # Raises `ComfyCliError` on a decline, before any child is spawned.
+        await _resolve_workflow_spend_consent(
+            _display_workflow_path(workflow_path),
+            confirm_spend,
+            ctx,
+            after_refusal=after_refusal,
+            fingerprint=pinned,
+        )
+        if await asyncio.to_thread(_workflow_graph_digest, workflow_path) != pinned:
+            raise ComfyCliError(
+                "spend not confirmed: the workflow file "
+                f"'{_display_workflow_path(workflow_path)}' CHANGED while the "
+                "spend prompt was open, so the approval covers a graph that is "
+                "no longer on disk. Nothing was spent and no run was started. "
+                "Re-read the file and ask again if the new graph should run."
+            )
+
     if confirm_spend and not await asyncio.to_thread(_comfy_run_takes_allow_spend):
         # This engine has no interlock, so a paid graph will simply run and
         # spend rather than refusing — the prompt has to come first or it comes
@@ -4420,12 +4466,7 @@ async def run_workflow(
         # authorizes the spend; an engine with no interlock has nothing to
         # engage. Probed only when `confirm_spend` is set, so a free run —
         # nearly all of them — never pays for the extra `--help` spawn.
-        await _resolve_workflow_spend_consent(
-            _display_workflow_path(workflow_path),
-            confirm_spend,
-            ctx,
-            after_refusal=False,
-        )
+        await _ask_about_this_graph(after_refusal=False)
         asked_up_front = True
 
     async def _attempt() -> Any:
@@ -4482,9 +4523,18 @@ async def run_workflow(
         # the moment the prompt is worth a human's attention, and the second
         # run below is the first one that could cost anything.
         #
-        # Deliberately NOT a loop: `spend_args` being set already means the
-        # engine refused a run it had been told to allow, which is the engine's
-        # answer and not something a re-ask could change.
+        # Deliberately NOT a loop: a `spend_consent_required` on a run that
+        # already carried `--allow-spend` is the engine's answer, not something
+        # a re-ask could change.
+        #
+        # What enforces that TODAY is the consented re-run's POSITION — it sits
+        # outside this `try`, so its refusal never reaches this handler at all,
+        # and `spend_args` below is therefore always `()` here. The condition is
+        # kept rather than dropped because it is the only thing that would hold
+        # if the re-run were ever moved inside the `try`: without it, that
+        # refactor silently turns the single-prompt guarantee into a loop that
+        # re-asks a human whose answer the engine has already overruled. A dead
+        # guard with a comment saying it is dead is cheaper than the bug.
         if (
             exc.code != "spend_consent_required"
             or spend_args
@@ -4518,13 +4568,13 @@ async def run_workflow(
         # answer was yes.
         if not asked_up_front:
             # Raises `ComfyCliError` on a declined prompt, which is correct to
-            # let out: the engine's refusal already stopped the run.
-            await _resolve_workflow_spend_consent(
-                _display_workflow_path(workflow_path),
-                confirm_spend,
-                ctx,
-                after_refusal=True,
-            )
+            # let out: the engine's refusal already stopped the run. Also raises
+            # if the graph changed while the prompt was open (see
+            # `_ask_about_this_graph`) — the one path where the human's wait sits
+            # between the two reads of the file. On the `asked_up_front` branch
+            # the pin was taken before the refused run, so what remains between
+            # it and the re-run is the engine's own runtime, not a person's.
+            await _ask_about_this_graph(after_refusal=True)
         spend_args = ("--allow-spend",)
         return await _run_with_credential_retries()
 
@@ -5110,6 +5160,35 @@ def _display_workflow_path(path: str) -> str:
         # `or path` covers a trailing-separator path, whose basename is empty.
         path = "…/" + (os.path.basename(path) or path)
     return _display_caller_text(path, _ELICIT_PATH_DISPLAY_MAX) or "<unnamed workflow>"
+
+
+def _workflow_graph_digest(path: str) -> str | None:
+    """SHA-256 of the graph a spend prompt is about, or ``None`` if it cannot be read.
+
+    Identity for a consent prompt, not integrity against an attacker who can
+    also edit this process: the question "may this graph spend credits?" is
+    answered by a human across an unbounded wait, and ``comfy run`` re-reads the
+    file when the consented run spawns. Those are two reads of a mutable file
+    with a human in between, so the approval has to be pinned to CONTENTS rather
+    than to a path.
+
+    ``None`` on any ``OSError`` — unreadable is a legitimate answer here and is
+    *distinguishable* from a digest, which is all the pin needs (a file that
+    becomes readable, or stops being, changes the answer and so breaks the pin).
+    Whether a path resolves at all is comfy-cli's question to answer, and it
+    does; this function deliberately does not second-guess it.
+
+    Streamed rather than read whole: a workflow JSON is small, but ``path`` is
+    caller-supplied and may name something that is not.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 class _ApprovalWording(NamedTuple):
@@ -6410,6 +6489,7 @@ async def _resolve_workflow_spend_consent(
     ctx: Context | None,
     *,
     after_refusal: bool,
+    fingerprint: str | None = None,
 ) -> bool:
     """Decide whether to forward ``--allow-spend`` for this ``run_workflow`` call.
 
@@ -6428,7 +6508,27 @@ async def _resolve_workflow_spend_consent(
     The hedged wording is still correct, and still needed, on the one path with
     no engine verdict to quote: an engine with no interlock, where the prompt is
     raised up front because no refusal will ever arrive.
+
+    ``fingerprint`` is :func:`_workflow_graph_digest` of the graph this prompt is
+    about (``None`` when it could not be read, and then nothing is quoted). It is
+    appended to the prompt text for a reason beyond telling the human: the
+    ``request_state`` a prompt mints is keyed on that text (:func:`_consent_state`),
+    so on the resumable transport — where the answer arrives on a RETRY of the
+    whole tool call, and no variable from the asking round survives — a graph
+    that changed under the prompt renders a different question, fails the nonce
+    claim, and is asked about afresh instead of inheriting the first answer. Bare
+    hex, never a code span: the prompt opens exactly two backticks, around the
+    caller-supplied path, and that is asserted.
     """
+    pinned = (
+        ""
+        if fingerprint is None
+        else (
+            f" The graph approved here is the one hashing to sha256 "
+            f"{fingerprint[:12]}; if the file changes before the run, this "
+            "approval is refused rather than reused."
+        )
+    )
     if after_refusal:
         prompt = (
             f"Run the workflow `{path_display}` with credit spending ALLOWED? "
@@ -6436,7 +6536,7 @@ async def _resolve_workflow_spend_consent(
             "from the account the machine RUNNING it is signed into — this one, "
             "or the remote a COMFYUI_URL/COMFYUI_HOST names. It has already "
             "been refused once for want of this consent, so nothing has been "
-            "spent yet."
+            f"spent yet.{pinned}"
         )
         declined_tail = (
             " This graph cannot be run for free: it was already refused with "
@@ -6449,7 +6549,7 @@ async def _resolve_workflow_spend_consent(
             "Most workflows run for free on your own ComfyUI, but one "
             "containing partner-API nodes SPENDS Comfy credits from the account "
             "the machine RUNNING it is signed into — this one, or the remote a "
-            "COMFYUI_URL/COMFYUI_HOST names."
+            f"COMFYUI_URL/COMFYUI_HOST names.{pinned}"
         )
         # No interlock on this engine, so there is no fail-closed path to fall
         # back to and `confirm_spend=False` is NOT a way to run the graph for

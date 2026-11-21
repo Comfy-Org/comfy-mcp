@@ -50,6 +50,19 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ### Fixed
 
+- **A `run_workflow` spend approval covered a path, and now covers a graph.**
+  `comfy run` re-reads the workflow file when the consented run spawns, and the
+  human's decision sits between that read and the one the refusal came from — a
+  window as long as a person takes to answer. Anything writing the file inside
+  it, including a parallel `emit_partner_workflow` with the same `out_path`,
+  changed what the approval bought: on the retry transport, where the answer
+  arrives on a fresh call, the yes was spent on bytes nobody had been shown. The
+  approval is now pinned to the file's SHA-256. The digest is quoted in the
+  prompt — which is what the sealed `request_state` is keyed on, so a changed
+  graph fails the nonce claim and is asked about afresh — and re-read in-frame
+  for clients that elicit over the back-channel, where a mismatch refuses the
+  run with nothing spent. A path this server cannot read itself pins on that
+  fact and quotes nothing, so a run comfy-cli resolves on its own is unaffected.
 - **An approved `run_workflow` spend could be discarded rather than spent.**
   The `--allow-spend` capability probe answers False whenever it *cannot*
   answer — a `comfy run --help` that exits nonzero, or that will not spawn —
