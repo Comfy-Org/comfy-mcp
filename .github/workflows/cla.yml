@@ -121,8 +121,10 @@ jobs:
       # The condition mirrors this workflow's own rule rather than re-deriving
       # the action's: every non-author committer is allowlisted in the step
       # above, so the PR author is the only signature this repo asks for. The
-      # author is matched on their numeric account id first, because a login
-      # change leaves a stale login in the store while the id is stable.
+      # author is matched on their numeric account id, which is stable across a
+      # rename; a login match is accepted only for a record that carries no id
+      # at all. And the count has to be a number before anything is reported,
+      # so that a read which comes back empty cannot green an author.
       - name: Report cla-assistant on the PR head when a re-run is impossible
         if: >
           github.event_name == 'issue_comment' && github.event.issue.pull_request && (
@@ -141,13 +143,39 @@ jobs:
         run: |
           set -euo pipefail
           head_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .head.sha)
-          signed=$(gh api repos/comfy-org/comfy-cla/contents/signatures/cla.json --jq .content \
-            | base64 -d \
+          # Read the store through the RAW media type. The JSON contents API
+          # base64-encodes the file and, once it passes 1 MB, answers with
+          # `content: ""` and `encoding: "none"` instead of failing -- and
+          # `base64 -d | jq` on that prints nothing and exits 0. An empty
+          # `signed` then made `[ "" -eq 0 ]` error with status 2, which an `if`
+          # treats as false and `set -e` does not see, so the step fell through
+          # and posted a PASS for an author it had not checked. cla.json is
+          # 100,490 bytes of that 1 MB at 516 signatures (read 2026-11-22), so
+          # the size trigger is ahead of us and not live -- but a gate must
+          # never be able to go green because a read came back empty, for any
+          # reason, so the count is required below to be a number. Raw also
+          # reads up to 100 MB, so the base64 path is gone rather than guarded.
+          #
+          # Match on the numeric account id, and fall back to the login ONLY for
+          # a record that carries no id. An id is stable across a rename, which
+          # is why it is first; the plain `or` this replaces also accepted a
+          # login match against a DIFFERENT id, and GitHub frees a login when an
+          # account is renamed, so whoever registered that freed login was
+          # matched against the original signer's record. All 516 records in the
+          # store today carry an id, so this changes no current verdict.
+          signed=$(gh api "repos/comfy-org/comfy-cla/contents/signatures/cla.json?ref=main" \
+            -H 'Accept: application/vnd.github.raw' \
             | jq -r --argjson id "${PR_AUTHOR_ID}" --arg login "${PR_AUTHOR}" \
                 '[.signedContributors[]?
-                   | select((.id == $id)
-                            or ((.name // "" | ascii_downcase) == ($login | ascii_downcase)))]
+                   | select(if .id then (.id == $id)
+                            else ((.name // "" | ascii_downcase) == ($login | ascii_downcase)) end)]
                  | length')
+          case "${signed}" in
+            ''|*[!0-9]*)
+              echo "::error::could not count signatures for ${PR_AUTHOR} (${PR_AUTHOR_ID}): the store read produced '${signed}', not a number. Reporting nothing." >&2
+              exit 1
+              ;;
+          esac
           if [ "${signed}" -eq 0 ]; then
             echo "${PR_AUTHOR} (${PR_AUTHOR_ID}) has no signature on file -- reporting nothing"
             exit 0
