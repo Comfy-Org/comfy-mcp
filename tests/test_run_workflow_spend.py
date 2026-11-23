@@ -710,7 +710,7 @@ def test_the_probe_is_skipped_when_no_consent_was_granted(streamed_run, monkeypa
 
 def test_allow_spend_probe_reads_the_help_text(patched_run, monkeypatch):
     """The probe asks `comfy run --help`, which spends nothing to learn the answer."""
-    monkeypatch.setattr(server, "_run_allow_spend_probed", False)
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
     calls = patched_run(
         "Usage: comfy run [OPTIONS]\n\nOptions:\n  --allow-spend  Consent to spend.\n"
     )
@@ -723,7 +723,7 @@ def test_allow_spend_probe_is_false_when_the_help_lacks_the_flag(
     patched_run, monkeypatch
 ):
     """A comfy-cli predating 1.14.0: the verb exists, the flag does not."""
-    monkeypatch.setattr(server, "_run_allow_spend_probed", False)
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
     patched_run("Usage: comfy run [OPTIONS]\n\nOptions:\n  --workflow TEXT\n")
 
     assert _REAL_ALLOW_SPEND_PROBE() is False
@@ -745,15 +745,17 @@ def test_allow_spend_probe_is_false_when_it_cannot_answer(
     interlock; raising instead would break a call the user approved because a
     `--help` spawn hiccuped.
     """
-    monkeypatch.setattr(server, "_run_allow_spend_probed", False)
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
     patched_run("--allow-spend", **kwargs)
 
     assert _REAL_ALLOW_SPEND_PROBE() is False, why
 
 
-def test_allow_spend_probe_latches_only_a_positive_answer(patched_run, monkeypatch):
-    """A True is cached for the process; a False is re-asked, so an upgrade lands."""
-    monkeypatch.setattr(server, "_run_allow_spend_probed", False)
+def test_allow_spend_probe_latches_only_a_positive_answer(
+    patched_run, monkeypatch, real_engine
+):
+    """A True is cached for THAT engine; a False is re-asked, so an upgrade lands."""
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
     calls = patched_run("Usage: comfy run\n  --workflow TEXT\n")
 
     assert _REAL_ALLOW_SPEND_PROBE() is False
@@ -761,9 +763,133 @@ def test_allow_spend_probe_latches_only_a_positive_answer(patched_run, monkeypat
     assert len(calls) == 2  # re-probed, not wedged on the negative
 
     calls2 = patched_run("Usage: comfy run\n  --allow-spend\n")
+    real_engine.bind()
     assert _REAL_ALLOW_SPEND_PROBE() is True
     assert _REAL_ALLOW_SPEND_PROBE() is True
     assert len(calls2) == 1  # latched, so the second call spawns nothing
+
+
+# --- the capability latch is bound to the ENGINE, not to the process ---------
+#
+# [P1] on comfy-mcp#322 (@skishore23): a process-wide boolean let ONE positive
+# probe silence the up-front prompt forever. Swap `COMFY_BIN` for an ungated
+# build inside that lifetime and the paid graph goes out unflagged to an engine
+# with no interlock — it runs, it spends, and nothing ever asks.
+
+
+class _RealEngine:
+    """A `COMFY_BIN` that is a real file, so it has a stat-able identity.
+
+    `patched_run` points `shutil.which` at `/fake/comfy`, which cannot be
+    stat'ed — and an unreadable identity deliberately re-probes rather than
+    latching, so these tests need a file that exists. `patched_run` re-applies
+    its own `which` stub on every call, hence `bind()` rather than a one-shot
+    fixture: call it after each `patched_run(...)` to point the lookup back.
+    """
+
+    def __init__(self, path, monkeypatch):
+        self._path = path
+        self._monkeypatch = monkeypatch
+        self._path.write_text("#!/bin/sh\nexit 0\n")
+        self.bind()
+
+    def bind(self):
+        self._monkeypatch.setattr(server.shutil, "which", lambda _: str(self._path))
+
+    def swap(self):
+        # Unlink + rewrite, which is what an uninstall/install does to a console
+        # script: a NEW inode, so the identity moves even at the same path.
+        self._path.unlink()
+        self._path.write_text("#!/bin/sh\nexit 1\n")
+
+
+@pytest.fixture
+def real_engine(tmp_path, monkeypatch):
+    return _RealEngine(tmp_path / "comfy", monkeypatch)
+
+
+def test_a_rolled_back_engine_is_reprobed_rather_than_trusted(
+    patched_run, monkeypatch, real_engine
+):
+    """[P1] The latch is keyed on the executable, so a rollback re-asks the engine."""
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
+    patched_run("Usage: comfy run\n  --allow-spend\n")
+    real_engine.bind()
+    assert _REAL_ALLOW_SPEND_PROBE() is True
+
+    real_engine.swap()  # the gated build is replaced by an ungated one
+    calls = patched_run("Usage: comfy run\n  --workflow TEXT\n")
+    real_engine.bind()
+
+    assert _REAL_ALLOW_SPEND_PROBE() is False, "a stale latch answered for a new engine"
+    assert len(calls) == 1, "the new engine was never asked"
+
+
+def test_an_unreadable_engine_identity_reprobes_instead_of_refusing(
+    patched_run, monkeypatch
+):
+    """An unstat-able `COMFY_BIN` costs the spawn, not a false up-front prompt.
+
+    A macOS TCC denial resolves on PATH and refuses to be stat'ed. Refusing on
+    that would re-raise comfy-mcp#300 for every `confirm_spend=True` caller: a
+    free graph would be prompted because the CACHE KEY could not be read, even
+    though the interlock itself answers fine.
+    """
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
+    calls = patched_run("Usage: comfy run\n  --allow-spend\n")  # which -> /fake/comfy
+
+    assert _REAL_ALLOW_SPEND_PROBE() is True
+    assert _REAL_ALLOW_SPEND_PROBE() is True
+    assert len(calls) == 2, "an unknown identity must not latch"
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_a_rolled_back_engine_asks_before_the_paid_submit(
+    monkeypatch, patched_run, patched_stream, real_engine, wait
+):
+    """[P1] Both wait modes: no child carries the graph until a human has said yes.
+
+    The latch is primed against a gated engine, THEN the engine becomes ungated
+    — the exact transition that used to submit unflagged, with no refusal to
+    catch and no prompt ever raised.
+    """
+    monkeypatch.setattr(server, "_run_allow_spend_engine", None)
+    # Drop the autouse fixture's blanket "capable": this test is ABOUT the probe.
+    monkeypatch.setattr(server, "_comfy_run_takes_allow_spend", _REAL_ALLOW_SPEND_PROBE)
+
+    patched_run("Usage: comfy run\n  --allow-spend\n")
+    real_engine.bind()
+    assert _REAL_ALLOW_SPEND_PROBE() is True  # latched against the gated build
+
+    real_engine.swap()  # ...and now it is not that build any more
+
+    spawned: list[tuple] = []
+    probe_text = "Usage: comfy run\n  --workflow TEXT\n"
+
+    def record(*args, **kwargs):
+        spawned.append(args)
+        return {"outputs": ["/x.png"]}
+
+    async def record_async(*args, **kwargs):
+        spawned.append(args)
+        return {"outputs": ["/x.png"]}
+
+    def fake_raw(*args, **kwargs):
+        # The capability probe, and ONLY the capability probe, reaches here.
+        assert args[:2] == ("run", "--help"), args
+        return ("", probe_text, "", 0, None)
+
+    monkeypatch.setattr(server, "_run_comfy_raw", fake_raw)
+    monkeypatch.setattr(server, "_run_comfy", record)
+    monkeypatch.setattr(server, "_run_comfy_streaming", record_async)
+
+    ctx = _FakeCtx(action="decline")
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _run_workflow("wf.json", confirm_spend=True, wait=wait, ctx=ctx)
+
+    assert "spend not confirmed" in str(excinfo.value)
+    assert spawned == [], "a paid graph was submitted before anyone was asked"
+    assert len(ctx.elicitations) == 1
 
 
 # --- consent resolves once, outside the retry loop ---------------------------
@@ -1034,3 +1160,155 @@ def test_a_swapped_graph_is_asked_about_afresh_on_the_retry_transport(
     )
     # Two unflagged runs, one per round, both refused. Neither carried consent.
     assert all("--allow-spend" not in call for call in calls)
+
+
+# --- the prompt mode must survive the input-required retry -------------------
+#
+# [P2] on comfy-mcp#322 (@skishore23): the asking round and the answering round
+# are two separate executions of the tool, and the branch that picks the prompt
+# WORDING is a `comfy run --help` probe that can fail transiently. A probe that
+# failed on the asking call and succeeded on the answering one renders the gate's
+# other wording; `_consent_state` is keyed on the prompt text, so the nonce claim
+# fails and a human who already answered is asked a second time.
+
+
+def _spend_answer(key, pending, *, action="accept", approve=True):
+    """The retry context that carries one answered consent prompt back in."""
+    return _FakeCtx(
+        protocol_version=_INPUT_REQUIRED,
+        input_responses={
+            key: types.ElicitResult(action=action, content={"approve": approve})
+        },
+        request_state=pending.request_state,
+    )
+
+
+@pytest.fixture
+def flaky_probe(monkeypatch):
+    """`set(capable: bool)` — drive the capability probe between the two rounds.
+
+    The up-front wording is reached only when the probe says False, the
+    after-refusal wording only when it says True, so flipping this between the
+    rounds is exactly the transition [P2] describes.
+    """
+    state = {"capable": False}
+    monkeypatch.setattr(
+        server, "_comfy_run_takes_allow_spend", lambda: state["capable"]
+    )
+    return lambda capable: state.__setitem__("capable", capable)
+
+
+@pytest.mark.parametrize(
+    ("first_capable", "then_capable", "why"),
+    [
+        (False, True, "a transient probe failure asked up front, then recovered"),
+        (True, False, "a capable engine asked after the refusal, then probed badly"),
+    ],
+)
+def test_an_approval_survives_a_capability_flip_between_the_rounds(
+    refusing_engine, tmp_path, flaky_probe, first_capable, then_capable, why
+):
+    """[P2] The answer is consumed, the graph runs, and nobody is asked twice."""
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+
+    flaky_probe(first_capable)
+    pending = _run_workflow(
+        path, confirm_spend=True, ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED)
+    )
+    assert isinstance(pending, types.InputRequiredResult), why
+    [key] = pending.input_requests
+
+    flaky_probe(then_capable)
+    retry = _spend_answer(key, pending)
+    assert _run_workflow(path, confirm_spend=True, ctx=retry) == {
+        "outputs": ["/x.png"]
+    }, why
+    assert any("--allow-spend" in call for call in calls), why
+
+
+@pytest.mark.parametrize(
+    ("first_capable", "then_capable"), [(False, True), (True, False)]
+)
+def test_a_decline_survives_a_capability_flip_between_the_rounds(
+    refusing_engine, tmp_path, flaky_probe, first_capable, then_capable
+):
+    """[P2] A "no" must be consumed too — re-asking a refusal is the same bug.
+
+    Discarding a decline is not a safety hole the way discarding an approval is
+    a usability one, but it is the SAME mechanism, and asking a person who just
+    said no to say it again is how a click-through habit gets trained.
+    """
+    path = _graph(tmp_path)
+    calls = refusing_engine()
+
+    flaky_probe(first_capable)
+    pending = _run_workflow(
+        path, confirm_spend=True, ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED)
+    )
+    [key] = pending.input_requests
+
+    flaky_probe(then_capable)
+    retry = _spend_answer(key, pending, action="decline", approve=False)
+    with pytest.raises(server.ComfyCliError) as excinfo:
+        _run_workflow(path, confirm_spend=True, ctx=retry)
+
+    assert "spend not confirmed" in str(excinfo.value)
+    assert all("--allow-spend" not in call for call in calls)
+
+
+def test_a_changed_graph_still_defeats_the_claim_under_a_capability_flip(
+    refusing_engine, tmp_path, flaky_probe
+):
+    """Accepting either wording must not loosen the pin that matters.
+
+    Both candidate texts carry the same graph digest, so widening the claim to
+    two messages widens it across the WORDING only. A graph swapped under the
+    prompt still fails both, and the human is asked afresh.
+    """
+    path = _graph(tmp_path)
+    refusing_engine()
+
+    flaky_probe(False)
+    pending = _run_workflow(
+        path, confirm_spend=True, ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED)
+    )
+    [key] = pending.input_requests
+
+    open(path, "w", encoding="utf-8").write(_OTHER_GRAPH)
+    flaky_probe(True)
+    replay = _run_workflow(path, confirm_spend=True, ctx=_spend_answer(key, pending))
+
+    assert isinstance(replay, types.InputRequiredResult)
+    [(_, request)] = replay.input_requests.items()
+    assert (
+        hashlib.sha256(_OTHER_GRAPH.encode()).hexdigest()[:12] in request.params.message
+    )
+
+
+def test_one_answer_is_still_spent_only_once_across_a_capability_flip(
+    refusing_engine, tmp_path, flaky_probe
+):
+    """The nonce is consumed by whichever wording claimed it, and only once.
+
+    `any()` short-circuits over the candidate texts, so a replay of the same
+    sealed state cannot be redeemed a second time by the OTHER wording.
+    """
+    path = _graph(tmp_path)
+    refusing_engine()
+
+    flaky_probe(False)
+    pending = _run_workflow(
+        path, confirm_spend=True, ctx=_FakeCtx(protocol_version=_INPUT_REQUIRED)
+    )
+    [key] = pending.input_requests
+
+    flaky_probe(True)
+    assert _run_workflow(path, confirm_spend=True, ctx=_spend_answer(key, pending)) == {
+        "outputs": ["/x.png"]
+    }
+
+    # Same sealed state, replayed. Flip back so the OTHER wording is in force.
+    flaky_probe(False)
+    replay = _run_workflow(path, confirm_spend=True, ctx=_spend_answer(key, pending))
+    assert isinstance(replay, types.InputRequiredResult), "a nonce was spent twice"

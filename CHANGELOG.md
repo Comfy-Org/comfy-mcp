@@ -121,6 +121,36 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ### Fixed
 
+- **A cached capability answer could let a paid graph run with nobody asked.**
+  `run_workflow` skips the up-front spend prompt when `comfy run --help` says
+  the engine has `--allow-spend`, because a gated engine will refuse the
+  unflagged run and the prompt is better raised on that refusal. That probe
+  latched on a process-wide boolean, so ONE positive answer silenced the
+  up-front prompt for the life of the server — and a `COMFY_BIN` replaced or
+  rolled back to an ungated build inside that lifetime has no interlock to
+  refuse with, so the next paid graph simply ran and spent. The latch is now
+  bound to the executable it was taken against (resolved real path plus
+  device, inode, size and mtime), so a rollback re-probes; an identity that
+  cannot be read — a macOS TCC denial resolves on PATH and refuses to be
+  stat'ed — re-probes every call rather than latching, and deliberately does
+  not refuse, because refusing would re-prompt every `confirm_spend=True`
+  caller on FREE graphs ([#300](https://github.com/Comfy-Org/comfy-mcp/issues/300)).
+  Reported by @skishore23 on [#322](https://github.com/Comfy-Org/comfy-mcp/pull/322).
+
+- **A spend approval could be discarded and the same person asked twice.** On
+  the `2026-07-28` transport the answer arrives on a RETRY of the whole tool
+  call, and `request_state` is keyed on the prompt's text. This gate has two
+  wordings — up front on an engine with no interlock, after the engine's
+  refusal otherwise — chosen by a `comfy run --help` probe that can fail
+  transiently. A probe that failed on the asking round and succeeded on the
+  answering one rendered the other wording, whose digest did not match, so a
+  valid approval was thrown away and a second prompt went out. The gate now
+  also accepts the counterpart wording it could have minted on the asking
+  round; both texts carry the same subject and the same graph digest, so a
+  graph swapped under the prompt still defeats the claim and one answer is
+  still redeemable exactly once. Reported by @skishore23 on
+  [#322](https://github.com/Comfy-Org/comfy-mcp/pull/322).
+
 - **Three capability claims named the release that does NOT have the feature.**
   `search_templates(runnable_only=True)` told a caller its `--runnable` filter
   "landed after comfy-cli 1.26.0", the `search_models` remote refusal said

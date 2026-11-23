@@ -5564,7 +5564,12 @@ def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
 
 
 def _consent_via_input_required(
-    ctx: Context, message: str, schema: type, wording: _ApprovalWording
+    ctx: Context,
+    message: str,
+    schema: type,
+    wording: _ApprovalWording,
+    *,
+    also_accept: tuple[str, ...] = (),
 ) -> bool:
     """Elicit on ``>= 2026-07-28``, where ``ctx.elicit()`` has no back-channel.
 
@@ -5582,11 +5587,35 @@ def _consent_via_input_required(
     re-asks. A claimed answer is judged by the same :func:`_consent_from_outcome`
     the back-channel path uses. ``getattr``/``Mapping`` throughout, because a
     non-conforming client's content must fail closed, never crash.
+
+    ``also_accept`` carries the OTHER texts the same gate could have minted this
+    answer under, and exists because the asking round and the answering round are
+    two separate executions of the tool that need not take the same branch. The
+    ``run_workflow`` spend gate has two wordings — up front on an engine with no
+    interlock, after the engine's refusal otherwise — chosen by a ``comfy run
+    --help`` probe that can fail transiently. A probe that failed on the asking
+    call and succeeded on the answering one (or the reverse) renders the gate's
+    OTHER wording, whose digest does not match the state the human's answer came
+    back with, so a perfectly valid approval is discarded and the same person is
+    asked a second time. Reported by @skishore23 on comfy-mcp#322 ([P2]).
+
+    This widens nothing a caller controls. Every candidate is a text THIS server
+    composes for THIS gate on THIS call, carrying the same subject and the same
+    graph digest; the alternative to accepting them both is re-prompting a human
+    who already answered. The mint is always ``message`` — the wording actually
+    in force — so a fresh question is never phrased by the stale branch.
     """
     key = _consent_channel_key(wording)
     responses = getattr(ctx, "input_responses", None)
     answer = responses.get(key) if isinstance(responses, Mapping) else None
-    if answer is None or not _claim_consent_nonce(ctx, key, message):
+    # `any` short-circuits, so at most ONE candidate ever consumes the nonce;
+    # a candidate whose digest does not match is refused by `startswith` before
+    # the consumed set is touched at all.
+    claimed = answer is not None and any(
+        _claim_consent_nonce(ctx, key, candidate)
+        for candidate in (message, *also_accept)
+    )
+    if not claimed:
         request = types.ElicitRequest(
             params=types.ElicitRequestFormParams(
                 message=message,
@@ -5609,7 +5638,12 @@ def _consent_via_input_required(
 
 
 async def _elicit_approval(
-    ctx: Context, message: str, schema: type, wording: _ApprovalWording
+    ctx: Context,
+    message: str,
+    schema: type,
+    wording: _ApprovalWording,
+    *,
+    also_accept: tuple[str, ...] = (),
 ) -> bool:
     """Raise one confirmation prompt and report whether it was approved.
 
@@ -5644,7 +5678,12 @@ async def _elicit_approval(
         )
         return True
     if _uses_input_required(ctx):
-        return _consent_via_input_required(ctx, message, schema, wording)
+        return _consent_via_input_required(
+            ctx, message, schema, wording, also_accept=also_accept
+        )
+    # `also_accept` is deliberately NOT forwarded to `ctx.elicit()`: that
+    # transport awaits the answer inside this frame, so there is no second
+    # execution for a branch to differ on and nothing to reconcile.
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message=message, schema=schema),
@@ -6404,6 +6443,7 @@ async def _resolve_optin_spend_consent(
     schema: type[BaseModel],
     prompt: str,
     declined: str,
+    also_accept: tuple[str, ...] = (),
 ) -> bool:
     """The shared OPT-IN spend gate behind ``run_template`` and ``run_workflow``.
 
@@ -6450,7 +6490,13 @@ async def _resolve_optin_spend_consent(
     # on the generate path: guessing "cannot elicit" would silently demote a
     # capable client onto the caller's own say-so and spend without a human.
     if _client_elicitation_support(ctx) is not False:
-        if await _elicit_approval(ctx, prompt, schema, _OPTIN_SPEND_APPROVAL_WORDING):
+        if await _elicit_approval(
+            ctx,
+            prompt,
+            schema,
+            _OPTIN_SPEND_APPROVAL_WORDING,
+            also_accept=also_accept,
+        ):
             return True
         raise ComfyCliError(declined)
     # Client cannot elicit: `confirm_spend` is the documented fallback.
@@ -6489,11 +6535,58 @@ async def _resolve_template_spend_consent(
     )
 
 
-# Latch for `_comfy_run_takes_allow_spend`. Latched only on a POSITIVE result,
-# the same posture as `_emit_workflow_capability_probed`: a probe that fails for
-# a transient reason (a hung binary, a bad spawn) must not wedge the answer for
-# the life of the process, and an upgrade mid-process should be picked up.
-_run_allow_spend_probed = False
+def _comfy_engine_identity() -> str | None:
+    """Fingerprint the ``comfy`` executable a spawn would reach RIGHT NOW.
+
+    ``None`` when it cannot be established at all — ``COMFY_BIN`` resolves to
+    nothing, or the file refuses to be stat'ed (a macOS TCC denial on a
+    protected folder does exactly that, and this server already has a whole
+    diagnostic for it). ``None`` means "cannot tell", and the one thing a caller
+    must never do with it is read it as "unchanged".
+
+    Resolution goes through :func:`shutil.which`, the same lookup
+    :func:`_require_comfy_bin` performs, so a bare ``COMFY_BIN`` is found on
+    ``PATH`` rather than against the current working directory. The identity is
+    then the resolved real path plus the `(device, inode, size, mtime_ns)` of
+    the file behind it: a `pip install comfy-cli==<older>` rewrites the console
+    script, so the inode and mtime both move even when the path does not.
+
+    What it does NOT catch is an in-place overwrite that preserves size and
+    restores mtime. That is a narrower window than the one it closes (a whole
+    process lifetime) and it is not reachable by any ordinary install or
+    rollback, so it is a residual rather than a hole left open on purpose.
+    """
+    try:
+        resolved = shutil.which(COMFY_BIN)
+        if resolved is None:
+            return None
+        real = os.path.realpath(resolved)
+        st = os.stat(real)
+    except OSError:
+        return None
+    return f"{real}|{st.st_dev}|{st.st_ino}|{st.st_size}|{st.st_mtime_ns}"
+
+
+# Latch for `_comfy_run_takes_allow_spend`, BOUND TO THE EXECUTABLE it was taken
+# against (`_comfy_engine_identity`) rather than to the process. Latched only on
+# a POSITIVE result, the same posture as `_emit_workflow_capability_probed`: a
+# probe that fails for a transient reason (a hung binary, a bad spawn) must not
+# wedge the answer for the life of the process, and an upgrade mid-process
+# should be picked up.
+#
+# A plain boolean was WRONG here in a way the other capability latches are not,
+# because this one gates a spend prompt rather than an error message. With it,
+# one positive probe made every later call skip the up-front prompt for the life
+# of the process; replace or roll back `COMFY_BIN` to an UNGATED build inside
+# that lifetime and the next paid graph is submitted with neither `--allow-spend`
+# nor a human — the engine has no interlock to refuse with, so it simply runs
+# and spends, and the refusal handler that raises the prompt is never reached.
+# Reported by @skishore23 on comfy-mcp#322 ([P1]).
+#
+# An identity that cannot be read does NOT latch and does NOT refuse: it
+# re-probes. See `_comfy_run_takes_allow_spend` for why refusing would be the
+# worse of the two.
+_run_allow_spend_engine: str | None = None
 
 
 def _comfy_run_takes_allow_spend() -> bool:
@@ -6517,9 +6610,19 @@ def _comfy_run_takes_allow_spend() -> bool:
     which is the conservative direction here — it costs a usage error, never a
     surprise spend.
     """
-    global _run_allow_spend_probed
-    if _run_allow_spend_probed:
+    global _run_allow_spend_engine
+    engine = _comfy_engine_identity()
+    if engine is not None and _run_allow_spend_engine == engine:
         return True
+    # `engine is None` falls through to a FRESH probe rather than to a refusal.
+    # What cannot be established in that case is the cache KEY, not the
+    # interlock: `comfy run --help` still answers for the executable in front of
+    # us right now. Refusing instead would ask up front on every
+    # `confirm_spend=True` call, which is the comfy-mcp#300 regression — an
+    # agent passing the flag prophylactically would re-prompt on FREE graphs.
+    # The residual is the window between this probe and the spawn below it,
+    # which is milliseconds; the bug being fixed had a window of a whole
+    # process lifetime.
     try:
         _, stdout, _, returncode, _ = _run_comfy_raw("run", "--help", timeout=30.0)
     # Broad on purpose, like the other probes: a present-but-unusable binary
@@ -6531,7 +6634,12 @@ def _comfy_run_takes_allow_spend() -> bool:
         return False
     if returncode != 0 or "--allow-spend" not in stdout:
         return False
-    _run_allow_spend_probed = True
+    # Latch only against an identity that is both known and unchanged across the
+    # probe: the probe spawned a child, so there is a window in which the engine
+    # the upcoming run will reach is no longer the one that answered. An
+    # unknown identity simply does not latch, so the next call re-probes.
+    if engine is not None and _comfy_engine_identity() == engine:
+        _run_allow_spend_engine = engine
     return True
 
 
@@ -6581,28 +6689,35 @@ async def _resolve_workflow_spend_consent(
             "approval is refused rather than reused."
         )
     )
+    # BOTH wordings are composed on every call, not just the one in force. The
+    # one in force is what gets asked and what a fresh `request_state` is minted
+    # against; the other rides along as `also_accept` so an answer minted under
+    # it on an earlier execution of this same tool call is still redeemable.
+    # See `_consent_via_input_required` for why the two rounds can disagree.
+    after_refusal_prompt = (
+        f"Run the workflow `{path_display}` with credit spending ALLOWED? "
+        "It embeds partner-API nodes, so running it SPENDS Comfy credits "
+        "from the account the machine RUNNING it is signed into — this one, "
+        "or the remote a COMFYUI_URL/COMFYUI_HOST names. It has already "
+        "been refused once for want of this consent, so nothing has been "
+        f"spent yet.{pinned}"
+    )
+    up_front_prompt = (
+        f"Run the workflow `{path_display}` with credit spending ALLOWED? "
+        "Most workflows run for free on your own ComfyUI, but one "
+        "containing partner-API nodes SPENDS Comfy credits from the account "
+        "the machine RUNNING it is signed into — this one, or the remote a "
+        f"COMFYUI_URL/COMFYUI_HOST names.{pinned}"
+    )
     if after_refusal:
-        prompt = (
-            f"Run the workflow `{path_display}` with credit spending ALLOWED? "
-            "It embeds partner-API nodes, so running it SPENDS Comfy credits "
-            "from the account the machine RUNNING it is signed into — this one, "
-            "or the remote a COMFYUI_URL/COMFYUI_HOST names. It has already "
-            "been refused once for want of this consent, so nothing has been "
-            f"spent yet.{pinned}"
-        )
+        prompt, alternate = after_refusal_prompt, up_front_prompt
         declined_tail = (
             " This graph cannot be run for free: it was already refused with "
             "`spend_consent_required`, so retrying with confirm_spend=False "
             "will fail closed the same way rather than running it."
         )
     else:
-        prompt = (
-            f"Run the workflow `{path_display}` with credit spending ALLOWED? "
-            "Most workflows run for free on your own ComfyUI, but one "
-            "containing partner-API nodes SPENDS Comfy credits from the account "
-            "the machine RUNNING it is signed into — this one, or the remote a "
-            f"COMFYUI_URL/COMFYUI_HOST names.{pinned}"
-        )
+        prompt, alternate = up_front_prompt, after_refusal_prompt
         # No interlock on this engine, so there is no fail-closed path to fall
         # back to and `confirm_spend=False` is NOT a way to run the graph for
         # free — it would run it and spend, having asked nobody.
@@ -6622,6 +6737,10 @@ async def _resolve_workflow_spend_consent(
             "spent and no run was started."
             f"{_DECLINE_MAY_BE_AUTOMATIC}{declined_tail}"
         ),
+        # Both texts carry the same subject and the same graph digest, so this
+        # never lets one graph's approval unlock another's: `pinned` is inside
+        # both, and an unreadable graph quotes nothing in either.
+        also_accept=(alternate,),
     )
 
 
