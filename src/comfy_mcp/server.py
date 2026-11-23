@@ -8745,13 +8745,20 @@ def _remote_target_configured() -> bool:
     process. Falling back to the guidance error costs an explanation; guessing
     wrong costs a running server.
 
+    :func:`target._comfy_target` answers only "did the operator configure a
+    remote?", so a Comfy Desktop port-lock discovery (which lives in
+    :func:`target._forward_target`) is never read as remote here and the
+    guided-restart recovery path stays available for a Desktop-launched
+    instance with nothing configured.
+
     Fails CLOSED: a set-but-malformed value raises out of :func:`target._comfy_target`,
     and that is read as "configured", not as "local".
     """
     try:
-        return target._comfy_target() is not None
+        resolved = target._comfy_target()
     except Exception:  # noqa: BLE001 - unreadable config must not unlock a kill
         return True
+    return resolved is not None
 
 
 def _kill_target_port(extra_args: list[str] | None) -> int | None:
