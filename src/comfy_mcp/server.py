@@ -13438,9 +13438,10 @@ async def download_model(
         unrenamed; the pre-1.14 foreground fallback payload carries none.
 
     Gotchas:
-        - comfy-cli writes straight to the FINAL path while transferring, so a
-          present file proves nothing. ``download(action="status")`` reporting
-          ``completed`` is the only proof the model is usable.
+        - ``completed`` from ``download(action="status")`` proves the
+          TRANSFER finished, not that a model arrived: nothing reads the body,
+          so a URL answering ``200 text/html`` saves the page and reports
+          completed. Check the size is plausible.
         - REFUSES when a remote ComfyUI is configured (``COMFYUI_URL``/
           ``COMFYUI_HOST``): this always writes LOCALLY, so a remote target
           would silently get the wrong disk. Set
@@ -13711,6 +13712,25 @@ _DOWNLOAD_ACTION_VERB = {
         openWorldHint=False,
     )
 )
+# `completed` is a statement about bytes, not about what the bytes are. Nothing on
+# comfy-cli's download path reads the response body or its content-type, so a URL that
+# answers `200 text/html` -- a Hugging Face or Civitai repo PAGE, a GitHub blob page, a
+# Drive link -- transfers successfully and leaves the web page at `dest` under the
+# caller's `--filename`. Measured 2026-11-23 against comfy-cli main: `status:
+# "completed"`, `percent: 100.0`, `error: null`, 577 bytes of HTML saved as
+# `notamodel.safetensors`; and 276,289 bytes of model-card HTML as
+# `flux1-dev.safetensors` from a bare `huggingface.co/<org>/<repo>` link. The Hugging
+# Face half is refused upstream as of Comfy-Org/comfy-cli#1187; the general
+# content-type case is still open.
+#
+# Both docstrings used to call `completed` "the only proof a model is usable", which is
+# the sentence an agent acts on when it reports a download done. `search_models` cannot
+# tell the difference either -- it lists filenames and never content -- so the
+# plausibility of the SIZE is the only check available here, and that is what they say
+# now. The "writes straight to the FINAL path, so a present file proves nothing" note
+# stays on `download`, the tool that reports status, and dropped out of `download_model`
+# to pay for the correction's length: it is the weaker half of the same point, and one
+# copy of it is enough.
 @_object_payload
 def download(
     action: str = "status",
@@ -13721,9 +13741,9 @@ def download(
 
     Wraps `comfy model download-status`/`download-cancel`. `action`:
     - "status" (default) -> status, completed_bytes/total_bytes/percent,
-      elapsed_seconds, dest, error. comfy-cli writes to `dest` while
-      transferring, so a present file proves nothing until status reads
-      "completed" -- the only proof a model is usable.
+      elapsed_seconds, dest, error. comfy-cli writes to `dest` mid-transfer,
+      so a present file proves nothing; and "completed" proves the TRANSFER
+      finished, not that a model arrived.
     - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns
       the final payload, or `{"timed_out": True, "download_id": ...,
       "status": <last>}` on expiry -- a TIMEOUT, not a failure.

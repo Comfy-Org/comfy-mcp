@@ -109,7 +109,24 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # reads a whole graph's slots as one node's. The tree was already at ~16,337 of
 # 16,350, so no version of it fit the slack. Measured ~16,409 after the edit,
 # so the next growth is still a decision.
-_BUDGET_TOKENS = 16_450
+# 16,450 -> 16,475 to correct a FALSE claim rather than to add a feature. Both
+# download docstrings said `completed` from `download(action="status")` was "the only
+# proof a model is usable". It is not: nothing on comfy-cli's download path reads the
+# response body or its content-type, so a URL answering `200 text/html` transfers
+# successfully and leaves the web page at `dest` under the caller's filename, reporting
+# `status: "completed"`, `percent: 100.0`, `error: null`. Measured 2026-11-23 against
+# comfy-cli main: 577 bytes of HTML saved as `notamodel.safetensors`, and 276,289 bytes
+# of model-card HTML as `flux1-dev.safetensors` from a bare `huggingface.co/<org>/<repo>`
+# link. That sentence is the one an agent acts on when it tells a user a model is
+# installed, and `search_models` cannot catch it either -- it lists filenames and never
+# content -- so the docstrings now name the size check instead.
+#
+# The true statement is longer than the false one and the tree was at ~16,448 of 16,450,
+# so no version of it fit the slack; it was trimmed to the agent contract first (the
+# measurements and the reasoning are in a comment above `download`, and
+# `download_model` gave up its duplicate copy of the mid-transfer note to pay for the
+# rest). Measured ~16,460 after the edit, so the next growth is still a decision.
+_BUDGET_TOKENS = 16_475
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
