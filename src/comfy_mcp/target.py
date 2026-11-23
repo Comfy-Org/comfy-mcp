@@ -560,10 +560,17 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     The flags are injected into the SUBCOMMAND args (after the ``run`` /
     ``run-template`` / ``jobs`` / ``upload`` / ``models`` verb), never into the global
     ``--json`` / ``--where`` prefix, since ``--host`` / ``--port`` are
-    subcommand options. A no-op for the local default (``_comfy_target`` is
-    None) and for any subcommand that doesn't accept the flags (see
+    subcommand options. A no-op for the local default (:func:`_forward_target`
+    is None — note that is the FORWARDING resolver, which includes Comfy
+    Desktop's discovered port, not :func:`_comfy_target`) and for any
+    subcommand that doesn't accept the flags (see
     :data:`_TARGET_AWARE_SUBCOMMANDS`), so unconfigured behavior is
     byte-identical to today.
+
+    Anything reading back "was ``--host`` sent?" — ``search_models``' version-skew
+    retry is the one caller that does — must resolve through
+    :func:`_forward_target` too, or it will disagree with what this function
+    actually put on the argv.
 
     They go at the END of the subcommand args, past any positionals — Click
     parses options wherever they appear, and ``upload``'s variadic file list

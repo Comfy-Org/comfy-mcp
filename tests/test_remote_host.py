@@ -779,6 +779,114 @@ def test_search_models_old_comfy_cli_retries_via_comfy_local_url(
     assert "COMFY_LOCAL_URL" not in server.os.environ
 
 
+def test_search_models_desktop_discovered_port_retries_via_comfy_local_url(
+    patched_run, monkeypatch
+):
+    """Regression: the retry must key on what was FORWARDED, not on config.
+
+    ``_with_target`` forwards ``--host``/``--port`` from
+    :func:`target._forward_target`, which includes Comfy Desktop's discovered
+    port-lock. The retry below used to re-resolve through
+    :func:`target._comfy_target` — "is a remote CONFIGURED?" — which is ``None``
+    for a discovered Desktop. So on the one configuration the fallback exists
+    for (nothing set, ComfyUI launched via Desktop) plus a ``comfy models`` that
+    predates ``--host``, the forwarded flag was rejected and the retry re-raised
+    Click's usage dump under a branch commented "unreachable". It was reachable,
+    and ``search_models`` was simply broken there.
+    """
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+    monkeypatch.delenv("COMFY_LOCAL_URL", raising=False)
+    calls = patched_run(
+        replies=[
+            CliReply("", returncode=2, stderr=_MODELS_NO_HOST_USAGE),
+            envelope(data={"rows": ["desktop_model.safetensors"]}),
+        ]
+    )
+
+    assert server.search_models(query="xl") == {"rows": ["desktop_model.safetensors"]}
+
+    assert len(calls) == 2
+    assert calls[0]["cmd"][4:] == [
+        "models",
+        "search",
+        "--text",
+        "xl",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8003",
+    ]
+    assert calls[1]["cmd"][4:] == ["models", "search", "--text", "xl"]
+    assert calls[1]["env"]["COMFY_LOCAL_URL"] == "http://127.0.0.1:8003"
+    # The child's env only, and no remote was ever configured here.
+    assert "COMFY_LOCAL_URL" not in server.os.environ
+    assert target._comfy_target() is None
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"query": "xl"}, ["models", "search", "--text", "xl"]),
+        ({"folder": "loras"}, ["models", "list-folder", "loras"]),
+        ({}, ["models", "list-folders"]),
+    ],
+)
+def test_search_models_desktop_discovery_retries_every_mode(
+    patched_run, monkeypatch, kwargs, expected
+):
+    """All three modes share the one call site, so all three retry."""
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+    calls = patched_run(
+        replies=[
+            CliReply("", returncode=2, stderr=_MODELS_NO_HOST_USAGE),
+            envelope(data={}),
+        ]
+    )
+
+    server.search_models(**kwargs)
+
+    assert len(calls) == 2
+    assert calls[1]["cmd"][4:] == expected
+    assert calls[1]["env"]["COMFY_LOCAL_URL"] == "http://127.0.0.1:8003"
+
+
+def test_search_models_with_nothing_forwarded_still_raises(patched_run):
+    """The over-correction guard: no target at all is still a hard failure.
+
+    With neither a configured remote nor a discovered Desktop, ``_with_target``
+    sends no ``--host``, so a usage error naming it is a genuine failure of the
+    engine's own — not a version gap. Retrying flaglessly here would return THIS
+    machine's catalog, which is the wrong-machine bug the forward exists to fix.
+    One spawn, and the engine's message survives.
+    """
+    calls = patched_run("", returncode=2, stderr=_MODELS_NO_HOST_USAGE)
+
+    with pytest.raises(server.ComfyCliError):
+        server.search_models(query="xl")
+
+    assert len(calls) == 1
+
+
+def test_search_models_comfy_local_url_set_means_nothing_is_forwarded(
+    patched_run, monkeypatch
+):
+    """A Desktop lock plus an operator-chosen ``COMFY_LOCAL_URL`` forwards nothing.
+
+    ``_forward_target`` stands down for ANY non-empty ``COMFY_LOCAL_URL``, so
+    the retry has nothing to hand over and must not overwrite the operator's own
+    value with a discovered port.
+    """
+    monkeypatch.setattr(target, "_discover_comfy_desktop_port", lambda: 8003)
+    monkeypatch.setenv("COMFY_LOCAL_URL", "http://127.0.0.1:8189")
+    calls = patched_run("", returncode=2, stderr=_MODELS_NO_HOST_USAGE)
+
+    with pytest.raises(server.ComfyCliError):
+        server.search_models()
+
+    assert len(calls) == 1
+    assert "--host" not in calls[0]["cmd"]
+
+
 def test_search_models_retry_failure_surfaces_the_engine_s_error(
     patched_run, monkeypatch
 ):

@@ -24,9 +24,10 @@ These lock in:
    ``_comfy_target``, so a discovered Desktop is forwarded as ``--host``/
    ``--port`` without reading as a configured remote to the remote-only guards.
    It applies only when neither ``COMFYUI_URL`` nor ``COMFYUI_HOST`` is set
-   (both still take unconditional precedence, unchanged), stands down when
-   ``COMFY_LOCAL_URL`` names a local address, and is byte-identical ``None``
-   when discovery itself finds nothing — the existing local-only default keeps
+   (both still take unconditional precedence, unchanged), stands down for ANY
+   non-empty ``COMFY_LOCAL_URL`` (the guard reads the variable's presence, not
+   whether the address it names is local), and is byte-identical ``None`` when
+   discovery itself finds nothing — the existing local-only default keeps
    governing.
 """
 
