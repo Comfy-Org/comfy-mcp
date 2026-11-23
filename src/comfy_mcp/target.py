@@ -225,7 +225,8 @@ def _comfy_desktop_port_locks_dir() -> Path | None:
     unrecognized or the directory does not exist, so a Comfy-Desktop-less
     environment resolves this fallback to "no candidates" rather than erroring
     — the same "byte-identical when nothing applies" contract every other
-    branch of `_comfy_target` keeps.
+    branch of `_forward_target` keeps. This fallback is a branch of that
+    function, not of `_comfy_target`, which stays explicit-only.
     """
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
