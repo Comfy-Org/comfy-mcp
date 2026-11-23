@@ -106,9 +106,10 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # as the remote's catalog, so an agent gated a run (or a redundant multi-GB
 # ``download_model``) on the wrong disk. Unlike ``upload`` its flags are NEWER
 # than ``_MIN_COMFY_CLI``: the ``--host`` / ``--port`` options landed on ``comfy
-# models`` (Comfy-Org/comfy-cli#876) after v1.26.0, long after the discovery
-# leaves themselves, so every supported release has the verbs and rejects only
-# the flags. ``search_models`` therefore retries once on Click's "No such
+# models`` (Comfy-Org/comfy-cli#876) in comfy-cli 1.27.0
+# (``server._MIN_MODELS_HOST_COMFY_CLI_STR``), long after the discovery leaves
+# themselves, so every supported release below that has the verbs and rejects
+# only the flags. ``search_models`` therefore retries once on Click's "No such
 # option" by handing the same target to comfy-cli's own ``COMFY_LOCAL_URL`` in
 # the child's env (the pre-flag ``comfy models`` resolves its target through
 # ``resolve_target``, whose local precedence honors it for any host) — never

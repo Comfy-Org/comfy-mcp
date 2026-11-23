@@ -426,13 +426,22 @@ _NO_RUNNABLE_USAGE = (
 
 
 def test_search_templates_runnable_only_names_a_missing_flag(patched_run):
-    """A comfy-cli without `--runnable` gets an upgrade error, never the unfiltered gallery."""
+    """A comfy-cli without `--runnable` gets an upgrade error, never the unfiltered gallery.
+
+    The upgrade hint has to name a VERSION. `pip install -U comfy-cli`, which is
+    what this asserted until 2026-11-18, is only an instruction while no release
+    carries the flag — the install it talks to is already the newest one, so an
+    agent that ran it and retried got the same error forever. comfy-cli 1.27.0
+    carries `--runnable`, so the bound is sayable and the hint says it.
+    """
     calls = patched_run("", returncode=2, stderr=_NO_RUNNABLE_USAGE)
 
     with pytest.raises(server.ComfyCliError, match="no `--runnable` filter") as ei:
         server.search_templates(runnable_only=True)
 
-    assert "pip install -U comfy-cli" in str(ei.value)
+    message = str(ei.value)
+    assert f"comfy-cli>={server._MIN_RUNNABLE_COMFY_CLI_STR}" in message
+    assert "pip install --upgrade" in message
     assert len(calls) == 1  # no unfiltered re-ask
 
 
