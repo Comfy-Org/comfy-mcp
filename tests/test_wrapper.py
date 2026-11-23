@@ -38,6 +38,7 @@ from conftest import (
     envelope,
     stream_reader,
 )
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 
 from comfy_mcp import argv, clitext, errors, failure_log, server, tcc, textutil
 
@@ -508,6 +509,48 @@ def test_error_envelope_carries_structured_code(patched_run):
     assert excinfo.value.code == "server_not_running"
 
 
+def test_error_envelope_reaches_the_client_and_not_only_the_log(patched_run):
+    """Issue #267: the reason has to survive the SDK's crash/anticipated split.
+
+    MCP Python SDK 2.x forwards a ``ToolError``'s text to the client and drops
+    every other exception's — "the exception's own text stays on the server"
+    (``mcp/server/mcpserver/tools/base.py``). ``MCPServer.call_tool`` re-raises
+    the first as ``ToolError`` and the second as ``UnexpectedToolError``, whose
+    message is only ``Error executing tool <name>``; either way
+    ``_handle_call_tool`` puts ``str(exc)`` into the ``CallToolResult``. So the
+    exception class this raises IS the client's error surface, which is why the
+    negative assertion matters as much as the positive one: while
+    ``ComfyCliError`` was a plain ``RuntimeError``, every failure of this server
+    reached the model as that bare line, with no code, no hint and no way to
+    correct itself.
+    """
+    patched_run(
+        envelope(
+            ok=False,
+            error={
+                "code": "workflow_not_found",
+                "message": "/tmp/missing.json does not exist",
+                "hint": "pass a path to a frontend-format workflow JSON",
+            },
+        ),
+        returncode=1,
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(
+            server.mcp.call_tool(
+                "list_workflow_slots", {"workflow_path": "/tmp/missing.json"}
+            )
+        )
+
+    assert not isinstance(excinfo.value, UnexpectedToolError), (
+        "an UnexpectedToolError is the masked one: the client would see only the tool name"
+    )
+    message = str(excinfo.value)
+    assert "workflow_not_found" in message
+    assert "pass a path to a frontend-format workflow JSON" in message
+
+
 def test_error_envelope_carries_its_data_payload(patched_run):
     """A negative verdict that IS a structured report reaches the caller intact.
 
@@ -667,6 +710,76 @@ def test_version_guard_fails_open_on_unparseable_version(monkeypatch):
 
     server._check_comfy_version()  # no raise
     assert server._version_checked is True
+
+
+def test_version_guard_fails_open_on_the_unstamped_placeholder(monkeypatch):
+    """comfy-cli's `0.0.0` means "version unknown", so the floor must not refuse it.
+
+    `comfy-cli`'s `pyproject.toml` pins
+    `version = "0.0.0"` until its publish workflow rewrites it from the release
+    tag, so every source install and editable checkout reports `0.0.0` — and
+    `ConfigManager.get_cli_version` returns the same string when the
+    `importlib.metadata` lookup fails outright. `"0.0.0"` parses cleanly, so
+    `(0, 0, 0) < (1, 14, 0)` made this guard fail CLOSED on a build whose version
+    it could not establish, and every tool answered "too old, upgrade" on a
+    checkout that may well have been newer than the floor. The reported
+    workaround was hand-stamping `pyproject.toml` before testing.
+    """
+    monkeypatch.setattr(server, "_version_checked", False)
+    monkeypatch.setattr(server, "_comfy_cli_version", (9, 9, 9))  # a stale read
+    fake, _ = _fake_version("comfy-cli, version 0.0.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    server._check_comfy_version()  # no raise
+
+    assert server._version_checked is True
+    # Normalized to the SAME unknown every other reader already fails open on,
+    # rather than a second sentinel each of them would have to learn: a per-verb
+    # floor (`job(action="watch")`) reading `(0, 0, 0)` would refuse the build
+    # the server-wide floor just waved through. It must also clear the stale
+    # tuple above, not keep it.
+    assert server._comfy_cli_version is None
+
+
+def test_version_floor_still_refuses_releases_below_it(monkeypatch):
+    """The `0.0.0` exemption is that tuple and nothing around it.
+
+    `0.0.1` and `0.1.0` are versions somebody could really have published, so
+    they stay refusals — the leniency covers comfy-cli's placeholder, not the
+    whole pre-1.0 range, and a guard that stopped enforcing the floor below 1.0
+    would be a worse bug than the one it fixed.
+    """
+    for below in ("0.0.1", "0.1.0", "1.13.0"):
+        monkeypatch.setattr(server, "_version_checked", False)
+        fake, _ = _fake_version(f"comfy-cli, version {below}")
+        monkeypatch.setattr(server.subprocess, "run", fake)
+        with pytest.raises(server.ComfyCliError, match=r"too old"):
+            server._check_comfy_version()
+
+    assert server._UNSTAMPED_COMFY_CLI == (0, 0, 0)
+
+
+def test_detect_version_reports_the_unstamped_placeholder_as_unknown(monkeypatch):
+    """The second site the unstamped placeholder reaches: the version report.
+
+    `_detect_comfy_cli_version` parses `--version` on its own, so before the fix
+    an unstamped build (a) published `comfy_cli_version: "0.0.0"` in
+    `server_info` — a version the build does not have — and (b) raised
+    "comfy-cli 0.0.0 is older than the required minimum" for any deployment that
+    set `COMFY_CLI_MIN_VERSION`. Unknown takes the documented warn-and-continue
+    path instead.
+    """
+    monkeypatch.setattr(server.shutil, "which", lambda _: "/fake/comfy")
+    fake, _ = _fake_version("comfy-cli, version 0.0.0")
+    monkeypatch.setattr(server.subprocess, "run", fake)
+
+    assert server._detect_comfy_cli_version() is None
+
+    monkeypatch.setattr(server, "MIN_COMFY_CLI_VERSION", "1.20.0")
+    report = server._check_comfy_cli_version()  # no raise
+
+    assert report["comfy_cli_version"] is None
+    assert any("could not determine" in w for w in report["warnings"])
 
 
 def test_version_guard_fails_open_when_version_errors(monkeypatch):
@@ -2715,43 +2828,49 @@ def test_validate_workflow_does_not_mutate_the_engine_payload(patched_run):
 # always-polls-once, caps-each-poll, gives-full-budget,
 # deadline-poll-timeout-as-timed-out, the three reraise cases,
 # sleeps-the-shared-poll-interval) moved to tests/test_jobs.py as
-# `job(action="wait")`. Several were rewritten there to call
-# `_poll_until_terminal` directly rather than scripting `time.monotonic()`
-# through the tool: `job` now off-loads the "wait" branch onto a REAL
-# `anyio.to_thread.run_sync` worker thread (R2), and that thread hand-off
-# itself reads the process-global `time.monotonic()` — a scripted fake that
-# stops ADVANCING (a fixed final value, or `StopIteration`) livelocks the
-# hand-off, since it never observes time moving and never signals the
-# coroutine that the thread is done. See test_jobs.py's module docstring and
-# `test_job_wait_clamps_an_oversized_timeout`'s docstring for the confirmed
-# repro.
+# `job(action="wait")`. The one-poll-minimum / per-poll-budget / re-raise
+# invariants are exercised by calling the SYNC `_poll_until_terminal` directly
+# there, scripting `time.monotonic()` with no event loop or thread to perturb
+# the clock; `job(action="wait")` itself now runs the cancellable async twin
+# `_poll_until_terminal_async`. See test_jobs.py's module docstring.
 
 
-def test_the_two_bounded_polls_run_on_one_shared_loop(monkeypatch):
-    """`job(action="wait")` and `_poll_download` both route through the shared loop.
+def test_the_two_bounded_polls_share_one_loop_across_the_sync_async_twins(monkeypatch):
+    """`job(action="wait")` and `_poll_download` route through the twin loops.
 
     The two ran statement-for-statement identical loops — the one-poll minimum,
     the per-poll budget cap, the three-clause re-raise — and drifted apart in the
-    only place they were spelled twice. Re-inlining either one is what this
-    guards against; the loop's own behavior is covered by the tests around it.
+    only place they were spelled twice. The cancellation migration split that
+    into a sync/async TWIN pair (`_poll_until_terminal` / `_async`), so this now
+    pins that each caller reaches its twin with the identical argv, predicate and
+    extra-key contract — re-inlining or crossing either wiring is what it guards.
     """
-    calls: list[tuple[tuple, dict]] = []
+    async_calls: list[tuple[tuple, dict]] = []
+    sync_calls: list[tuple[tuple, dict]] = []
 
-    def fake_poll(*args, **kwargs):
-        calls.append((args, kwargs))
+    async def fake_poll_async(*args, **kwargs):
+        async_calls.append((args, kwargs))
         return {"status": "completed"}
 
+    def fake_poll(*args, **kwargs):
+        sync_calls.append((args, kwargs))
+        return {"status": "completed"}
+
+    monkeypatch.setattr(server, "_poll_until_terminal_async", fake_poll_async)
     monkeypatch.setattr(server, "_poll_until_terminal", fake_poll)
 
     asyncio.run(server.job(action="wait", prompt_id="pid", timeout_seconds=25.0))
     server._poll_download("a1b2c3d4e5f6", 25.0)
 
-    assert calls[0][0] == ("jobs", "status", "pid")
-    assert calls[0][1]["is_terminal"] is server._is_terminal
-    assert "timed_out_extra" not in calls[0][1]  # jobs add no extra key
-    assert calls[1][0] == ("model", "download-status", "a1b2c3d4e5f6")
-    assert calls[1][1]["is_terminal"] is server._is_download_terminal
-    assert calls[1][1]["timed_out_extra"] == {"download_id": "a1b2c3d4e5f6"}
+    # job(action="wait") -> the CANCELLABLE async twin, with the jobs-status cap.
+    assert async_calls[0][0] == ("jobs", "status", "pid")
+    assert async_calls[0][1]["is_terminal"] is server._is_terminal
+    assert "timed_out_extra" not in async_calls[0][1]  # jobs add no extra key
+    assert async_calls[0][1]["stdout_cap"] == server._JOB_STATUS_STDOUT_MAX_CHARS
+    # _poll_download -> the sync loop (the sync `download` tool depends on it).
+    assert sync_calls[0][0] == ("model", "download-status", "a1b2c3d4e5f6")
+    assert sync_calls[0][1]["is_terminal"] is server._is_download_terminal
+    assert sync_calls[0][1]["timed_out_extra"] == {"download_id": "a1b2c3d4e5f6"}
 
 
 def test_the_shared_poll_puts_its_extra_keys_before_the_status(monkeypatch):
@@ -2927,6 +3046,83 @@ def test_fetch_outputs_wraps_comfy_download(patched_run):
     assert cmd[1:4] == ["--json", "--where", "local"]  # global --where pins local
     assert cmd[4:] == ["download", "pid", "-o", "/tmp/out"]  # mapped subcommand
     assert calls[0]["env"]["COMFY_WHERE"] == "local"
+
+
+def test_fetch_outputs_omitted_out_dir_passes_no_dash_o(patched_run):
+    """No `out_dir` means no `-o`, so comfy-cli resolves the destination.
+
+    This tool used to REQUIRE `out_dir`, which made it stricter than the
+    command it wraps: `comfy download` resolves a project-aware default, and a
+    caller who had configured one still had to name a path on every call. The
+    passthrough is to leave the option off the argv entirely rather than to
+    reproduce comfy-cli's resolution here.
+    """
+    calls = patched_run(envelope(data={"files": []}))
+
+    server.fetch_outputs("pid")
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]
+    assert cmd[4:] == ["download", "pid"]
+    assert "-o" not in cmd
+
+
+@pytest.mark.parametrize("bad_id", ["--help", "-o", "", "p\x001"])
+def test_fetch_outputs_omitted_out_dir_still_guards_the_prompt_id(no_spawn, bad_id):
+    """Skipping the `out_dir` guards must not skip the id's.
+
+    The leading-dash case is the one that got sharper rather than softer: with
+    no `-o` on the argv, a dash-led id is now the FIRST option-shaped token
+    comfy-cli sees.
+    """
+    with pytest.raises(server.ComfyCliError, match="prompt_id"):
+        server.fetch_outputs(bad_id)
+
+
+def test_fetch_outputs_scopes_inline_media_to_the_reported_dir(patched_run, tmp_path):
+    """With no `out_dir`, the manifest is scoped by the payload's own `out_dir`.
+
+    comfy-cli reports the directory it resolved and wrote to, and has carried
+    that field since 1.14.0 — this server's floor — so the inline manifest is
+    read off the payload instead of guessing at a default this server does not
+    own.
+    """
+    written = tmp_path / "resolved"
+    written.mkdir()
+    (written / "gen.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    patched_run(
+        envelope(
+            data={
+                "out_dir": str(written),
+                "files": [{"path": str(written / "gen.png")}],
+            }
+        )
+    )
+
+    result = server.fetch_outputs("pid", inline_images=True)
+
+    media = result.structured_content["media"]
+    assert [os.path.basename(entry["path"]) for entry in media] == ["gen.png"]
+
+
+def test_fetch_outputs_inline_media_skipped_when_the_dir_is_unknowable(
+    patched_run, tmp_path, monkeypatch
+):
+    """No `out_dir` argument and none in the payload: return metadata, not a guess.
+
+    `_collect_output_media` needs a containing directory to reject a same-named
+    file in this process's CWD, so with nothing to scope to the honest result is
+    the download's own metadata rather than a manifest built against the wrong
+    directory.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "gen.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    patched_run(envelope(data={"files": [{"path": "gen.png"}]}))
+
+    result = server.fetch_outputs("pid", inline_images=True)
+
+    # The plain payload, not a `CallToolResult` carrying a media manifest.
+    assert result == {"files": [{"path": "gen.png"}]}
 
 
 def test_fetch_outputs_url_only_appends_flag(patched_run):
@@ -5949,31 +6145,57 @@ def test_update_comfyui_invalid_target_does_not_take_the_lock(patched_run):
     server._UPDATE_LOCK.release()
 
 
-# --- fetch_outputs inline image return -------------------------------------
+# --- fetch_outputs inline media return -------------------------------------
 
 # A few bytes standing in for a PNG — Image just base64-encodes the file, it
 # does not decode/validate the pixels, so any bytes exercise the round-trip.
 _FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-pixels"
 
 
+def _image_blocks(result):
+    """The ``ImageContent`` blocks of a ``fetch_outputs`` CallToolResult."""
+    return [c for c in result.content if isinstance(c, server.types.ImageContent)]
+
+
+def _audio_blocks(result):
+    """The ``AudioContent`` blocks of a ``fetch_outputs`` CallToolResult."""
+    return [c for c in result.content if isinstance(c, server.types.AudioContent)]
+
+
+def _media_records(result):
+    """The ``structuredContent`` media manifest of a ``fetch_outputs`` CallToolResult."""
+    return result.structured_content["media"]
+
+
+def _metadata(result):
+    """The envelope dict, decoded from the CallToolResult's leading text block."""
+    import json
+
+    return json.loads(result.content[0].text)
+
+
 def test_fetch_outputs_inline_images_returns_image_content(patched_run, tmp_path):
-    """inline_images=True returns [metadata, Image...] for each downloaded image."""
+    """inline_images=True returns a CallToolResult: metadata text + one ImageContent."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
     patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert isinstance(result, list)
-    assert result[0] == {"downloaded": ["gen.png"]}  # metadata preserved first
-    images = [r for r in result[1:] if isinstance(r, server.Image)]
+    assert isinstance(result, server.types.CallToolResult)
+    assert _metadata(result) == {"downloaded": ["gen.png"]}  # metadata preserved first
+    images = _image_blocks(result)
     assert len(images) == 1
 
-    content = images[0].to_image_content()
+    content = images[0]
     assert content.type == "image"
     assert content.mime_type == "image/png"
     import base64
 
     assert base64.b64decode(content.data) == _FAKE_PNG  # the real file bytes
+    # The manifest surfaces the on-disk path alongside the inlined bytes.
+    [record] = _media_records(result)
+    assert record["inline"] is True and record["media_type"] == "image/png"
+    assert record["bytes"] == len(_FAKE_PNG) and "data_url" not in record
 
 
 def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
@@ -5994,18 +6216,19 @@ def test_fetch_outputs_inline_images_resolves_nested_absolute_paths(
     # writes there), so it is inlined.
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    images = _image_blocks(result)
     assert len(images) == 1
-    assert images[0].to_image_content().mime_type == "image/jpeg"
+    assert images[0].mime_type == "image/jpeg"
 
 
 def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
     patched_run, tmp_path
 ):
-    """A real image referenced by the data but living OUTSIDE out_dir is not inlined.
+    """A real image referenced by the data but living OUTSIDE out_dir is not surfaced.
 
     comfy download only writes into out_dir, so an absolute/`..` path escaping it
-    is an input reference or a traversal, never a file this job produced.
+    is an input reference or a traversal, never a file this job produced — so it
+    is neither inlined NOR listed in the manifest.
     """
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -6023,7 +6246,8 @@ def test_fetch_outputs_inline_images_rejects_paths_outside_out_dir(
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
-    assert not any(isinstance(r, server.Image) for r in result)
+    assert not _image_blocks(result)
+    assert _media_records(result) == []
 
 
 def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
@@ -6043,15 +6267,61 @@ def test_fetch_outputs_inline_images_prefers_out_dir_over_cwd(
 
     result = server.fetch_outputs("pid", str(out_dir), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    images = _image_blocks(result)
     assert len(images) == 1
     import base64
 
     # the out_dir copy, never the CWD decoy
-    assert base64.b64decode(images[0].to_image_content().data) == _FAKE_PNG
+    assert base64.b64decode(images[0].data) == _FAKE_PNG
 
 
-def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
+@pytest.mark.parametrize(
+    ("project_set", "absolute_out_dir", "cwd_shadow"),
+    [
+        (True, False, True),
+        (True, False, False),
+        (True, True, True),
+        (False, False, False),
+    ],
+    ids=["project-with-shadow", "project-without-shadow", "absolute", "unanchored"],
+)
+def test_fetch_outputs_inline_images_uses_the_download_cwd(
+    patched_run, tmp_path, monkeypatch, project_set, absolute_out_dir, cwd_shadow
+):
+    """Preview the file downloaded by the CLI, including a relative project output."""
+    cwd = tmp_path / "client"
+    project = tmp_path / "project"
+    cwd.mkdir()
+    project.mkdir()
+    monkeypatch.chdir(cwd)
+    if project_set:
+        monkeypatch.setenv("COMFY_PROJECT", str(project))
+    download_cwd = project if project_set else cwd
+    output = download_cwd / "outputs"
+    out_dir = str(output) if absolute_out_dir else "outputs"
+    if cwd_shadow:
+        (cwd / "outputs").mkdir()
+        (cwd / "outputs" / "gen.png").write_bytes(b"stale-client-output")
+
+    def download(cmd):
+        output.mkdir(exist_ok=True)
+        (output / "gen.png").write_bytes(_FAKE_PNG)
+
+    data = {"out_dir": str(output), "files": [{"path": str(output / "gen.png")}]}
+    calls = patched_run(envelope(data=data), on_spawn=download)
+    result = server.fetch_outputs("pid", out_dir, inline_images=True)
+
+    assert calls[0]["cwd"] == (str(project) if project_set else None)
+    assert calls[0]["cmd"][4:] == ["download", "pid", "-o", out_dir]
+    assert _metadata(result) == data
+    images = _image_blocks(result)
+    assert len(images) == 1
+    import base64
+
+    assert base64.b64decode(images[0].data) == _FAKE_PNG
+
+
+def test_fetch_outputs_url_only_returns_no_inline_media(patched_run, tmp_path):
     """url_only downloads no bytes, so inline_images can't surface stale out_dir files."""
     # A stale image from a prior run whose basename the emitted URL echoes.
     (tmp_path / "old.png").write_bytes(_FAKE_PNG)
@@ -6067,12 +6337,12 @@ def test_fetch_outputs_url_only_returns_no_inline_images(patched_run, tmp_path):
         "pid", str(tmp_path), url_only=True, inline_images=True
     )
 
-    # Bare envelope data — no [data, Image...] wrapping, no stale file inlined.
+    # Bare envelope data — no CallToolResult wrapping, no stale file surfaced.
     assert result == {"urls": ["http://localhost:8188/view/old.png"]}
 
 
 def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
-    """No more than _INLINE_IMAGE_MAX_COUNT images are inlined, however many exist."""
+    """No more than _INLINE_IMAGE_MAX_COUNT images are inlined; the rest are records."""
     names = [f"g{i}.png" for i in range(server._INLINE_IMAGE_MAX_COUNT + 5)]
     for name in names:
         (tmp_path / name).write_bytes(_FAKE_PNG)
@@ -6080,8 +6350,14 @@ def test_fetch_outputs_inline_images_caps_count(patched_run, tmp_path):
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
+    images = _image_blocks(result)
     assert len(images) == server._INLINE_IMAGE_MAX_COUNT
+    # Every image is still in the manifest; the ones past the cap as path-only
+    # records (the 9th image is refused inline, not dropped).
+    records = _media_records(result)
+    assert len(records) == len(names)
+    assert sum(1 for r in records if r["inline"]) == server._INLINE_IMAGE_MAX_COUNT
+    assert all("data_url" not in r for r in records)
 
 
 def test_fetch_outputs_inline_images_caps_aggregate_bytes(
@@ -6101,13 +6377,16 @@ def test_fetch_outputs_inline_images_caps_aggregate_bytes(
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    images = [r for r in result if isinstance(r, server.Image)]
-    # first (7B) fits; second would push to 14B > 10B budget -> stop.
+    images = _image_blocks(result)
+    # first (7B) fits; the others would push past the 10B budget -> recorded only.
     assert len(images) == 1
+    records = _media_records(result)
+    assert len(records) == 3
+    assert sum(1 for r in records if r["inline"]) == 1
 
 
-def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tmp_path):
-    """Non-image outputs and dangling references yield no inline images."""
+def test_fetch_outputs_inline_images_skips_non_media_and_missing(patched_run, tmp_path):
+    """Non-media outputs and dangling references yield no inline media and no records."""
     (tmp_path / "notes.txt").write_bytes(b"hello")
     patched_run(
         {
@@ -6119,8 +6398,117 @@ def test_fetch_outputs_inline_images_skips_non_image_and_missing(patched_run, tm
 
     result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
 
-    assert result[0] == {"downloaded": ["notes.txt", "ghost.png"]}
-    assert not any(isinstance(r, server.Image) for r in result)  # neither qualifies
+    assert _metadata(result) == {"downloaded": ["notes.txt", "ghost.png"]}
+    assert not _image_blocks(result)  # neither qualifies
+    assert _media_records(result) == []
+
+
+def test_fetch_outputs_inlines_audio_as_audio_content(patched_run, tmp_path):
+    """A small audio clip rides back as an AudioContent block, plus a manifest record."""
+    (tmp_path / "voice.wav").write_bytes(b"RIFFfake-wav")
+    patched_run(envelope(data={"downloaded": ["voice.wav"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    audio = _audio_blocks(result)
+    assert len(audio) == 1
+    assert audio[0].type == "audio" and audio[0].mime_type == "audio/wav"
+    import base64
+
+    assert base64.b64decode(audio[0].data) == b"RIFFfake-wav"
+    assert not _image_blocks(result)  # audio is never an image block
+    [record] = _media_records(result)
+    assert record["inline"] is True and record["media_type"] == "audio/wav"
+    assert "data_url" not in record  # bytes ride in the AudioContent block
+
+
+def test_fetch_outputs_records_video_as_path_only(patched_run, tmp_path):
+    """Even a small video is a path-only record — never a block, never a data URL.
+
+    MCP has no video content block, and a base64 data URL in structuredContent
+    reaches the agent's context as text, so the video's on-disk path, type and
+    size are recorded and its bytes stay on disk. (Acceptance: image bytes are
+    only ever the contact sheet.)
+    """
+    clip = b"\x00\x00\x00\x18ftypmp42fake-video"
+    (tmp_path / "clip.mp4").write_bytes(clip)
+    patched_run(envelope(data={"downloaded": ["clip.mp4"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _image_blocks(result) and not _audio_blocks(result)
+    [record] = _media_records(result)
+    assert record["inline"] is False
+    assert record["media_type"] == "video/mp4"
+    assert record["bytes"] == len(clip)
+    assert record["path"].endswith("clip.mp4")
+    assert "data_url" not in record
+
+
+def test_fetch_outputs_oversized_first_file_is_a_path_only_record(
+    patched_run, tmp_path, monkeypatch
+):
+    """A FIRST file past the byte budget is still refused inline — no first-file pass.
+
+    It becomes a ResourceLink-style record (path/type/size only), and a later
+    file that fits the budget is still inlined.
+    """
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 4)
+    (tmp_path / "big.wav").write_bytes(b"a much larger clip than the budget")
+    (tmp_path / "s.png").write_bytes(b"1234")
+    patched_run(envelope(data={"downloaded": ["big.wav", "s.png"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _audio_blocks(result)
+    assert len(_image_blocks(result)) == 1
+    big, small = _media_records(result)
+    assert big["inline"] is False and big["media_type"] == "audio/wav"
+    assert "data_url" not in big
+    assert small["inline"] is True
+
+
+def test_fetch_outputs_kind_follows_the_resolved_file(patched_run, tmp_path):
+    """A media-named symlink to a non-media file is dropped, not inlined as an image."""
+    (tmp_path / "notes.txt").write_bytes(b"hello")
+    (tmp_path / "gen.png").symlink_to(tmp_path / "notes.txt")
+    patched_run(envelope(data={"downloaded": ["gen.png"]}))
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    assert not _image_blocks(result)
+    assert _media_records(result) == []
+
+
+def test_read_b64_refuses_a_file_that_changed_size(tmp_path):
+    """A file no longer the budgeted size is not inlined (nor read in full)."""
+    path = tmp_path / "grew.png"
+    path.write_bytes(b"12345678")
+    assert server._read_b64(str(path), 8) is not None
+    assert server._read_b64(str(path), 4) is None
+
+
+def test_fetch_outputs_shared_budget_records_the_overflow(
+    patched_run, tmp_path, monkeypatch
+):
+    """Images, audio and video share ONE budget; the overflow becomes path-only records."""
+    monkeypatch.setattr(server, "_INLINE_IMAGE_MAX_BYTES", 10)
+    (tmp_path / "a.png").write_bytes(b"1234567")  # 7B — fits first
+    (tmp_path / "b.wav").write_bytes(b"RIFFwav")  # 7B — would push to 14B
+    (tmp_path / "c.mp4").write_bytes(b"ftypmp4")  # 7B — also over
+    patched_run(
+        envelope(data={"downloaded": ["a.png", "b.wav", "c.mp4"]}),
+    )
+
+    result = server.fetch_outputs("pid", str(tmp_path), inline_images=True)
+
+    # One image inlined; audio/video recorded without their bytes.
+    assert len(_image_blocks(result)) == 1
+    assert not _audio_blocks(result)
+    records = _media_records(result)
+    assert len(records) == 3
+    assert sum(1 for r in records if r["inline"]) == 1
+    assert all("data_url" not in r for r in records)
 
 
 def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
@@ -6137,13 +6525,13 @@ def test_fetch_outputs_inline_images_still_downloads(patched_run, tmp_path):
 
 
 def test_fetch_outputs_default_return_is_unchanged(patched_run, tmp_path):
-    """Without inline_images the bare envelope data is returned (no list wrapping)."""
+    """Without inline_images the bare envelope data is returned (no CallToolResult)."""
     (tmp_path / "gen.png").write_bytes(_FAKE_PNG)
     patched_run(envelope(data={"downloaded": ["gen.png"]}))
 
     result = server.fetch_outputs("pid", str(tmp_path))
 
-    assert result == {"downloaded": ["gen.png"]}  # dict, not a [data, ...] list
+    assert result == {"downloaded": ["gen.png"]}  # dict, not a CallToolResult
 
 
 # --- envelope-terminated read: don't wait on a lingering child ----------------

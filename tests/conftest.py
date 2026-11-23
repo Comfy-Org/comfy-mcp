@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -169,6 +170,30 @@ def _clear_comfyui_target_env(monkeypatch):
         target.REMOTE_SHARED_MODELS_ENV,
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_comfy_desktop_discovery(monkeypatch):
+    """Default every test to "no Comfy Desktop port-lock directory found".
+
+    ``_forward_target`` falls back to :func:`target._discover_comfy_desktop_port`
+    when no ``COMFYUI_*`` target or ``COMFY_LOCAL_URL`` is set, which in turn
+    reads :func:`target._comfy_desktop_port_locks_dir` — the REAL
+    ``%APPDATA%\\Comfy Desktop\\port-locks`` (or the macOS/Linux equivalent) —
+    whatever happens to be on the machine running the suite. Left ambient, a
+    developer's or CI runner's own Comfy Desktop install would perturb every
+    "nothing configured" assertion across the suite (starting with
+    ``test_target_none_when_unset``) exactly the way a stray ``COMFYUI_URL``
+    would, which is why that env is cleared by the fixture above.
+
+    Patched at ``_comfy_desktop_port_locks_dir`` rather than
+    ``_discover_comfy_desktop_port`` itself so that
+    ``test_comfy_desktop_discovery.py``'s own tests of the discovery function
+    — which override THIS attribute to point at a ``tmp_path`` full of lock
+    fixtures — still exercise the REAL scanning/liveness logic rather than a
+    blanket stub sitting in front of it.
+    """
+    monkeypatch.setattr(target, "_comfy_desktop_port_locks_dir", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -385,6 +410,19 @@ class _FakeRunProc:
         self.returncode = -9
 
 
+class CliReply(NamedTuple):
+    """One sequenced ``replies`` entry carrying its OWN exit status and stderr.
+
+    A bare stdout body or exception shares the fixture-wide ``returncode`` /
+    ``stderr``; this is for the fallback whose first call must fail the way
+    Click fails (exit 2, usage dump, no envelope) and whose retry succeeds.
+    """
+
+    stdout: Any = ""
+    returncode: int = 0
+    stderr: str = ""
+
+
 def _canonical_run(
     calls: list[dict], *, stdout, returncode, stderr, raises, on_spawn, replies=None
 ):
@@ -417,7 +455,7 @@ def _canonical_run(
     child has actually started — after the spawn-time ``raises`` check — because
     a ``Popen`` that never returned wrote nothing either.
     """
-    canned_stdout, canned_stderr = stdout, stderr
+    canned_stdout, canned_stderr, canned_returncode = stdout, stderr, returncode
     pending = iter(replies) if replies is not None else None
 
     def fake(cmd, stdout, stderr, stdin, text, encoding, env, start_new_session, cwd):
@@ -432,6 +470,7 @@ def _canonical_run(
         }
         calls.append(record)
         current_stdout, current_raises = canned_stdout, raises
+        current_stderr, current_returncode = canned_stderr, canned_returncode
         if pending is not None:
             try:
                 reply = next(pending)
@@ -439,6 +478,9 @@ def _canonical_run(
                 raise AssertionError(
                     f"unexpected extra comfy-cli call: {cmd}"
                 ) from None
+            if isinstance(reply, CliReply):
+                current_stderr, current_returncode = reply.stderr, reply.returncode
+                reply = reply.stdout
             if isinstance(reply, BaseException):
                 current_stdout, current_raises = "", reply
             else:
@@ -453,8 +495,8 @@ def _canonical_run(
             cmd,
             record,
             stdout=current_stdout,
-            stderr=canned_stderr,
-            returncode=returncode,
+            stderr=current_stderr,
+            returncode=current_returncode,
             raises=current_raises,
         )
 
@@ -478,8 +520,9 @@ def patched_run(monkeypatch):
     * ``on_spawn`` — a callable handed the spawned argv, for a verb whose real
       output is a FILE rather than stdout (``node deps-in-workflow`` writes to
       its ``--output`` path). See :func:`_canonical_run`.
-    * ``replies`` — stdout bodies or exceptions consumed once per spawn. Use it
-      when a compatibility fallback must receive different successive answers.
+    * ``replies`` — stdout bodies or exceptions consumed once per spawn (or a
+      :class:`CliReply` for one with its own exit status/stderr). Use it when a
+      compatibility fallback must receive different successive answers.
 
     ``calls`` is the live list every invocation is recorded into, for the exact
     argv assertions this suite is built on.
@@ -900,7 +943,19 @@ def patched_async_run(monkeypatch):
     path) — same hook, same firing point as :func:`_canonical_run`'s: once the
     child has actually started, after the ``raises`` check, because a spawn that
     never returned wrote nothing either.
+
+    ``stdout`` may also be a LIST, for a caller that spawns repeatedly and needs a
+    different reply each time (``job(action="wait")``'s poll loop): spawn ``n``
+    gets entry ``n`` (each encoded as above), and the last entry repeats once the
+    script runs out.
     """
+
+    def _encode(out):
+        if out is None:
+            return ""
+        if isinstance(out, dict):
+            return json.dumps(out)
+        return out
 
     def setup(
         stdout=None,
@@ -911,14 +966,15 @@ def patched_async_run(monkeypatch):
         raises=None,
         on_spawn=None,
     ) -> list[_FakeAsyncRunProc]:
-        if stdout is None:
-            stdout = ""
-        if isinstance(stdout, dict):
-            stdout = json.dumps(stdout)
-        # Rebound because the inner fake's own `stdout=` kwarg (the PIPE sentinel
+        script = (
+            [_encode(out) for out in stdout]
+            if isinstance(stdout, list)
+            else [_encode(stdout)]
+        )
+        # Rebound because the inner fake's own `stderr=` kwarg (the PIPE sentinel
         # `server` passes) shadows the name — same reason `_canonical_run` keeps a
         # `canned_*` pair.
-        canned_stdout, canned_stderr = stdout, stderr
+        canned_stderr = stderr
         procs: list[_FakeAsyncRunProc] = []
 
         async def fake_exec(
@@ -931,7 +987,7 @@ def patched_async_run(monkeypatch):
                 on_spawn(list(cmd))
             proc = _FakeAsyncRunProc(
                 list(cmd),
-                stdout=canned_stdout,
+                stdout=script[min(len(procs), len(script) - 1)],
                 stderr=canned_stderr,
                 returncode=returncode,
                 hang=hang,

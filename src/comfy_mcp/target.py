@@ -1,9 +1,9 @@
-"""Remote-target resolution, redaction, and provenance for target-aware tools.
+"""Remote-target resolution, redaction, and provenance for the run/job tools.
 
 Leaf module over :mod:`comfy_mcp.errors` and :mod:`comfy_mcp.textutil`: it owns
-everything about pointing target-aware tools (``run_workflow``, ``run_template``,
-``generate_image``, the ``jobs``/``upload`` verbs) at a
-ComfyUI running ELSEWHERE via ``COMFYUI_URL`` / ``COMFYUI_HOST`` (+ optional ``COMFYUI_PORT``)
+everything about pointing the run/job tools (``run_workflow``, ``run_template``,
+``generate_image``, the ``jobs``/``upload`` verbs) at a ComfyUI running
+ELSEWHERE via ``COMFYUI_URL`` / ``COMFYUI_HOST`` (+ optional ``COMFYUI_PORT``)
 instead of the implicit local default — resolution (:func:`_comfy_target`),
 the ``--host``/``--port`` forward (:func:`_with_target`), userinfo/credential
 redaction on the way back to the client (:func:`_redact_config_url`,
@@ -12,7 +12,7 @@ redaction on the way back to the client (:func:`_redact_config_url`,
 LOCAL-only tools (``system_stats`` / ``free_memory``) attach so an agent does
 not gate a remote run on local numbers (:func:`_annotate_comfy_target`,
 :func:`_target_provenance_suffix`, :func:`_with_target_provenance`). Nothing
-here imports ``server``. Node discovery and validation only forward loopback targets.
+here imports ``server``.
 
 Everything here is private and reached as ``target._name`` — there is no
 public name in this module.
@@ -21,7 +21,10 @@ public name in this module.
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
+import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -61,9 +64,11 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 
 # The comfy-cli verbs this server forwards ``--host`` / ``--port`` to: ``comfy
 # run``, ``comfy run-template``, every ``comfy jobs`` subcommand, ``comfy
-# upload``, ``comfy nodes`` and ``comfy validate`` — every verb that submits or
-# reads a job or stages its inputs must agree on the server it is talking to.
-# Catalog verbs forward only loopback targets, as explained below. ``run`` / ``jobs`` / ``upload`` are the set comfy-cli's
+# upload``, and ``comfy models`` (discovery: ``search`` / ``list-folder`` /
+# ``list-folders``) — every verb that SUBMITS a job, reads one back, stages the
+# files a job will read, or INSPECTS what a job will find already there, which is
+# the set that has to agree on which server it is talking to. ``run`` / ``jobs``
+# / ``upload`` are the set comfy-cli's
 # ``comfy_cli/host_port.py`` documents; ``run-template`` declares the same two
 # options and resolves them through that module's own ``resolve_host_port``
 # (``comfy_cli/command/templates.py``), it is just missing from that docstring's
@@ -94,6 +99,24 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # ``local_address.resolve_local_host_port``, which honors ``COMFY_LOCAL_URL``
 # for ANY host (it is not loopback-restricted).
 #
+# ``models`` (the discovery leaves ``search`` / ``list-folder`` /
+# ``list-folders``, behind ``search_models``) is here for the INSPECTION analogue
+# of the upload argument: it answers "what models does the install already have?"
+# and, unforwarded, answered it about THIS machine while ``run_workflow``
+# submitted to the remote — custom-pack folders that exist only locally reported
+# as the remote's catalog, so an agent gated a run (or a redundant multi-GB
+# ``download_model``) on the wrong disk. Unlike ``upload`` its flags are NEWER
+# than ``_MIN_COMFY_CLI``: the ``--host`` / ``--port`` options landed on ``comfy
+# models`` (Comfy-Org/comfy-cli#876) in comfy-cli 1.27.0
+# (``server._MIN_MODELS_HOST_COMFY_CLI_STR``), long after the discovery leaves
+# themselves, so every supported release below that has the verbs and rejects
+# only the flags. ``search_models`` therefore retries once on Click's "No such
+# option" by handing the same target to comfy-cli's own ``COMFY_LOCAL_URL`` in
+# the child's env (the pre-flag ``comfy models`` resolves its target through
+# ``resolve_target``, whose local precedence honors it for any host) — never
+# without a target, since a local catalog returned as the remote's is the exact
+# wrong-machine bug this fixes.
+#
 # ``run-template`` is here because SUBMIT and POLL must land on the SAME server.
 # It backs both ``run_template`` and ``generate_image``, and while it was absent
 # the submit-then-poll flow did not merely run on the wrong box, it could not
@@ -116,20 +139,18 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 # hypothetical — for ALL THREE verbs, not just this one.
 #
 # Deliberately NOT forwarded:
-#   * ``env`` / ``download`` / ``templates`` / ``models`` /
+#   * ``env`` / ``download`` / ``templates`` /
 #     ``generate`` / the lifecycle verbs take NO ``--host`` / ``--port`` at all,
 #     so forwarding would error "No such option" — they stay local-only. That is
 #     not always a functional limit: ``download`` still collects a REMOTE job's
 #     files, because it resolves the ``prompt_id`` from the state file this
 #     machine wrote at submit (which records absolute ``/view`` URLs on the
 #     remote) instead of asking a server — see ``fetch_outputs``.
-#
-# ``nodes`` / ``validate`` accept both options at the 1.14.0 floor, but in
-# ``--where local`` mode comfy-cli refuses non-loopback object_info fetches.
-# Forward only an explicit loopback target for these catalog verbs. Other hosts
-# retain the existing local catalog behavior until upstream supports them.
+# Catalog verbs accept these flags, but local-mode object_info fetching is
+# loopback-only. Their target is filtered by _catalog_target after the shared
+# explicit/Comfy Desktop resolution; non-loopback selections keep the local catalog.
 _TARGET_AWARE_SUBCOMMANDS = frozenset(
-    {"run", "run-template", "jobs", "upload", "nodes", "validate"}
+    {"run", "run-template", "jobs", "upload", "models", "nodes", "validate"}
 )
 
 
@@ -182,6 +203,163 @@ def _redact_config_url(url: str) -> str:
         return masked
     cut = min(cuts)
     return f"{masked[: cut + 1]}<redacted>"
+
+
+_COMFY_DESKTOP_PORT_LOCK_SOURCE = "comfy_desktop_port_lock"
+
+
+def _comfy_desktop_port_locks_dir() -> Path | None:
+    """The platform-specific ``Comfy Desktop/port-locks`` directory, or None.
+
+    Comfy Desktop (the Electron app) writes one JSON file per port it is
+    CURRENTLY bound to, named ``port-<N>.json`` with ``{"pid", "installationName",
+    "timestamp"}`` — its own dynamic-port bookkeeping, independent of anything
+    comfy-cli tracks. Locations mirror Comfy Desktop's own ``stateDir()``
+    (``src/main/lib/paths.ts``) plus ``writePortLock()`` (``process.ts``):
+    Electron's ``userData`` on Windows and macOS (``Comfy Desktop`` product
+    name; Windows verified against a live Comfy Desktop 1.1.6.0 install), and
+    ``$XDG_STATE_HOME/comfyui-desktop-2`` on Linux. Returns None (not a raise) when the platform is
+    unrecognized or the directory does not exist, so a Comfy-Desktop-less
+    environment resolves this fallback to "no candidates" rather than erroring
+    — the same "byte-identical when nothing applies" contract every other
+    branch of `_comfy_target` keeps.
+    """
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        base = Path(appdata) / "Comfy Desktop"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Comfy Desktop"
+    elif sys.platform == "linux":
+        # Unlike Windows/macOS, Comfy Desktop does NOT use Electron's
+        # `userData` on Linux: its `stateDir()` is `$XDG_STATE_HOME` (else
+        # `~/.local/state`) joined with the package name `comfyui-desktop-2`
+        # (the "Comfy Desktop" product name only reaches the path on the
+        # other two platforms). Its `migrateXdgPaths()` also moves the old
+        # `~/.config/Comfy Desktop/port-locks` here once (only when the state
+        # dir does not exist yet; a failed copy leaves the source in place) and
+        # writes only to the state dir afterwards, so the legacy location is
+        # deliberately not read. A Desktop build that predates that migration
+        # finds no lock and falls through to the existing default.
+        base = (
+            Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+            / "comfyui-desktop-2"
+        )
+    else:
+        # An unrecognized platform gets no fallback rather than guessing at a
+        # path convention that may not even apply there.
+        return None
+    d = base / "port-locks"
+    return d if d.is_dir() else None
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    """Best-effort liveness check for *pid*, cross-platform, never raises.
+
+    *pid* comes from a lock file this process did not write, so it is
+    accepted as an untyped JSON value, not trusted as an ``int``: a
+    non-``int`` (a JSON string, float, bool, or a non-positive value) is
+    rejected outright rather than coerced — ``os.kill(0, 0)`` on POSIX checks
+    the CALLING process's own group and would make a lock naming pid ``0``
+    look alive regardless of whether anything real is listening.
+
+    A STALE lock file (the app crashed instead of cleaning up on exit) must
+    not be trusted — this is what distinguishes "the live instance" from
+    "whatever port some now-dead process last used". Unable to determine
+    (permission denied, an OS quirk) errs TOWARD treating the pid as alive,
+    which only means the stale-lock case falls through to the existing
+    zero-or-multiple-candidates "don't guess" path below, never a wrong guess.
+    """
+    if type(pid) is not int or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        # EPERM means the process exists but is not ours, so it is alive, as in
+        # Comfy Desktop's own check. Desktop answers "dead" for every other
+        # error; this answers "alive", which can only push a lock into the
+        # "more than one live candidate, don't guess" path (the safe direction).
+        return True
+    return True
+
+
+def _discover_comfy_desktop_port() -> int | None:
+    """The single LIVE port Comfy Desktop is currently bound to, or None.
+
+    Comfy Desktop dynamically picks a port per launch (falling back to another
+    one when its preferred port is taken) and has no notion of a static
+    ``COMFYUI_URL`` — so a value that was correct at config time silently goes
+    stale on the app's next relaunch, with no signal that it did (a healthy
+    server, a config confidently pointed at the WRONG one — the failure mode
+    this fallback exists to close). Discovered by reading every
+    ``port-<N>.json`` lock in :func:`_comfy_desktop_port_locks_dir`, filtering
+    to ones whose recorded ``pid`` is still alive (:func:`_pid_is_alive`) — a
+    lock left behind by a crashed instance names a port nothing is listening on
+    anymore.
+
+    Deliberately conservative, matching :func:`_comfy_target`'s own "raise or
+    return None, never guess" discipline: returns the port ONLY when EXACTLY
+    ONE live lock exists. Zero live locks means Comfy Desktop is not running
+    (or was not launched through it at all) — None, same as today. More than
+    one means multiple Comfy Desktop instances are genuinely running at once
+    (a real, if unusual, configuration) and there is no principled way to pick
+    one over the other from a lock file alone — None here too, so the existing
+    local-default (or an explicit ``COMFYUI_URL``/``COMFYUI_HOST``) still
+    governs rather than this fallback silently guessing wrong.
+
+    Malformed lock files (bad JSON, a non-integer filename suffix, a missing
+    ``pid`` key) are skipped individually rather than aborting the whole scan —
+    they are Comfy Desktop's own files, not something this fallback should ever
+    raise about.
+    """
+    locks_dir = _comfy_desktop_port_locks_dir()
+    if locks_dir is None:
+        return None
+    live_ports: list[int] = []
+    try:
+        candidates = sorted(locks_dir.glob("port-*.json"))
+    except OSError:
+        return None
+    for lock_path in candidates:
+        try:
+            port = int(lock_path.stem.removeprefix("port-"))
+        except ValueError:
+            continue
+        if not (1 <= port <= 65535):
+            continue
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            # A syntactically-valid JSON value that isn't an object (a list,
+            # a bare string, a number) -- data["pid"] below would raise
+            # TypeError, which is NOT in the except clause, aborting the
+            # whole scan instead of skipping this one malformed lock.
+            continue
+        try:
+            pid = data["pid"]
+        except KeyError:
+            continue
+        if _pid_is_alive(pid):
+            live_ports.append(port)
+    if len(live_ports) == 1:
+        return live_ports[0]
+    return None
 
 
 def _comfy_target() -> tuple[str, int, str] | None:
@@ -266,6 +444,9 @@ def _comfy_target() -> tuple[str, int, str] | None:
                 "not select a remote. Set COMFYUI_HOST (or COMFYUI_URL) to "
                 "target a remote ComfyUI."
             )
+        # Neither COMFYUI_URL nor COMFYUI_HOST is set: nothing is configured.
+        # Comfy Desktop's port-lock fallback deliberately does NOT live here --
+        # see _forward_target.
         return None
     if not raw_port:
         return _strip_brackets(host), DEFAULT_COMFYUI_PORT, "COMFYUI_HOST"
@@ -334,20 +515,49 @@ def _malformed_target_note(exc: ComfyCliError) -> dict[str, str]:
         "note": (
             "COMFYUI_URL/COMFYUI_HOST is set but malformed, so no remote is "
             "resolved; the submit/poll tools (run_workflow, generate_image, "
-            "run_template and the jobs/queue tools) will raise this same error "
-            "until it is fixed."
+            "run_template, the jobs/queue tools, upload_file and search_models) "
+            "will raise this same error until it is fixed."
         ),
     }
 
 
+def _forward_target() -> tuple[str, int, str] | None:
+    """Resolve the ``(host, port, source)`` that ``--host``/``--port`` forwards.
+
+    This is :func:`_comfy_target` (an EXPLICITLY configured target) plus one
+    extra, forwarding-only fallback: Comfy Desktop's single live port-lock. It
+    is deliberately NOT folded into :func:`_comfy_target`, because that function
+    answers "did the operator configure a remote?" and feeds every remote-only
+    guard (``download_model``'s refusal, the restart kill gate, the divergence
+    notes, ``server_info``'s remote banner). A discovered same-machine Desktop is
+    not a configured remote, so it must never trip those.
+
+    The fallback stands down — returning ``None`` so comfy-cli resolves the
+    address itself — whenever the operator already chose a local address with
+    ``COMFY_LOCAL_URL``: ``--host``/``--port`` flags outrank that variable, so
+    forwarding a discovered port would silently retarget a configured session at
+    a different ComfyUI. It also stays silent when discovery is ambiguous (none,
+    stale, or more than one live lock).
+    """
+    explicit = _comfy_target()
+    if explicit is not None:
+        return explicit
+    if os.environ.get("COMFY_LOCAL_URL", "").strip():
+        return None
+    desktop_port = _discover_comfy_desktop_port()
+    if desktop_port is None:
+        return None
+    return "127.0.0.1", desktop_port, _COMFY_DESKTOP_PORT_LOCK_SOURCE
+
+
 def _catalog_target() -> tuple[str, int, str] | None:
-    """Resolve a catalog target only when it is a literal loopback host.
+    """Resolve the forwarding target only when it is a literal loopback host.
 
     Never resolve DNS or change comfy-cli's local-mode SSRF policy. Hostnames
     other than localhost, including names that happen to resolve locally, keep
-    comfy-cli's default catalog. Malformed configuration still raises.
+    comfy-cli's default catalog. Explicit configuration wins over Desktop discovery; malformed config still raises.
     """
-    resolved = _comfy_target()
+    resolved = _forward_target()
     if resolved is None:
         return None
     host = resolved[0]
@@ -369,9 +579,10 @@ def _catalog_target() -> tuple[str, int, str] | None:
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
-    The flags are injected into the SUBCOMMAND args, never into the global
+    The flags are injected into the SUBCOMMAND args (after the ``run`` /
+    ``run-template`` / ``jobs`` / ``upload`` / ``models`` verb), never into the global
     ``--json`` / ``--where`` prefix, since ``--host`` / ``--port`` are
-    subcommand options. A no-op for the local default (``_comfy_target`` is
+    subcommand options. A no-op for the local default (``_forward_target`` is
     None) and for any subcommand that doesn't accept the flags (see
     :data:`_TARGET_AWARE_SUBCOMMANDS`), so unconfigured behavior is
     byte-identical to today.
@@ -389,7 +600,9 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     # breaking the "local behavior unchanged" contract.
     if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
         return args
-    target = _catalog_target() if args[0] in {"nodes", "validate"} else _comfy_target()
+    target = (
+        _catalog_target() if args[0] in {"nodes", "validate"} else _forward_target()
+    )
     if target is None:
         return args
     host, port, _source = target
@@ -571,8 +784,37 @@ def _local_launch_refusal_for_remote_target() -> dict[str, Any] | None:
 
 _COMFY_TARGET_NOTE_KEY = "comfy_target_note"
 
+# The default `note` text — the resource verbs `_annotate_comfy_target` was built for.
+_RESOURCE_TARGET_NOTE = (
+    "this payload describes whichever ComfyUI comfy-cli itself "
+    "targets — `comfy system-stats` / `comfy free` take no "
+    "--host/--port — and NOT necessarily the host/port above, which "
+    "is where the run/job tools submit. The two are the same machine "
+    "when that host resolves to THIS box and different machines "
+    "otherwise; this server does not verify which, so compare them "
+    "before gating a run on these numbers, and ask the user when the "
+    "host is one you cannot place (a loopback host can be a tunnel "
+    "to a remote GPU)."
+)
 
-def _annotate_comfy_target(payload: Any) -> Any:
+# The same divergence for the template runnability verdicts (`check_template`,
+# `search_templates(runnable_only=True)`): `comfy templates` takes no
+# --host/--port, so the weights it checks are those of whichever ComfyUI comfy-cli
+# itself resolves (its local default, or a ``COMFY_LOCAL_URL`` that can point off-box).
+_TEMPLATE_TARGET_NOTE = (
+    "this verdict checks the model list of whichever ComfyUI comfy-cli itself "
+    "resolves — its local default, or COMFY_LOCAL_URL when set (which can name "
+    "another machine) — since `comfy templates` takes no --host/--port; it is "
+    "NOT necessarily the host/port above, which is where run_template / "
+    "run_workflow submit. The two are the same install when both resolve to the "
+    "same ComfyUI (or share a models dir) and different installs otherwise; this "
+    "server does not verify which, so do not tell the user to download, or that "
+    "nothing is missing, until you have settled that, and ask the user when the "
+    "host is one you cannot place."
+)
+
+
+def _annotate_comfy_target(payload: Any, note: str = _RESOURCE_TARGET_NOTE) -> Any:
     """Return *payload* tagged with the configured remote, for a LOCAL-only tool.
 
     ``comfy system-stats`` and ``comfy free`` take no ``--host`` / ``--port``
@@ -620,6 +862,9 @@ def _annotate_comfy_target(payload: Any) -> Any:
     ``system`` and ``devices`` at the top level, and ``comfy free`` returns
     comfy-cli's own ``{"requested": ..., "note": ...}`` — but if one ever
     appeared, the existing value wins: annotation must never clobber engine data.
+
+    *note* is the divergence sentence; it defaults to the resource verbs' text,
+    and the template runnability verdicts pass ``_TEMPLATE_TARGET_NOTE``.
     """
     if not isinstance(payload, dict) or _COMFY_TARGET_NOTE_KEY in payload:
         return payload
@@ -638,17 +883,7 @@ def _annotate_comfy_target(payload: Any) -> Any:
             "host": _redact_target_host(host),
             "port": port,
             "source": source,
-            "note": (
-                "this payload describes whichever ComfyUI comfy-cli itself "
-                "targets — `comfy system-stats` / `comfy free` take no "
-                "--host/--port — and NOT necessarily the host/port above, which "
-                "is where the run/job tools submit. The two are the same machine "
-                "when that host resolves to THIS box and different machines "
-                "otherwise; this server does not verify which, so compare them "
-                "before gating a run on these numbers, and ask the user when the "
-                "host is one you cannot place (a loopback host can be a tunnel "
-                "to a remote GPU)."
-            ),
+            "note": note,
         },
     }
 

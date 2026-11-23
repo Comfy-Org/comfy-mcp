@@ -74,7 +74,42 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # omits it hands the user a canvas that doesn't say what each step does; and
 # its invented class_types need the `validate_workflow` pointer the existing
 # missing-nodes bullet doesn't cover. Measured ~15,916 after the edit.
-_BUDGET_TOKENS = 15_950
+#
+# 15,950 -> 16,050 for `search_models`'s target-awareness contract (+~60 tokens,
+# the paragraph already trimmed twice against this ceiling). Growth a caller
+# cannot do without, and the same shape as the `launch_comfyui` /
+# `restart_comfyui` refusals above: that `search_models` now FOLLOWS
+# `COMFYUI_URL` / `COMFYUI_HOST` like `run` / `jobs` — reading the REMOTE
+# install's model catalog, and RAISING on a comfy-cli too old to accept the
+# forwarded `--host` rather than silently listing THIS machine's — is not
+# inferable from any other tool's docs, and an agent that does not know it
+# trusts a local catalog as the remote's (the exact wrong-machine bug the
+# forward fixes). The tree was already at ~15,916, so no useful version fit the
+# slack. Measured ~15,986 after the edit, so the next growth is still a decision.
+#
+# 16,050 -> 16,350 when `check_template` was added. A whole new TOOL, not
+# docstring growth on an existing one (same shape as the `billing_status` bump
+# above): its description is ~1,050 chars — near the ~1,140-char mean of the 41
+# already here — so there was no version of it that fit the slack left under the
+# prior ceiling. The verdict vocabulary it documents (`runnable` /
+# `missing-models` / `api-required` / `unknown`, and that `api-required` is the
+# same paid-node gate `run_template` enforces) is the agent contract, not
+# inferable from any other tool's docs. Measured ~16,294 after it (42 tool
+# docstrings); the review round's caveats (`runnable` is weights only, a remote
+# target gets a `comfy_target_note`) took it to ~16,342 within the same ceiling,
+# so the next growth is still a decision.
+#
+# 16,350 -> 16,450 when `list_workflow_slots` gained `node`. Docstring growth on
+# an existing tool rather than a new one, so the bar is the one the comment
+# above sets: the three sentences are the agent contract for the parameter
+# (what it selects, the comfy-cli 1.23.0 floor, that below the floor it is
+# REFUSED rather than silently answered unfiltered, and that an unknown id is
+# an error rather than an empty list). None of that is inferable from another
+# tool's docs, and an agent that assumes the filter applied when it did not
+# reads a whole graph's slots as one node's. The tree was already at ~16,337 of
+# 16,350, so no version of it fit the slack. Measured ~16,409 after the edit,
+# so the next growth is still a decision.
+_BUDGET_TOKENS = 16_450
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

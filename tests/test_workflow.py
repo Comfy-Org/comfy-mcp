@@ -1418,3 +1418,95 @@ def test_set_workflow_slot_allows_an_unaffected_slot(patched_run):
     server.set_workflow_slot("/tmp/h3.json", ["8.filename_prefix=out"])
 
     assert calls[-1]["cmd"][4:][:2] == ["workflow", "set-slot"]
+
+
+# ---------------------------------------------------------------------------
+# list_workflow_slots(node=...) — the per-verb 1.23.0 floor
+# ---------------------------------------------------------------------------
+
+
+def test_list_workflow_slots_forwards_node_filter(patched_run, monkeypatch):
+    """`node` becomes `--node <id>` after the path, and nothing else moves."""
+    monkeypatch.setattr(server, "_checked_comfy_version", lambda: (1, 26, 0))
+    data = {"workflow": "/tmp/f.json", "count": 1, "slots": [{"address": "6.text"}]}
+    calls = patched_run(envelope(data=data))
+
+    assert server.list_workflow_slots("/tmp/f.json", node="6") == data
+
+    cmd = calls[0]["cmd"]
+    assert cmd[1:4] == ["--json", "--where", "local"]
+    assert cmd[4:] == ["workflow", "slots", "/tmp/f.json", "--node", "6"]
+
+
+def test_list_workflow_slots_without_node_is_byte_identical(patched_run):
+    """The default is the argv that shipped: no `--node`, no version probe."""
+    calls = patched_run(envelope(data={"slots": []}))
+
+    server.list_workflow_slots("/tmp/f.json")
+
+    assert calls[0]["cmd"][4:] == ["workflow", "slots", "/tmp/f.json"]
+
+
+def test_list_workflow_slots_node_refused_below_the_floor(patched_run, monkeypatch):
+    """A comfy-cli without `--node` is told the version, not handed a usage dump.
+
+    Refused rather than silently answered unfiltered: the whole point of the
+    filter is the context an unfiltered answer costs, so quietly dropping it
+    returns the payload the caller asked not to receive.
+    """
+    monkeypatch.setattr(server, "_checked_comfy_version", lambda: (1, 22, 0))
+    unlatched: list[bool] = []
+    monkeypatch.setattr(
+        server, "_invalidate_version_cache", lambda: unlatched.append(True)
+    )
+    calls = patched_run(envelope(data={"slots": []}))
+
+    with pytest.raises(errors.ComfyCliError) as exc:
+        server.list_workflow_slots("/tmp/f.json", node="6")
+
+    assert server._MIN_SLOT_FILTER_COMFY_CLI_STR in str(exc.value)
+    # No call at all, so no usage dump to misread as an empty graph.
+    assert calls == []
+    # And the refusal un-latches, so the upgrade it asks for takes effect in
+    # this same process rather than one restart later.
+    assert unlatched == [True]
+
+
+def test_list_workflow_slots_node_fails_open_on_an_unreadable_version(
+    patched_run, monkeypatch
+):
+    """A source build whose `--version` cannot be parsed is not wedged."""
+    monkeypatch.setattr(server, "_checked_comfy_version", lambda: None)
+    calls = patched_run(envelope(data={"slots": []}))
+
+    server.list_workflow_slots("/tmp/f.json", node="115/75")
+
+    assert calls[0]["cmd"][4:] == [
+        "workflow",
+        "slots",
+        "/tmp/f.json",
+        "--node",
+        "115/75",
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param("-6", id="leading_dash"),
+        pytest.param("6\0", id="nul"),
+    ],
+)
+def test_list_workflow_slots_node_hygiene(patched_run, bad):
+    """A dash-leading or NUL-bearing id is named here, not sent to argv.
+
+    A node id is the head of a slot ADDR, which comfy-cli surfaces
+    non-negative, so no reachable id starts with `-` — the same reasoning
+    `vary_workflow`'s ADDR guard rests on.
+    """
+    calls = patched_run(envelope(data={"slots": []}))
+
+    with pytest.raises(errors.ComfyCliError):
+        server.list_workflow_slots("/tmp/f.json", node=bad)
+
+    assert calls == []

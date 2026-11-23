@@ -23,7 +23,9 @@ the fixture catalogue and the rationale behind it.
   plain-JSON *async* path (`_run_comfy_async`): same spawn and real `StreamReader` pipes as
   `patched_stream`, but parses the capture once at the end, not line-by-line. `hang=True`
   leaves the pipes OPEN so the child never finishes; `kill()` closes them (the process-group
-  kill, so a post-kill drain reaches EOF), records `killed`, and fires `on_spawn(cmd)`.
+  kill, so a post-kill drain reaches EOF), records `killed`, and fires `on_spawn(cmd)`. A
+  LIST `stdout` scripts repeated spawns (spawn `n` gets entry `n`, the last repeats) for a
+  poll loop like `job("wait")`'s.
 
 The two spawn paths differ deliberately: the plain `--json` path is synchronous
 (`subprocess.Popen` + a bounded `communicate`, off-loaded to a thread pool for async
@@ -32,7 +34,8 @@ blocking runs on the event loop, enforced by ruff's `ASYNC` select. Two async ru
 there: `_run_comfy_streaming` (NDJSON + progress) and `_run_comfy_async`, a plain-JSON twin of
 `_run_comfy` for CANCELLATION — cancellation never reaches a `to_thread` worker, so a client
 giving up left the child running; it carries the longest-lived children (foreground `model
-download`, `workflow_deps`, `upload_file`, `job("watch")`'s status polls). Each stream keeps
+download`, `workflow_deps`, `upload_file`, `job("watch")`'s status polls, and `job("wait")`'s
+poll loop — up to 3600s of re-polling that a disconnect now reaps). Each stream keeps
 only a `_STDERR_MAX_CHARS` tail (`_drain_capped_into`; callers widen stdout via `stdout_cap=`),
 never `communicate()`'s full capture. `auth_login` (`_start_login`) is a third spawn site.
 

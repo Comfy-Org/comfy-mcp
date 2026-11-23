@@ -19,14 +19,39 @@ call time), never an import-bound copy.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
+
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import failure_log
 
 
-class ComfyCliError(RuntimeError):
+class ComfyCliError(ToolError, RuntimeError):
     """comfy-cli was missing, timed out, or returned an error envelope.
+
+    Deriving from the SDK's ``ToolError`` is what puts the reason in front of
+    the model. MCP Python SDK 2.x splits an anticipated tool failure from a
+    crash (``mcp/server/mcpserver/tools/base.py``): a ``ToolError``'s text is
+    forwarded to the client, while any other exception is treated as a crash
+    and "the exception's own text stays on the server". Under SDK 1.x every
+    exception's text was forwarded, so when this server moved to ``mcp>=2`` its
+    whole error surface went dark at once, without a line of it changing: every
+    failure reached the client as the bare ``Error executing tool <name>``, and
+    an agent could not tell a missing model file from a server that was down
+    from a typo in a slot address. That is issue #267, and it is the reason for
+    the first base class.
+
+    Everything this module does to the message assumes it is client-facing —
+    ``_render_error_details`` scrubs it, ``_MAX_ERROR_FIELD_CHARS`` bounds it so
+    a multi-KB ``hint`` cannot bloat what the client receives. That intent is
+    only realized now.
+
+    ``RuntimeError`` stays as the second base so that neither the hundreds of
+    ``except ComfyCliError`` sites nor any caller that catches ``RuntimeError``
+    changes meaning: this is still a runtime failure, it is now also one the
+    server means to report.
 
     ``code`` carries the envelope's structured ``error.code`` when the failure
     came from an error envelope (used to drive the bounded credential retry in
@@ -55,7 +80,7 @@ class ComfyCliError(RuntimeError):
     running out of patience: the child's whole process group was killed at the
     ``timeout=`` we handed ``communicate``. A caller that *chose* that budget
     can then tell its own deadline firing from a genuine comfy-cli error without
-    matching on the message — ``job(action="wait")`` (:func:`server._job_wait_sync`),
+    matching on the message — ``job(action="wait")`` (:func:`server._job_wait_async`),
     which caps each poll to the time left on the caller's bound, is exactly that
     caller.
 
@@ -198,9 +223,10 @@ def _is_no_recorded_server(exc: ComfyCliError) -> bool:
 
 
 # Error-envelope ``error.details`` keys worth surfacing verbatim in the raised
-# message. ``partner_nodes`` names the offending nodes on a partner-credential
-# failure; keep the set small so a large envelope can't bloat the message.
-_SURFACED_DETAIL_KEYS = ("partner_nodes",)
+# message. Validation failures carry either comfy-cli's ``errors`` list or
+# ComfyUI's ``node_errors`` map; the hint alone cannot identify what to fix.
+# Keep the set small and each value bounded, as with ``partner_nodes``.
+_SURFACED_DETAIL_KEYS = ("partner_nodes", "errors", "node_errors")
 
 # Per-field cap for the rendered error message (mirrors the stderr cap) so a
 # multi-KB `message`/`hint` or a huge `partner_nodes` array can't produce an
@@ -211,11 +237,9 @@ _MAX_ERROR_FIELD_CHARS = 500
 def _render_error_details(details: Any) -> str | None:
     """Render the useful keys of an envelope's ``error.details`` for the message.
 
-    Scrubbed before the cap like every other envelope-derived field
-    :func:`_unwrap_envelope` renders — today ``_SURFACED_DETAIL_KEYS`` is only
-    node names, so it masks nothing in practice, but this string lands in the
-    same client-facing sentence as ``error.message``/``hint`` and a later key
-    added to that tuple should not have to remember to redact separately.
+    Validation details retain node IDs, fields and suggestions as JSON text.
+    Scrub before the cap, as for ``error.message``/``hint``: a diagnostic can
+    quote a credential-bearing URL from the workflow.
     """
     if not isinstance(details, dict):
         return None
@@ -224,8 +248,10 @@ def _render_error_details(details: Any) -> str | None:
         value = details.get(key)
         if not value:
             continue
-        if isinstance(value, (list, tuple)):
+        if key == "partner_nodes" and isinstance(value, (list, tuple)):
             value = ", ".join(str(v) for v in value)
+        elif isinstance(value, (dict, list, tuple)):
+            value = json.dumps(value, ensure_ascii=False)
         rendered = failure_log._scrub_text(str(value))[:_MAX_ERROR_FIELD_CHARS]
         parts.append(f"{key}: {rendered}")
     return "; ".join(parts) if parts else None

@@ -82,7 +82,7 @@ server has no path to is Comfy Cloud itself: no cloud-hosted execution, no cloud
 cross-session cloud batches. Every tool here shells out to `comfy --where local`. Pick by where you
 want the work to run, or [install the cloud server too](#comfy-cloud-mcp).
 
-> **Status:** beta. 41 tools; core loop validated end-to-end against a live local ComfyUI
+> **Status:** beta. 42 tools; core loop validated end-to-end against a live local ComfyUI
 > (`server_info → run_workflow → fetch_outputs` → PNG on disk). CI runs pytest + ruff on
 > Python 3.10 and 3.14.
 
@@ -148,9 +148,12 @@ Four steps take you from a fresh install to your first generated image.
 name — so telling the agent "save them to `./outputs`" puts a copy right where you asked while
 the originals stay in the ComfyUI workspace.
 
-For video or audio output, pass the downloaded file to `preview_media`. It asks comfy-cli to
-render a PNG contact sheet or waveform and returns that image inline, so the agent can inspect
-the result without trying to embed the original media file in the MCP response.
+For video or audio output, `fetch_outputs(inline_images=True)` records every output's on-disk
+path, media type and size in `structuredContent` and inlines small audio clips directly as MCP
+audio content, while a video — MCP has no video content type — and anything past the cap stays a
+path-only record. For a visual summary of a video, pass the downloaded file to `preview_media`: it asks
+comfy-cli to render a PNG contact sheet or waveform and returns that image inline, so the agent can
+inspect the result without embedding the whole media file in the MCP response.
 
 ## Upgrading from `comfy-local-mcp`
 
@@ -403,6 +406,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Templates your install can't run](#templates-your-install-cant-run)
 - [Driving a remote ComfyUI](#driving-a-remote-comfyui)
 - [Targeting a non-default ComfyUI address](#targeting-a-non-default-comfyui-address)
+- [ComfyUI Desktop and the Windows portable package](#comfyui-desktop-and-the-windows-portable-package)
 - [Which address variable do I want?](#which-address-variable-do-i-want)
 - [Project anchoring](#project-anchoring)
 - [Tools](#tools)
@@ -449,6 +453,7 @@ full cloud tool list, and the slash-command/prompt tables live.
   `comfy launch` (or, from an agent, the `launch_comfyui` tool), and confirm it is up with
   `server_info`. Nothing here starts ComfyUI implicitly.
 
+<a id="optional-environment-variables"></a>
 <details>
 <summary><strong>Optional environment variables</strong> (<code>COMFY_BIN</code>, <code>COMFY_API_KEY</code>, <code>COMFYUI_URL</code>, <code>COMFY_MCP_REMOTE_SHARED_MODELS</code>, <code>COMFY_LOCAL_URL</code>, <code>COMFY_T2I_TEMPLATE</code>; plus <code>COMFY_USER_AGENT</code>, which the server sets itself)</summary>
 
@@ -471,11 +476,23 @@ full cloud tool list, and the slash-command/prompt tables live.
   full precedence chain; every example in
   [Configure your AI client](#configure-your-ai-client) shows where it goes.
 - **`COMFYUI_URL` / `COMFYUI_HOST` / `COMFYUI_PORT` (optional — drive a ComfyUI on *another
-  machine*).** Read by **this server**. By default every tool targets `127.0.0.1:8188`. Set
+  machine*).** Read by **this server**. With none of these and no `COMFY_LOCAL_URL` set, the **submit / job**
+  tools target Comfy Desktop's current port when it can be discovered — read from Comfy Desktop's own
+  `port-locks` directory and matched against a live process, only when exactly one instance is
+  running — otherwise no `--host`/`--port` is forwarded and comfy-cli resolves its own local
+  target the usual way (`COMFY_LOCAL_URL`, then a comfy-cli-launched background server, then its
+  hardcoded default `127.0.0.1:8188` — see [Which address variable do I want?](#which-address-variable-do-i-want)).
+  This discovery is a same-machine fallback for the submit/job tools, `search_models`,
+  `nodes`, `validate_workflow` and template checks. Catalog forwarding is loopback-only
+  (see [Discovery / validation](#driving-a-remote-comfyui)); `get_logs` still resolves
+  independently through comfy-cli's own rules. Set
   `COMFYUI_URL` (e.g. `http://gpu-box:8188`) — or the `COMFYUI_HOST` (+ optional `COMFYUI_PORT`,
-  default `8188`) pair — to point the **submit / job / node catalog** tools at a ComfyUI running elsewhere, e.g. a
-  GPU box reachable over a private network (Tailscale). See **[Driving a remote
-  ComfyUI](#driving-a-remote-comfyui)** for what is and isn't remoted. Unset ⇒ nothing changes.
+  default `8188`) pair — to point the **submit / job** tools at a ComfyUI running elsewhere, e.g. a
+  GPU box reachable over a private network (Tailscale); either one always overrides the Desktop
+  discovery, and so does `COMFY_LOCAL_URL` (an address you chose is never retargeted by discovery).
+  Discovery never makes the server treat the session as remote: `download_model` and the
+  guided restart stay available. See **[Driving a remote ComfyUI](#driving-a-remote-comfyui)** for what is and isn't
+  remoted.
 - **`COMFY_MCP_REMOTE_SHARED_MODELS` (optional — only meaningful alongside the variables above).**
   `download_model` writes to *this* machine's models dir and has no remote mode, so with a remote
   configured it refuses rather than downloading onto the wrong disk. Set this to `1` when this
@@ -524,7 +541,7 @@ The discrete-GPU rows are written for NVIDIA but apply to an AMD or Intel card o
 
 The instructions walk these as an ordered procedure, because several of the checks only make sense in sequence:
 
-1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts every tool that submits a job — `run_workflow`, `generate_image`, `run_template` — along with the queue/`jobs` tools, `upload_file`, live node discovery and validation; gallery fetching, model discovery, downloads, outputs and lifecycle tools stay here; so against a genuine remote the thresholds below describe the wrong machine. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
+1. **Is the work even local?** `hardware` describes the machine *this server* runs on, and that is where most tools execute. A `comfy_target` block ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) diverts every tool that submits a job — `run_workflow`, `generate_image`, `run_template` — along with the queue/`jobs` tools, `upload_file` and `search_models`. Live node discovery, validation and template checks forward only loopback targets; gallery fetching, downloads, outputs and lifecycle tools stay here; so against a genuine remote the thresholds below describe the wrong machine. It counts as another machine only when its `host` is neither loopback (anything in `127.0.0.0/8`, `localhost`, IPv6 `::1`) nor this host's own address, and a malformed config produces an error-shaped `{error, note}` block that resolves no remote at all. Nothing the server returns carries the local hostname or interface addresses, so a `host` the agent can't place is a question for you rather than a guess — a hostname or LAN IP can be this same machine, and a loopback host can be a tunnel to a remote GPU. `COMFY_LOCAL_URL` is a second signal worth checking: it repoints comfy-cli without producing a `comfy_target` block.
 2. **Get a memory figure.** The sizes are bytes (`ram_bytes`, `gpu.vram_bytes`) and the divisor gives GiB, while drivers report under the advertised size — a consumer 24 GB card reads 23.99, an ECC/reserving datacenter card (A10, L4) about 22.3 — so a *small* shortfall, within ~10% of a nominal size, reads as that nominal capacity. A gap wider than that is not driver overhead and is taken at face value instead: on a MIG/vGPU partition the model string names the whole card while `vram_bytes` is the slice you actually get, and rounding a 6 GB A100 slice up into the ≥ 24 GB band would OOM the run. On Apple Silicon `gpu.vram_bytes` is `null` (with `gpu.unified_memory` true) and the figure is `ram_bytes` — an Apple-only substitution.
 3. **If the figure is missing, ask.** A `null` **or zero** `vram_bytes` on any **non-Apple** GPU (a discrete card comfy-cli can't size, but also a non-Apple unified part like a Jetson/Grace board or a Strix Halo APU), a missing `gpu` object, or a missing/zero `ram_bytes` on the Apple path all mean **unknown**, not "no GPU" — the agent asks rather than stranding a machine that has one. The "no GPU" verdict is reserved for a *confirmed* absence, and the only thing that confirms one is your own answer: no `hardware` payload encodes it, because a null or missing `gpu` is unknown by this same step. Nothing in this repo probes hardware, and the instructions tell the agent not to shell out either: a probe runs on a path this server can neither bound nor audit.
 4. **Route on the figure**, then **redirect rather than dead-end** when the answer is "not on this machine". A figure that came from your answer rather than the payload routes on whichever row fits the machine — the unified-memory row on an Apple Silicon Mac, the VRAM rows otherwise, which is what covers the non-Apple unified-memory boards that have no row of their own.
@@ -738,10 +755,24 @@ ComfyUI, so it sees your custom nodes and your model options, not a bundled cata
 The check is advisory and fails open: the workflow file is written either way, `path` always comes
 back, and nothing is ever refused on its account. Pass `check_local=False` to skip it.
 
+To ask a narrower question *before* fetching anything, `check_template(name)` forwards comfy-cli's
+own `templates check` and returns a verdict — `runnable`, `missing-models` (with the missing file
+names and download URLs), `api-required`, or `unknown` — so you can tell the user what to download,
+or steer them to an API-key flow, up front rather than after a run fails. It is a model-availability
+and API-requirement check, not a substitute for the live check above: `runnable` means the weights
+are present, not that every custom node is installed or every input value is accepted, so still
+read `local_check` (or run `validate_workflow`) before running the template.
+
 ## Driving a remote ComfyUI
 
-By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at a ComfyUI running
-**elsewhere** — e.g. a GPU box reachable over a private network (Tailscale) — by setting one of:
+By default the server drives ComfyUI on this machine — the Comfy Desktop instance it can discover
+via its own port-lock file when exactly one live instance is found (see [Optional environment
+variables](#optional-environment-variables) above), or comfy-cli's own local target otherwise
+(normally `127.0.0.1:8188`, but `COMFY_LOCAL_URL` or a comfy-cli-launched background server can
+already point it elsewhere — see [Which address variable do I want?](#which-address-variable-do-i-want)).
+(An explicitly set `COMFY_LOCAL_URL` takes precedence over that discovery.)
+Point it at a ComfyUI running **elsewhere** — e.g. a GPU box reachable over a private network
+(Tailscale) — by setting one of:
 
 - **`COMFYUI_URL`** — a full URL, e.g. `http://gpu-box:8188` (host-only is fine; port defaults to
   `8188`). Takes precedence over the pair below. Only the **host and port** are forwarded to
@@ -755,21 +786,25 @@ By default the server drives ComfyUI on the local `127.0.0.1:8188`. Point it at 
 - **`COMFYUI_HOST`** (+ optional **`COMFYUI_PORT`**, default `8188`) — e.g. `COMFYUI_HOST=gpu-box`.
   A port without a host (setting only `COMFYUI_PORT`) is rejected — set the host too.
 
-Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set,
-behavior is unchanged (`127.0.0.1:8188` on this machine). If what you actually have is a ComfyUI on
-*this* machine on a different port, you want `COMFY_LOCAL_URL` instead — see [Which address variable
-do I want?](#which-address-variable-do-i-want).
+Set it in the client registration `env` block (same place as `COMFY_BIN`). With nothing set, these
+tools target a discovered Comfy Desktop instance when exactly one live one is found, else
+comfy-cli's own local target (see [Optional environment variables](#optional-environment-variables)
+above). If what you actually have is a ComfyUI on *this* machine on a different port (and Desktop
+discovery doesn't apply — e.g. it wasn't launched via Comfy Desktop), you want `COMFY_LOCAL_URL`
+instead — see [Which address variable do I want?](#which-address-variable-do-i-want).
 
-When configured, the server forwards `--host` / `--port` to `comfy run`,
-`comfy run-template`, `comfy jobs …` and `comfy upload`. The tools that submit a job,
-read one back, or stage its inputs (`run_workflow`, `generate_image`, `run_template`,
-`job` and `upload_file`) therefore target the configured server. `server_info` reports
-that configuration under `comfy_target`.
+When configured, the server forwards `--host` / `--port` to comfy-cli for exactly the verbs that
+accept them — `comfy run`, `comfy run-template`, `comfy jobs …`, `comfy upload` and `comfy models`
+(discovery) — so every tool that **submits a job, reads one back, stages the files a job will read,
+or inspects what a job will find already there** targets the remote: `run_workflow`,
+`generate_image`, `run_template`, `job` (every action), `upload_file`, `search_models`. `server_info`
+reports the configured target under a `comfy_target` block.
 
 Live discovery (`nodes`), `validate_workflow`, and the `local_check` blocks on
 `fetch_template` / `get_template` forward the target **only for loopback hosts**:
-`localhost`, IPv4 addresses in `127.0.0.0/8`, and IPv6 `::1`. This supports a local
-ComfyUI on a different port, including Desktop's `http://127.0.0.1:8000`.
+`localhost`, IPv4 addresses in `127.0.0.0/8`, and IPv6 `::1`. This includes a
+local ComfyUI on a different port and the single discovered live Desktop instance
+when no explicit address is set. `COMFY_LOCAL_URL` disables Desktop discovery.
 Non-loopback hosts keep comfy-cli's existing local catalog behavior: released
 comfy-cli versions through 1.26.0 refuse non-loopback `/object_info` fetches in
 `--where local` mode. A successful local check is not validation of the remote server.
@@ -790,6 +825,15 @@ they are read here and their bytes sent to the target. Remote upload needs comfy
 (this server's floor); an older one rejects the forwarded `--host` and `upload_file` raises with the
 upgrade step rather than silently staging into the local `input` dir.
 
+`search_models` is in the set as the inspection side of the same argument: "what models does the
+install already have?" must be answered about the machine that will run the job, or an agent gates a
+run (or a redundant multi-GB `download_model`) on the wrong disk's catalog — local-only custom-pack
+folders reported as the remote's. The `--host` / `--port` options landed on `comfy models` in
+comfy-cli 1.27.0, so on an older comfy-cli, which rejects the forwarded `--host`, `search_models` retries once
+with the same address in comfy-cli's own `COMFY_LOCAL_URL` (set for that one child process only — your
+`COMFYUI_URL` and the guards keyed off it are untouched). It never falls back to listing this
+machine's catalog as the remote's.
+
 **Not remoted (this repo is a thin wrapper and never opens its own socket):**
 
 - **Lifecycle** (`launch_comfyui`, `stop_comfyui`, `restart_comfyui`, `update_comfyui`,
@@ -798,9 +842,14 @@ upgrade step rather than silently staging into the local `input` dir.
   packs into, or read logs from a remote box. Start and update ComfyUI, and install its node packs,
   on the remote host yourself. `install_node` in particular writes into *this* machine's ComfyUI
   workspace and venv, so with `COMFYUI_URL` set the pack lands where the run isn't.
-- **Catalog / partner verbs** — `search_templates` / `search_models` / `download_model` /
+- **Catalog / partner verbs** — `search_templates` / `check_template` / `download_model` /
   `partner_generate` — this server forwards **no** `--host`/`--port` to these verbs (they accept
-  none at all), so they run against comfy-cli's local default. A model must be installed on the
+  none at all), so they run against comfy-cli's local default. `check_template` and
+  `search_templates(runnable_only=True)` judge the models of whichever ComfyUI comfy-cli itself
+  resolves — its local default, or `COMFY_LOCAL_URL` when set, which can name another machine — so
+  with a remote configured their reply carries a `comfy_target_note` naming the remote rather than
+  passing that verdict off as the remote's. (`search_models` used to be here; it
+  is now target-aware — see the forwarded set above.) A model must be installed on the
   machine that actually runs the job, and `download_model` cannot do that for you — so rather than
   writing the checkpoint to the wrong disk and letting the run fail later on a missing model, it
   **refuses** while `COMFYUI_URL`/`COMFYUI_HOST` is set, naming the remote it would have missed.
@@ -861,26 +910,82 @@ address. Seeing `:8189` there (and the server reported running) confirms the ove
 this server accepts honors the variable. The floor is not a guarantee, though: the version guard
 fails OPEN on a `--version` it can't parse, that errors, or that times out, so a source build or
 fork older than 1.13.0 can still slip past it and silently ignore the variable. On any comfy-cli
-without the support the variable is simply ignored (no error) and every tool keeps targeting
-`127.0.0.1:8188` — which is why the `server_info` check above is the way to confirm it took
-effect, rather than the version alone.
+without the support the variable is simply never consulted — every tool resolves via whatever that
+comfy-cli's own local-target logic does without it (the same **Precedence** below, minus this step)
+— which is why the `server_info` check above is the way to confirm `COMFY_LOCAL_URL` took effect,
+rather than the version alone.
 
-**Still reporting `:8188`?** Three causes, all silent, in the order worth checking:
+**Still reporting `:8188`?** Three causes, all silent, in the order worth checking — each one just
+means `COMFY_LOCAL_URL` didn't win, so comfy-cli falls through to the next step in **Precedence**
+below (normally the hardcoded default, but not always — see there):
 
 1. **The value never reached comfy-cli** — it's in the wrong `env` block, or the client wasn't
    restarted after the edit. The workspace/Python fields `server_info` reports confirm which
    comfy-cli install you're actually talking to.
-2. **The value is malformed** — comfy-cli ignores it and falls back to `127.0.0.1:8188`, emitting
-   only a one-line stderr warning that this server's success path discards, so a typo
-   (`https://…` — only `http` is accepted; a non-numeric port; a port outside 1–65535) looks
-   exactly like the other two causes from the MCP side. Confirm by running
-   `COMFY_LOCAL_URL=<your value> comfy env` in a terminal and reading stderr; see
-   **Accepted values** above.
+2. **The value is malformed** — comfy-cli ignores it, emitting only a one-line stderr warning that
+   this server's success path discards, so a typo (`https://…` — only `http` is accepted; a
+   non-numeric port; a port outside 1–65535) looks exactly like the other two causes from the MCP
+   side. Confirm by running `COMFY_LOCAL_URL=<your value> comfy env` in a terminal and reading
+   stderr; see **Accepted values** above.
 3. **comfy-cli is too old** — it predates the variable and ignored it. `server_info`'s
    `compatibility.comfy_cli_version` reports the detected version.
 
 **Precedence** (comfy-cli resolves this, first match wins): an explicit `--host`/`--port` flag →
 `COMFY_LOCAL_URL` → a comfy-cli-launched background server → `127.0.0.1:8188`.
+
+## ComfyUI Desktop and the Windows portable package
+
+`comfy install` creates a comfy-cli workspace. ComfyUI Desktop (the Electron app) and the Windows
+portable package (`ComfyUI_windows_portable`) are installs you may already be running. Reach the
+one that is up through the address and workspace settings below.
+
+**ComfyUI Desktop.** The app defaults to `127.0.0.1` and port 8000, and moves to the next free
+port when that one is taken. With nothing configured, the **submit / job** tools and
+`search_models`, `nodes`, `validate_workflow` and template checks follow Desktop's current port: they read it from Desktop's own `port-locks`
+directory and match it against a live process, only when exactly one instance is running (see
+[Optional environment variables](#optional-environment-variables)). An address you set yourself
+always wins: `COMFYUI_URL` / `COMFYUI_HOST`, or `COMFY_LOCAL_URL`, which stops the discovery from
+forwarding anything. When discovery finds none or several, comfy-cli resolves its own target as
+[Which address variable do I want?](#which-address-variable-do-i-want) describes. Confirm the URL
+`server_info` reports. `launch_comfyui` and `stop_comfyui` start and stop the
+ComfyUI process comfy-cli itself launched. `restart_comfyui` does that too, and if comfy-cli has
+nothing recorded and the new launch finds the port taken, it names the process listening there
+and asks before killing it (`confirm_kill_untracked` defaults to false, so a decline kills
+nothing). That process can be Desktop's server. Start and quit Desktop from the app.
+
+**Windows portable.** `run_nvidia_gpu.bat` runs the package's embedded Python
+(`python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build`) and passes no
+`--port`. ComfyUI's own default listen port is 8188, the same default this server uses. With the
+bat's server on 8188 and no `COMFY_LOCAL_URL`, tools follow the precedence above, so a background
+server comfy-cli has already launched is chosen ahead of 8188. `server_info` is the check.
+Start the portable copy with the bat. `launch_comfyui` starts the ComfyUI in the comfy-cli
+workspace, which also defaults to 8188, so give that launch a different `--port` in `extra_args`
+while the bat's server is up. `restart_comfyui` can ask to kill the process holding the port,
+which in that case is the portable server.
+
+**Where model downloads go.** comfy-cli 1.25 and newer can save a CivitAI or Hugging Face
+`download_model` that omits `relative_path` into the folder the running server scans for that
+model type, when the server comfy-cli reaches is on a loopback address. That address is the
+precedence above: `COMFY_LOCAL_URL`, then a background server comfy-cli launched, then
+`127.0.0.1:8188`. A plain file URL has no model type, so that call saves under the workspace
+`models` directory. Older comfy-cli, including this server's 1.14.0 floor, writes the comfy-cli
+workspace for every download. For the portable package, `comfy set-default` on
+`ComfyUI_windows_portable\ComfyUI` makes that tree the workspace, so those downloads land in its
+`models` directory (`models\checkpoints` is where the package tells you to put checkpoints).
+`launch_comfyui`, `install_node`, `update_comfyui`, and `switch_comfyui_version` then act on that
+same tree, using the Python comfy-cli resolves for it (an active virtualenv, a `.venv` or `venv`
+inside the tree, or the Python running comfy-cli). The bat's interpreter stays
+`python_embeded`, next to that tree. `COMFY_PROJECT` is a separate knob: it sets the cwd of
+every comfy-cli spawn, which also selects the workspace when that directory looks like a ComfyUI
+tree, and it is where `project(action="init")` and relative paths land. Desktop creates a
+`models` directory in the install folder you chose and records it in `extra_models_config.yaml`
+in the app's user-data directory (`base_path` plus `download_model_base: models`, and a second
+root when you imported models from another install). A file that landed in the comfy-cli
+workspace is a different directory; move it into that `models` folder, or into a path the yaml
+lists.
+
+Install `comfy-mcp` and `comfy-cli` with the Python the MCP client will run. When `comfy` is off
+that client's `PATH`, set `COMFY_BIN` to its absolute path.
 
 ## Which address variable do I want?
 
@@ -890,10 +995,10 @@ different layers. Pick by which one you need; the table is the whole answer.
 
 | | `COMFYUI_URL` (+ `COMFYUI_HOST` / `COMFYUI_PORT`) | `COMFY_LOCAL_URL` |
 | --- | --- | --- |
-| **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never reads it |
+| **Read by** | **this MCP server** (`_comfy_target`) | **comfy-cli** (`comfy_cli/local_address.py`); this server never *interprets* it — its one look is a set-or-unset presence check, so the Comfy Desktop fallback stands down when you set it |
 | **Means** | "a ComfyUI on **another machine** I control" | "the ComfyUI on **this machine** is not on `127.0.0.1:8188`" |
 | **How it acts** | this server forwards `--host` / `--port` to the verbs that accept them | comfy-cli resolves its own target from the environment it inherits |
-| **What it moves** | the **submit / job** tools plus `upload_file`; node catalog tools only for loopback targets (`run_workflow`, `generate_image`, `run_template`, the `jobs` family, input staging, `nodes`, `validate_workflow`, and template checks) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
+| **What it moves** | the **submit / job** tools plus `upload_file` and `search_models`; node catalog tools only for loopback targets (`run_workflow`, `generate_image`, `run_template`, the `jobs` family, input staging, `nodes`, `validate_workflow`, and template checks) — see [what is and isn't remoted](#driving-a-remote-comfyui) | **every** verb, including the ones that take no `--host` / `--port` (`comfy env`, templates, models, download) |
 | **Reported as** | a `comfy_target` block on `server_info` | the resolved `server` URL on `server_info` — **no** `comfy_target` block |
 | **Use it for** | a GPU box over Tailscale / a private network | a port clash, a second instance, a container publishing a different port |
 
@@ -968,7 +1073,7 @@ Set it in the client registration `env` block, same as `COMFY_BIN`:
 
 ## Tools
 
-41 tools, grouped below by what they do. Every tool runs `comfy` with the global
+42 tools, grouped below by what they do. Every tool runs `comfy` with the global
 `--json --where local` flags, unwraps comfy-cli's `envelope/1`, and returns its `data`.
 
 **Argument naming** is uniform, so an agent never has to guess it (the server's handshake
@@ -986,7 +1091,7 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 | `emit_partner_workflow(model, out_path, params=None)` | `comfy generate <model> [--param=value…] --emit-workflow=<path>` | Write a runnable workflow JSON that drives the partner model's **API node** instead of calling the proxy, so **your own ComfyUI executes the partner model** (the other way there is an existing `API`-tagged gallery template via `search_templates` / `run_template`; this is the path from a model *alias*). Chain it: `emit_partner_workflow` → `run_workflow` → `fetch_outputs` (the three stay separate so the graph can be inspected, edited with `set_workflow_slot`, re-run, or embedded in a bigger pipeline). Calls no partner API, needs no API key, and **spends nothing**, so unlike `partner_generate` it has no `confirm_spend` argument and raises no confirmation prompt — *running* the emitted graph is what bills the partner node, so that `run_workflow` step is the one that needs `confirm_spend=True`. **Coverage is narrow:** comfy-cli maps only `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana` and `seedance` to a node class, a small subset of `list_partner_models()`; every other model reaches its partner through the proxy only, so send those to `partner_generate`. An unsupported model raises with comfy-cli's own `emit_workflow_failed` message, which names the supported set for the comfy-cli you actually have installed. Returns comfy-cli's envelope data — `{"out", "model", "nodes"}`. |
 | `run_template(name, params=None, confirm_spend=False, wait=True, timeout_seconds=600.0, ctx=None)` | `comfy run-template <name> [--param=KEY=VALUE…] [--timeout=<s>] [--allow-spend] [--async]` | One-command template run — fetch the gallery template, fill its parameterized slots, and run it on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)) (the one-shot alternative to `fetch_template` → `run_workflow`). `params` are `{slot: value}` (slot address `6.text` or name `prompt`), JSON-encoded so types round-trip. Most templates are free OSS graphs; one embedding partner (paid) nodes spends credits and fails closed unless `confirm_spend=True` unlocks it — and on an elicitation-capable client that asks **you** per call before anything runs (same posture as `partner_generate`; a default, free run is never prompted, and `comfy generate consent always` does not apply to this verb). No capability probe is needed here (unlike `partner_generate`): this verb's gate ships inside the verb itself, so a comfy-cli that has `run-template` has the gate. `wait=True` (the default) streams the run's live progress as MCP progress notifications, the same way `run_workflow` / `job(action="watch")` do, so a long template run is not a silent block; `wait=False` submits `--async` and returns a `prompt_id`. comfy-cli's `--timeout` for this verb is *per-event*, not a whole-run deadline, so `timeout_seconds` is forwarded only to tighten it below the engine's 120s default — prefer `wait=False` over a large `timeout_seconds` for long runs. |
 | `job(action="status", prompt_id="", timeout_seconds=None)` | `comfy jobs status/watch/cancel/ls <prompt_id>` | One grouped tool over the six former `job_status`/`wait_for_job`/`watch_job`/`get_execution_error`/`cancel_job`/`get_queue` tools — pick a behavior with `action`. `"status"` (default) polls status + outputs. `"error"` returns a compact failure verdict — the failing node, `exception_type`/`exception_message`, and a bounded traceback tail — so an agent can self-repair; `error: None` on a healthy prompt. Failures comfy-cli diagnosed itself rather than ComfyUI (a `server_died` crash mid-run) carry no node-level fields, so the verdict also reports `error_code` — comfy-cli's own code, `None` on an ordinary node failure — with its message backfilling `exception_message`. `"wait"` polls (bounded, default 25.0s) until a job reaches a terminal status, returning a `{"timed_out": True, …}` payload on expiry — chain several rather than one long call. `"watch"` streams live progress (bounded, default 600.0s) as MCP progress notifications, same `timed_out` shape except `status` is a live `{progress, total, nodes_done}` snapshot. `"cancel"` stops a queued/running job. `"queue"` lists known jobs (Comfy Cloud-tracked rows filtered out, since this server never drives them; follows a configured remote like the other job actions). `prompt_id` is required for every action but `"queue"`; `timeout_seconds` only for `"wait"`/`"watch"` — passing either where the action does not use it is rejected rather than silently ignored. |
-| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` also returns the copied images as inline MCP image content so the agent can see them without a second read. |
+| `fetch_outputs(prompt_id, out_dir, url_only=False, inline_images=False)` | `comfy download <prompt_id> --where local -o <out_dir> [--url-only]` | Write a finished job's outputs into `out_dir` — including a job that ran on a configured remote, which comfy-cli resolves from the local `prompt_id` state file rather than from a server (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)); `url_only=True` emits the output URLs without copying bytes; `inline_images=True` surfaces the outputs as MCP content plus a `structuredContent` object — the download metadata with a `media` manifest under `media`: images and small audio clips inline (audio as MCP audio content), a video always as a path-only record, and every output's on-disk path, media type and size recorded (files past the 8-file / 16 MiB cap are path-only records). No listening socket is opened. |
 | `preview_media(media_path, out_path="", grid="4x3", width=480, inline_image=True)` | `comfy preview <media_path> [--out <out_path>] --grid <COLSxROWS> --width <pixels>` | Render a local image thumbnail, video contact sheet, or audio waveform as PNG. comfy-cli owns media classification and rendering; this server does not parse media or call ffmpeg. By default the result contains comfy-cli's metadata followed by the generated PNG as inline MCP image content; `inline_image=False` returns metadata only. `grid` controls video frame sampling, and `out_path` is optional because comfy-cli otherwise writes `<media>.preview.png`. The input must exist on the MCP host, so for a remote job call `fetch_outputs` first and pass one of its downloaded paths here. Relative paths follow `COMFY_PROJECT`. |
 
 ### Resource management
@@ -994,7 +1099,7 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 | Tool | Wraps | What it does |
 |---|---|---|
 | `system_stats()` | `comfy system-stats` | Read the live local ComfyUI's VRAM per device and system RAM. ComfyUI's whole `/system_stats` payload is forwarded **unmodified except for a `comfy_target_note` key** added when a remote target is configured (see below), so treat it as a passthrough, not a fixed schema: a `devices` list plus a `system` dict, whose keys are whatever that ComfyUI reports. The ones this server's guidance reads are per-device `vram_free` / `vram_total` (byte counts, alongside e.g. `name`, `type`, `index`, `torch_vram_free`) and `system.ram_free` / `ram_total` / `comfyui_version` — examples, not an exhaustive list. Nothing is filtered, so the `system` block also carries ComfyUI's `python_version` and `argv` (its full launch command line), which reach the model's context verbatim. Call it before a heavy `run_workflow` / `run_template` to decide whether to free memory first, and again afterwards to confirm the headroom landed. Read-only. Needs a running ComfyUI (the numbers come from the server), and unlike the run/job tools it is **not** diverted by `COMFYUI_URL`/`COMFYUI_HOST` — `comfy system-stats` takes no `--host`/`--port`. When one of those is set, a top-level `comfy_target_note` (`host` / `port` / `source` / `note`) is added naming that target and saying these numbers describe whichever ComfyUI comfy-cli itself targets — settle whether that host is *this* machine before gating a run on them. A malformed value gives an error-shaped note (`error` / `note`) rather than breaking the call; with nothing configured the key is absent. |
-| `free_memory(unload_models=True, free_memory=None)` | `comfy free [--unload-models\|--no-unload-models] [--free-memory]` | Ask ComfyUI to unload models from VRAM and reset its executor cache (`POST /free`). `free_memory=None` means **follow `unload_models`**, so the default call requests both — maximum headroom, and a deliberate divergence from comfy-cli's `--free-memory`, which defaults to off; pass `free_memory=False` for the CLI's lighter unload that keeps cached executor state. **The cache reset can't be had without the unload:** ComfyUI's worker resolves the pair as `flags.get("unload_models", free_memory)` and its `/free` handler only records `unload_models` when true, so `unload_models=False, free_memory=True` would unload everything — that pair is rejected rather than sent. `unload_models=False` therefore asks ComfyUI to do nothing; it's a deliberate no-op kept for symmetry with the CLI. **Not immediate and never destructive:** ComfyUI applies the request when its queue worker next iterates — immediate if idle, after the current job if busy — and it does **not** interrupt a running job, so it cannot be used to stop one (`job(action="cancel")` does that). Returns comfy-cli's acknowledgement of what was *requested*, not a measurement; read `system_stats` afterwards to confirm. Also **not** diverted by `COMFYUI_URL`/`COMFYUI_HOST`, and it carries the same `comfy_target_note` key when one of those is set — naming the target this call may not have freed. See [Using with local LLMs](#using-with-local-llms-vram-coordination). |
+| `free_memory(unload_models=True, free_memory=None)` | `comfy free [--unload-models\|--no-unload-models] [--free-memory]` | Ask ComfyUI to unload models from VRAM and reset its executor cache (`POST /free`). `free_memory=None` means **follow `unload_models`**, so the default call requests both — maximum headroom, and a deliberate divergence from comfy-cli's `--free-memory`, which defaults to off; pass `free_memory=False` for the CLI's lighter unload that keeps cached executor state. **The cache reset can't be had without the unload:** ComfyUI's worker resolves the pair as `flags.get("unload_models", free_memory)` and its `/free` handler only records `unload_models` when true, so `unload_models=False, free_memory=True` would unload everything — that pair is rejected rather than sent. `unload_models=False` therefore asks ComfyUI to do nothing; it's a deliberate no-op kept for symmetry with the CLI. **Not immediate, and recoverable** (unloaded models reload on next use)**:** ComfyUI applies the request when its queue worker next iterates — immediate if idle, after the current job if busy — and it does **not** interrupt a running job, so it cannot be used to stop one (`job(action="cancel")` does that). Returns comfy-cli's acknowledgement of what was *requested*, not a measurement; read `system_stats` afterwards to confirm. Also **not** diverted by `COMFYUI_URL`/`COMFYUI_HOST`, and it carries the same `comfy_target_note` key when one of those is set — naming the target this call may not have freed. See [Using with local LLMs](#using-with-local-llms-vram-coordination). |
 
 ### Diagnostics
 
@@ -1003,7 +1108,7 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 | `server_info()` | `comfy env` + `comfy outdated` | Is a local ComfyUI running, where, and which workspace. **Call first.** Passes through comfy-cli's `hardware` block (GPU vendor/model, VRAM or unified memory, total RAM) when the installed comfy-cli reports one — the signal behind [When to use this server](#when-to-use-this-server), which the startup `Machine snapshot` also carries in the handshake instructions so routing never waits on this call. Also attaches a `freshness` block (`comfy outdated`): installed-vs-latest for ComfyUI core and each custom node pack, so a stale install is flagged before it masquerades as a missing model/node. On a comfy-cli without the `outdated` verb the block degrades to `freshness: {"error": "freshness unavailable: …", "unsupported": true}` (a benign capability gap — skip staleness advice, nothing is broken); on any other probe failure such as a network error it degrades to `freshness: {"error": …}` carrying the real reason. Either way the tool itself still succeeds. Reports the configured remote under a `comfy_target` block when `COMFYUI_URL`/`COMFYUI_HOST` is set (see [Driving a remote ComfyUI](#driving-a-remote-comfyui)). |
 | `auth_status()` | `comfy cloud whoami` | Comfy Cloud credential status for partner-API nodes (read-only, never returns secrets). Adds a local `registration_env_key_present` bool for the `COMFY_API_KEY` registration-env slot whoami can't see. |
 | `auth_login()` | `comfy cloud login --no-browser --timeout 600` | Start Comfy Cloud sign-in and return `{"status": "awaiting_browser", "login_url": …, "expires_in_s": …}` — the URL for the **user** to open, so an agent can get them signed in instead of telling them to run the CLI by hand. Returns as soon as comfy-cli emits the URL; the sign-in keeps running in the background (comfy-cli owns the OAuth flow and the loopback callback, so no OAuth logic lives here). Confirm the result with `auth_status`. Only one sign-in at a time: calling it again while one is pending re-reports the same URL without spawning a second flow, and calling it after the flow ended reports `completed` / `failed` once and then clears. Never returns tokens. |
-| `billing_status()` | `comfy cloud status` | Comfy Cloud credit balance, subscription tier and job concurrency for the signed-in workspace — **read-only, spends nothing**, so it raises no spend confirmation. Answers "how many credits do I have", "what plan am I on", "when does it renew", "how many jobs can I run at once". Returns comfy-cli's payload as-is: `cloud_workspace`, `credit_balance_usd` / `credit_balance_credits` / `effective_balance_micros`, `currency`, `balance_confirmed`, `subscription` (tier / status / is_active / plan_slug / renewal_date / cancel_at), `max_concurrent_jobs`, `upgrade_suggestion`, `manage_url` and `message`. `balance_confirmed: false` means the balance fields are `null` because none could be *established* — not that the balance is zero — and `message` is comfy-cli's own neutral copy for that case, to be relayed verbatim rather than re-derived from the numbers. Signed out raises comfy-cli's own error (`auth_login` / `auth_status` are the fix); on a comfy-cli predating the verb — or predating the whole `comfy cloud` group — it degrades to `{"error": …, "unsupported": true, "balance_confirmed": false}` — with the three balance fields carried as `null` — naming the upgrade, the same benign capability gap as `server_info`'s `freshness` block (the verdict and the fields it is about travel with the degrade, so the `balance_confirmed`-then-read rule holds on that shape too). |
+| `billing_status()` | `comfy cloud status` | Comfy Cloud credit balance, subscription tier and job concurrency for the signed-in workspace — **read-only, spends nothing**, so it raises no spend confirmation. Answers "how many credits do I have", "what plan am I on", "when does it renew", "how many jobs can I run at once". Returns comfy-cli's payload as-is: `cloud_workspace`, `credit_balance_usd` / `credit_balance_credits` / `effective_balance_micros`, `currency`, `balance_confirmed`, `subscription` (tier / status / is_active / plan_slug / renewal_date / cancel_at), `max_concurrent_jobs`, `upgrade_suggestion`, `manage_url` and `message`. `balance_confirmed: false` means the balance fields are `null` because none could be *established* — not that the balance is zero — and `message` is comfy-cli's own neutral copy for that case, to be relayed verbatim rather than re-derived from the numbers. Signed out raises comfy-cli's own error (`auth_login` / `auth_status` are the fix); on a comfy-cli older than 1.17.0, where `comfy cloud status` shipped — or predating the whole `comfy cloud` group — it degrades to `{"error": …, "unsupported": true, "balance_confirmed": false}` — with the three balance fields carried as `null` — naming the upgrade, the same benign capability gap as `server_info`'s `freshness` block (the verdict and the fields it is about travel with the degrade, so the `balance_confirmed`-then-read rule holds on that shape too). |
 | `which()` | `comfy which` | Which ComfyUI install/workspace comfy-cli currently targets (a lighter answer than `server_info`). |
 | `project(action="status")` | `comfy project status` / `comfy project init` | Report or create the operator-anchored `project/1` (`action="status"` / `"init"`). See [Project anchoring](#project-anchoring). |
 | `get_logs(tail=200, port=None)` | `comfy logs --tail <tail> [--port <port>]` | Tail the background ComfyUI's captured log (`<workspace>/user/comfyui_<port>.log`) — closes the debugging loop after a detached `launch_comfyui`. Returns `{lines, path, truncated}`; a missing log file returns `{"error": "no_log_file", …}` rather than raising, and on a newer comfy-cli that message lists every candidate path checked. Pass `port` when several instances/ports have run, or after a crash, to force `user/comfyui_<port>.log` resolution. A newer comfy-cli also returns `source` / `port_mismatch` / `mtime` / `size`, forwarded untouched: if `port_mismatch` is true or `source` reports a fallback, the lines may belong to a different server — re-call with an explicit `port` (note `user/comfyui.log`, unsuffixed, is ComfyUI-Manager's log for servers started without an explicit `--port`). A comfy-cli too old to accept `--port` raises an upgrade instruction rather than silently returning the default log. |
@@ -1014,7 +1119,7 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 | Tool | Wraps | What it does |
 |---|---|---|
 | `validate_workflow(workflow_path, object_info_path="")` | `comfy validate --workflow <path> [--input <object_info.json>]` | Pre-flight a workflow against the local or configured loopback target's live `object_info` before a slow run, or pass `object_info_path` to validate against a saved catalog when the live response is too large. Returns comfy-cli's own report — `{"valid": bool, "error_count", "errors": [...], "warnings": [...]}` — where each error names the `node_id` (subgraph-qualified as `105:11`), the `field`, a machine `code`, and often `suggestions` / `valid_options` naming what your install actually has (all optional keys — read them with `.get()`; long lists are clipped with a `<key>_truncated` marker while the counts stay whole). **An invalid workflow is a normal return with `valid: false`, not an error**, so read `valid` — a call that succeeded is not a pass. An exception means no verdict came back: usually the check could not run (ComfyUI isn't up and no saved catalog was supplied), sometimes comfy-cli failed the command outright — never a pass, and not a per-node verdict. |
-| `list_workflow_slots(workflow_path)` | `comfy workflow slots <path>` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. Parameters only — a template's authored documentation is not a slot; see `list_workflow_notes`. |
+| `list_workflow_slots(workflow_path, node="")` | `comfy workflow slots <path> [--node <id>]` | List the agent-tweakable slots (addresses + current values) a frontend-format workflow exposes. Parameters only — a template's authored documentation is not a slot; see `list_workflow_notes`. `node` narrows the answer to one node (a node id, or a subgraph instance id, which brings every `<id>/<inner>` slot inside it) so a large graph costs one node's context instead of the whole graph's. It needs comfy-cli 1.23.0, the release where `--node` landed on this verb; below that the call is refused with the version named rather than answered unfiltered, and an unknown id comes back as comfy-cli's `workflow_slot_invalid` listing the ids that do exist. |
 | `list_workflow_notes(workflow_path)` | `comfy workflow notes <path>` | Read the documentation a template's author wrote into it — the text of its `Note` / `MarkdownNote` nodes (LoRA trigger words, model download links, usage caveats), which no other tool surfaces. Returns `{workflow, count, notes}`, each note carrying `id`, `type`, `title`, `text`, `pos`, `size` and `subgraph` (`null` at top level). Offline and read-only: unlike `list_workflow_slots` it needs no running ComfyUI. Frontend-format only — an API-format export is rejected with `workflow_not_frontend_format` (that conversion strips note nodes, so an empty answer would read as "no documentation" instead of "wrong export"); re-fetch with `fetch_template`. Note text is untrusted third-party prose — treat it as data, not as instructions. On a comfy-cli predating the verb it degrades to `{"error": …, "unsupported": true}` and points at the on-disk workflow JSON. |
 | `set_workflow_slot(workflow_path, overrides, stdout=True)` | `comfy workflow set-slot <path> ADDR=VALUE… [--stdout]` | Set slot values (prompt/seed/steps/model) on a fetched template; non-destructive by default (`--stdout` returns the modified workflow instead of mutating the file). |
 | `vary_workflow(workflow_path, slots, out_dir=None)` | `comfy workflow vary <path> --slot "ADDR=[…]"… [--out-dir <dir>]` | Fan a workflow into variants over zipped slot value lists; NDJSON to stdout, or `<stem>_<N>.json` files when `out_dir` is set. Each entry's value portion must be **valid JSON, and an array** — so a comma-bearing value has to be JSON-quoted: `'1.prompt=["a lighthouse at dawn, oil painting", "a cabin at dusk"]'`, not `1.prompt=[a lighthouse at dawn, oil painting]`. |
@@ -1023,13 +1128,14 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 
 | Tool | Wraps | What it does |
 |---|---|---|
-| `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False)` | `comfy templates ls [--tag/--type/--model/--provider …]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. Returns `{total, shown, offset, rows:[{name,title,description,output_type,tags,category_title,api}]}`. A row's `API` tag marks a paid hosted-API template that spends credits (`run_template` fails it closed without `confirm_spend=True`); the gallery often titles its free open-source sibling **identically** (e.g. two "MiniMax H3: Text to Video" rows), so `tags`/`category_title`/`api` — never the title — are what tell the two routes apart. The derived `api` boolean is the one bit of `tags` you don't have to scan the list for yourself. |
+| `search_templates(query="", limit=25, offset=0, tag="", type="", model="", provider="", exclude_api=False, runnable_only=False)` | `comfy templates ls [--tag/--type/--model/--provider …] [--runnable]` | Find a built-in workflow template: free-text `query` (client-side over name/title/description/tags/models), paged via `limit`/`offset`, narrowed by the `tag`/`type`/`model`/`provider` gallery filters or `exclude_api=True`. `runnable_only=True` adds comfy-cli's `--runnable` filter — only templates every weight for which is already on **this** install (weights only; still validate before running) — which fetches each candidate's workflow to check on its first run, so that call is slow (300s cap vs 60s) and the `query` narrowing still applies on top, without `unmatched_query_words` (a word may match a template that just isn't runnable here). A comfy-cli without `--runnable` (it landed in comfy-cli 1.27.0) gets an upgrade error naming that release, never the unfiltered gallery; with a remote target configured the reply carries a `comfy_target_note`, since the weights checked are those of the ComfyUI comfy-cli itself resolves (`COMFY_LOCAL_URL` included). Returns `{total, shown, offset, rows:[{name,title,description,output_type,tags,category_title,api}]}`. A row's `API` tag marks a paid hosted-API template that spends credits (`run_template` fails it closed without `confirm_spend=True`); the gallery often titles its free open-source sibling **identically** (e.g. two "MiniMax H3: Text to Video" rows), so `tags`/`category_title`/`api` — never the title — are what tell the two routes apart. The derived `api` boolean is the one bit of `tags` you don't have to scan the list for yourself. |
 | `get_template(name, check_local=True)` | `comfy templates show <name>` (+ `comfy validate`) | Show one template's details/schema before fetching it, plus a `local_check` block cross-checking its graph against the live `object_info` of your install — see [Templates your install can't run](#templates-your-install-cant-run). `check_local=False` skips the check (metadata only, one call). |
+| `check_template(name)` | `comfy templates check <name>` | Step 2.5 of the on-ramp (after `search_templates`, before `fetch_template`): ask whether **this** install has a template's weights *before* fetching it — a model-availability and API-requirement check, not workflow validation, so `local_check` / `validate_workflow` is still needed before running. Returns comfy-cli's own verdict — `runnable`, `missing-models` (names the missing files and their download URLs, ready to hand the user or feed to `download_model`), `api-required` (a paid hosted node — `run_template` fails it closed without `confirm_spend=True`), or `unknown` — so you can tell the user exactly what to download or steer them to an API-key flow up front. A thin passthrough; the verdict is comfy-cli's. `comfy templates` takes no `--host`/`--port`, so it checks whichever ComfyUI comfy-cli itself resolves (its local default, or `COMFY_LOCAL_URL` when set); with `COMFYUI_URL`/`COMFYUI_HOST` set the reply carries a `comfy_target_note` naming the remote the run tools submit to. |
 | `fetch_template(name, out_path, check_local=True)` | `comfy templates fetch <name> --out <path>` (+ `comfy validate`) | Write a template's runnable workflow JSON to `out_path`; returns `{path, local_check}` — `path` is the absolute path for `run_workflow`, `local_check` is the same cross-check run on the file just written. The file is written either way. |
 | `nodes(action="search", query="", name="", produces="", accepts="", category="", pack="", label="", limit=None, from_type="", to_type="", max_depth=None, max_paths=None, exclude_api=False, object_info_path="")` | `comfy nodes search/show/ls/upstream/downstream/path/types/categories [--input <object_info.json>]` | One grouped tool over the eight former `search_nodes`/`get_node`/`list_nodes`/`nodes_upstream`/`nodes_downstream`/`nodes_path`/`nodes_types`/`nodes_categories` tools — pick a behavior with `action`. `"search"` (default) finds a class name by keyword; `"get"` returns one class's full input/output schema; `"list"` filters by `produces`/`accepts`/`category`/`pack`/`label` (bare call lists all); `"upstream"`/`"downstream"` list classes that can feed `name`'s inputs / accept its outputs (`limit` caps the count); `"path"` finds node chains routing a value from `from_type` to `to_type` (`max_depth`/`max_paths` default to 6/10 when omitted), every step a node that genuinely accepts the socket type the previous step produced — link inputs only, so an enum/COMBO widget merely *named* like a type is never routed through — and an unroutable pair comes back as no paths rather than as unrelated nodes. That holds across the whole supported comfy-cli range: comfy-cli's default `--exact` walker only became type-constrained in 1.16.0 (before it, a node with no link inputs vacuously satisfied it, so `MODEL` -> `IMAGE` answered with widget-only loaders, blanked each step's `from_type`, and dropped the canonical `KSampler` -> `VAEDecode` route), so on an engine whose payload still speaks the pre-1.16.0 contract this server re-asks in `--loose`, which routes on socket type on that engine too. Up-to-date engines are asked once, in `--exact`, and keep what only that mode reports: each path's other required inputs under `support`, and the `exact: true` claim that makes an empty result a proof no route exists rather than merely none found; `"types"` lists every connection type by connectivity; `"categories"` returns the menu-category tree. Each param is scoped to the actions that consume it — `query` only `"search"`, `name` only `"get"`/`"upstream"`/`"downstream"`, the five list filters only `"list"`, `limit` only `"upstream"`/`"downstream"`, `from_type`/`to_type`/`max_depth`/`max_paths` only `"path"`, `exclude_api` only `"search"` — passing one where the action does not use it is rejected rather than silently ignored. `object_info_path` applies to every action and forwards comfy-cli's `--input` option for a saved catalog. `"search"` and `"list"` rows carry comfy-cli's own `is_api_node` flag once the installed engine emits it: `true` marks a **paid partner-API node** that bills the signed-in account's credits when executed (`run_workflow`/`run_template` fail it closed without `confirm_spend=True`), `false` a free node running on local weights — two classes can share a display name and differ only in this flag (the MiniMax H3 pair), so it, not the title, is what tells the paid and free routes apart. `exclude_api=True` (search only — `"list"` is already filter-rich) drops the `true` rows client-side and reports the page as `count` plus a new `excluded_api`, leaving `total` exactly as comfy-cli reported it: `total` counts every match the engine found *before* its own 20-row page cap, so recomputing it post-filter would report an all-paid page as `total: 0` and read as "no such node". Rows that do **not** carry the field at all are KEPT — unknown is not paid, so an engine predating the field filters nothing rather than hiding free nodes. Reads use the local or **configured loopback target's live** `object_info` by default (includes installed custom nodes), or the saved snapshot named by `object_info_path`. Non-loopback targets keep the local catalog; they do not follow remote `run_workflow` submissions. |
 | `workflow_deps(workflow_path)` | `comfy node deps-in-workflow --workflow <path> --output <tmp>` | Which node **packs** a workflow needs, resolved from the node classes it references — the **diagnosis** half of the missing-node story, and the only tool here that can go from a class name to a pack id. `nodes` (`"get"`/`"search"`) reads only the selected `object_info` catalog, which is the live install by default; this instead reads ComfyUI-Manager's node→pack map, which covers packs that are not installed. Returns Manager's manifest verbatim: `{"custom_nodes": {"<pack-id-or-repo-url>": {"state": "<status>", …}}, "unknown_nodes": ["SomeClass", …]}`, where `<status>` is `installed`, `not-installed`, `disabled`, or `invalid-installation`; the `not-installed` keys are the `install_node` list, and `unknown_nodes` are classes Manager could attribute to no pack at all (a hand-written node, or a typo in the graph). So the full loop is `validate_workflow` → `workflow_deps` → `install_node` → `restart_comfyui`. Read-only: it installs and downloads nothing. Accepts the same `.json` (API or UI export) file `run_workflow` takes, plus a `.png` with an embedded workflow. **Requires ComfyUI-Manager** — the verb resolves through Manager's `cm-cli`, so an install without it gets `{"error": …, "unsupported": true}` rather than a raw usage dump. comfy-cli emits no envelope for this verb and writes its answer to a `--output` file, so this server supplies a temporary path of its own, reads the manifest back, and removes it. |
 | `node_dependencies(pack="", registry_id="")` | `comfy node deps [<pack>] [--registry <id>]` | A custom node **pack**'s declared Python requirements (its `requirements.txt` / `pyproject.toml`) against the versions actually installed in the workspace venv — each requirement carrying a `satisfied` / `mismatch` / `missing` / `unparseable` / `unknown` status, plus per-pack counts. This is what tells you whether a pack's imports are failing because a dependency is absent, or whether installing one pack would conflict with another. `pack` empty reports every installed pack; `registry_id` pre-checks a **not-yet-installed** registry pack against the same venv before you install it (its latest published version — the registry exposes no per-version endpoint). The two are additive, so naming the same id both ways yields an installed row and a registry row to compare. Read-only: nothing is installed or changed. Pack-level filesystem + venv introspection, so it is deliberately separate from `nodes`, which introspects node **classes** over the live `object_info`. The verb ships in comfy-cli 1.14.0, this server's floor; on a build without it (one that got past the fail-open version guard) it returns `{"error": …, "unsupported": true}` rather than a raw usage dump. |
-| `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk. **Local:** filenames only, no cloud enrichment. |
+| `search_models(query="", folder="")` | `comfy models search` / `models list-folder <folder>` / `models list-folders` | List/search model files on disk — filenames only, no cloud enrichment. **Follows `COMFYUI_URL`/`COMFYUI_HOST`** like `run`/`jobs` (reads the remote install's models when set); on a comfy-cli whose `comfy models` predates `--host` it retries via comfy-cli's `COMFY_LOCAL_URL` rather than listing this machine's catalog. See [Driving a remote ComfyUI](#driving-a-remote-comfyui). |
 | `list_partner_models(style="", partner="", query="", limit=100, offset=0)` | `comfy generate list [--style S] [--partner P] [--query Q]` | The catalog of hosted **partner** models `partner_generate` can run — the only place that list exists (nothing in `discover` / `nodes` / `search_templates` carries the partner aliases). One record per model: `alias` (what you pass as `model`), `id`, `partner`, `category` (the model's style, and the axis `style` filters on — `text-to-image`, `image-edit`, `image-to-image`, `text-to-video`, `image-to-video`, `video-extend`, `controlnet`, `inpaint`, `outpaint`, `upscale`, `background`, `lipsync`, `vectorize` as this is written; comfy-cli owns that set, so read it off an unfiltered call), `mode` (`sync`/`async`, the partner's protocol — `partner_generate` waits either way) and the model's full, untruncated `summary`. Filters are forwarded to comfy-cli: `style` is exact and **case-sensitive**, `partner` exact and case-insensitive, `query` a substring over `id` + `summary`. `limit` (default 100, capped at 200) / `offset` page the result (`{total, shown, offset, filters, models}`) so a growing catalog can't trip the client's tool-output cap; 52 models as this is written, so the default returns all of them — check `shown` against `total` rather than assuming that stays true. |
 | `partner_model_schema(model)` | `comfy generate schema <model>` | One partner model's callable parameters — what to put in `partner_generate`'s `params`. Returns `{model, id, partner, category, summary, mode, polling, content_type, params, example}`, where each `params` record carries `name`, `type` (`string`/`integer`/`number`/`boolean`/`enum`/`object`/`array`/`binary` — `binary` is a local file path comfy-cli uploads or inlines for you), `required`, `default`, `enum` and the spec's own `description`. Reads the spec only: no partner call, no key, no spend. |
 

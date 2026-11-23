@@ -68,11 +68,39 @@ primitive is this repo's job. Project anchoring (`_project_root`, `COMFY_PROJECT
 `project` tool) is the same kind of adaptation: comfy-cli resolves its governing `project/1`
 by walking up from its own process cwd, assuming a persistent shell session an MCP client's
 arbitrary per-call cwd can't provide, so this server passes `cwd=` on its own spawns instead
-— the `status`/`init` verdicts stay entirely comfy-cli's own.
+— the `status`/`init` verdicts stay entirely comfy-cli's own. `search_models`' retry is the
+same kind: a `comfy models` predating `--host` gets the configured target through comfy-cli's
+own `COMFY_LOCAL_URL`, set in that child's env only (`_run_comfy(local_url=…)`).
 
 The second MCP-surface capability is the startup **machine snapshot**
 (`_machine_snapshot_block`): comfy-cli's own `hardware` payload, quoted verbatim into the
 handshake instructions, fail-open on any probe failure — no derived verdict, same guardrail.
+
+The third is the static **tool annotations** every `@mcp.tool()` carries
+(`types.ToolAnnotations`: `readOnlyHint` / `destructiveHint` / `idempotentHint` /
+`openWorldHint`, plus a `title` where the bare name is opaque — `which` / `discover` /
+`nodes`). They are `tools/list` metadata comfy-cli can't express, so a host stops confirming
+on the spec's destructive/open-world DEFAULTS before a harmless read like `server_info`. No
+product behavior — the hints DESCRIBE each passthrough, they don't gate it (the per-call
+confirmation above is the gate): `openWorldHint` is true only where comfy-cli reaches the
+open internet / Comfy Cloud / a partner API / a registry, NOT the local ComfyUI process or
+filesystem (so `search_models`, a ComfyUI-install read, is closed-world while `download_model`,
+an arbitrary-URL fetch, is open-world) — a ComfyUI the user points `COMFYUI_URL`/`HOST` at
+still counts as "the ComfyUI process", and a tool that MAY reach out (a partner node, a
+cold-cache registry or gallery fetch) is open-world. Multi-mode tools annotate for their
+worst action: `job` / `download` for `cancel`, and every tool that can replace a file at a
+caller-chosen path (`out_path` / `out_dir` / `overwrite=True`) is destructive. The pinned classification lives in `tests/test_tool_annotations.py` — add
+a new tool's row there with the tool.
+
+The fourth is the **MCP Apps output viewer** (`output_viewer`): a `ui://comfy-mcp/output-viewer`
+HTML resource, built as an `Apps()` extension and handed to `MCPServer(..., extensions=[...])`,
+with `_meta.ui.resourceUri` stamped on `fetch_outputs` and `preview_media` ONLY. An Apps host
+renders those tools' output inline; it adds NO product behavior — the resource and its pointer
+are advertised unconditionally, so a non-Apps host ignores `_meta.ui` and still gets the same
+text/image `content` the tools already return. The document renders the host-delivered tool
+result with `data:` URLs and `textContent` only — no `fetch`, no `tools/call`, no socket, no
+`file://`/loopback URL — so it needs no CSP widening past the ext-apps default. Same guardrail:
+this is a protocol surface comfy-cli can't express, not a derived verdict.
 
 The three *spend* gates — `partner_generate`, `run_template`, `run_workflow` — differ where
 the engine's own shape differs, and those differences are load-bearing: `comfy generate`
@@ -94,15 +122,15 @@ registry slugs, refusing a URL, since the prompt promises a REGISTRY pack.
 `restart_comfyui`'s kill gate is STATE-scoped instead, firing mid-sequence once a launch
 loses the port. Mirror the engine's contract per tool; never generalize one gate to another.
 
-Discovery reads the configured **loopback** target's live install (custom nodes included).
+Discovery reads the explicit or discovered Desktop **loopback** target's live install (custom nodes included).
 Non-loopback targets keep comfy-cli's local catalog behavior; they are not fetched.
 Alternatively, use a saved `object_info` catalog supplied to `nodes` / `validate_workflow`. `search_models`
-reads this machine's model files; `preview_media` returns comfy-cli's PNG inline.
+reads the target install's model files; `preview_media` returns comfy-cli's PNG inline.
 
 ## Module layout
 
 `server.py` holds the wrapper core (`_run_comfy`, the envelope parser, the `--json-stream`
-machinery, the spend-consent plumbing) and every `@mcp.tool()`. Ten **leaf** modules sit
+machinery, the spend-consent plumbing) and every `@mcp.tool()`. Eleven **leaf** modules sit
 under it — none imports `server`, so the dependency edges only ever point one way.
 
 Who owns what, per module: [`docs/agents/module-layout.md`](docs/agents/module-layout.md).

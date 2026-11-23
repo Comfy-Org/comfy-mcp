@@ -7,6 +7,278 @@ behaviour changes, even though that would be a major bump after 1.0 — while th
 project is pre-1.0, minor is the strongest signal available, so read it as
 "check the notes before upgrading".
 
+## Unreleased
+
+### Added
+
+- **Comfy Desktop's port is discovered when nothing is configured.** Comfy
+  Desktop picks its port per launch (it moves off 8000 when that is taken), so
+  the hardcoded `127.0.0.1:8188` default was frequently the wrong ComfyUI. With
+  no `COMFYUI_URL` / `COMFYUI_HOST` and no `COMFY_LOCAL_URL`, the verbs that
+  take `--host`/`--port` (`run`, `run-template`, `jobs`, `upload`, `models`) now
+  follow the port in Desktop's own `port-locks` directory, but only when exactly
+  one lock names a live process. Zero, stale or several live locks resolve to
+  nothing, so behaviour is unchanged from today. Lock files are read from
+  Desktop's own state directory (Windows/macOS: its `Comfy Desktop` user-data
+  folder; Linux: `$XDG_STATE_HOME/comfyui-desktop-2`). A configured address
+  always wins, and a discovered Desktop is never treated as a remote, so
+  `download_model`, `restart_comfyui` and `server_info` behave as they do for a
+  plain local install. `COMFY_LOCAL_URL` is only checked for being set, never
+  parsed.
+
+### Changed
+
+- **`fetch_outputs` no longer requires `out_dir`.** Omit it and `-o` is left
+  off the argv entirely, so comfy-cli resolves the destination it already knows
+  how to resolve. This tool was stricter than the command it wraps: a caller
+  with a configured download directory still had to name a path on every call,
+  and an LLM caller has to invent one — which is what the reporter of
+  [#304](https://github.com/Comfy-Org/comfy-mcp/issues/304) asked to stop doing
+  ("llm model do not assure the path, it should be made programmatically").
+  Passing `out_dir` is unchanged, including both of its input guards. With
+  `inline_images=True` the media manifest is now scoped by the directory
+  comfy-cli reports in its own payload rather than by one recomputed here; with
+  no parameter and no reported directory there is nothing to scope to, so the
+  download's metadata is returned without a manifest instead of one built
+  against the wrong directory. Full effect needs
+  [comfy-cli#1158](https://github.com/Comfy-Org/comfy-cli/pull/1158), whose
+  absence leaves `comfy download`'s own default shadowing its project-aware
+  resolver.
+
+### Added
+
+- **`list_workflow_slots` can answer for one node.** The new `node` parameter
+  forwards `comfy workflow slots --node`, which has existed engine-side since
+  comfy-cli 1.23.0 and was not reachable through this server. On a large graph
+  the unfiltered answer is most of what an agent spends its context on, which is
+  the first thing the reporter of
+  [#303](https://github.com/Comfy-Org/comfy-mcp/issues/303) asked for: "on
+  complex graph too much parameters occured as choice, waste of context". Takes
+  a node id or a subgraph instance id, and a subgraph instance brings every
+  `<id>/<inner>` slot inside it. On comfy-cli below 1.23.0 the call is refused
+  with the version named rather than answered unfiltered, because an agent that
+  believes the filter applied reads a whole graph's slots as one node's. An
+  unknown id is comfy-cli's own `workflow_slot_invalid`, which lists the ids
+  that do exist.
+
+### Fixed
+
+- **Three capability claims named the release that does NOT have the feature.**
+  `search_templates(runnable_only=True)` told a caller its `--runnable` filter
+  "landed after comfy-cli 1.26.0", the `search_models` remote refusal said
+  `--host` "ships in a comfy-cli newer than v1.26.0", and the `search_models`
+  docstring dated token-AND search to "newer than v1.15.0". All three were true
+  when written — the first two had no release at all to point at — and all three
+  made the reader derive the number that matters. comfy-cli **1.27.0** shipped
+  both flags on 2026-11-18 ([#878](https://github.com/Comfy-Org/comfy-cli/pull/878),
+  [#876](https://github.com/Comfy-Org/comfy-cli/pull/876)) and token search has
+  been in **1.16.0** since 2026-08-10
+  ([#684](https://github.com/Comfy-Org/comfy-cli/pull/684)), so each site now
+  names its release, the two degrades name a `pip install --upgrade` bound you
+  can act on, and the floors are constants
+  (`_MIN_RUNNABLE_COMFY_CLI_STR`, `_MIN_MODELS_HOST_COMFY_CLI_STR`) beside
+  `_MIN_WATCH_COMFY_CLI_STR` and `_MIN_BILLING_COMFY_CLI_STR`. The existing
+  hedge guard only failed a claim at or below the **server-wide** floor, so it
+  passed all three; it now fails *any* hedged comfy-cli version, across
+  `server.py`, `target.py` and the README, and sees the shape that hid two of
+  them (a clause between "landed" and "after"), on whole words only so a verb
+  inside a longer word cannot fail CI on prose that hedges nothing. Two contract
+  tests ask the real binary whether the flags are there, because a mocked
+  `NoSuchOption` proves the message's wording and never its version. The
+  token-search floor has no degrade to live in -- that path fails soft, with a
+  narrower match and no error -- so its constant is pinned to the `search_models`
+  docstring by a test instead, which is what keeps the number in one place.
+
+- **`billing_status` described a comfy-cli that stopped existing in August.**
+  0.11.0 said in five places — these release notes, the tool docstring, the
+  README tool table, a code comment and a test — that no tagged comfy-cli
+  release had `comfy cloud status` yet, and that its `unsupported: true`
+  degrade was therefore "the common result today". The verb shipped in
+  comfy-cli **1.17.0 on 2026-08-22**, nine releases before 0.11.0 went out,
+  so on any install at or above **1.17.0** the degrade is unreachable
+  and the message asking the user to upgrade reached only users who were
+  already current. The degrade now names the floor it is about — comfy-cli
+  1.17.0 — the way `job(action="watch")` names 1.16.0, and a scheduled
+  contract test asserts the real binary still has the verb, so the claim
+  cannot go stale again without something failing.
+
+## 0.11.0
+
+The server now introduces itself, and a few answers that used to look finished
+were not. `comfy-mcp --help` and `--version` print instead of exiting with no
+output, and the MCP `initialize` handshake reports the installed package
+version. Node search can tell a free node from a paid partner node,
+`billing_status` is wired to `comfy cloud status` — **corrected
+2026-11-17: that verb shipped in comfy-cli 1.17.0 on 2026-08-22; the
+sentence published here claimed no tagged release had it** — and image,
+video, and audio outputs can come back as an inline preview. Minor rather than patch:
+several tool responses gain fields, and `launch_comfyui` / `restart_comfyui`
+stop acting on the local server when a remote ComfyUI is configured.
+
+The comfy-cli floor stays **>= 1.14.0**. Two verbs sit beside that floor
+rather than under it. `job(action="watch")` needs comfy-cli >= 1.16.0, and a
+server-wide raise would refuse every other tool on an install where only
+watch is broken. `billing_status` is the other caveat: it needs
+comfy-cli >= 1.17.0. **Corrected 2026-11-17** — as published this paragraph
+said the verb was newer than every tagged release and that a current install
+returns `unsupported: true`; 1.17.0 shipped 2026-08-22 and returns a
+balance.
+
+### Added
+
+- **`comfy-mcp --help` and `--version`.** A bare `comfy-mcp` still serves MCP
+  over stdio. The two flags print a short usage screen and the installed
+  version, then exit 0, so a first install is distinguishable from a process
+  that started, read nothing, and left. (#228)
+- **`billing_status`.** One read-only passthrough of `comfy cloud status`:
+  remaining credits, plan, and how many jobs can run at once, once the
+  engine has the verb. It does not spend and it does not prompt.
+  **Corrected 2026-11-17:** `comfy cloud status` shipped in comfy-cli 1.17.0
+  (2026-08-22), so the `unsupported: true` degrade described here is the rare
+  case, not the common one, and the message now names 1.17.0 as the floor.
+  (#250)
+- **`preview_media`.** Wraps `comfy preview` and returns comfy-cli's metadata
+  plus an optional bounded inline PNG — an image thumbnail, a video contact
+  sheet, or an audio waveform — so an agent can look at video and audio that
+  `fetch_outputs` can download but cannot show through the MCP image path.
+  (#256, thanks @wgu9)
+- **`is_api_node` on node rows, and `exclude_api` on `nodes(action="search")`.**
+  comfy-cli tags each `nodes search` / `nodes ls` row with `is_api_node`. The
+  field is documented on `nodes`, and `exclude_api=True` drops the paid rows
+  when the caller asked for free, local generation. The default is `False`,
+  so an existing caller sees the same rows plus the flag. A comfy-cli too old
+  to send the flag is left unfiltered: a node that cannot be classified is
+  shown. (#235)
+- **`object_info_path` on `nodes` and `validate_workflow`.** Optional saved
+  `object_info` catalog, forwarded as comfy-cli's `--input`, for installs
+  whose live catalog exceeds the engine's response ceiling. Live discovery
+  stays the default. (#246, thanks @wgu9)
+- **PyPI project URLs.** `[project.urls]` now carries Homepage, Repository,
+  Documentation, and Issues. Through 0.10.0 the published metadata had
+  `project_urls: null` and a blank Home-page, so the PyPI sidebar linked
+  nowhere. (#227)
+- **MCP Registry listing, published with the GitHub Release.** `server.json`
+  names `io.github.Comfy-Org/comfy-mcp` and points at the PyPI package over
+  stdio. `publish.yml` publishes that listing after the PyPI upload, once the
+  registry can see this exact version. Cutting the 0.11.0 GitHub Release is
+  what sends it; this changelog entry does not. (#232)
+
+### Changed
+
+Check these before upgrading. The floor is unchanged; the verbs below are not.
+
+- **`job(action="watch")` refuses a comfy-cli it can identify as older than
+  1.16.0.** On those builds the watch attached as a new session, heard no
+  execution events, and after its timeout returned a payload that looked like
+  a job that never started. It now fails immediately, says to upgrade with
+  `pip install -U comfy-cli`, and points at `job(action="wait")`, which is
+  unaffected. Timeouts that still happen report
+  how many events arrived, and attach a `jobs status` reading when that count
+  is zero. Other tools keep working on 1.14.x and 1.15.x. (#241)
+- **`launch_comfyui` and `restart_comfyui` refuse a configured remote.** With
+  `COMFYUI_URL` or `COMFYUI_HOST` set, both used to act on the local server
+  and report success. `launch_comfyui` now starts nothing and returns a
+  structured refusal (`launched: false`). `restart_comfyui` names the remote
+  it did not touch and says to restart that one on its own machine. (#274,
+  #275)
+- **`stop_comfyui` says a configured remote was not checked.** `comfy stop`
+  only knows about background launches on this machine, so a remote used to
+  come back as "No ComfyUI is running in the background". The same answer now
+  says the configured remote was not inspected and may still be up. (#276)
+- **A declined consent prompt no longer says "the user declined".** Some
+  clients answer `decline` themselves when they cannot show a prompt. The
+  error now says the prompt was declined and that a client may have done so
+  on its own. The gates still fail closed, and what they allow is unchanged.
+  (#236)
+- **Download results spell the handle `download_id`.** Arguments already did.
+  comfy-cli's own `id` stays beside the new key, so a caller reading `id`
+  keeps working. (#234)
+- **The template gallery cache is warmed at startup.** A missing or corrupt
+  `~/.cache/comfy-cli/gallery/index.json` used to be fetched inside the first
+  `search_templates` call. That fetch now runs once on a background thread at
+  process start. (#243)
+
+### Fixed
+
+- **The MCP handshake reports this package's version.** `initialize` was
+  answering `serverInfo.version: ""` because the SDK does not invent one. It
+  now reports the installed distribution version, falling back to the
+  `__version__` literal when there is no distribution metadata. (#230)
+- **comfy-cli JSON that contains U+2028 parses.** `_last_json_object` split
+  stdout with `str.splitlines()`, which also breaks on Unicode line
+  separators. A one-line envelope whose string value held U+2028 (the MiniMax
+  H3 image-to-video template prompt) was cut in two, and the tool raised
+  "comfy-cli returned no JSON". Captured stdout now splits on `\n`, `\r\n`,
+  and a bare `\r` only. (#307, fixes #296)
+- **Inline output previews resolve inside the project directory.** With
+  `COMFY_PROJECT` set and a relative `out_dir`, `fetch_outputs(inline_images=True)`
+  wrote the files into the project and then looked for them relative to the
+  MCP process directory, so it could return a stale image or omit one it had
+  just downloaded. The preview directory is resolved against the download
+  child's project directory. (#294, thanks @allenflux)
+- **`generate_image(wait=True)` returns the `prompt_id` when the wait
+  expires.** The job kept running with no handle in the error. The bounded
+  wait now comes back with the id either way: finished outputs, or still
+  running. (#238)
+- **`download(action="cancel")` says whether the transfer actually stopped.**
+  The reply used to be the same `status: "completed"` row a finished download
+  returns. It now carries `cancelled`, comfy-cli's `changed`, and a one-line
+  `note` for the case where the call was too late. (#237)
+- **`nodes(action="path")` falls back to `--loose` when the engine's default
+  walk is not type-constrained.** On those builds an exact path search
+  returned nodes that do not accept the requested socket, with nothing in the
+  payload saying so. The fallback is the query that engine answers correctly.
+  (#239)
+- **Launch and restart report the pid that holds the port.** comfy-cli records
+  the detached `comfy launch` wrapper, and killing that pid left `python
+  main.py` running. The reported pid is the process bound to the port; the
+  wrapper pid stays beside it, labelled. (#233)
+- **Racing first calls share one `comfy --version` probe.** The version guard
+  memoized only after the probe finished, so several tools arriving during
+  that first cold start each spawned their own. They now wait on the in-flight
+  probe. (#240)
+
+### Docs
+
+- **Install comfy-cli next to comfy-mcp.** The wheel still does not depend on
+  comfy-cli — the binary that matters is the one on `PATH` — and the README
+  quickstart now installs both in one command,
+  `pip install comfy-mcp "comfy-cli>=1.14.0"`, and says why a bare
+  `pip install comfy-mcp` then fails on every tool call. (#229)
+- **Hand-written workflow nodes get a plain-language `_meta.title`.** Agent
+  instructions say to title every node, pre-flight the graph with
+  `validate_workflow`, and prefer a template when one fits. (#287)
+- **`AGENTS.md` reference tables moved under `docs/agents/`.** The module
+  layout and the test-fixture catalogue moved verbatim so the root file stays
+  inside its line ceiling. The architecture rules stay in `AGENTS.md`. (#298)
+- **Vulnerability reports go to support@comfy.org.** GitHub private
+  vulnerability reporting is not enabled here, so `SECURITY.md` no longer
+  offers that form. The issue chooser's security contact link opens the same
+  policy. (#308, fixes #295)
+- **ComfyUI Desktop and the Windows portable package.** The README only
+  described a comfy-cli workspace on `127.0.0.1:8188`. It now says how to
+  point this server at Desktop — the app defaults to port 8000, so set
+  `COMFY_LOCAL_URL` — and at `ComfyUI_windows_portable`. A comfy-cli
+  background server still outranks 8188. `restart_comfyui` asks before
+  killing an untracked listener on a taken port, which can be Desktop's
+  server or the portable one. `comfy set-default` on the portable tree makes
+  that tree the workspace for launch and node installs too, and those use
+  the Python comfy-cli resolves rather than `python_embeded`. A plain file
+  URL still downloads into the workspace `models` directory; a typed CivitAI
+  or Hugging Face download on comfy-cli 1.25 or newer can follow the running
+  server's model folder. (#309, fixes #258)
+
+### Internal
+
+CI and dependency bumps, folded together: shared-workflow SHA updates (#231,
+#244, #249, #253, #260, #262, #263, #264, #266, #268, #269, #270, #271, #277,
+#280, #282, #283, #289, #290), adoption of the public-repo-hygiene check and
+its ECMA-48 allowlist (#254, #261), re-pinning `agents-md-integrity` so `uses:`
+and `workflows_ref` name one commit (#279), GitHub Actions and TruffleHog
+updates (#265, #288, #306), and the ruff dev extra widened to `>=0.16,<0.18`
+(#292). Tests: the packaged version files are pinned to agree at PR time
+(#226), and the blocking-child stub lives in one shared fixture (#242).
+
 ## 0.10.0
 
 `search_templates` rows can now tell a paid template from a free one.

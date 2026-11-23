@@ -60,15 +60,19 @@ against a real comfy-cli install and a running local ComfyUI.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import errno
 import functools
+import hashlib
+import inspect
 import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -76,14 +80,17 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import anyio.to_thread
 from mcp import types
-from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.server.elicitation import render_elicitation_schema
+from mcp.server.mcpserver import Context, Image, MCPServer, RequestStateSecurity
+from mcp.types.version import is_version_at_least
 from pydantic import BaseModel, Field
 
 from . import (
@@ -93,6 +100,7 @@ from . import (
     errors,
     failure_log,
     instructions,
+    output_viewer,
     params,
     target,
     tcc,
@@ -129,16 +137,122 @@ def _server_version() -> str:
     return cli._version()
 
 
+# The MCP Apps inline output viewer (`output_viewer`). Registering the `ui://`
+# resource is the one capability that genuinely lives here rather than in
+# comfy-cli — an MCP protocol surface comfy-cli cannot express — so it is built
+# here and handed to the server as an extension. The resource and its tool
+# pointer are advertised UNCONDITIONALLY: a host that never negotiated the
+# extension ignores `_meta.ui` and shows the tool's existing text/image content,
+# so this is strictly additive. The pointer is stamped via `@mcp.tool(meta=...)`,
+# not `Apps.tool`, so the SDK's own dangling-URI check never sees it;
+# `test_meta_ui_is_set_on_exactly_the_two_result_tools` pins it to the
+# registered resource instead.
+_apps = output_viewer.build_apps()
+
 # `version` is passed explicitly because the SDK does not infer one: it defaults
 # to `""` and `Server.server_info` hands that straight to the client, so an
 # unversioned server answers `initialize` with `"serverInfo": {"name":
 # "comfy-mcp", "version": ""}` — nothing for a client to display, and nothing to
 # correlate a bug report against.
+#
+# The request-state policy is the SDK's own default (`ephemeral()`: a
+# process-local key, 600s TTL), built here only so the consent gates can READ the
+# TTL their sealed `request_state` lives for — `_claim_consent_nonce` must remember
+# a consumed nonce for at least that long, and deriving it from the policy in use
+# means a changed TTL cannot silently outlive that memory.
+_REQUEST_STATE_SECURITY = RequestStateSecurity.ephemeral()
+
 mcp = MCPServer(
     "comfy-mcp",
     version=_server_version(),
     instructions=instructions.INSTRUCTIONS,
+    request_state_security=_REQUEST_STATE_SECURITY,
+    extensions=[_apps],
 )
+
+
+class _ElicitationInputRequired(Exception):
+    """Internal: a consent gate needs an answer the client has not sent yet.
+
+    The ``2026-07-28`` protocol revision removed the server-to-client back-channel
+    that ``ctx.elicit()`` sends ``elicitation/create`` on, so a gate running there
+    cannot ask mid-call; it must carry the question out as the tool's RESULT (an
+    :class:`~mcp.types.InputRequiredResult`) and read the answer off
+    ``ctx.input_responses`` when the client retries the same ``tools/call``.
+
+    :func:`_elicit_approval` raises this on the first round of that flow and
+    :func:`_resumable_consent` — the decorator every gated tool wears — catches it
+    and returns the carried result. It is deliberately NOT a
+    :class:`~comfy_mcp.errors.ComfyCliError`: a gate's own fail-closed ``except``
+    must let a pending question propagate to that decorator rather than mistake it
+    for a refusal. On the handshake transport it is never raised at all.
+    """
+
+    def __init__(self, result: types.InputRequiredResult) -> None:
+        super().__init__("elicitation requires a client round-trip")
+        self.result = result
+
+
+def _resumable_consent(fn):
+    """Let a ``2026-07-28`` consent prompt round-trip through the tool result.
+
+    On that transport :func:`_elicit_approval` raises
+    :class:`_ElicitationInputRequired` on the first round instead of asking over a
+    (now absent) back-channel; this returns the carried
+    :class:`~mcp.types.InputRequiredResult`, which the SDK surfaces as
+    ``resultType: "input_required"``. The client answers by RETRYING the call, the
+    tool body re-runs — its work up to the gate is read-only, so re-running is
+    safe — and the gate reads the answer off ``ctx.input_responses`` rather than
+    raising. On the handshake transport (``<= 2025-11-25``) nothing is raised and
+    this is a pass-through, so every gated tool wears it unconditionally.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except _ElicitationInputRequired as pending:
+            return pending.result
+
+    return wrapper
+
+
+def _as_object(payload: Any) -> Any:
+    """Hand back ``payload`` as the object an ``outputSchema`` tool must return.
+
+    A ``dict`` (and a prebuilt ``CallToolResult``) passes through untouched; any
+    other shape — a list, ``None``, a scalar — is kept verbatim under ``data``,
+    the spelling ``_with_cancel_verdict`` already uses for a non-object reply.
+    """
+    if isinstance(payload, (dict, types.CallToolResult)):
+        return payload
+    return {"data": payload}
+
+
+def _object_payload(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Make a ``-> dict[str, Any]`` tool's reply satisfy its own ``outputSchema``.
+
+    The SDK validates a structured tool's return value against that schema AFTER
+    the tool ran, and ``_run_comfy`` returns the envelope's ``data`` unchanged —
+    so a ``null`` or list payload would turn a call that already spent credits,
+    cancelled a job, or finished a download into a validation-error failure the
+    agent is invited to retry. Wrapping every exit here, below ``@mcp.tool()``,
+    keeps that guarantee in one place instead of at each tool's return sites.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(await fn(*args, **kwargs))
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return _as_object(fn(*args, **kwargs))
+
+    return wrapper
+
 
 # Allow overriding the binary (e.g. a venv path) without touching code. The
 # companion address override needs no constant here: a LOCAL ComfyUI on a
@@ -372,6 +486,34 @@ _STREAM_LINE_LIMIT = 1024 * 1024
 # message for a raw Click usage dump.
 _MIN_COMFY_CLI = (1, 14, 0)
 _MIN_COMFY_CLI_STR = "1.14.0"
+
+# comfy-cli's unstamped placeholder, exempted from the floor above.
+#
+# `comfy-cli`'s `pyproject.toml` carries `version = "0.0.0"` until its publish
+# workflow rewrites it from the release tag, and `ConfigManager.get_cli_version`
+# ALSO returns `"0.0.0"` when the `importlib.metadata` lookup fails outright. So
+# every source install, editable checkout and metadata-less environment reports
+# `0.0.0`, and no comfy-cli release ever has: the value means "this build's
+# version is unknown", never "this build is old".
+#
+# The floor's documented policy is to fail OPEN on a `--version` it cannot
+# positively read as too old. `"0.0.0"` parses cleanly, so `(0, 0, 0) <
+# (1, 14, 0)` made the guard fail CLOSED on exactly the builds whose version it
+# could not establish — every tool refused with "too old, upgrade", on a
+# checkout that may well be NEWER than the floor. The reported workaround was to
+# hand-stamp `pyproject.toml` before testing.
+#
+# Exactly this tuple, not a `major == 0` range: `0.1.0` and `0.0.1` are versions
+# somebody could really have published, and the leniency is meant to cover the
+# placeholder rather than the whole pre-1.0 range.
+#
+# Compared as a PARSED tuple, so the exemption also covers the handful of
+# strings `_parse_version` normalizes to it — `"0.0"` pads to `(0, 0, 0)`, and a
+# four-part `"0.0.0.1"` truncates to it. Deliberate: comfy-cli has never
+# published any of them either, and matching the raw token instead would mean a
+# `"version 0.0"` build is refused while `"version 0.0.0"` is waved through,
+# which is a distinction with no cause behind it.
+_UNSTAMPED_COMFY_CLI = (0, 0, 0)
 
 # The version guard shells out to `comfy --version`; memoize so it runs at most
 # once per process (it sits on the hot path of every _run_comfy call).
@@ -933,6 +1075,15 @@ def _probe_comfy_version() -> None:
     version = None
     if proc.returncode == 0:
         version = _parse_version(proc.stdout) or _parse_version(proc.stderr)
+    # An unstamped build reports a version it does not have. Normalized to None
+    # HERE, before the global is written and before the floor compares, so every
+    # reader sees one "unknown" and not two: the server-wide floor below, the
+    # per-verb floors reading `_comfy_cli_version`, and the opt-in
+    # `COMFY_CLI_MIN_VERSION` report all already treat None as fail-OPEN, and a
+    # second sentinel that each of them had to know about is how one of them
+    # ends up refusing a source build on its own.
+    if version == _UNSTAMPED_COMFY_CLI:
+        version = None
     # Recorded UNCONDITIONALLY, and BEFORE the floor check below, which raises
     # WITHOUT latching `_version_checked`: a too-old install the caller retries
     # in the same process re-runs this whole function, and a per-verb floor
@@ -1352,7 +1503,7 @@ def _spawn_failure(
 
 
 def _run_comfy_raw(
-    *args: str, timeout: float | None = None
+    *args: str, timeout: float | None = None, local_url: str | None = None
 ) -> tuple[dict | None, str, tuple[str, ...], int, str]:
     """Run ``comfy --json --where local <args>`` and return the RAW envelope + context.
 
@@ -1362,6 +1513,14 @@ def _run_comfy_raw(
     ``server_info`` reading the versioned ``schema``) can inspect it, or the raw
     ``stdout`` (e.g. the lifecycle-success synthesizer), while :func:`_run_comfy`
     just unwraps it down to ``data``.
+
+    ``local_url`` names the target through comfy-cli's own ``COMFY_LOCAL_URL``
+    instead of the forwarded ``--host`` / ``--port``: set, it goes into the
+    CHILD's environment only (the server's own ``COMFYUI_URL`` and the guards
+    keyed off it are untouched) and the flags are not appended. It exists for
+    the one verb whose flags are newer than this server's floor —
+    ``search_models``' retry on a comfy-cli whose ``comfy models`` rejects
+    ``--host``.
     """
     _require_comfy_bin()
     _check_comfy_version()
@@ -1369,11 +1528,14 @@ def _run_comfy_raw(
     # configured (no-op for the local default; see target._with_target). Reassigning
     # args here means the forwarded flags also appear in the error/timeout
     # context returned below, so a remote failure reports the real invocation.
-    args = target._with_target(args)
+    if local_url is None:
+        args = target._with_target(args)
     # Global flags (--json, --where) MUST precede the subcommand in comfy-cli;
     # a trailing --json errors with "No such option". (Verified against comfy-cli.)
     cmd = [COMFY_BIN, "--json", "--where", "local", *args]
     env = _comfy_env()
+    if local_url is not None:
+        env["COMFY_LOCAL_URL"] = local_url
     # Anchor the child's cwd to the operator-designated COMFY_PROJECT root, if
     # one is configured (None — the default — is byte-identical to not passing
     # `cwd` at all). Resolved fresh on every call, right before the spawn, so a
@@ -1454,7 +1616,12 @@ def _run_comfy_raw(
     )
 
 
-def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False) -> Any:
+def _run_comfy(
+    *args: str,
+    timeout: float | None = None,
+    plain_ok: bool = False,
+    local_url: str | None = None,
+) -> Any:
     """Run ``comfy <args> --where local --json`` and return the envelope's ``data``.
 
     comfy-cli emits a versioned ``envelope/1`` object on stdout (a single line
@@ -1467,9 +1634,11 @@ def _run_comfy(*args: str, timeout: float | None = None, plain_ok: bool = False)
     exit with no JSON is treated as success and a result dict is synthesized
     from the printed text, rather than raising the "returned no JSON" error on
     an action that actually succeeded. A non-zero exit, or a real error
-    envelope, still raises as usual.
+    envelope, still raises as usual. ``local_url`` is :func:`_run_comfy_raw`'s.
     """
-    envelope, stdout, args, returncode, stderr = _run_comfy_raw(*args, timeout=timeout)
+    envelope, stdout, args, returncode, stderr = _run_comfy_raw(
+        *args, timeout=timeout, local_url=local_url
+    )
     # A plain_ok command that exits 0 without a *real* envelope is a success
     # (the lifecycle verbs and model download, per the docstring above).
     # `_last_json_object` may return a stray non-envelope JSON line (e.g. a
@@ -2104,7 +2273,17 @@ def _unwrap_envelope(
 def _last_json_object(stdout: str) -> dict | None:
     """Return the last JSON object on stdout, preferring a ``type==envelope`` one."""
     best: dict | None = None
-    for raw in stdout.splitlines():
+    # Lines end at `\n`, `\r\n`, or a bare `\r`. `str.splitlines()` also breaks
+    # on U+2028, U+2029, U+0085 and the other Unicode line boundaries. Those
+    # are legal inside a JSON string — the MiniMax H3 image-to-video
+    # template's prompt ends in U+2028 — so splitting on them cut one envelope
+    # into two fragments and the caller reported "returned no JSON" for a line
+    # that parses. A bare `\r` still splits: the async path decodes raw bytes,
+    # and a `\r`-redrawn progress line (`100%\r{envelope}\n`) would otherwise
+    # stay glued to the envelope. A raw `\r` cannot appear unescaped inside a
+    # JSON string, so treating it as a break does not reopen that bug.
+    # `\r\n` is matched first so a CRLF pair is one break, not two.
+    for raw in re.split(r"\r\n|\r|\n", stdout):
         line = raw.strip()
         if not line:
             continue
@@ -2610,7 +2789,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
     Naming an outdated comfy-cli is the whole point when the version is
     UNREADABLE: an install below :data:`_MIN_WATCH_COMFY_CLI` that slipped past
     the gate — which fails OPEN on an unparseable ``--version`` — produces
-    exactly this payload, and this is the only place left to say so. But when
+    exactly this payload, and this is the only place left to say so. It is named
+    as ONE of two open causes rather than as the likely one, because the
+    unreadable-version population is mostly source checkouts of `main`: those
+    are usually NEWER than the floor, so asserting "usually too old" would send
+    the majority of the people who see this line to upgrade a comfy-cli that is
+    already ahead of the one being asked for. But when
     the gate positively VERIFIED the floor, that half is a diagnosis the code
     already knows is false: a job sitting queued behind another, or loading
     models, for the whole 600s default yields zero events on a perfectly modern
@@ -2632,9 +2816,12 @@ def _watch_no_events_hint(version: tuple[int, int, int] | None) -> str:
             "`timeout_seconds`"
         )
     return (
-        f"{_WATCH_NO_EVENTS_HINT} — this usually means comfy-cli < "
-        f"{_MIN_WATCH_COMFY_CLI_STR} (jobs watch cannot attach as the "
-        "submitting session there)"
+        f"{_WATCH_NO_EVENTS_HINT} — this server could not establish the "
+        "comfy-cli version, so both causes are open: an install below "
+        f"{_MIN_WATCH_COMFY_CLI_STR} (where `jobs watch` cannot attach as the "
+        "submitting session), or a job queued behind another or still loading "
+        'models. Check `comfy --version`, then poll `job(action="status")` or '
+        "watch again with a longer `timeout_seconds`"
     )
 
 
@@ -3247,6 +3434,13 @@ def _detect_comfy_cli_version() -> str | None:
     if proc.returncode != 0:
         return None
     parsed = _parse_version(proc.stdout)
+    # Same exemption as the server-wide floor, and this is the SECOND site that
+    # needed it: an unstamped build reported `"0.0.0"` here, so a deployment
+    # setting `COMFY_CLI_MIN_VERSION` raised "comfy-cli 0.0.0 is older than the
+    # required minimum" on it, and `server_info` published a version the build
+    # does not have. None takes the documented "could not determine" path.
+    if parsed == _UNSTAMPED_COMFY_CLI:
+        return None
     return ".".join(str(part) for part in parsed) if parsed else None
 
 
@@ -3358,8 +3552,16 @@ def _freshness_report() -> Any:
         return {"error": str(exc)}
 
 
-@mcp.tool()
-def server_info() -> Any:
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+@_object_payload
+def server_info() -> dict[str, Any]:
     """Report the local ComfyUI/comfy-cli environment and verify compatibility.
 
     Wraps ``comfy env``. Call this first to confirm a local ComfyUI is up before
@@ -3427,9 +3629,11 @@ def server_info() -> Any:
                 "source": source,
                 "note": (
                     "the submit/poll tools target this remote ComfyUI via "
-                    "--host/--port — run_workflow, generate_image, run_template "
-                    "and the jobs/queue tools; the lifecycle, discovery and "
-                    "catalog tools forward no host and describe THIS machine, "
+                    "--host/--port — run_workflow, generate_image, run_template, "
+                    "the jobs/queue tools, upload_file and search_models (the "
+                    "remote's model catalog); the lifecycle tools and the other "
+                    "discovery and catalog tools forward no host and describe "
+                    "THIS machine, "
                     "and so do the env fields above, which are the LOCAL "
                     "comfy-cli install. (fetch_outputs forwards no host either "
                     "but still collects a remote job's files, from the local "
@@ -3460,7 +3664,14 @@ _RETRYABLE_CREDENTIAL_CODES = frozenset(
 _CREDENTIAL_RETRY_BACKOFFS = (1.0, 2.0)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def auth_status() -> Any:
     """Comfy Cloud credential status for partner-API nodes (read-only; never returns secrets).
 
@@ -3502,6 +3713,16 @@ def auth_status() -> Any:
 # request itself.
 _BILLING_STATUS_TIMEOUT = 180.0
 
+# `comfy cloud status` is a per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a
+# raise of `_MIN_COMFY_CLI`: every other tool works at 1.14.0, and refusing
+# them all to report a balance would be the worse trade. Unlike watch's it
+# gates nothing — the verb either dispatches or Click refuses it, and the
+# degrade below reads comfy-cli's own answer rather than a version string. It
+# exists so the ONE number a caller below the floor needs is in the message.
+# comfy-cli 1.17.0 (2026-08-22) is where `comfy_cli/cloud/command.py` first
+# registers `status_cmd`; 1.16.0 has the `cloud` group without the leaf.
+_MIN_BILLING_COMFY_CLI_STR = "1.17.0"
+
 # `_run_comfy_async` keeps only the trailing `_STDERR_MAX_CHARS` (64 KiB) of
 # stdout by default, which is the one place its contract is narrower than
 # `_run_comfy`'s unbounded `communicate()`. That bound exists for a multi-GB
@@ -3516,7 +3737,14 @@ _BILLING_STATUS_TIMEOUT = 180.0
 _BILLING_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 async def billing_status() -> Any:
     """Comfy Cloud credit balance, plan tier and job concurrency — READ-ONLY, spends nothing.
 
@@ -3537,7 +3765,7 @@ async def billing_status() -> Any:
     not something to re-derive from the numbers.
 
     Signed out raises comfy-cli's own error — get the user signed in with
-    ``auth_login`` / ``auth_status``. On a comfy-cli predating the verb,
+    ``auth_login`` / ``auth_status``. Below comfy-cli 1.17.0,
     degrades to ``{"error", "unsupported": True}`` carrying
     ``balance_confirmed: False`` and the balance fields ``null``, so the rule
     above holds there too.
@@ -3580,12 +3808,16 @@ async def billing_status() -> Any:
         # user can actually act on, and burying them under "your CLI is old"
         # would send them to the wrong fix.
         #
-        # Unlike those two this is NOT an edge path: `cloud status` landed in
-        # comfy-cli AFTER its newest release, so today every install answers
-        # this verb with Click's usage dump and this branch is the common one.
-        # It is expected to become the rare case once the verb ships, which is
-        # why the message names no version floor to go stale — the installed
-        # comfy-cli either has the verb or does not.
+        # This is an edge path, and the comment here said the opposite until
+        # 2026-11-17. `comfy cloud status` shipped in comfy-cli
+        # `_MIN_BILLING_COMFY_CLI_STR` (2026-08-22), nine releases before
+        # 0.11.0 went out saying no tagged release had the verb yet, so on any
+        # install at or above the floor this branch never runs and the degrade
+        # it writes is unreachable. The "names no version floor to go stale"
+        # rule went with that premise: there IS a floor, it is the one number a
+        # user below it needs, and leaving it out told a 1.26.0 install to
+        # upgrade to nothing in particular. Say the version, the way
+        # `_MIN_WATCH_COMFY_CLI_STR` does for `job(action="watch")`.
         #
         # No `clitext._phrase_is_only_the_caller_s` subtraction here (which
         # `list_workflow_notes` needs): this tool takes no arguments, so nothing
@@ -3617,8 +3849,8 @@ async def billing_status() -> Any:
         return {
             "error": (
                 "billing status unavailable: the installed comfy-cli does not "
-                "support 'comfy cloud status' (the verb ships in a comfy-cli "
-                "newer than the one installed here). Nothing was broken by "
+                "support 'comfy cloud status' (the verb ships in comfy-cli "
+                f"{_MIN_BILLING_COMFY_CLI_STR} and newer). Nothing was broken by "
                 # Deliberately about STATE, not about capability: on the
                 # whole-group-missing branch below, sign-in is not available
                 # either, so a blanket "sign-in is unchanged" would contradict
@@ -4069,7 +4301,14 @@ async def _abandon_login_child(child: _LoginChild) -> None:
         await asyncio.gather(child.reader, return_exceptions=True)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def auth_login() -> Any:
     """Start Comfy Cloud sign-in; returns an OAuth URL for the USER to open.
 
@@ -4110,14 +4349,23 @@ async def auth_login() -> Any:
         return payload
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_resumable_consent
+@_object_payload
 async def run_workflow(
     workflow_path: str,
     wait: bool = True,
     timeout_seconds: float = 110.0,
     confirm_spend: bool = False,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a ComfyUI workflow JSON on the ComfyUI this server targets.
 
     That is this machine unless ``COMFYUI_URL``/``COMFYUI_HOST`` points the
@@ -4412,7 +4660,14 @@ def _t2i_config() -> tuple[str, str, str]:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 async def generate_image(
     prompt: str,
     checkpoint: str | None = None,
@@ -4967,6 +5222,233 @@ def _is_preauthorized(wording: _ApprovalWording) -> bool:
     return "all" in granted or token.lower() in granted
 
 
+# First protocol revision whose `tools/call` carries an elicitation INSIDE an
+# `InputRequiredResult` the client answers on a retry, instead of over a
+# standalone `elicitation/create` server-to-client request. On it and later there
+# is no back-channel: `ctx.elicit()` raises `NoBackChannelError`, so every consent
+# gate must round-trip its question through the tool RESULT. Pinned to the
+# revision that introduced the flow (not the latest), mirroring the SDK's own
+# resolver, so a newer revision does not silently move the boundary.
+_INPUT_REQUIRED_PROTOCOL = "2026-07-28"
+
+
+def _uses_input_required(ctx: Context | None) -> bool:
+    """Whether this request must elicit via `InputRequiredResult` (>= 2026-07-28).
+
+    ``ctx.protocol_version`` is ``None`` outside an active request — and on the
+    test doubles that predate it — which means the handshake transport, the one
+    that still sends ``elicitation/create`` over the back-channel, so a missing
+    version keeps today's ``ctx.elicit()`` path.
+    """
+    version = getattr(ctx, "protocol_version", None)
+    return version is not None and is_version_at_least(
+        version, _INPUT_REQUIRED_PROTOCOL
+    )
+
+
+def _consent_channel_key(wording: _ApprovalWording) -> str:
+    """The `input_requests`/`input_responses` key this gate answers on.
+
+    Must be DISTINCT for any two gates that can fire within one ``tools/call``:
+    ``restart_comfyui`` raises the network-exposure gate and then, mid-sequence,
+    the untracked-kill gate, and a shared key would let the kill gate read the
+    network gate's "yes" as its own and stop a server nobody approved stopping.
+    ``consent_token`` is already unique per gate where it is set; the spend gates
+    leave it empty (that is what holds them out of the pre-authorization
+    mechanism) and no two spend gates ever fire in one call, so the subject is a
+    safe fallback there.
+
+    The key only ROUTES an answer; it never authorizes one. It is a fixed
+    constant any client can fill in, so an answer counts only alongside the
+    ``request_state`` the prompt minted (:func:`_claim_consent_nonce`), which the
+    SDK binds to the tool and its arguments and which carries the prompt text's
+    digest — a ``run_template`` "yes" on ``"spend"`` cannot unlock a
+    ``partner_generate`` call, because that call never echoes its state.
+    """
+    return wording.consent_token or wording.subject
+
+
+def _consent_from_outcome(
+    action: Any, approved: bool, wording: _ApprovalWording
+) -> bool:
+    """Interpret one answered consent prompt — the SINGLE fail-closed verdict.
+
+    Shared by both transports so the accept / decline / everything-else handling
+    cannot drift between them: ``ctx.elicit()``'s ``ElicitationResult`` and the
+    ``>= 2026-07-28`` ``ElicitResult`` carried on ``ctx.input_responses`` are each
+    read down to the same ``(action, approved)`` pair and judged here.
+
+    Three outcomes, not two — the distinction the QA pass found missing:
+
+    * True — a person saw the prompt and approved.
+    * False — the client answered ``"decline"``. USUALLY a person saying no, but
+      not provably one: a client may auto-decline a prompt it cannot show (see
+      :data:`_DECLINE_MAY_BE_AUTOMATIC`), and that is indistinguishable here. A
+      caller may report a refusal, but must not assert WHO made it.
+    * raises — the client never got a decision to us (``"cancel"``, a missing
+      action, an auto-answer). Failing closed is the same; claiming a human
+      refused is not, so that wording is not available to the caller at all.
+    """
+    if action == "accept":
+        return approved is True
+    if action == "decline":
+        # "DECLINE" is an ANSWER to the request — usually a person saying no,
+        # but not provably one: a client may auto-decline a prompt it could not
+        # show (see `_DECLINE_MAY_BE_AUTOMATIC`), so callers report the refusal
+        # without naming who made it.
+        return False
+    # Anything else — "cancel", a missing action, a client that resolves the
+    # request without ever rendering it — is not even an answer, and reporting it
+    # as a decision would be a lie about a human: this is the bug behind "the user
+    # declined ..." appearing in sessions where no prompt was ever displayed.
+    # Failing closed is right; naming a refusal nobody made is not.
+    raise ComfyCliError(
+        f"{wording.subject} not confirmed: the client did not present the "
+        f"confirmation prompt (it answered {action!r} without a user "
+        f"decision), so nobody was asked. {wording.nothing_done}"
+        f"{wording.escape_hatch}"
+    )
+
+
+# Prefix of every `request_state` a consent prompt mints. The SDK's
+# `RequestStateBoundary` (installed by `MCPServer` by default) seals that value
+# and binds it to the tool name and its arguments, and only ever hands a handler
+# plaintext THIS server minted — so a state the server never issued, or one
+# minted for a call with different arguments, never reaches the gate at all.
+_CONSENT_STATE_PREFIX = "comfy-mcp/consent/v1"
+
+# Nonces of consent prompts already answered, so one prompt's answer is honored
+# ONCE: a client replaying a sealed state plus its "yes" (inside the SDK's TTL)
+# gets a fresh prompt instead of a second run on the first approval. Each nonce
+# maps to the wall-clock time it was consumed and is forgotten only once
+# `_REQUEST_STATE_SECURITY.ttl` has passed since then — by which point
+# `_claim_consent_nonce` itself rejects the state as expired (it was minted no
+# later than it was consumed, and its sealed issuance time is read on the same
+# wall clock). That expiry check is this gate's own, not the SDK's: the SDK
+# checks `exp` when the request ARRIVES, and a gate reached after an awaited
+# preflight (`partner_generate`'s) can redeem the answer past it. The size cap is a
+# MEMORY bound only: it never evicts a live nonce, so a full cache refuses the
+# claim (the gate asks afresh) rather than forget one that could be replayed.
+_CONSUMED_CONSENT_NONCES: OrderedDict[str, float] = OrderedDict()
+_CONSUMED_CONSENT_NONCES_MAX = 4096
+_CONSUMED_CONSENT_LOCK = threading.Lock()
+
+
+def _consent_state(key: str, message: str, suffix: str) -> str:
+    """The `request_state` one prompt mints: the gate, the prompt text, a suffix.
+
+    The message digest is what ties an answer to the question a person actually
+    SAW: every gated prompt names what it authorizes (the model, the packs, the
+    version, the exposed address), so a retry whose prompt would read differently
+    no longer matches the state its answer came back with. The ``suffix`` is
+    ``<issued>:<nonce>`` when minting (:func:`_mint_consent_state`) and empty when
+    building the prefix a retry's state must start with.
+    """
+    digest = hashlib.sha256(message.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{_CONSENT_STATE_PREFIX}:{key}:{digest}:{suffix}"
+
+
+def _mint_consent_state(key: str, message: str) -> str:
+    """A fresh prompt's state, carrying its issuance time and a one-use nonce.
+
+    The issuance time rides INSIDE the sealed state, so the SDK authenticates it
+    along with everything else; it is floored to whole seconds, which can only
+    make a state look older (fail closed), never younger.
+    """
+    issued = int(time.time())
+    return _consent_state(key, message, f"{issued}:{secrets.token_urlsafe(16)}")
+
+
+def _claim_consent_nonce(ctx: Context, key: str, message: str) -> bool:
+    """Whether this retry's `request_state` answers THIS prompt, first time.
+
+    False — the answer is ignored and the gate asks afresh — when the state is
+    absent (an answer attached to a first call nobody was prompted on), minted
+    for another gate or another prompt text, older than the state TTL, already
+    consumed, or the consumed set is full of nonces still inside the state TTL.
+
+    The age check runs HERE, at redemption, before any pruning: the SDK rejects an
+    expired state only when the request arrives, so a replay admitted just inside
+    the TTL could otherwise reach this gate after its consumed nonce was pruned
+    and run a second time on one approval.
+    """
+    state = getattr(ctx, "request_state", None)
+    if not isinstance(state, str):
+        return False
+    expected = _consent_state(key, message, "")
+    if not state.startswith(expected):
+        return False
+    issued_text, _, nonce = state[len(expected) :].partition(":")
+    if not issued_text.isdigit() or not nonce:
+        return False
+    now = time.time()
+    ttl = _REQUEST_STATE_SECURITY.ttl
+    # `>=` matches the pruning horizon below: a nonce is pruned once `ttl` has
+    # passed since it was consumed, and it was minted no later than that, so any
+    # replay of a pruned nonce is already refused here.
+    if now - int(issued_text) >= ttl:
+        return False
+    with _CONSUMED_CONSENT_LOCK:
+        # Insertion order is consumption order, so the expired entries lead.
+        horizon = now - ttl
+        while _CONSUMED_CONSENT_NONCES:
+            oldest, consumed_at = next(iter(_CONSUMED_CONSENT_NONCES.items()))
+            if consumed_at > horizon:
+                break
+            del _CONSUMED_CONSENT_NONCES[oldest]
+        if nonce in _CONSUMED_CONSENT_NONCES:
+            return False
+        if len(_CONSUMED_CONSENT_NONCES) >= _CONSUMED_CONSENT_NONCES_MAX:
+            return False
+        _CONSUMED_CONSENT_NONCES[nonce] = now
+    return True
+
+
+def _consent_via_input_required(
+    ctx: Context, message: str, schema: type, wording: _ApprovalWording
+) -> bool:
+    """Elicit on ``>= 2026-07-28``, where ``ctx.elicit()`` has no back-channel.
+
+    First round (no answer this server asked for): raise
+    :class:`_ElicitationInputRequired` carrying the
+    :class:`~mcp.types.InputRequiredResult` the gated tool returns, so the client
+    is asked by RETRYING the call. The ``requested_schema`` is rendered by the
+    SDK's own :func:`render_elicitation_schema`, the same one ``ctx.elicit()``
+    sends, so the prompt a client sees is identical across the two transports.
+
+    Resume round: an answer counts only when the retry echoes the
+    ``request_state`` this prompt minted (:func:`_claim_consent_nonce`) — never
+    on the ``input_responses`` key alone, which is a fixed per-gate constant any
+    client can fill in on a first call. Anything else is "not asked yet" and
+    re-asks. A claimed answer is judged by the same :func:`_consent_from_outcome`
+    the back-channel path uses. ``getattr``/``Mapping`` throughout, because a
+    non-conforming client's content must fail closed, never crash.
+    """
+    key = _consent_channel_key(wording)
+    responses = getattr(ctx, "input_responses", None)
+    answer = responses.get(key) if isinstance(responses, Mapping) else None
+    if answer is None or not _claim_consent_nonce(ctx, key, message):
+        request = types.ElicitRequest(
+            params=types.ElicitRequestFormParams(
+                message=message,
+                requested_schema=render_elicitation_schema(schema),
+            )
+        )
+        state = _mint_consent_state(key, message)
+        raise _ElicitationInputRequired(
+            types.InputRequiredResult(
+                input_requests={key: request}, request_state=state
+            )
+        )
+    if isinstance(answer, Mapping):
+        action, content = answer.get("action"), answer.get("content")
+    else:
+        action = getattr(answer, "action", None)
+        content = getattr(answer, "content", None)
+    approved = content.get("approve", False) if isinstance(content, Mapping) else False
+    return _consent_from_outcome(action, approved, wording)
+
+
 async def _elicit_approval(
     ctx: Context, message: str, schema: type, wording: _ApprovalWording
 ) -> bool:
@@ -4976,18 +5458,20 @@ async def _elicit_approval(
     destructive install gates (``switch_comfyui_version``, ``update_comfyui``'s
     ``target="all"``), and the launch pair's network-exposure gate. Only the
     message, the answer schema, and ``wording`` differ; the fail-closed handling
-    below must not. True = the user affirmatively approved.
+    must not. True = the user affirmatively approved.
 
-    Three outcomes, not two — the distinction the QA pass found missing:
+    Two transports, ONE fail-closed verdict (:func:`_consent_from_outcome`):
 
-    * True — a person saw the prompt and approved.
-    * False — the client answered ``"decline"``. USUALLY a person saying no,
-      but not provably one: a client may auto-decline a prompt it cannot show
-      (see :data:`_DECLINE_MAY_BE_AUTOMATIC`), and that is indistinguishable
-      here. A caller may report a refusal, but must not assert WHO made it.
-    * raises — the client never got a decision to us (``"cancel"``, a missing
-      action, an auto-answer). Failing closed is the same; claiming a human
-      refused is not, so that wording is not available to the caller at all.
+    * ``<= 2025-11-25`` — the handshake back-channel: ``ctx.elicit()`` sends
+      ``elicitation/create`` and awaits the answer in-call.
+    * ``>= 2026-07-28`` — no back-channel: the question is carried out as the
+      tool's ``InputRequiredResult`` and answered when the client retries (see
+      :func:`_consent_via_input_required` and :func:`_resumable_consent`).
+
+    Either way a timeout, a client error, a decline, a cancel, and an accept that
+    never actually said yes all mean "not approved"; the ``confirm_*`` arguments
+    remain the fallback for a client that cannot elicit at all (handled by the
+    callers' :func:`_client_elicitation_support` check, unchanged).
     """
     if _is_preauthorized(wording):
         # Checked BEFORE contacting the client: the operator has already decided,
@@ -5000,6 +5484,8 @@ async def _elicit_approval(
             _ASSUME_CONSENT_ENV,
         )
         return True
+    if _uses_input_required(ctx):
+        return _consent_via_input_required(ctx, message, schema, wording)
     try:
         result = await asyncio.wait_for(
             ctx.elicit(message=message, schema=schema),
@@ -5023,31 +5509,8 @@ async def _elicit_approval(
     # with no `.action`/`.data`, and an AttributeError here would escape as an
     # uncaught crash instead of the refusal this contract promises.
     action = getattr(result, "action", None)
-    if action != "accept":
-        # "DECLINE" is an ANSWER to the request — usually a person saying no,
-        # but not provably one: a client may auto-decline a prompt it could not
-        # show (see `_DECLINE_MAY_BE_AUTOMATIC`), so callers report the refusal
-        # without naming who made it. Anything else — "cancel", a missing
-        # action, a client that resolves the request without ever rendering it —
-        # is not even an answer, and reporting it as a decision is a lie about a
-        # human.
-        #
-        # This is the bug behind "the user declined ..." appearing in sessions
-        # where no prompt was ever displayed, across four different gates: every
-        # non-accept answer collapsed into the same False, and each caller then
-        # raised its "the user declined" text. Failing closed was right; naming a
-        # refusal nobody made was not — it sends the reader to argue with a user
-        # who was never asked, and hides that the client is the thing that needs
-        # fixing.
-        if action == "decline":
-            return False
-        raise ComfyCliError(
-            f"{wording.subject} not confirmed: the client did not present the "
-            f"confirmation prompt (it answered {action!r} without a user "
-            f"decision), so nobody was asked. {wording.nothing_done}"
-            f"{wording.escape_hatch}"
-        )
-    return getattr(getattr(result, "data", None), "approve", False) is True
+    approved = getattr(getattr(result, "data", None), "approve", False)
+    return _consent_from_outcome(action, approved, wording)
 
 
 async def _elicit_spend_consent(ctx: Context, model: str) -> bool:
@@ -5179,7 +5642,14 @@ def _generate_catalog_gap(exc: ComfyCliError, verb: str) -> ComfyCliError:
 # not this tool: `partner_generate` waits either way, so callers never branch
 # on it. `summary` is the model's full one-line description, not the
 # `…`-clipped form comfy-cli's human table cuts to fit its column.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def list_partner_models(
     style: str = "",
     partner: str = "",
@@ -5275,7 +5745,14 @@ def list_partner_models(
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def partner_model_schema(model: str) -> Any:
     """Show one partner model's callable parameters — the input to ``partner_generate``.
 
@@ -5319,7 +5796,16 @@ def partner_model_schema(model: str) -> Any:
         raise
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_resumable_consent
+@_object_payload
 async def partner_generate(
     model: str,
     params: dict[str, Any] | None = None,
@@ -5327,7 +5813,7 @@ async def partner_generate(
     out_path: str | None = None,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a hosted PARTNER model (Flux / Ideogram / DALL·E / Recraft / …) — SPENDS CREDITS.
 
     Wraps ``comfy generate <model> [--param=value]…``. Runs entirely on the
@@ -5493,7 +5979,14 @@ def _require_emit_workflow_capability() -> None:
     _emit_workflow_capability_probed = True
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 async def emit_partner_workflow(
     model: str,
     out_path: str,
@@ -5994,7 +6487,16 @@ async def _run_template_exec(
 # the gate does not exist. Probing `comfy generate consent` here would test an
 # unrelated subsystem and wrongly refuse free, local-only template runs on a
 # CLI that lacks it.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_resumable_consent
+@_object_payload
 async def run_template(
     name: str,
     params: dict[str, Any] | None = None,
@@ -6002,7 +6504,7 @@ async def run_template(
     wait: bool = True,
     timeout_seconds: float = 600.0,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Run a gallery template — fetch, fill params, execute.
 
     Wraps ``comfy run-template <name> [--param=KEY=VALUE]…`` (fetches the
@@ -6300,9 +6802,10 @@ def _poll_until_terminal(
 ) -> Any:
     """Poll ``comfy <args>`` until ``is_terminal`` or ``timeout_seconds`` expires.
 
-    The one bounded-poll loop behind ``job(action="wait")`` (``jobs status``,
-    via :func:`_job_wait_sync`) and :func:`_poll_download` (``model
-    download-status``). Those two ran
+    The bounded-poll loop behind :func:`_poll_download` (``model
+    download-status``), which serves the ``download`` tool and
+    ``download_model``'s background wait. ``job(action="wait")`` runs the
+    cancellable async twin, :func:`_poll_until_terminal_async`; the two ran
     statement-for-statement identical loops and differ only in argv, in the
     terminal predicate, and in the extra keys their timed-out payload carries —
     so the timing rules below hold identically for both, and cannot drift apart.
@@ -6391,13 +6894,85 @@ def _poll_until_terminal(
         time.sleep(min(_POLL_INTERVAL, remaining))
 
 
-# Stdout bound for the async ``jobs status`` polls. `_run_comfy_async` keeps
-# only the TRAILING bytes, so this has to be comfortably larger than the biggest
-# envelope `jobs status` can produce — a many-output job, or a failed one whose
-# `error` carries a full Python traceback — or the JSON loses its head and
-# parses as nothing. Far below `upload_file`'s 4 MiB: a status payload does not
-# scale with caller input the way a staged batch does.
-_JOB_STATUS_STDOUT_MAX_CHARS = 1024 * 1024
+async def _poll_until_terminal_async(
+    *args: str,
+    timeout_seconds: float,
+    is_terminal: Callable[[Any], bool],
+    timed_out_extra: dict[str, Any] | None = None,
+    stdout_cap: int | None = None,
+) -> Any:
+    """Cancellable async twin of :func:`_poll_until_terminal`.
+
+    Line-for-line the same bounded-poll contract — the finiteness precondition,
+    the reserved-key guard, the one-poll minimum, the per-poll budget capped to
+    the caller's remaining bound, and the timed-out envelope — but it spawns each
+    poll through :func:`_run_comfy_async` and sleeps with :func:`asyncio.sleep`
+    instead of blocking the thread, so the two MUST stay in step (the sync one is
+    the reference; change both or neither).
+
+    The difference is the whole point and it is about CANCELLATION, the same one
+    :func:`_run_comfy_async` exists for: ``job(action="wait")`` used to run this
+    loop on a worker thread (``anyio.to_thread.run_sync``), where neither a
+    client disconnect nor ``notifications/cancelled`` could reach it — the loop
+    kept re-spawning ``comfy jobs status`` until its full bound (up to
+    :data:`_MAX_WATCH_TIMEOUT` = 3600s) elapsed, with the in-flight child
+    orphaned. Here a cancel lands on the ``await``: mid-poll it propagates out of
+    :func:`_run_comfy_async` only AFTER that runner's ``finally`` has reaped the
+    poll's whole process group, and during the inter-poll sleep it simply ends
+    the loop with no child running. ``stdout_cap`` is forwarded for the reason
+    :func:`_job_status_async` documents: the async runner keeps only the trailing
+    bytes, and a ``jobs status`` envelope scales with the job.
+    """
+    if not math.isfinite(timeout_seconds):
+        raise ComfyCliError(
+            f"invalid timeout_seconds: {timeout_seconds!r} — expected a finite "
+            "number of seconds (clamp with `argv._bounded_timeout` first)."
+        )
+    extra = timed_out_extra or {}
+    reserved = sorted(extra.keys() & {"timed_out", "status"})
+    if reserved:
+        raise ComfyCliError(
+            f"timed_out_extra may not carry reserved keys: {reserved} — they are "
+            "the poll loop's own."
+        )
+    deadline = time.monotonic() + timeout_seconds
+    last: Any = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and last is not None:
+            return {"timed_out": True, **extra, "status": last}
+        try:
+            last = await _run_comfy_async(
+                *args,
+                timeout=min(
+                    _JOB_STATUS_POLL_TIMEOUT,
+                    max(remaining, _MIN_JOB_STATUS_POLL_TIMEOUT),
+                ),
+                stdout_cap=stdout_cap,
+            )
+        except ComfyCliError as exc:
+            if not exc.timed_out or last is None or deadline - time.monotonic() > 0:
+                raise
+            return {"timed_out": True, **extra, "status": last}
+        if is_terminal(last):
+            return last
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"timed_out": True, **extra, "status": last}
+        await asyncio.sleep(min(_POLL_INTERVAL, remaining))
+
+
+# Stdout bound for the async ``jobs status`` polls: effectively NONE.
+# `_run_comfy_async` keeps only the TRAILING bytes, and nothing bounds how big a
+# `jobs status` envelope can get — a many-output job, or a failed one whose
+# `error` carries a full Python traceback — so any finite cap is a guess that,
+# once exceeded, cuts the JSON's head off and turns the job's real (often
+# terminal) status into "comfy-cli returned no JSON". Retaining it whole is what
+# the synchronous `_run_comfy` (`communicate()`) always did for these polls; the
+# tail bound exists for the long-lived, chatty children (a multi-GB download's
+# progress text), not for a short child that prints one envelope and exits. A
+# full-range slice of `bytes` returns the object itself, so this costs no copy.
+_JOB_STATUS_STDOUT_MAX_CHARS = sys.maxsize
 
 
 def _job_status_sync(prompt_id: str) -> Any:
@@ -6421,13 +6996,13 @@ async def _job_status_async(
     timeouts. ``timeout`` is required, not defaulted, because a poll that is
     carved out of somebody else's budget must never quietly inherit a 60s one.
 
-    ``stdout_cap`` is widened for the same reason ``upload_file`` widens it:
+    ``stdout_cap`` is lifted (see :data:`_JOB_STATUS_STDOUT_MAX_CHARS`):
     :func:`_run_comfy_async` keeps only the TRAILING
-    :data:`_STDERR_MAX_CHARS` of stdout, and a ``jobs status`` envelope scales
-    with the job — every output file, and a failed run's whole traceback under
-    ``error``. Losing its opening brace to the tail makes it unparseable, so
-    both diagnostic callers would silently drop a status they did in fact
-    receive, which is the one thing a diagnosis must not do.
+    :data:`_STDERR_MAX_CHARS` of stdout by default, and a ``jobs status``
+    envelope scales with the job — every output file, and a failed run's whole
+    traceback under ``error``. Losing its opening brace to the tail makes it
+    unparseable, so both diagnostic callers would silently drop a status they
+    did in fact receive, which is the one thing a diagnosis must not do.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     return await _run_comfy_async(
@@ -6446,26 +7021,35 @@ def _job_error_sync(prompt_id: str) -> Any:
     return _execution_error_verdict(prompt_id, status)
 
 
-def _job_wait_sync(prompt_id: str, timeout_seconds: float) -> Any:
-    """``job(action="wait")``'s body — the exact ``wait_for_job`` this replaced.
+async def _job_wait_async(prompt_id: str, timeout_seconds: float) -> Any:
+    """``job(action="wait")``'s body — cancellable, on :func:`_poll_until_terminal_async`.
 
     ``timeout_seconds`` arrives already defaulted (25.0 when the caller passed
     none) but NOT yet bounded — the guard order below (prompt_id, then the
-    bound) matches every other branch's, and matches what ``wait_for_job`` did.
-    "Bounded by design" only holds if the bound itself is bounded. Left raw,
-    `inf` keeps `remaining` positive forever and NaN makes every comparison
-    False (so `remaining <= 0` never fires and `min(_POLL_INTERVAL, nan)`
-    yields `_POLL_INTERVAL`) — either way the poll loop re-spawns
-    `comfy jobs status` until the client gives up. See `argv._bounded_timeout`.
+    bound) matches every other branch's. "Bounded by design" only holds if the
+    bound itself is bounded. Left raw, `inf` keeps `remaining` positive forever
+    and NaN makes every comparison False (so `remaining <= 0` never fires and
+    `min(_POLL_INTERVAL, nan)` yields `_POLL_INTERVAL`) — either way the poll
+    loop re-spawns `comfy jobs status` until the client gives up. See
+    `argv._bounded_timeout`.
+
+    Runs on the async poll twin rather than the thread pool so a client that
+    disconnects, or ``notifications/cancelled`` on a 3600s wait, reaps the
+    in-flight ``comfy jobs status`` child instead of orphaning it — see
+    :func:`_poll_until_terminal_async`. ``stdout_cap`` is lifted exactly as
+    :func:`_job_status_async` lifts it, for the same reason — the terminal poll
+    is the one whose envelope is biggest, and the one a wait cannot afford to
+    lose.
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     timeout_seconds = argv._bounded_timeout(timeout_seconds, _MAX_WATCH_TIMEOUT)
-    return _poll_until_terminal(
+    return await _poll_until_terminal_async(
         "jobs",
         "status",
         prompt_id,
         timeout_seconds=timeout_seconds,
         is_terminal=_is_terminal,
+        stdout_cap=_JOB_STATUS_STDOUT_MAX_CHARS,
     )
 
 
@@ -6627,13 +7211,21 @@ _JOB_ACTIONS_TAKING_PROMPT_ID = ("status", "error", "wait", "watch", "cancel")
 _JOB_ACTIONS_TAKING_TIMEOUT = ("wait", "watch")
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+@_object_payload
 async def job(
     action: str = "status",
     prompt_id: str = "",
     timeout_seconds: float | None = None,
     ctx: Context | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Inspect, wait on, watch, or cancel a submitted job — one action per call.
 
     Wraps the `comfy jobs` family. `action`:
@@ -6781,14 +7373,12 @@ async def job(
             no_events_hint=_watch_no_events_hint(gate_version),
         )
 
-    # Every other branch is a blocking `subprocess` call or a `time.sleep`
-    # poll loop (up to `_MAX_WATCH_TIMEOUT` = 3600s for "wait") — off-loaded to
-    # a worker thread via `anyio.to_thread.run_sync`, exactly what the SDK
-    # itself does to run a plain `def` tool (`func_metadata.py`), so `job`
+    # The four SHORT blocking branches are a single `subprocess` call each —
+    # off-loaded to a worker thread via `anyio.to_thread.run_sync`, exactly what
+    # the SDK itself does to run a plain `def` tool (`func_metadata.py`), so `job`
     # being `async def` (forced by the "watch" branch above) never wedges the
-    # event loop for the other five. R2 in the job-tool consolidation; mirrors
-    # `_in_generate_pool` / `_GENERATE_EXECUTOR`'s reasoning for
-    # `partner_generate`'s own blocking run.
+    # event loop. R2 in the job-tool consolidation; mirrors `_in_generate_pool` /
+    # `_GENERATE_EXECUTOR`'s reasoning for `partner_generate`'s own blocking run.
     if action == "status":
         return await anyio.to_thread.run_sync(_job_status_sync, prompt_id)
     if action == "error":
@@ -6797,9 +7387,14 @@ async def job(
         return await anyio.to_thread.run_sync(_job_cancel_sync, prompt_id)
     if action == "queue":
         return await anyio.to_thread.run_sync(_job_queue_sync)
-    # action == "wait"
+    # action == "wait": NOT off-loaded. It is a `_MAX_WATCH_TIMEOUT`-long (up to
+    # 3600s) poll loop, and `anyio.to_thread.run_sync`'s cancellation never
+    # reaches the worker — a client that gave up left it re-spawning
+    # `comfy jobs status` for the full bound, with the in-flight child orphaned.
+    # `_job_wait_async` runs the cancellable async twin instead, so a cancel
+    # ends the loop and reaps that child. See `_poll_until_terminal_async`.
     bound = 25.0 if timeout_seconds is None else timeout_seconds
-    return await anyio.to_thread.run_sync(_job_wait_sync, prompt_id, bound)
+    return await _job_wait_async(prompt_id, bound)
 
 
 # `comfy system-stats` and `comfy free` landed in comfy-cli 1.14.0, which is also
@@ -6857,7 +7452,14 @@ def _resource_verb_upgrade_error(
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def system_stats() -> Any:
     """Read the live local ComfyUI's VRAM per device and system RAM.
 
@@ -6888,7 +7490,14 @@ def system_stats() -> Any:
     return target._annotate_comfy_target(data)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> Any:
     """Ask the local ComfyUI to unload models / reset its executor cache.
 
@@ -6943,11 +7552,45 @@ def free_memory(unload_models: bool = True, free_memory: bool | None = None) -> 
 # suffix would fall back to ``application/octet-stream`` and not render).
 _INLINE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
+# Audio/video outputs ComfyUI saves. Audio that fits the budget rides back as an
+# MCP ``AudioContent`` block; video has no MCP content type, so it is always a
+# path-only ``structuredContent`` record. Both — and any file past the budget —
+# always get a manifest record so the on-disk copy is reachable even when its
+# bytes are not base64'd.
+_INLINE_AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus")
+_INLINE_VIDEO_SUFFIXES = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v")
+
+# Explicit, OS-independent media types for the manifest and inline blocks (stdlib
+# ``mimetypes`` varies by host and this payload is protocol-visible).
+_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".opus": "audio/opus",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".m4v": "video/x-m4v",
+}
+
 # Bounds on what ``fetch_outputs(inline_images=True)`` base64-inlines into the
 # reply, mirroring the module's other output caps (``_TRACEBACK_TAIL_MAX_CHARS``,
 # ``_EXCEPTION_TEXT_MAX_CHARS``): a big batch or high-res render must not force an
 # unbounded allocation / blow the agent's context. The on-disk copies in
-# ``out_dir`` are untouched — only the inline preview is capped.
+# ``out_dir`` are untouched — only the inline preview is capped. The cap is one
+# shared budget across images and audio (see ``_render_output_media``); a video
+# is never inlined, since MCP has no video content type and a base64 data URL in
+# ``structuredContent`` lands in the agent's context as text.
 _INLINE_IMAGE_MAX_COUNT = 8
 _INLINE_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 
@@ -6969,30 +7612,77 @@ def _is_within(root: str, path: str) -> bool:
     return path == root or path.startswith(root + os.sep)
 
 
-def _collect_output_images(data: Any, out_dir: str) -> list[str]:
-    """Resolve image files referenced by ``comfy download``'s data to on-disk paths.
+def _media_kind(name: str) -> str | None:
+    """Classify ``name`` by suffix as ``"image"`` / ``"audio"`` / ``"video"``, else None."""
+    lower = name.lower()
+    if lower.endswith(_INLINE_IMAGE_SUFFIXES):
+        return "image"
+    if lower.endswith(_INLINE_AUDIO_SUFFIXES):
+        return "audio"
+    if lower.endswith(_INLINE_VIDEO_SUFFIXES):
+        return "video"
+    return None
 
-    Walks every string in the envelope ``data``, keeps those with an image
-    suffix, and returns the ones that resolve to a real file **inside**
-    ``out_dir`` (deduped, order-preserving). ``comfy download -o out_dir`` writes
-    every file it produces into ``out_dir``, so scoping to that directory is what
-    keeps the inline preview honest: a bare/relative name binds to the copy just
-    written rather than a same-named file in the process CWD, and an absolute or
-    ``../``-traversal path that escapes ``out_dir`` (an input reference, a URL
-    basename, or an outright traversal in the metadata) is rejected instead of
-    read and inlined. Inline return is best-effort and never masks the on-disk
-    copy.
+
+def _media_type(path: str) -> str:
+    """The manifest/data-URL media type for ``path`` by suffix (octet-stream if unknown)."""
+    return _MEDIA_TYPES.get(
+        os.path.splitext(path)[1].lower(), "application/octet-stream"
+    )
+
+
+def _download_dest(data: Any, out_dir: str | None) -> str | None:
+    """Resolve the directory ``comfy download`` wrote to, for media scoping.
+
+    comfy-cli's download payload carries ``out_dir`` as an already-resolved
+    absolute path, and has since **1.14.0** — this server's own floor
+    (``_MIN_COMFY_CLI``) — so this needs no per-verb version gate and is read
+    rather than recomputed. It is the only answer available when the caller
+    omitted the parameter and comfy-cli chose the directory itself.
+
+    The fallback matters only when the payload lacks the field: with a
+    caller-supplied ``out_dir`` it reproduces the previous behaviour, matching
+    the download child's cwd before it ran (the MCP client's cwd may hold a
+    stale, same-named output directory). With no parameter and no field there is
+    nothing to resolve, so this returns ``None`` and the caller skips inlining.
+    """
+    if isinstance(data, dict):
+        reported = data.get("out_dir")
+        if isinstance(reported, str) and reported:
+            return os.path.realpath(reported)
+    if out_dir is None:
+        return None
+    return os.path.realpath(os.path.join(_project_root() or os.curdir, out_dir))
+
+
+def _collect_output_media(data: Any, out_dir: str) -> list[tuple[str, str]]:
+    """Resolve media files referenced by ``comfy download``'s data to on-disk paths.
+
+    Walks every string in the envelope ``data``, keeps those with an image, audio
+    or video suffix, and returns ``(realpath, kind)`` for the ones that resolve to
+    a real file **inside** ``out_dir`` (deduped, order-preserving). ``comfy
+    download -o out_dir`` writes every file it produces into ``out_dir``, so
+    scoping to that directory is what keeps the manifest honest: a bare/relative
+    name binds to the copy just written rather than a same-named file in the
+    process CWD, and an absolute or ``../``-traversal path that escapes
+    ``out_dir`` (an input reference, a URL basename, or an outright traversal in
+    the metadata) is rejected instead of read and surfaced. This is best-effort
+    and never masks the on-disk copy.
     """
     out_root = os.path.realpath(out_dir)
-    resolved: dict[str, None] = {}
+    resolved: dict[str, str] = {}
     for value in _iter_strings(data):
-        if not value.lower().endswith(_INLINE_IMAGE_SUFFIXES):
+        kind = _media_kind(value)
+        if kind is None:
             continue
         # Most-specific form first (the value as given, then joined onto out_dir,
         # then bare basename in out_dir) — but every candidate must resolve to a
         # real file INSIDE out_dir. Containment is what neutralizes the CWD
         # shadow (a bare "gen.png" resolves to CWD/gen.png, outside out_dir, so
         # it's rejected in favor of the out_dir copy) and the `../` traversal.
+        # The kind is re-read off the RESOLVED path, so a `gen.png` symlink to a
+        # non-media file is dropped and the block type always matches the
+        # manifest's media type.
         for candidate in (
             value,
             os.path.join(out_dir, value),
@@ -7000,9 +7690,11 @@ def _collect_output_images(data: Any, out_dir: str) -> list[str]:
         ):
             real = os.path.realpath(candidate)
             if _is_within(out_root, real) and os.path.isfile(real):
-                resolved.setdefault(real, None)
+                real_kind = _media_kind(real)
+                if real_kind is not None:
+                    resolved.setdefault(real, real_kind)
                 break
-    return list(resolved)
+    return list(resolved.items())
 
 
 def _select_inline_images(paths: list[str]) -> list[str]:
@@ -7011,6 +7703,8 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     Preserves order and stops as soon as either bound would be exceeded, so a
     large batch or a high-res render can't force an unbounded base64 payload into
     the reply. Unreadable files are skipped (the on-disk copy still stands).
+    Used by ``preview_media`` for its single rendered PNG; ``fetch_outputs`` uses
+    ``_render_output_media`` instead, which spans media kinds.
     """
     selected: list[str] = []
     total = 0
@@ -7028,30 +7722,134 @@ def _select_inline_images(paths: list[str]) -> list[str]:
     return selected
 
 
+def _read_b64(path: str, size: int) -> str | None:
+    """Base64 of ``path``'s ``size`` bytes, or None if unreadable or no longer ``size``.
+
+    Reads at most ``size + 1`` bytes, so a file that grew after it was sized
+    against the budget is refused rather than read in full (on-disk copy stands).
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(size + 1)
+    except OSError:
+        return None
+    if len(raw) != size:
+        return None
+    return base64.b64encode(raw).decode()
+
+
+def _render_output_media(
+    media: list[tuple[str, str]],
+) -> tuple[list[types.ContentBlock], list[dict[str, Any]]]:
+    """Split collected media into inline content blocks and a ``structuredContent`` manifest.
+
+    One shared budget (``_INLINE_IMAGE_MAX_COUNT`` files, ``_INLINE_IMAGE_MAX_BYTES``
+    aggregate raw bytes) spans images and audio, so a leading large file can't
+    starve the rest — each file is inlined only while both bounds still hold,
+    the first file included. EVERY file gets a manifest record (on-disk path,
+    media type, byte size, ``inline`` flag), which is what lifts the path out of
+    the metadata JSON. An image/audio clip that fits comes back as an MCP content
+    block (its bytes there, not duplicated on the record); a video is always a
+    path-only, ResourceLink-style record — MCP has no video content type, and a
+    data URL in ``structuredContent`` would reach the agent's context as text —
+    as is anything that doesn't fit. The content block's media type is the
+    manifest's, so the two never disagree. The caps are preserved exactly — the
+    9th image, or the file that would cross the byte budget, is recorded rather
+    than inlined.
+    """
+    blocks: list[types.ContentBlock] = []
+    records: list[dict[str, Any]] = []
+    total = 0
+    count = 0
+    for path, kind in media:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        media_type = _media_type(path)
+        record: dict[str, Any] = {
+            "path": path,
+            "media_type": media_type,
+            "bytes": size,
+            "inline": False,
+        }
+        fits = (
+            kind != "video"
+            and count < _INLINE_IMAGE_MAX_COUNT
+            and total + size <= _INLINE_IMAGE_MAX_BYTES
+        )
+        encoded = _read_b64(path, size) if fits else None
+        if encoded is not None:
+            record["inline"] = True
+            count += 1
+            total += size
+            if kind == "image":
+                blocks.append(
+                    types.ImageContent(type="image", data=encoded, mime_type=media_type)
+                )
+            else:
+                blocks.append(
+                    types.AudioContent(type="audio", data=encoded, mime_type=media_type)
+                )
+        records.append(record)
+    return blocks, records
+
+
 # The docstring below says "not in _TARGET_AWARE_SUBCOMMANDS" without a module
 # qualifier deliberately: tool docstrings are protocol-visible (the `tools/list`
 # `description` field), so this stays reader prose rather than an internal
 # cross-reference. For maintainers: that's `target._TARGET_AWARE_SUBCOMMANDS`
 # (src/comfy_mcp/target.py) — `download` is not in it, which is the whole point
-# being made below.
-@mcp.tool()
+# being made below. Not idempotent: `comfy download` never overwrites — a repeat
+# into the same `out_dir` writes a collision-suffixed copy (`name.1.ext`) — which
+# is also why it is not destructive.
+#
+# `out_dir` is optional because comfy-cli already resolves a project-aware
+# default and this tool required the parameter anyway, which made the wrapper
+# stricter than the command it wraps: a caller who had configured a download
+# directory once still had to name a path on every call, and an LLM caller has
+# to invent one. Omitting the parameter leaves `-o` off the argv rather than
+# reproducing comfy-cli's resolution here — the thin-wrapper reading of the
+# same request (Comfy-Org/comfy-mcp#304), where an `AUTO_DOWNLOAD_PATH` this
+# server interpreted itself would have been the wrong shape. Full effect needs
+# Comfy-Org/comfy-cli#1158: below it, `comfy download`'s own `--out-dir`
+# default is the literal `./outputs`, which shadows the resolver, so omitting
+# `-o` lands files relative to this server's spawn directory (`COMFY_PROJECT`
+# when set) rather than at the configured default. That is already an
+# improvement on a path the model guessed, and it becomes the configured
+# default the moment #1158 ships.
+@mcp.tool(
+    meta=output_viewer.TOOL_META,
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+@_object_payload
 def fetch_outputs(
     prompt_id: str,
-    out_dir: str,
+    out_dir: str | None = None,
     url_only: bool = False,
     inline_images: bool = False,
-) -> Any:
+) -> dict[str, Any]:
     """Download a completed job's output files into ``out_dir``.
 
-    Wraps ``comfy download <prompt_id> --where local -o <out_dir>``.
+    Wraps ``comfy download <prompt_id> --where local [-o <out_dir>]``.
     ``url_only=True`` emits URLs without downloading.
+
+    Omit ``out_dir`` and comfy-cli picks it: the project's ``outputs/``, its
+    configured default, or ``./outputs``; the returned ``out_dir`` names where
+    it wrote.
 
     Remote jobs work although ``download`` is not in
     ``_TARGET_AWARE_SUBCOMMANDS``: the submitting run's local state file maps
     ``prompt_id`` to output URLs. An unknown local id has no record.
 
-    ``inline_images=True`` appends bounded MCP images to the metadata. Disk
-    copies remain uncapped.
+    ``inline_images=True`` adds bounded MCP media (images, small audio) plus a
+    ``structuredContent`` manifest of every output's path/type/size; video and
+    over-cap files are path-only records (``preview_media`` renders a video).
     """
     prompt_id = argv._guard_prompt_id(prompt_id)
     # `out_dir` is the sibling client-supplied positional and rides the same argv
@@ -7061,9 +7859,13 @@ def fetch_outputs(
     # here — `-o` takes a value, so comfy-cli reads even a dash-led one as this
     # option's argument, and a relative path is legitimate input. Size runs
     # ahead of the NUL refusal for the ordering reason `argv._guard_arg_len` gives.
-    argv._guard_arg_len("out_dir", out_dir)
-    out_dir = argv._reject_nul("out_dir", out_dir)
-    args = ["download", prompt_id, "-o", out_dir]
+    # Both guards are skipped when the parameter is absent: there is no string to
+    # bound, and `-o` is then not on the argv at all.
+    args = ["download", prompt_id]
+    if out_dir is not None:
+        argv._guard_arg_len("out_dir", out_dir)
+        out_dir = argv._reject_nul("out_dir", out_dir)
+        args += ["-o", out_dir]
     if url_only:
         args.append("--url-only")
     data = _run_comfy(*args, timeout=300.0)
@@ -7072,9 +7874,33 @@ def fetch_outputs(
     # a previous run into ``out_dir`` (which would contradict the docstring).
     if not inline_images or url_only:
         return data
-    paths = _select_inline_images(_collect_output_images(data, out_dir))
-    images = [Image(path=path) for path in paths]
-    return [data, *images]
+    preview_dir = _download_dest(data, out_dir)
+    if preview_dir is None:
+        # Nothing to scope the manifest to. `_collect_output_media` requires a
+        # containing directory to reject a same-named file in this process's CWD
+        # (see its docstring), and guessing comfy-cli's resolution here would
+        # duplicate a default this server deliberately does not own. The download
+        # itself succeeded, so return its metadata rather than failing the call.
+        return data
+    blocks, records = _render_output_media(_collect_output_media(data, preview_dir))
+    # A `CallToolResult` is how this verb carries BOTH content blocks and a
+    # `structuredContent` payload — a bare list return produces only the former.
+    # The SDK passes a returned `CallToolResult` through unchanged (see
+    # `convert_result`), so this branch builds the object its `dict[str, Any]`
+    # `outputSchema` advertises itself: the download metadata — wrapped by
+    # `_as_object` exactly as `_object_payload` wraps the plain return — plus the
+    # `media` manifest. The text block keeps the metadata alone, verbatim.
+    metadata = _as_object(data)
+    content: list[types.ContentBlock] = [
+        types.TextContent(
+            type="text",
+            text=json.dumps(metadata, indent=2, default=str, ensure_ascii=False),
+        ),
+        *blocks,
+    ]
+    return types.CallToolResult(
+        content=content, structured_content={**metadata, "media": records}
+    )
 
 
 def _preview_image_path(data: Any) -> str | None:
@@ -7090,7 +7916,15 @@ def _preview_image_path(data: Any) -> str | None:
     return resolved if os.path.isfile(resolved) else None
 
 
-@mcp.tool()
+@mcp.tool(
+    meta=output_viewer.TOOL_META,
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
 def preview_media(
     media_path: str,
     out_path: str = "",
@@ -7587,7 +8421,15 @@ def _launch_comfyui_sync(extra_args: list[str]) -> Any:
 # exception is `FileNotFoundError: 'comfy'` from the inner re-invocation. The
 # upstream fix — re-invoking via `sys.executable -m comfy_cli` instead of a
 # bare name — is still desirable, but this server no longer depends on it.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+@_resumable_consent
 async def launch_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -7650,7 +8492,14 @@ async def launch_comfyui(
     return await asyncio.to_thread(_launch_comfyui_sync, guarded)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def stop_comfyui() -> Any:
     """Stop the LOCAL ComfyUI server that comfy-cli launched.
 
@@ -7774,6 +8623,7 @@ def _untracked_server_guidance(
     extra_args: list[str] | None = None,
     listener: _UntrackedListener | None = None,
     refusal: str = "",
+    retry_can_ask: bool = True,
 ) -> str:
     """Explain a port clash that followed a stop with nothing recorded to stop.
 
@@ -7793,7 +8643,8 @@ def _untracked_server_guidance(
       confirmation prompt on a retry, or running ``comfy stop --port <p>``
       directly. ``refusal`` says why this call did not, and is the only part
       that varies between a decline, an unanswered prompt, and a client that
-      could not be asked.
+      could not be asked. ``retry_can_ask=False`` drops the retry route where
+      no retry could ever prompt (``refusal`` then names the terminal one).
     """
     suggested = _ALT_PORT_SUGGESTION
     if _requested_port(extra_args) == suggested:
@@ -7816,13 +8667,17 @@ def _untracked_server_guidance(
             f"Either stop it the way you started it and retry, or {alongside}"
         )
     trailer = f"{refusal} " if refusal else ""
+    recycle = (
+        "To recycle that server, call restart_comfyui again and approve the "
+        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        if retry_can_ask
+        else ""
+    )
     return (
         f"Port {listener.port} is held by pid {listener.pid}, which comfy-cli "
         f"identified as a ComfyUI it did not start: `{listener.display_cmdline()}`. "
         "That is why there was nothing for the restart to stop and the fresh launch "
-        f"then hit the occupied port. {trailer}"
-        "To recycle that server, call restart_comfyui again and approve the "
-        f"confirmation, or run `comfy stop --port {listener.port}` in a terminal. "
+        f"then hit the occupied port. {trailer}{recycle}"
         f"Otherwise {alongside}"
     )
 
@@ -7890,13 +8745,20 @@ def _remote_target_configured() -> bool:
     process. Falling back to the guidance error costs an explanation; guessing
     wrong costs a running server.
 
+    :func:`target._comfy_target` answers only "did the operator configure a
+    remote?", so a Comfy Desktop port-lock discovery (which lives in
+    :func:`target._forward_target`) is never read as remote here and the
+    guided-restart recovery path stays available for a Desktop-launched
+    instance with nothing configured.
+
     Fails CLOSED: a set-but-malformed value raises out of :func:`target._comfy_target`,
     and that is read as "configured", not as "local".
     """
     try:
-        return target._comfy_target() is not None
+        resolved = target._comfy_target()
     except Exception:  # noqa: BLE001 - unreadable config must not unlock a kill
         return True
+    return resolved is not None
 
 
 def _kill_target_port(extra_args: list[str] | None) -> int | None:
@@ -8159,6 +9021,10 @@ class _KillDecision(NamedTuple):
 
     approved: bool
     reason: str
+    #: Whether calling ``restart_comfyui`` again can raise the prompt. False only
+    #: where no retry ever could (the ``>= 2026-07-28`` transport), so the
+    #: guidance names the terminal route alone instead of a loop.
+    retry_can_ask: bool = True
 
 
 async def _elicit_kill_untracked_consent(
@@ -8207,7 +9073,27 @@ async def _resolve_kill_untracked_consent(
     errors (an unanswered prompt, a client that errored) are folded into
     ``reason`` instead, so every refusal — decline included — surfaces as the
     enriched guidance error rather than three differently-shaped failures.
+
+    On the ``>= 2026-07-28`` transport it refuses OUTRIGHT, before any
+    capability check or answer is read: that transport asks by returning the
+    question and re-running the call on a retry, but this gate fires mid-sequence
+    on the restart's worker thread, after the stop half — there is no result to
+    carry a question out on, and no prompt is ever issued. So an
+    ``input_responses`` answer the client attached is ignored (nobody was asked
+    it), ``confirm_kill_untracked`` is not a substitute for the human the
+    capable client could otherwise reach, and the reason names the terminal
+    route rather than a retry that can never succeed.
     """
+    if _uses_input_required(ctx):
+        return _KillDecision(
+            False,
+            "This MCP protocol revision cannot raise a confirmation prompt from "
+            "inside a restart already in progress, so nothing was asked and pid "
+            f"{listener.pid} is still running. Retrying restart_comfyui will "
+            "not change that; stop it from a terminal with `comfy stop --port "
+            f"{listener.port}` if the USER wants it stopped, then retry.",
+            retry_can_ask=False,
+        )
     if _client_elicitation_support(ctx) is not False:
         try:
             approved = await _elicit_kill_untracked_consent(ctx, listener)
@@ -8343,6 +9229,7 @@ def _offer_untracked_kill(
     port = _kill_target_port(extra_args)
     listener = None
     refusal = ""
+    retry_can_ask = True
     if kill_approver is not None and port is not None:
         if not _remote_target_configured():
             listener = _verified_untracked_listener(port)
@@ -8351,8 +9238,10 @@ def _offer_untracked_kill(
         if decision.approved:
             return _recycle_untracked_server(clash, extra_args, listener)
         refusal = decision.reason
+        retry_can_ask = decision.retry_can_ask
+    guidance = _untracked_server_guidance(extra_args, listener, refusal, retry_can_ask)
     raise ComfyCliError(
-        f"{clash}\n\n{_untracked_server_guidance(extra_args, listener, refusal)}",
+        f"{clash}\n\n{guidance}",
         code=clash.code,
         no_envelope=clash.no_envelope,
         returncode=clash.returncode,
@@ -8408,7 +9297,15 @@ def _recycle_untracked_server(
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+@_resumable_consent
 async def restart_comfyui(
     extra_args: list[str] | None = None,
     confirm_network_exposure: bool = False,
@@ -8637,7 +9534,15 @@ async def _resolve_update_all_consent(
         )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_resumable_consent
 async def update_comfyui(
     target: str = "comfy",
     confirm_update_all: bool = False,
@@ -8963,7 +9868,15 @@ def _run_version_switch(version: str) -> Any:
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_resumable_consent
 async def switch_comfyui_version(
     version: str,
     confirm_switch: bool = False,
@@ -9493,7 +10406,15 @@ def _run_node_install(names: list[str]) -> Any:
 # ComfyUI-Manager itself does from its live UI. The one case that can still
 # disturb a running server is a pack that upgrades a dependency ComfyUI already
 # imported, which is another reason to restart promptly after installing.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_resumable_consent
 async def install_node(
     names: list[str],
     confirm_install: bool = False,
@@ -9634,7 +10555,14 @@ _LOG_PORT_UPGRADE_HINT = (
 )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def get_logs(tail: int = 200, port: int | None = None) -> Any:
     """Return the tail of the LOCAL background ComfyUI's captured log file.
 
@@ -9704,7 +10632,15 @@ def get_logs(tail: int = 200, port: int | None = None) -> Any:
     return data
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        title="Discover comfy-cli commands",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def discover(schemas_only: bool = True, command: str = "") -> Any:
     """Return comfy-cli's self-describing command surface (its own contract).
 
@@ -9778,7 +10714,15 @@ def discover(schemas_only: bool = True, command: str = "") -> Any:
     return data
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        title="Which ComfyUI is targeted",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def which() -> Any:
     """Report which ComfyUI install/workspace comfy-cli currently targets.
 
@@ -9793,7 +10737,14 @@ def which() -> Any:
 _PROJECT_ACTIONS = ("status", "init")
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def project(action: str = "status") -> Any:
     """Report or create the operator-anchored comfy-cli project (`project/1`).
 
@@ -9978,7 +10929,25 @@ def _unmatched_template_tokens(rows: list[dict], query_lower: str) -> list[str]:
     return [t for t in tokens if not any(word.startswith(t) for word in vocabulary)]
 
 
-@mcp.tool()
+# `comfy templates ls --runnable` landed in comfy-cli 1.27.0 (`6d1f7f3e`,
+# Comfy-Org/comfy-cli#878, released 2026-11-18). When `runnable_only` was built
+# no tagged release carried the flag, so the degrade could only say "after
+# 1.26.0" — a hedge, and hedges expire silently the moment upstream ships. One
+# did, so the release has a number now and the message says it. Per-verb, like
+# `_MIN_WATCH_COMFY_CLI`: `runnable_only` is one optional argument of one tool,
+# so raising the server-wide `_MIN_COMFY_CLI` for it would refuse every other
+# tool on an install where only this filter is missing.
+_MIN_RUNNABLE_COMFY_CLI_STR = "1.27.0"
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def search_templates(
     query: str = "",
     limit: int = 25,
@@ -9988,6 +10957,7 @@ def search_templates(
     model: str = "",
     provider: str = "",
     exclude_api: bool = False,
+    runnable_only: bool = False,
 ) -> Any:
     """Search the built-in ComfyUI workflow-template gallery.
 
@@ -10021,14 +10991,20 @@ def search_templates(
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
         exclude_api: drop ``API``-tagged rows.
+        runnable_only: keep only templates every weight for which is already on
+            THIS install (``comfy templates ls --runnable``) — comfy-cli's own
+            runnable filter. Weights only — step-4 validation is still
+            MANDATORY. The FIRST such call is slow (300s cap, not 60s).
+            ``query`` still narrows on top, without ``unmatched_query_words``.
+            A remote target adds a ``comfy_target_note``.
         limit/offset: page results (``limit`` capped at 200).
 
-    Step 1: pick a ``name``, inspect with ``get_template``, then
-    ``fetch_template``. Step 4 — validating before ``run_workflow`` — is
-    MANDATORY via ``local_check``.
+    Step 1: pick a ``name``, inspect with ``get_template`` (and
+    ``check_template`` for a runnable verdict), then ``fetch_template``. Step 4
+    — validating before ``run_workflow`` — is MANDATORY via ``local_check``.
 
     Freshness: CACHED, 24h TTL as of v1.14.0; refresh via ``comfy templates
-    refresh``. NOT read from the local install.
+    refresh``. NOT read from the local install (``runnable_only`` aside).
     """
     if limit < 0:
         raise ComfyCliError(f"invalid limit: {limit} (must be >= 0)")
@@ -10048,7 +11024,43 @@ def search_templates(
             argv._reject_option_like(f"{flag} value", value)
             argv._reject_nul(f"{flag} value", value)
             args += [flag, value]
-    data = _run_comfy(*args, timeout=60.0)
+    if runnable_only:
+        args.append("--runnable")
+    # `--runnable` fetches every candidate's workflow to check it on the first
+    # run (comfy-cli caches after), so it needs the wider cap a cold fetch does.
+    try:
+        data = _run_comfy(*args, timeout=300.0 if runnable_only else 60.0)
+    except ComfyCliError as exc:
+        # The flag is newer than this server's comfy-cli floor. Say so by name
+        # rather than relay Click's usage dump — and never fall back to the
+        # unfiltered gallery, which would answer "runnable" with rows that are
+        # not. Narrow as at every option site: the parser's own phrase, minus
+        # any copy a caller forged through a filter value.
+        if (
+            not runnable_only
+            or not clitext._is_missing_option_error(exc, "--runnable")
+            or clitext._phrase_is_only_the_caller_s(
+                exc,
+                clitext._MISSING_OPTION_RE_TEMPLATE.format(
+                    option=re.escape("--runnable")
+                ),
+                tag,
+                type,
+                model,
+                provider,
+            )
+        ):
+            raise
+        raise ComfyCliError(
+            "search_templates(runnable_only=True) unavailable: the installed "
+            "comfy-cli's `templates ls` has no `--runnable` filter, which "
+            f"comfy-cli {_MIN_RUNNABLE_COMFY_CLI_STR} and newer carry; upgrade "
+            'with `pip install --upgrade "comfy-cli>='
+            f'{_MIN_RUNNABLE_COMFY_CLI_STR}"`, or drop runnable_only and ask '
+            "`check_template` per template.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
 
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         shape = (
@@ -10089,9 +11101,12 @@ def search_templates(
         if not rows:
             rows = [r for r in candidates if _template_matches(r, q)]
             relaxed = bool(rows)
-        if not rows:
+        if not rows and not runnable_only:
             # Only computed on the empty path, where it is the whole value: a
-            # populated result needs no explanation.
+            # populated result needs no explanation. Not under `runnable_only`:
+            # `candidates` is then only the runnable subset, so a word matching
+            # nothing in it may still match a template whose weights are
+            # missing, and "matched nothing in the gallery" would be false.
             unmatched = _unmatched_template_tokens(candidates, q)
 
     total = len(rows)
@@ -10119,6 +11134,8 @@ def search_templates(
             f"{', '.join(unmatched)}. Drop or reword them and search again — all "
             "query words must match, so each extra word only narrows the result."
         )
+    if runnable_only:
+        return target._annotate_comfy_target(result, target._TEMPLATE_TARGET_NOTE)
     return result
 
 
@@ -10491,7 +11508,14 @@ def _check_not_requested() -> dict:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def get_template(name: str, check_local: bool = True) -> Any:
     """Show one template's details/schema, and whether your install can run it.
 
@@ -10533,7 +11557,71 @@ def get_template(name: str, check_local: bool = True) -> Any:
     }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+def check_template(name: str) -> Any:
+    """Say whether THIS install has a gallery template's weights, before you fetch it.
+
+    Wraps ``comfy templates check <name>``. Step 2.5 of the on-ramp — after
+    ``search_templates``, before ``fetch_template`` — so you can tell the user
+    what to download (or steer them to an API-key flow) up front.
+
+    comfy-cli returns the verdict — ``runnable`` (every weight is already on
+    this install), ``missing-models`` (names the missing files and their
+    download URLs, ready to hand the user or feed to ``download_model``),
+    ``api-required`` (a paid hosted node — needs a signed-in account and spends
+    credits, so ``run_template`` fails it CLOSED unless ``confirm_spend=True``),
+    or ``unknown`` (comfy-cli could not decide). The verdict is comfy-cli's own;
+    this is a thin passthrough and adds no logic of its own.
+
+    A model/API check, NOT validation: ``runnable`` says nothing of custom
+    nodes or input values, so step-4 ``local_check`` is still MANDATORY. It
+    reads comfy-cli's own ComfyUI's weights; a remote target adds a note.
+    """
+    # Bare positional: a leading-dash name is read by comfy-cli as an option
+    # rather than the template to check (argument injection).
+    argv._reject_option_like(
+        "name", name, expected="a template name (e.g. 'image_flux2')"
+    )
+    argv._reject_nul("name", name)
+    try:
+        data = _run_comfy("templates", "check", name, timeout=120.0)
+    except ComfyCliError as exc:
+        # The verb is at this server's comfy-cli floor, but that floor fails
+        # OPEN — name the version gap rather than relay Click's usage dump. The
+        # same caller-echo subtraction as every degrade site whose argv carries
+        # caller text.
+        if not clitext._is_missing_verb_error(
+            exc, "check"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_VERB_RE_TEMPLATE.format(verb=re.escape("check")),
+            name,
+        ):
+            raise
+        raise ComfyCliError(
+            "check_template unavailable: the installed comfy-cli has no "
+            f"`comfy templates check` verb. It {_RESOURCE_VERB_UPGRADE_HINT}.",
+            no_envelope=exc.no_envelope,
+            returncode=exc.returncode,
+        ) from exc
+    return target._annotate_comfy_target(data, target._TEMPLATE_TARGET_NOTE)
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
     """Fetch a template workflow to ``out_path``; report whether the target can run it.
 
@@ -10955,7 +12043,15 @@ _NODES_ACTIONS_TAKING_PATH_TYPES = ("path",)
 _NODES_ACTIONS_TAKING_DEPTH_PATHS = ("path",)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        title="Search the local node catalog",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def nodes(
     action: str = "search",
     query: str = "",
@@ -11173,7 +12269,14 @@ def nodes(
 # against the venv on every call); the `registry_id` half reflects the
 # registry's LATEST published version, which is not necessarily what an
 # install would actually resolve to.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 def node_dependencies(pack: str = "", registry_id: str = "") -> Any:
     """Report a custom node pack's Python dependency requirements vs the installed venv (read-only).
 
@@ -11445,7 +12548,14 @@ def _parse_deps_manifest(out_path: str, plain: Any) -> dict:
 # fetched per Manager's own channel/mode settings and CACHED there — so a pack
 # published minutes ago may not be attributed yet even though this call itself
 # never caches. `state` is read off this install's disk on every call.
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 async def workflow_deps(workflow_path: str) -> Any:
     """Map a workflow's node classes to the node PACKS that provide them (read-only).
 
@@ -11592,9 +12702,34 @@ async def workflow_deps(workflow_path: str) -> Any:
     return manifest
 
 
-@mcp.tool()
+# `--host` / `--port` landed on `comfy models` in comfy-cli 1.27.0 (`5f381e57`,
+# Comfy-Org/comfy-cli#876, released 2026-11-18), and token-AND
+# separator-insensitive `models search --text` in 1.16.0 (`ed47611b`,
+# Comfy-Org/comfy-cli#684). Both were first written up against the release
+# BELOW them — 1.26.0 and 1.15.0 — because the flag had no release at all yet
+# and the search change was being contrasted with what came before. That shape
+# is not durable: it names the release that does NOT have the capability, so a
+# caller has to know what shipped next to act on it, and the `--host` one
+# became answerable the moment 1.27.0 went out. Both are per-verb and fail SOFT
+# (a retry and a narrower search), never a refusal, so neither belongs in
+# `_MIN_COMFY_CLI`.
+_MIN_MODELS_HOST_COMFY_CLI_STR = "1.27.0"
+_MIN_MODELS_TOKEN_SEARCH_COMFY_CLI_STR = "1.16.0"
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def search_models(query: str = "", folder: str = "") -> Any:
-    """Search / list model files available to the LOCAL ComfyUI install.
+    """Search / list model files available to the targeted ComfyUI install.
+
+    FOLLOWS ``COMFYUI_URL`` / ``COMFYUI_HOST`` like ``run`` / ``jobs`` — reads
+    the REMOTE install's models when set, else byte-identical to before.
 
     Three modes: ``query`` -> ``comfy models search --text <query>``
     (filename match, all folders on v1.14.0+, ``checkpoints`` only below the
@@ -11602,10 +12737,9 @@ def search_models(query: str = "", folder: str = "") -> Any:
     ``comfy models list-folders`` (folder names).
 
     ``query`` tokens match word-order-independently and ignore ``-`` ``_``
-    ``.`` separators, so "sdxl base" finds ``sd_xl_base_1.0.safetensors``.
-    That needs a comfy-cli NEWER than v1.15.0 (Comfy-Org/comfy-cli#684,
-    merged after v1.15.0 was cut); on v1.15.0 and older the whole query is
-    one substring, so search a single word there.
+    ``.`` separators ("sdxl base" finds ``sd_xl_base_1.0.safetensors``) on
+    comfy-cli 1.16.0 and newer; below that the whole query is one contiguous
+    substring, so search a single word there.
 
     RESPONSE SHAPE DIFFERS BY MODE: ``query`` returns ``{rows: [...]}``,
     ``folder`` returns ``{files: [...]}``. Filenames only — no base-model/
@@ -11636,8 +12770,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # `--out`), where a dash-leading value really is a caller slip and an
         # escape hatch exists. See `argv._reject_option_like`.
         argv._reject_nul("query", query)
-        return _run_comfy("models", "search", "--text", query, timeout=60.0)
-    if folder:
+        args: tuple[str, ...] = ("models", "search", "--text", query)
+    elif folder:
         # `folder` rides as a bare positional, so its leading-dash guard is the
         # mandatory kind. Size runs ahead of it: this is a models-subfolder path,
         # so it takes the same argv-safety CEILING as `download_model`'s
@@ -11662,8 +12796,74 @@ def search_models(query: str = "", folder: str = "") -> Any:
             "folder", folder, expected="a model folder (e.g. 'checkpoints')"
         )
         argv._reject_nul("folder", folder)
-        return _run_comfy("models", "list-folder", folder, timeout=60.0)
-    return _run_comfy("models", "list-folders", timeout=60.0)
+        args = ("models", "list-folder", folder)
+    else:
+        args = ("models", "list-folders")
+    # `_run_comfy` forwards --host/--port itself now that "models" is in
+    # `target._TARGET_AWARE_SUBCOMMANDS`, exactly as it does for `run` / `jobs` /
+    # `upload` (no-op for the local default — the argv is byte-identical to before
+    # "models" was allowlisted). The single call site is what lets the
+    # version-skew retry below cover all three modes at once.
+    try:
+        return _run_comfy(*args, timeout=60.0)
+    except ComfyCliError as exc:
+        # Version skew: the `--host` / `--port` options landed on `comfy models`
+        # (Comfy-Org/comfy-cli#876) in `_MIN_MODELS_HOST_COMFY_CLI_STR` — well
+        # above `_MIN_COMFY_CLI` — so every supported comfy-cli below it has the
+        # discovery leaves and rejects just the forwarded flag, with Click's usage
+        # dump (`NoSuchOption`: exit 2, no envelope). Those same builds resolve
+        # their target through `resolve_target`, whose local precedence honors
+        # `COMFY_LOCAL_URL` for ANY host (comfy-cli's `local_address`, there since
+        # 1.14.0), so the retry hands the configured target over through that
+        # documented channel instead — in the CHILD's env only, so the server's
+        # own COMFYUI_URL, and the `download_model` / lifecycle guards keyed off
+        # it, stay exactly as configured. What is listed is still the remote's
+        # catalog, comfy-cli's answer; nothing is derived here. Never a retry
+        # with no target at all: this machine's catalog returned as the remote's
+        # is precisely the wrong-machine bug the forward exists to fix.
+        #
+        # `_is_missing_option_error` is deliberately narrow, and the phrase is
+        # discounted when it only appears inside the caller's own `query` /
+        # `folder` (Click can echo an argument back in a usage error), so a
+        # genuine failure keeps its own message. With no remote configured no
+        # `--host` was forwarded, so this branch cannot fire.
+        caller_values = tuple(v for v in (query, folder) if v)
+        if not clitext._is_missing_option_error(
+            exc, "--host"
+        ) or clitext._phrase_is_only_the_caller_s(
+            exc,
+            clitext._MISSING_OPTION_RE_TEMPLATE.format(option=re.escape("--host")),
+            *caller_values,
+        ):
+            raise
+        resolved = target._comfy_target()
+        if resolved is None:  # unreachable: no target means no `--host` sent
+            raise
+        host, port, _source = resolved
+        # comfy-cli IGNORES a `COMFY_LOCAL_URL` it cannot parse (a stderr warning,
+        # then its 127.0.0.1:8188 default) — that silent fallback would list THIS
+        # machine's catalog as the remote's, so a host that cannot ride inside a
+        # URL — or an empty one (`COMFYUI_HOST="[]"` strips to "") — is refused
+        # rather than retried.
+        if not host or any(
+            c.isspace() or not c.isprintable() or c in "/@?#[]\\" for c in host
+        ):
+            raise ComfyCliError(
+                "the installed comfy-cli cannot point `comfy models` at a remote "
+                "ComfyUI: it does not accept `--host` (which comfy-cli "
+                f"{_MIN_MODELS_HOST_COMFY_CLI_STR} and newer carry), and the "
+                "configured host is empty or contains "
+                "whitespace or URL-special characters, so it cannot be handed over as "
+                "COMFY_LOCAL_URL either. Nothing was listed, and this machine's "
+                "catalog was NOT returned instead. Set COMFYUI_HOST / COMFYUI_URL "
+                "to a plain host name or IP address, or upgrade comfy-cli "
+                f'(`pip install --upgrade "comfy-cli>={_MIN_MODELS_HOST_COMFY_CLI_STR}"`).'
+            ) from exc
+        return _run_comfy(
+            *args,
+            timeout=60.0,
+            local_url=f"http://{target._format_target_endpoint(host, port)}",
+        )
 
 
 # comfy-cli's own terminal set for a background download
@@ -12199,9 +13399,9 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     The blocking half of ``download(action="wait")`` and of ``download_model``'s
     wait path, shared so the two can never disagree about what a bound expiring
     means.
-    Runs on ``_poll_until_terminal``, the same bounded-poll loop
-    ``job(action="wait")`` (:func:`_job_wait_sync`) uses — see it for why each
-    poll is capped to the time left on the caller's bound, why the floor
+    Runs on ``_poll_until_terminal``, whose cancellable async twin
+    (:func:`_poll_until_terminal_async`) ``job(action="wait")`` uses — see it for
+    why each poll is capped to the time left on the caller's bound, why the floor
     exists, and why a poll killed at that cap yields the ``timed_out`` payload
     instead of an error.
 
@@ -12229,14 +13429,22 @@ def _poll_download(download_id: str, timeout_seconds: float) -> Any:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
+@_object_payload
 async def download_model(
     url: str,
     relative_path: str | None = None,
     filename: str | None = None,
     wait: bool = True,
     timeout_seconds: float = 110.0,
-) -> Any:
+) -> dict[str, Any]:
     """Download a model file into the LOCAL ComfyUI models dir, by URL.
 
     Wraps ``comfy model download --url <url> [--relative-path <path>]
@@ -12527,12 +13735,20 @@ _DOWNLOAD_ACTION_VERB = {
 }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+@_object_payload
 def download(
     action: str = "status",
     download_id: str = "",
     timeout_seconds: float | None = None,
-) -> Any:
+) -> dict[str, Any]:
     """Track a transfer already started by download_model; does NOT start one.
 
     Wraps `comfy model download-status`/`download-cancel`. `action`:
@@ -12626,7 +13842,14 @@ def download(
 _UPLOAD_STDOUT_MAX_CHARS = 4 * 1024 * 1024
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     """Upload files from this machine into the target ComfyUI's ``input`` directory.
 
@@ -12706,7 +13929,14 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def validate_workflow(workflow_path: str, object_info_path: str = "") -> Any:
     """Validate a workflow.
 
@@ -12868,8 +14098,35 @@ def _flag_mispaired_slots(data: Any) -> Any:
     return data
 
 
-@mcp.tool()
-def list_workflow_slots(workflow_path: str) -> Any:
+# `comfy workflow slots --node` landed in comfy-cli 1.23.0 (`7fd101a`,
+# 2026-10-17, the commit that also made a `get_template`-inserted node
+# addressable by its template id); 1.22.0 and older have the verb and not the
+# option. A per-VERB floor like `_MIN_WATCH_COMFY_CLI`, not a raise of
+# `_MIN_COMFY_CLI`: unfiltered `list_workflow_slots` works at 1.14.0, and the
+# filter is an optimization, so refusing every tool over it would be the wrong
+# trade.
+_MIN_SLOT_FILTER_COMFY_CLI = (1, 23, 0)
+_MIN_SLOT_FILTER_COMFY_CLI_STR = "1.23.0"
+
+_SLOT_FILTER_VERSION_ERROR = (
+    f"list_workflow_slots(node=...) requires comfy-cli "
+    f"{_MIN_SLOT_FILTER_COMFY_CLI_STR} or newer: `comfy workflow slots` has no "
+    f"`--node` option before {_MIN_SLOT_FILTER_COMFY_CLI_STR}, and passing one "
+    "makes Click print usage instead of a payload. Upgrade with `pip install "
+    "-U comfy-cli`, or call list_workflow_slots without `node` and filter the "
+    "rows by their `address` prefix."
+)
+
+
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+def list_workflow_slots(workflow_path: str, node: str = "") -> Any:
     """List the agent-tweakable slots a frontend-format workflow exposes.
 
     Wraps ``comfy workflow slots <path>``. A "slot" is a parameter comfy-cli
@@ -12883,17 +14140,56 @@ def list_workflow_slots(workflow_path: str) -> Any:
     alongside plain ``A.name`` for promoted proxy widgets — both come back in
     ``address`` and are set the same way.
 
+    ``node`` narrows the answer to one node's slots — a node id, or a subgraph
+    instance id, which brings every ``<id>/<inner>`` inside it. Needs comfy-cli
+    1.23.0: below that it is REFUSED, not answered unfiltered. An unknown id
+    is an error naming the ids that do exist, not an empty list.
+
     Slots are tweakable PARAMETERS only — Note/MarkdownNote text is not a
     slot; use ``list_workflow_notes`` for that.
     """
     # Bare positional, same as `set_workflow_slot` — a leading-dash path is read
     # as a flag rather than the path comfy-cli is meant to read.
     argv._guard_workflow_path(workflow_path, frontend=True)
-    data = _run_comfy("workflow", "slots", workflow_path, timeout=60.0)
+    # Why the floor REFUSES rather than dropping the filter: an unfiltered
+    # answer is exactly the context cost `node` was passed to avoid, and a
+    # caller that believes it was applied reads a whole graph's slots as one
+    # node's. The docstring says it is refused; this says why.
+    extra: tuple[str, ...] = ()
+    if node:
+        # Hygiene guards, inside the branch so `node=""` keeps meaning "no
+        # filter" rather than becoming an error (same shape as
+        # `search_models`). `_reject_option_like` applies here for the reason
+        # it applies to a slot ADDR: an address begins with the node id, which
+        # comfy-cli surfaces non-negative, so no reachable id starts with `-`.
+        node = argv._guard_arg_len(
+            "node", argv._reject_option_like("node", argv._reject_nul("node", node))
+        )
+        # Per-VERB floor, read BEFORE the call rather than from the failure:
+        # comfy-cli below 1.23.0 has no `--node` on `workflow slots`, and Click
+        # answers an unknown option with a usage dump on exit 2 and no
+        # envelope, which surfaces as "returned no JSON" instead of naming the
+        # one number the caller needs. The same policy as
+        # `_MIN_WATCH_COMFY_CLI`: fail OPEN on an unreadable version, and
+        # un-latch the memo on the way out so the upgrade this error asks for
+        # takes effect inside the same server process.
+        version = _checked_comfy_version()
+        if version is not None and version < _MIN_SLOT_FILTER_COMFY_CLI:
+            _invalidate_version_cache()
+            raise ComfyCliError(_SLOT_FILTER_VERSION_ERROR)
+        extra = ("--node", node)
+    data = _run_comfy("workflow", "slots", workflow_path, *extra, timeout=60.0)
     return _flag_mispaired_slots(data)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def list_workflow_notes(workflow_path: str) -> Any:
     """List the documentation notes a frontend-format workflow carries.
 
@@ -12972,7 +14268,14 @@ def list_workflow_notes(workflow_path: str) -> Any:
         }
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 def set_workflow_slot(
     workflow_path: str,
     overrides: list[str | SlotOverride],
@@ -13065,7 +14368,14 @@ def set_workflow_slot(
     return _run_comfy(*args, timeout=60.0)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def vary_workflow(
     workflow_path: str,
     slots: list[str | SlotVariants],
