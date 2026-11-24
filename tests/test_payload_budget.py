@@ -125,8 +125,19 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # so no version of it fit the slack; it was trimmed to the agent contract first (the
 # measurements and the reasoning are in a comment above `download`, and
 # `download_model` gave up its duplicate copy of the mid-transfer note to pay for the
-# rest). Measured ~16,460 after the edit, so the next growth is still a decision.
-_BUDGET_TOKENS = 16_475
+# rest).
+#
+# 16,475 -> 16,500 in review. The first cut of this correction added the size check to
+# `download_model` only, while the CHANGELOG entry and the comment above `download` both
+# claimed BOTH docstrings named it -- and `download` is the tool that actually reports
+# `completed`, so it was the one that had to say it (2 of 6 panel reviewers). Adding the
+# clause there measures 16,472, which fits 16,475 with three tokens to spare: too thin to
+# leave, since the next unrelated word anywhere in the tree would then fail an innocent
+# PR on this test. 25 tokens is the smallest step that is not a trap. Rewording the two
+# proof clauses into one sentence paid 5 tokens back, so the measurement is 16,467 of
+# 16,500 after the edit, and the next growth is still a decision. `download`'s own
+# per-tool ceiling in `test_downloads.py` moved 245 -> 255 for the same clause.
+_BUDGET_TOKENS = 16_500
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

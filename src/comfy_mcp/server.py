@@ -13742,8 +13742,8 @@ def download(
     Wraps `comfy model download-status`/`download-cancel`. `action`:
     - "status" (default) -> status, completed_bytes/total_bytes/percent,
       elapsed_seconds, dest, error. comfy-cli writes to `dest` mid-transfer,
-      so a present file proves nothing; and "completed" proves the TRANSFER
-      finished, not that a model arrived.
+      so a present file proves nothing, and "completed" proves only the
+      TRANSFER, not that a model arrived: check total_bytes is plausible.
     - "wait" -> poll until terminal (default 25.0s, ceiling 3600s); returns
       the final payload, or `{"timed_out": True, "download_id": ...,
       "status": <last>}` on expiry -- a TIMEOUT, not a failure.

@@ -40,9 +40,13 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   `huggingface.co/<org>/<repo>` link. `search_models` cannot catch it either,
   because it lists filenames and never content, so both docstrings now say that
   `completed` proves the *transfer* finished and that the size has to be checked
-  before reporting a model installed. Documentation only — no tool behaviour or
-  response shape changes. The Hugging Face case is refused at the source as of
-  Comfy-Org/comfy-cli#1187; the general content-type case is still open.
+  before reporting a model installed. The README tool table carried the same
+  claim in both rows — `download(action="status")` as "the source of truth" and
+  as "the only proof a model is complete and loadable" — and is corrected with
+  them, so the user-facing docs and the agent-facing docstrings no longer
+  disagree. Documentation only — no tool behaviour or response shape changes.
+  The Hugging Face case is refused at the source as of Comfy-Org/comfy-cli#1187;
+  the general content-type case is still open.
 - **`fetch_outputs` no longer requires `out_dir`.** Omit it and `-o` is left
   off the argv entirely, so comfy-cli resolves the destination it already knows
   how to resolve. This tool was stricter than the command it wraps: a caller
