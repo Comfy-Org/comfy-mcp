@@ -26,6 +26,22 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   plain local install. `COMFY_LOCAL_URL` is only checked for being set, never
   parsed.
 
+### Fixed
+
+- **`search_models` worked everywhere except on a Comfy Desktop install.** The
+  verbs that take `--host`/`--port` forward a discovered Desktop port the same
+  way they forward a configured remote, but `search_models`' version-skew retry
+  — the one that re-sends the request through `COMFY_LOCAL_URL` when the
+  installed `comfy models` predates those flags — asked a different question,
+  "is a remote configured?", which a discovered Desktop answers no to. So with
+  nothing configured, ComfyUI launched via Desktop, and a comfy-cli older than
+  the release that added `--host` to `comfy models`, the flag was sent, rejected,
+  and the retry re-raised Click's usage dump instead of running. That is exactly
+  the configuration the Desktop fallback was added for. Nothing changes for a
+  configured remote, for an operator-set `COMFY_LOCAL_URL` (which still stands
+  the fallback down), or for an install with no target at all, where no `--host`
+  is sent and a usage error naming it is still a real failure.
+
 ### Changed
 
 - **`download_model` and `download` no longer tell the agent that `completed`

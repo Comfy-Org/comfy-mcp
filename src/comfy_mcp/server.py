@@ -12793,8 +12793,8 @@ def search_models(query: str = "", folder: str = "") -> Any:
         # `_is_missing_option_error` is deliberately narrow, and the phrase is
         # discounted when it only appears inside the caller's own `query` /
         # `folder` (Click can echo an argument back in a usage error), so a
-        # genuine failure keeps its own message. With no remote configured no
-        # `--host` was forwarded, so this branch cannot fire.
+        # genuine failure keeps its own message. With nothing FORWARDED no
+        # `--host` was sent, so this branch cannot fire.
         caller_values = tuple(v for v in (query, folder) if v)
         if not clitext._is_missing_option_error(
             exc, "--host"
@@ -12804,8 +12804,18 @@ def search_models(query: str = "", folder: str = "") -> Any:
             *caller_values,
         ):
             raise
-        resolved = target._comfy_target()
-        if resolved is None:  # unreachable: no target means no `--host` sent
+        # `target._forward_target`, NOT `_comfy_target`: the question here is
+        # "what did `_with_target` put on the argv?", and that function forwards
+        # Comfy Desktop's discovered port-lock as well as an explicitly
+        # configured remote. Keyed on `_comfy_target` this re-raised the usage
+        # dump for a discovered Desktop — a target was forwarded, so the branch
+        # below was NOT unreachable — on exactly the configuration the Desktop
+        # fallback exists for: nothing set, ComfyUI launched via Desktop, and a
+        # `comfy models` predating `--host`. `_forward_target` also stands down
+        # for a non-empty `COMFY_LOCAL_URL`, which is what keeps this retry from
+        # overwriting an address the operator chose.
+        resolved = target._forward_target()
+        if resolved is None:  # unreachable: nothing forwarded means no `--host`
             raise
         host, port, _source = resolved
         # comfy-cli IGNORES a `COMFY_LOCAL_URL` it cannot parse (a stderr warning,
