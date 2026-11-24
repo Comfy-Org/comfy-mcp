@@ -28,6 +28,25 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ### Changed
 
+- **`download_model` and `download` no longer tell the agent that `completed`
+  proves a model is usable.** Both said it was "the only proof", and it is not:
+  nothing on comfy-cli's download path reads the response body or its
+  content-type, so a URL answering `200 text/html` — a Hugging Face or Civitai
+  repo *page*, a GitHub blob page, a Drive link — transfers successfully and
+  leaves the web page at `dest` under the filename the caller asked for, with
+  `status: "completed"`, `percent: 100.0` and `error: null`. Measured against
+  comfy-cli `main`: 577 bytes of HTML saved as `notamodel.safetensors`, and
+  276,289 bytes of model-card HTML as `flux1-dev.safetensors` from a bare
+  `huggingface.co/<org>/<repo>` link. `search_models` cannot catch it either,
+  because it lists filenames and never content, so both docstrings now say that
+  `completed` proves the *transfer* finished and that the size has to be checked
+  before reporting a model installed. The README tool table carried the same
+  claim in both rows — `download(action="status")` as "the source of truth" and
+  as "the only proof a model is complete and loadable" — and is corrected with
+  them, so the user-facing docs and the agent-facing docstrings no longer
+  disagree. Documentation only — no tool behaviour or response shape changes.
+  The Hugging Face case is refused at the source as of Comfy-Org/comfy-cli#1187;
+  the general content-type case is still open.
 - **`fetch_outputs` no longer requires `out_dir`.** Omit it and `-o` is left
   off the argv entirely, so comfy-cli resolves the destination it already knows
   how to resolve. This tool was stricter than the command it wraps: a caller
