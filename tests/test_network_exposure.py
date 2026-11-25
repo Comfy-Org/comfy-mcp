@@ -725,8 +725,20 @@ def _declined_messages(monkeypatch) -> dict[str, str]:
         "run_template": _refusal(
             server._resolve_template_spend_consent("txt2img", True, ctx)
         ),
+        # Both of this gate's wordings, because it has two: the one raised on
+        # `comfy run`'s own `spend_consent_required` refusal, and the up-front
+        # one for an engine with no interlock to refuse. Each is a separately
+        # assembled string, so each has to carry the anonymity and the hedge on
+        # its own.
         "run_workflow": _refusal(
-            server._resolve_workflow_spend_consent("graph.json", True, ctx)
+            server._resolve_workflow_spend_consent(
+                "graph.json", True, ctx, after_refusal=True
+            )
+        ),
+        "run_workflow (no engine interlock)": _refusal(
+            server._resolve_workflow_spend_consent(
+                "graph.json", True, ctx, after_refusal=False
+            )
         ),
         "launch_network_exposure": _refusal(
             server._resolve_network_exposure_consent(["--listen"], False, ctx, "launch")
@@ -756,8 +768,9 @@ def test_no_gate_asserts_a_person_on_a_decline(monkeypatch):
     must not survive is naming WHO refused, in any phrasing.
     """
     messages = _declined_messages(monkeypatch)
-    # All eight, so a gate added later cannot quietly skip the contract.
-    assert len(messages) == 8
+    # All eight gates, so one added later cannot quietly skip the contract —
+    # nine messages, because `run_workflow` assembles two (see the helper).
+    assert len(messages) == 9
 
     for gate, message in messages.items():
         assert "declined" in message, gate  # still reports the refusal

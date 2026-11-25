@@ -96,7 +96,60 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   unknown id is comfy-cli's own `workflow_slot_invalid`, which lists the ids
   that do exist.
 
+### Changed
+
+- **`run_workflow` asks about credits when the ENGINE says there is something
+  to spend, not when the caller passes `confirm_spend=True`.** The prompt was
+  driven off the argument, so an agent that passed it prophylactically — which
+  the tool description gave it every reason to do — put a credit confirmation
+  in front of every run, including the overwhelming majority that run for free
+  on the user's own ComfyUI. Only comfy-cli can tell a paid graph from a free
+  one, so the run now goes out unflagged first: a partner-free graph is
+  byte-identical without `--allow-spend` and simply runs, while a paid one
+  fails closed with `spend_consent_required` having submitted nothing, and
+  *that* refusal is what raises the prompt. A free workflow is therefore never
+  prompted whatever the caller passed, and consent is still per-call and still
+  asked exactly once per call. On a client that supports MCP elicitation it is
+  still never something the model can grant itself. On one that cannot elicit
+  there is no prompt to raise, so `confirm_spend=True` is the only consent
+  there is and the tool description says to set it only when the user has
+  actually agreed — unchanged by this release, and the same fallback
+  `partner_generate` documents. Reported in #300. An engine with no interlock
+  keeps the up-front prompt, because no refusal will ever arrive to raise it;
+  that is a build past the fail-open version check, or a capability probe that
+  could not answer — see the next entry for what happens when it was wrong.
+
 ### Fixed
+
+- **A cached capability answer could let a paid graph run with nobody asked.**
+  `run_workflow` skips the up-front spend prompt when `comfy run --help` says
+  the engine has `--allow-spend`, because a gated engine will refuse the
+  unflagged run and the prompt is better raised on that refusal. That probe
+  latched on a process-wide boolean, so ONE positive answer silenced the
+  up-front prompt for the life of the server — and a `COMFY_BIN` replaced or
+  rolled back to an ungated build inside that lifetime has no interlock to
+  refuse with, so the next paid graph simply ran and spent. The latch is now
+  bound to the executable it was taken against (resolved real path plus
+  device, inode, size and mtime), so a rollback re-probes; an identity that
+  cannot be read — a macOS TCC denial resolves on PATH and refuses to be
+  stat'ed — re-probes every call rather than latching, and deliberately does
+  not refuse, because refusing would re-prompt every `confirm_spend=True`
+  caller on FREE graphs ([#300](https://github.com/Comfy-Org/comfy-mcp/issues/300)).
+  Reported by @skishore23 on [#322](https://github.com/Comfy-Org/comfy-mcp/pull/322).
+
+- **A spend approval could be discarded and the same person asked twice.** On
+  the `2026-07-28` transport the answer arrives on a RETRY of the whole tool
+  call, and `request_state` is keyed on the prompt's text. This gate has two
+  wordings — up front on an engine with no interlock, after the engine's
+  refusal otherwise — chosen by a `comfy run --help` probe that can fail
+  transiently. A probe that failed on the asking round and succeeded on the
+  answering one rendered the other wording, whose digest did not match, so a
+  valid approval was thrown away and a second prompt went out. The gate now
+  also accepts the counterpart wording it could have minted on the asking
+  round; both texts carry the same subject and the same graph digest, so a
+  graph swapped under the prompt still defeats the claim and one answer is
+  still redeemable exactly once. Reported by @skishore23 on
+  [#322](https://github.com/Comfy-Org/comfy-mcp/pull/322).
 
 - **Three capability claims named the release that does NOT have the feature.**
   `search_templates(runnable_only=True)` told a caller its `--runnable` filter
@@ -123,6 +176,45 @@ project is pre-1.0, minor is the strongest signal available, so read it as
   token-search floor has no degrade to live in -- that path fails soft, with a
   narrower match and no error -- so its constant is pinned to the `search_models`
   docstring by a test instead, which is what keeps the number in one place.
+
+- **A `run_workflow` spend approval covered a path, and now covers a graph.**
+  `comfy run` re-reads the workflow file when the consented run spawns, and the
+  human's decision sits between that read and the one the refusal came from — a
+  window as long as a person takes to answer. Anything writing the file inside
+  it, including a parallel `emit_partner_workflow` with the same `out_path`,
+  changed what the approval bought: on the retry transport, where the answer
+  arrives on a fresh call, the yes was spent on bytes nobody had been shown. The
+  approval is now pinned to the file's SHA-256. The digest is quoted in the
+  prompt — which is what the sealed `request_state` is keyed on, so a changed
+  graph fails the nonce claim and is asked about afresh — and re-read in-frame
+  for clients that elicit over the back-channel, where a mismatch refuses the
+  run with nothing spent. A path this server cannot read itself pins on that
+  fact and quotes nothing, so a run comfy-cli resolves on its own is unaffected.
+
+- **An approved `run_workflow` spend could be discarded rather than spent.**
+  The `--allow-spend` capability probe answers False whenever it *cannot*
+  answer — a `comfy run --help` that exits nonzero, or that will not spawn —
+  and neither says anything about whether the flag exists. So a `--help` hiccup
+  could send a fully capable comfy-cli up the no-interlock branch, where the
+  user was prompted up front, approved, and then had the run refused anyway
+  with `spend_consent_required`: told consent was required moments after giving
+  it, with the flag they authorized never forwarded. The refusal settles which
+  answer was wrong — an engine lacking the flag has no gate to engage and would
+  have run the graph and spent, so it can never emit that code — and the engine
+  outranks the probe. The consent already in hand is now forwarded instead:
+  exactly one prompt per call, as before, and no new route to spending
+  unapproved, because the up-front prompt raises on a decline before any child
+  is spawned.
+
+- **The `run_workflow` decline message was wrong about every supported
+  engine.** It told a caller who had just refused a spend not to retry with
+  `confirm_spend=False`, because "`comfy run`'s spend gate is not in a
+  comfy-cli release yet" and the graph would therefore run and spend. The gate
+  shipped in comfy-cli **1.14.0 on 2026-08-04** — which is this server's own
+  enforced floor — so on every install this server will talk to at all, the
+  opposite was true: the graph fails closed and spends nothing. The message now
+  says so, and says it knowing the graph is paid, because the engine has
+  already refused it by the time anyone is asked.
 
 - **`billing_status` described a comfy-cli that stopped existing in August.**
   0.11.0 said in five places — these release notes, the tool docstring, the

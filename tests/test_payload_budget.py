@@ -137,7 +137,32 @@ _SERVER_SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_mcp" / "serve
 # proof clauses into one sentence paid 5 tokens back, so the measurement is 16,467 of
 # 16,500 after the edit, and the next growth is still a decision. `download`'s own
 # per-tool ceiling in `test_downloads.py` moved 245 -> 255 for the same clause.
-_BUDGET_TOKENS = 16_500
+#
+# 16,500 -> 16,600 when `run_workflow`'s `confirm_spend` regained the
+# spend-agreement requirement. On a client that cannot elicit,
+# `_resolve_optin_spend_consent` returns True with no prompt, so the caller's flag
+# is the only consent that exists. "Set True ONLY when the user has actually
+# agreed - never merely to clear an error" is therefore the agent contract on
+# exactly the path where nobody is asked, it is the line `run_template` and
+# `partner_generate` both already carry, and comfy-mcp#300 is the record of an
+# agent passing the flag prophylactically because the description had invited it.
+# It costs ~29 tokens net of moving the `Gotchas` bullet about a gateless source
+# build into a comment, which it belongs in anyway (no parameter selects that
+# branch, so an agent cannot act on it).
+#
+# The step is 100 and not 25, and the two raises above are the evidence. This
+# branch first raised 16,450 -> 16,600 because `main` had reached ~16,449 of
+# 16,450 on its own. While it waited, `main` raised the ceiling twice more on
+# the same reasoning - 16,475's author found three tokens of slack and called it
+# "too thin to leave", then took the smallest step that is "not a trap", +25 -
+# and that step was consumed inside two days: rebased on `main` at 5fccf21 this
+# tree measures 16,496 of 16,500, four tokens clear. So a 25-token step is
+# demonstrably a tripwire at this repo's current rate, and it is the NEXT
+# author's innocent pull request that trips it. 100 leaves ~104 tokens, about
+# one parameter description. Measured 16,496 before this raise; the next growth
+# is still a decision, and the thing to check when it fires is whether `main`
+# ate the slack rather than whether your own branch did.
+_BUDGET_TOKENS = 16_600
 
 
 def _is_tool_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:

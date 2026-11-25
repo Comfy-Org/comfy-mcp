@@ -715,26 +715,45 @@ inside the verb itself, so a comfy-cli that has the verb has the gate.
 
 ### Workflows that spend — `run_workflow`
 
-`run_workflow` takes the **same** `confirm_spend` argument, with the same three rules as
-`run_template` above — default never prompts and forwards nothing, `confirm_spend=True` asks you
-per call on a client that can elicit, and `comfy generate consent always` grants nothing here
-either. Most workflows are ordinary local graphs and are unaffected; the ones this matters for are
-the graph `emit_partner_workflow` writes and an `API`-tagged gallery template you fetched with
-`fetch_template`. When consent is withheld the engine refuses with `spend_consent_required` and
-names the offending `partner_nodes`, so you learn *which* nodes cost money without a second call.
-Consent is resolved once per call, so the server's brief credential retry never re-asks you.
+`run_workflow` takes the same `confirm_spend` argument, and it is still per-call and still
+unaffected by `comfy generate consent always`. On a client that supports MCP elicitation it is
+still never something the model can grant itself. On one that cannot elicit there is no prompt to
+raise, so the caller's `confirm_spend=True` is the only consent there is — the same fallback
+`partner_generate` has, and the reason this tool's description says to set it only when the user
+has actually agreed to spend.
+**What differs from `run_template` is when you are asked, and it is the more important half.**
+
+`confirm_spend` says what *you* would allow. It says nothing about whether the graph in front of
+you can spend anything, and only comfy-cli knows that — it has `/object_info` and the partner-node
+classification. So the run always goes out **unflagged first**: a partner-free graph is
+byte-identical without `--allow-spend` and simply runs, and a paid one fails closed with
+`spend_consent_required` before `/prompt` is ever hit. The prompt is raised on *that refusal*.
+
+The practical consequence: **a free workflow is never prompted, whatever the caller passed.** An
+agent reading this tool's description has every reason to pass `confirm_spend=True`
+prophylactically, and when the prompt hung off the argument that meant a credit confirmation in
+front of every run, including the overwhelming majority that cost nothing ([#300][i300]). Now the
+question only reaches you when there is a real answer to give, and when nothing has been spent
+yet. When you decline, the engine's refusal already stopped the run and names the offending
+`partner_nodes`, so you also learn *which* nodes cost money without a second call. Consent is
+resolved once per call — the server's brief credential retry never re-asks you, and a second
+refusal on the run you approved is the engine's answer rather than a cue to ask again.
+
+[i300]: https://github.com/Comfy-Org/comfy-mcp/issues/300
 
 One caveat specific to this verb, and the reason it is called out rather than folded into the
 section above: `comfy run` **long predates** its spend gate, so unlike `run-template` the verb's
 presence proves nothing. The gate shipped in comfy-cli 1.14.0, which is the floor this server
-enforces, so on every *published* comfy-cli it accepts the interlock is there and
-`confirm_spend=False` is a guarantee rather than a default. The probe stays because the floor
-can't prove it: the version guard fails **open**, so a source build or fork whose `--version`
-can't be read reaches the tool without the flag. The server probes `comfy run --help` on the
-calls you approved and simply omits `--allow-spend` when that comfy-cli has no such flag, so an
-approved run still runs instead of dying on a usage error — but on such a build what authorizes
-the spend is your answer to the prompt, not an engine gate, and a paid workflow runs and spends
-whether or not you pass `confirm_spend`. `pip install -U comfy-cli` closes that residual case.
+enforces, so on every *published* comfy-cli it accepts the interlock is there and this whole
+mechanism works. The probe stays because the floor can't prove it: the version guard fails
+**open**, so a source build or fork whose `--version` can't be read reaches the tool without the
+flag. Such an engine never refuses, so there would be no refusal to raise the prompt — that is the
+one case where `confirm_spend=True` still asks you **up front**, before the run, because asking
+afterwards would mean asking after the credits were gone. `--allow-spend` is omitted either way
+(an unknown flag would exit with a usage error and fail the run you just approved), so there what
+authorizes the spend is your answer and not an engine gate, and a paid workflow left at
+`confirm_spend=False` runs and spends having asked nobody. `pip install -U comfy-cli` closes that
+residual case.
 
 ## Templates your install can't run
 
@@ -1080,7 +1099,7 @@ registry lookup key is `name`, and a job handle is `prompt_id`.
 
 | Tool | Wraps | What it does |
 |---|---|---|
-| `run_workflow(workflow_path, wait=True, timeout_seconds=110.0, confirm_spend=False)` | `comfy run --workflow <path> [--wait] [--allow-spend]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. Most workflows are free local graphs, but one embedding partner (paid) nodes spends credits: `confirm_spend=True` unlocks that, and on an elicitation-capable client asks **you** per call, same posture as `run_template`. On a comfy-cli whose `comfy run` carries the gate the default fails closed (`spend_consent_required`, naming the `partner_nodes`); that is every release from 1.14.0 on, which the floor requires, so a paid graph only slips through on a build that got past the fail-open version guard. See [Workflows that spend](#workflows-that-spend--run_workflow). |
+| `run_workflow(workflow_path, wait=True, timeout_seconds=110.0, confirm_spend=False)` | `comfy run --workflow <path> [--wait] [--allow-spend]` | Run a workflow JSON; `wait=False` submits async and returns a `prompt_id`. Most workflows are free local graphs, but one embedding partner (paid) nodes spends credits: `confirm_spend=True` unlocks that, and on an elicitation-capable client asks **you** per call. Unlike `run_template`, the prompt is raised on the **engine's** `spend_consent_required` refusal rather than on the argument, so a free graph is never prompted whatever the caller passed; the default leaves a paid graph to fail closed, naming the `partner_nodes`. That interlock is in every release from 1.14.0 on, which the floor requires, so a paid graph only slips through — and only then is the prompt raised up front instead — on a build that got past the fail-open version guard. See [Workflows that spend](#workflows-that-spend--run_workflow). |
 | `generate_image(prompt, checkpoint=None, wait=True, timeout_seconds=60.0)` | `comfy run-template image_z_image_turbo --param=57.text=<prompt>` | Text prompt → image in one call, with no hand-assembled workflow needed: it runs the built-in text-to-image gallery template (`image_z_image_turbo`) through the same verb (and the same run path) as `run_template`. `checkpoint` needs a graph with a checkpoint slot, and the built-in one has none, so passing it is refused by name until `COMFY_T2I_CHECKPOINT_SLOT` points at a template that has one. Free — nothing here spends credits. Runs on whichever ComfyUI the server targets, so it follows `COMFYUI_URL`/`COMFYUI_HOST` like `run_workflow` does ([Driving a remote ComfyUI](#driving-a-remote-comfyui)); a checkpoint, where the template takes one, has to be installed on *that* machine. Retarget the template with [`COMFY_T2I_TEMPLATE` and its slot-key companions](#prerequisites). Same envelope shape as `run_workflow` (`prompt_id` + outputs); the fast on-ramp. `timeout_seconds` bounds this server's wait only — your MCP client's own transport cap applies too, and the shorter one wins, so the default is small enough to expire on this side first. An expired wait is not an error: it returns `{"timed_out": true, "prompt_id": …, "status": …, "note": …}` for a generation that is still running, so the job stays pollable with `job(action="status")`, collectable with `fetch_outputs` and cancellable with `job(action="cancel")` instead of being orphaned. On slow hardware prefer `wait=False` and poll. |
 | `partner_generate(model, params=None, confirm_spend=False, out_path=None, timeout_seconds=600.0)` | `comfy generate <model> [--param=value…] [--download=<path>] [--timeout=<s>] [--yes]` | Run a hosted **partner** model (Flux / Ideogram / DALL·E / Recraft / …). **Spends Comfy credits** on every call, where the local `run_workflow` / `generate_image` paths spend only when the graph itself carries partner nodes. Every call confirms the spend with you first — see [Spending credits](#spending-credits-on-partner-models) below. Runs **entirely on the partner's infrastructure** — your local ComfyUI is never in the execution path; use `emit_partner_workflow` below for the path where it is. `params` are the model's own schema-driven inputs, forwarded verbatim — `list_partner_models()` gives you the `model` aliases and `partner_model_schema(model)` the parameter list, so neither needs a terminal. `out_path` becomes comfy-cli's `--download` and is a save-path *template*: a plain path names the file, `{request_id}` / `{index}` / `{ext}` are substituted per output, and a trailing slash means "a default filename in this directory". `timeout_seconds` becomes comfy-cli's own `--timeout` so the engine — not a parent kill — owns the deadline on a job the partner may already have charged for. The result carries comfy-cli's printed text as `message` and, when it named the files it wrote, the resolved paths as `saved_paths` — so a caller reads the destination as data instead of scraping prose that rich may have wrapped mid-filename. |
 | `emit_partner_workflow(model, out_path, params=None)` | `comfy generate <model> [--param=value…] --emit-workflow=<path>` | Write a runnable workflow JSON that drives the partner model's **API node** instead of calling the proxy, so **your own ComfyUI executes the partner model** (the other way there is an existing `API`-tagged gallery template via `search_templates` / `run_template`; this is the path from a model *alias*). Chain it: `emit_partner_workflow` → `run_workflow` → `fetch_outputs` (the three stay separate so the graph can be inspected, edited with `set_workflow_slot`, re-run, or embedded in a bigger pipeline). Calls no partner API, needs no API key, and **spends nothing**, so unlike `partner_generate` it has no `confirm_spend` argument and raises no confirmation prompt — *running* the emitted graph is what bills the partner node, so that `run_workflow` step is the one that needs `confirm_spend=True`. **Coverage is narrow:** comfy-cli maps only `flux-2`, `flux-pro`, `kling-i2v`, `nano-banana` and `seedance` to a node class, a small subset of `list_partner_models()`; every other model reaches its partner through the proxy only, so send those to `partner_generate`. An unsupported model raises with comfy-cli's own `emit_workflow_failed` message, which names the supported set for the comfy-cli you actually have installed. Returns comfy-cli's envelope data — `{"out", "model", "nodes"}`. |
