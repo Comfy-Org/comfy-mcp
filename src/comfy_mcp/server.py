@@ -10940,6 +10940,34 @@ def _unmatched_template_tokens(rows: list[dict], query_lower: str) -> list[str]:
 _MIN_RUNNABLE_COMFY_CLI_STR = "1.27.0"
 
 
+def _exclude_api_emptied_the_phrase_pass(
+    rows_before_exclude_api: list[Any], exclude_api: bool, q: str
+) -> bool:
+    """Did ``exclude_api`` remove the phrase matches, rather than there being none?
+
+    The discriminator for whether :func:`search_templates`' all-words fallback is
+    legitimate. That fallback rescues a PHRASING miss (``MiniMax Text to Video``
+    finding ``MiniMax H3: Text to Video``). It must not rescue a FILTERING miss,
+    because a filter that empties the phrase pass and then hands back a page of
+    loosely-related rows has WIDENED a narrowing instruction.
+
+    Asked as "would the phrase pass have matched WITHOUT the filter?" rather than
+    as "is a filter set at all?", which is the cheap version and costs the rescue
+    in a case the tool's own docstring advertises: ``tag="API"`` plus a phrasing
+    miss is a filtering miss under the cheap test and a phrasing miss in truth.
+
+    KNOWN GAP, stated rather than hidden: ``tag`` / ``type`` / ``model`` /
+    ``provider`` are FORWARDED to comfy-cli, so the unfiltered row set does not
+    exist on this side and the same widening is still reachable through them.
+    Closing that needs a second ``templates ls`` call per search, which is not
+    worth it on a cached 558-row listing. ``exclude_api`` is the locally-applied
+    filter and the one the reproduction is about.
+    """
+    if not exclude_api or not q:
+        return False
+    return any(_template_phrase_matches(r, q) for r in rows_before_exclude_api)
+
+
 @mcp.tool(
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -10990,7 +11018,8 @@ def search_templates(
             the reply carries ``unmatched_query_words`` naming the dead words.
         tag/type/model/provider: forwarded filters (``tag``/``type`` exact,
             ``model``/``provider`` substring).
-        exclude_api: drop ``API``-tagged rows.
+        exclude_api: drop ``API``-tagged rows. If that empties the phrase
+            pass the reply is EMPTY — a filter never widens a result.
         runnable_only: keep only templates every weight for which is already on
             THIS install (``comfy templates ls --runnable``) — comfy-cli's own
             runnable filter. Weights only — step-4 validation is still
@@ -11082,6 +11111,7 @@ def search_templates(
             f"unexpected `comfy templates ls` payload: {bad} of {len(rows)} rows "
             "are not objects. comfy-cli's output shape may have drifted."
         )
+    before_exclude_api = rows
     if exclude_api:
         rows = [r for r in rows if not _template_is_api(r)]
     unmatched: list[str] = []
@@ -11098,7 +11128,16 @@ def search_templates(
         # Falling back only when the precise pass finds NOTHING means recall is
         # gained without ever diluting a query that already worked.
         rows = [r for r in candidates if _template_phrase_matches(r, q)]
-        if not rows:
+        # ...but NOT when `exclude_api` is what emptied the phrase pass. A
+        # filter is a narrowing instruction and must never widen the result:
+        # `exclude_api=True` on `image to image` turned 2 correct rows into 11+
+        # wrong ones, because the filter removed the only phrase matches and the
+        # all-words pass then matched every `X to Image` row on the word `to`.
+        # See :func:`_exclude_api_emptied_the_phrase_pass` for why this is asked
+        # as "would it have matched unfiltered?" and not "is a filter set?".
+        if not rows and not _exclude_api_emptied_the_phrase_pass(
+            before_exclude_api, exclude_api, q
+        ):
             rows = [r for r in candidates if _template_matches(r, q)]
             relaxed = bool(rows)
         if not rows and not runnable_only:

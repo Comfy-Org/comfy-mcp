@@ -1157,3 +1157,99 @@ def test_instructions_tell_agents_to_title_hand_written_nodes():
     doc = " ".join((server.run_workflow.__doc__ or "").split())
     assert "_meta.title" in doc
     assert "canvas label only, never execution" in doc
+
+
+# --- a filter must never WIDEN the result (comfy-mcp #221, unlanded since 08-08) -
+# `exclude_api=True` on `image to image` returned MORE rows than the same query
+# without it, and every extra row was wrong: the filter removed the only phrase
+# matches, the phrase pass came back empty, and the all-words fallback then
+# matched every `X to Image` row on the word `to`. Reproduced live on `main` at
+# 6c43880 before the fix -- 2 correct rows became 11 -- so these are regression
+# tests for a defect that shipped, not a hypothetical.
+
+_FILTER_ROWS = [
+    {
+        "name": "api_i2i_flux",
+        "title": "Flux: Image to Image",
+        "description": "Paid hosted image to image.",
+        "tags": ["API"],
+        "models": [],
+        "output_type": "image",
+        "category_title": "Image",
+    },
+    {
+        "name": "api_i2i_seedream",
+        "title": "Seedream: Image to Image",
+        "description": "Paid hosted image to image.",
+        "tags": ["API"],
+        "models": [],
+        "output_type": "image",
+        "category_title": "Image",
+    },
+] + [
+    {
+        "name": f"free_t2i_{i}",
+        "title": f"Free Text to Image {i}",
+        "description": "Local text to image.",
+        "tags": [],
+        "models": [],
+        "output_type": "image",
+        "category_title": "Image",
+    }
+    for i in range(1, 12)
+]
+
+
+def test_search_templates_exclude_api_cannot_widen_the_result(monkeypatch):
+    """The reproduction: `exclude_api` emptied the phrase pass, so no fallback.
+
+    Both phrase matches for `image to image` are API rows, so `exclude_api=True`
+    leaves nothing. The honest answer is "nothing matches your filters" -- the
+    all-words pass would have returned all eleven `Free Text to Image` rows on
+    the word `to`, which is a filter making a result BIGGER.
+    """
+    _patch_ls(monkeypatch, _FILTER_ROWS)
+
+    result = server.search_templates("image to image", exclude_api=True)
+
+    assert result["total"] == 0
+    assert _names(result) == []
+    # Not a widened match, because no widening was allowed to happen.
+    assert "match" not in result
+
+
+def test_search_templates_without_exclude_api_the_same_query_is_precise(monkeypatch):
+    """The control: the filter is what changed the answer, not the query.
+
+    Without it the phrase pass answers with exactly the two img2img rows, so the
+    test above is measuring the filter and not a broken phrase pass.
+    """
+    _patch_ls(monkeypatch, _FILTER_ROWS)
+
+    result = server.search_templates("image to image")
+
+    assert _names(result) == ["api_i2i_flux", "api_i2i_seedream"]
+    assert "match" not in result
+
+
+def test_search_templates_exclude_api_keeps_the_phrasing_rescue(monkeypatch):
+    """A PHRASING miss under `exclude_api` still gets the all-words fallback.
+
+    This is the case the cheap fix ("is any filter set? then never fall back")
+    gets wrong, and it is a case the tool's own docstring advertises. Nothing
+    here carries the phrase `minimax text to video`, filter or no filter, so the
+    emptiness is the phrasing's fault rather than `exclude_api`'s and the rescue
+    the fallback exists for must still fire.
+    """
+    _patch_ls(
+        monkeypatch,
+        [
+            _QA_ROWS[0],
+            {**_QA_ROWS[0], "name": "api_minimax_h3_t2v", "tags": ["API"]},
+        ],
+    )
+
+    result = server.search_templates("MiniMax Text to Video", exclude_api=True)
+
+    assert _names(result) == ["video_minimax_h3_t2v"]
+    assert result["match"] == "all-words"
