@@ -28,6 +28,22 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ### Fixed
 
+- **`search_templates(exclude_api=True)` could return MORE rows than the same
+  search without it, and every extra row was wrong.** A filter is a narrowing
+  instruction, so it must never widen a result. `image to image` with
+  `exclude_api=True` dropped the only two phrase matches (both paid `API` rows),
+  the phrase pass came back empty, and the all-words fallback then matched every
+  `X to Image` row on the word `to` — a page of unrelated templates presented as
+  the answer to a narrowed search. It now reports nothing found, which is the
+  true answer when the filter is what emptied the result. The fallback itself is
+  unchanged for the case it exists for: a PHRASING miss still gets rescued
+  (`MiniMax Text to Video` still finds `MiniMax H3: Text to Video`) even with
+  `exclude_api=True`, because the test asked is "would the phrase have matched
+  without the filter?" and not "is a filter set?". `tag` / `type` / `model` /
+  `provider` are forwarded to comfy-cli rather than applied here, so the same
+  widening is still reachable through them; closing that needs a second
+  `templates ls` call per search and is not done. Found by @skishore23 in #221.
+
 - **`search_models` worked everywhere except on a Comfy Desktop install.** The
   verbs that take `--host`/`--port` forward a discovered Desktop port the same
   way they forward a configured remote, but `search_models`' version-skew retry
