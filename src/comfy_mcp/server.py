@@ -11332,7 +11332,7 @@ def _unchecked(summary: str, reason: str) -> dict:
 
 
 def _local_template_check(workflow_path: str) -> dict:
-    """Cross-check a fetched template against the LOCAL install's ``object_info``.
+    """Cross-check a template against the local or loopback target's ``object_info``.
 
     The gallery is served fresh from ``Comfy-Org/workflow_templates`` while the
     user's ComfyUI is whatever they installed, so a template can legitimately
@@ -11351,6 +11351,19 @@ def _local_template_check(workflow_path: str) -> dict:
     ``object_info`` — comes back ``checked: False`` rather than a denial.
     """
     try:
+        explicit_catalog_target = target._catalog_target() is not None
+    except ComfyCliError:
+        # The validation call below reports malformed configuration. Do not
+        # suggest local repair for a check that could not choose its target.
+        explicit_catalog_target = True
+    local_catalog_fallback = not explicit_catalog_target and _remote_target_configured()
+    catalog_note = (
+        " The configured non-loopback target was not checked; "
+        "this uses comfy-cli's local catalog."
+        if local_catalog_fallback
+        else ""
+    )
+    try:
         result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
     except ComfyCliError as exc:
         # `comfy validate` reports an invalid workflow as an envelope whose `ok`
@@ -11359,13 +11372,22 @@ def _local_template_check(workflow_path: str) -> dict:
         # check could not run at all". The payload is what tells them apart.
         result = exc.data
         if _validation_report(result) is None:
+            start_hint = (
+                "on the configured target"
+                if explicit_catalog_target
+                else (
+                    "locally using your usual launch method"
+                    if local_catalog_fallback
+                    else "with `launch_comfyui`"
+                )
+            )
             return _unchecked(
                 "could not check this template against your ComfyUI install "
                 "(the live node catalog was unreachable — the server may not be "
-                "running). The template was still written. Start ComfyUI with "
-                "`launch_comfyui`, then re-check with "
+                f"running). The template was still written. Start ComfyUI {start_hint}, "
+                "then re-check with "
                 "`validate_workflow(workflow_path=...)`. "
-                f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}",
+                f"Details: {str(exc)[: errors._MAX_ERROR_FIELD_CHARS]}" + catalog_note,
                 "check_unavailable",
             )
 
@@ -11374,7 +11396,7 @@ def _local_template_check(workflow_path: str) -> dict:
         return _unchecked(
             "could not check this template against your ComfyUI install: "
             "`comfy validate` returned an unexpected payload, so its output "
-            "shape may have drifted. The template was still written.",
+            "shape may have drifted. The template was still written." + catalog_note,
             "unexpected_payload",
         )
 
@@ -11398,7 +11420,8 @@ def _local_template_check(workflow_path: str) -> dict:
             "could not check this template against your ComfyUI install: this "
             "comfy-cli did not convert the template's UI-format graph, so no "
             "node was actually compared against the live catalog. Upgrade "
-            "comfy-cli for a real check. The template was still written.",
+            "comfy-cli for a real check. The template was still written."
+            + catalog_note,
             "workflow_not_converted",
         )
 
@@ -11409,11 +11432,20 @@ def _local_template_check(workflow_path: str) -> dict:
             "see `validate_workflow` for what it cannot see."
         )
     else:
+        update_hint = (
+            "on the configured target"
+            if explicit_catalog_target
+            else (
+                "locally using your usual update method"
+                if local_catalog_fallback
+                else "(`update_comfyui`)"
+            )
+        )
         summary = (
             f"{len(validation_errors)} problem(s): this template needs a node "
             "class or an input option your ComfyUI install does not have — a "
             "template served from the gallery can be newer than your install. "
-            "Update ComfyUI and its custom nodes (`update_comfyui`), or pick "
+            f"Update ComfyUI and its custom nodes {update_hint}, or pick "
             f"another template. First: {_finding_line(validation_errors[0])}"
             if validation_errors
             else (
@@ -11425,7 +11457,7 @@ def _local_template_check(workflow_path: str) -> dict:
     check = {
         "checked": True,
         "runnable": report["valid"],
-        "summary": summary,
+        "summary": summary + catalog_note,
         "error_count": len(validation_errors),
         "errors": [
             _finding_line(e) for e in validation_errors[:_TEMPLATE_CHECK_MAX_FINDINGS]
@@ -11442,7 +11474,7 @@ def _check_template_by_name(name: str) -> dict:
     """``_local_template_check`` for a template that is not on disk yet.
 
     ``comfy templates show`` returns gallery metadata only — no graph — so the
-    workflow has to be materialized before it can be compared against the local
+    workflow has to be materialized before it can be compared against the target
     catalog. It goes to a scratch directory that is removed either way, leaving
     the caller's filesystem untouched (``fetch_template`` is the tool that
     writes a file the user keeps).
@@ -11492,7 +11524,7 @@ def get_template(name: str, check_local: bool = True) -> Any:
 
     Args:
         check_local: True (default) adds a ``local_check`` block comparing
-            the graph against the LIVE local ``object_info``.
+            the graph against the LIVE target ``object_info``.
             ``{"checked": true, "runnable": false}`` fails until updated;
             ``{"checked": false}`` means no comparison was made (usually
             ComfyUI not running) — no ``runnable`` key, read with
@@ -11591,7 +11623,7 @@ def check_template(name: str) -> Any:
     )
 )
 def fetch_template(name: str, out_path: str, check_local: bool = True) -> dict:
-    """Write a template's runnable workflow JSON to ``out_path``; report if it can run here.
+    """Fetch a template workflow to ``out_path``; report whether the target can run it.
 
     Wraps ``comfy templates fetch <name> --out <path>``. Returns ``{"path": ...,
     "local_check": {...}}`` — completing the on-ramp::
@@ -12039,7 +12071,7 @@ def nodes(
 ) -> Any:
     """Search, inspect, or graph-walk a node catalog.
 
-    Wraps the `comfy nodes` family (`object_info`, incl. custom nodes).
+    Wraps `comfy nodes` using the local/loopback catalog (incl. custom nodes).
     `action`:
     - "search" (default) -> `nodes search <query>`: find a class name by
       keyword. Case-insensitive, word-order-independent token match over
@@ -13936,11 +13968,11 @@ async def upload_file(paths: list[str], overwrite: bool = False) -> Any:
     )
 )
 def validate_workflow(workflow_path: str, object_info_path: str = "") -> Any:
-    """Pre-flight a workflow against a node catalog before running it.
+    """Validate a workflow.
 
     Wraps ``comfy validate --workflow <path> [--input <object_info.json>]``.
-    Checks class_types, input shapes, enums and wiring against live
-    ``object_info`` or the saved ``object_info_path``.
+    Checks class_types, input shapes, enums and wiring against a saved
+    ``object_info_path`` or the live local/loopback catalog. Non-loopback stays local.
 
     Returns:
         comfy-cli's own report: ``{"valid": bool, "errors": [...], "warnings":

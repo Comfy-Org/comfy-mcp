@@ -44,6 +44,66 @@ def test_target_none_when_unset():
     assert target._comfy_target() is None
 
 
+@pytest.mark.parametrize("tool", ["nodes", "validate"])
+@pytest.mark.parametrize("source", ["url", "host"])
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize(
+    "host, forwarded",
+    [
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("127.0.0.1", True),
+        ("127.42.0.2", True),
+        ("127.255.255.255", True),
+        ("::1", True),
+        ("0:0:0:0:0:0:0:1", True),
+        ("gpu.example", False),
+        ("localhost.example", False),
+        ("192.0.2.1", False),
+        ("2001:db8::1", False),
+        ("::ffff:127.0.0.1", False),
+        ("127.0.0.1.example", False),
+        ("127.1", False),
+    ],
+)
+def test_catalog_target_is_loopback_only(
+    monkeypatch, patched_run, tool, source, saved, host, forwarded
+):
+    """Catalog verbs retain local fallback for non-loopback targets without DNS."""
+    bracketed = f"[{host}]" if ":" in host else host
+    if source == "url":
+        monkeypatch.setenv("COMFYUI_URL", f"http://{bracketed}:8000")
+    else:
+        monkeypatch.setenv("COMFYUI_HOST", bracketed)
+        monkeypatch.setenv("COMFYUI_PORT", "8000")
+    data = {"valid": True, "errors": []}
+    calls = patched_run(envelope(data=data))
+    kwargs = {"object_info_path": "catalog.json"} if saved else {}
+    if tool == "nodes":
+        assert server.nodes(action="types", **kwargs) == data
+        args = ["nodes", "types"]
+    else:
+        assert server.validate_workflow("workflow.json", **kwargs) == data
+        args = ["validate", "--workflow", "workflow.json"]
+    if saved:
+        args += ["--input", "catalog.json"]
+    if forwarded:
+        args += ["--host", host.lower() if source == "url" else host, "--port", "8000"]
+    assert calls[0]["cmd"] == [server.COMFY_BIN, "--json", "--where", "local", *args]
+
+
+@pytest.mark.parametrize("tool", [server.nodes, server.validate_workflow])
+def test_catalog_tools_do_not_fall_back_on_a_bad_target(monkeypatch, patched_run, tool):
+    monkeypatch.setenv("COMFYUI_URL", "https://gpu.example")
+    calls = patched_run()
+    with pytest.raises(server.ComfyCliError, match="scheme"):
+        if tool is server.nodes:
+            tool(action="types")
+        else:
+            tool("workflow.json")
+    assert calls == []
+
+
 def test_target_from_host_defaults_port(monkeypatch):
     monkeypatch.setenv("COMFYUI_HOST", "gpu.example")
     assert target._comfy_target() == (

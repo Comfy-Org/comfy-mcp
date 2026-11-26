@@ -20,6 +20,7 @@ public name in this module.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sys
@@ -145,15 +146,11 @@ _REMOTE_SHARED_MODELS_TRUE = frozenset({"1", "true", "yes", "on"})
 #     files, because it resolves the ``prompt_id`` from the state file this
 #     machine wrote at submit (which records absolute ``/view`` URLs on the
 #     remote) instead of asking a server — see ``fetch_outputs``.
-#   * ``nodes`` / ``validate`` DO accept ``--host`` / ``--port`` in current
-#     comfy-cli, but remoting live discovery/validation is out of scope here;
-#     forwarding them is a clean follow-up. Their local answers are advisory —
-#     ``run_workflow`` and ``run_template`` already submit to a remote whose node
-#     set a local check cannot see.
-# Forwarding is a no-op for the local default regardless, so unconfigured
-# behavior is unchanged for every tool.
+# Catalog verbs accept these flags, but local-mode object_info fetching is
+# loopback-only. Their target is filtered by _catalog_target after the shared
+# explicit/Comfy Desktop resolution; non-loopback selections keep the local catalog.
 _TARGET_AWARE_SUBCOMMANDS = frozenset(
-    {"run", "run-template", "jobs", "upload", "models"}
+    {"run", "run-template", "jobs", "upload", "models", "nodes", "validate"}
 )
 
 
@@ -554,6 +551,32 @@ def _forward_target() -> tuple[str, int, str] | None:
     return "127.0.0.1", desktop_port, _COMFY_DESKTOP_PORT_LOCK_SOURCE
 
 
+def _catalog_target() -> tuple[str, int, str] | None:
+    """Resolve the forwarding target only when it is a literal loopback host.
+
+    Never resolve DNS or change comfy-cli's local-mode SSRF policy. Hostnames
+    other than localhost, including names that happen to resolve locally, keep
+    comfy-cli's default catalog. Explicit configuration wins over Desktop discovery; malformed config still raises.
+    """
+    resolved = _forward_target()
+    if resolved is None:
+        return None
+    host = resolved[0]
+    if host.lower() == "localhost":
+        return resolved
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    # IPv4-mapped and scoped IPv6 spellings are not the literal ::1 contract.
+    loopback = (
+        address.is_loopback
+        if address.version == 4
+        else address == ipaddress.IPv6Address("::1")
+    )
+    return resolved if loopback else None
+
+
 def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     """Append ``--host`` / ``--port`` to a target-aware subcommand, if configured.
 
@@ -585,7 +608,9 @@ def _with_target(args: tuple[str, ...]) -> tuple[str, ...]:
     # breaking the "local behavior unchanged" contract.
     if not args or args[0] not in _TARGET_AWARE_SUBCOMMANDS:
         return args
-    target = _forward_target()
+    target = (
+        _catalog_target() if args[0] in {"nodes", "validate"} else _forward_target()
+    )
     if target is None:
         return args
     host, port, _source = target
