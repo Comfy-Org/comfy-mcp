@@ -412,6 +412,7 @@ full cloud tool list, and the slash-command/prompt tables live.
 - [Tools](#tools)
 - [Troubleshooting](#troubleshooting)
 - [Failure log (opt-in)](#failure-log-opt-in)
+- [Serving over HTTP instead of stdio](#serving-over-http-instead-of-stdio)
 - [Smoke test](#smoke-test)
 - [Contributing](#contributing)
 - [License](#license)
@@ -1235,6 +1236,68 @@ full stop.
 > the URL appears — in `args`, in `message`, and in the `stdout_tail` / `stderr_tail` captures —
 > but read a file over before you attach it to an issue. The log directory is created `0700` and
 > its files `0600`, so on a shared machine they are readable only by you.
+
+## Serving over HTTP instead of stdio
+
+By default `comfy-mcp` speaks **stdio**: your client launches it as a subprocess
+and talks JSON-RPC over the pipe, which is what every config in
+[Configure your AI client](#configure-your-ai-client) does. Nothing below is
+needed for that, and nothing below changes it.
+
+Set `COMFY_MCP_TRANSPORT=http` to serve **Streamable HTTP** instead. That suits a
+different shape: a server already running next to ComfyUI — commonly in the same
+container — that one or more clients connect to over the network, rather than one
+each client spawns for itself.
+
+```bash
+COMFY_MCP_TRANSPORT=http comfy-mcp       # listens on http://127.0.0.1:8000/mcp
+```
+
+| Variable | Default | What it does |
+|---|---|---|
+| `COMFY_MCP_TRANSPORT` | `stdio` | `stdio`, or `http` (`streamable-http` is the same thing spelled the SDK's way). An unrecognized value is an error, not a silent fall back to stdio. |
+| `COMFY_MCP_HOST` | `127.0.0.1` | Bind address. Non-loopback needs `COMFY_MCP_ALLOW_REMOTE_BIND` — see below. |
+| `COMFY_MCP_PORT` | `8000` | Listen port. |
+| `COMFY_MCP_ALLOW_REMOTE_BIND` | unset | Set to `1` to permit a non-loopback `COMFY_MCP_HOST`. |
+
+`COMFY_MCP_HOST` and `COMFY_MCP_PORT` are read **only** on the HTTP transport. Set
+alongside stdio they are ignored rather than rejected, so forgetting
+`COMFY_MCP_TRANSPORT` leaves you with the old behaviour and nothing listening.
+
+### The bind is loopback by default
+
+**This server has no authentication**, and neither does the ComfyUI it drives. A
+listener on `0.0.0.0` therefore hands every tool here — running arbitrary
+workflows, and reading and writing files under whichever directories ComfyUI was
+started with — to anything that can route to the machine. So a non-loopback bind
+is refused unless you ask for it explicitly:
+
+```bash
+$ COMFY_MCP_TRANSPORT=http COMFY_MCP_HOST=0.0.0.0 comfy-mcp
+comfy-mcp: COMFY_MCP_HOST='0.0.0.0' is not a loopback address, and this server has
+NO authentication: … To bind it anyway, set COMFY_MCP_ALLOW_REMOTE_BIND=1.
+```
+
+Prefer keeping the listener on loopback and reaching it through something that
+authenticates — an SSH tunnel, a tailnet, or a reverse proxy in front of it.
+`COMFY_MCP_ALLOW_REMOTE_BIND=1` is for when you have decided the network it is
+exposed to is one you trust; it is read from the environment, so only whoever
+launches the process can set it.
+
+Anything that cannot be positively identified as loopback — including a hostname,
+which is not resolved — counts as remote and needs the opt-in.
+
+### Checking it came up
+
+```bash
+$ curl -sS -X POST http://127.0.0.1:8000/mcp \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+A working server answers `200` with an `mcp-session-id` header and an
+`initialize` result naming `comfy-mcp` and its version.
 
 ## Smoke test
 

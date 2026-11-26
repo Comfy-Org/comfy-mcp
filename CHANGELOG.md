@@ -11,6 +11,21 @@ project is pre-1.0, minor is the strongest signal available, so read it as
 
 ### Added
 
+- **A Streamable HTTP transport, off by default.** `comfy-mcp` has only ever
+  served stdio, which requires each client to spawn its own copy — so a server
+  already running next to ComfyUI, in the same container or on another machine,
+  had nothing to connect to. Set `COMFY_MCP_TRANSPORT=http` (or
+  `streamable-http`) to serve Streamable HTTP instead, with `COMFY_MCP_HOST` and
+  `COMFY_MCP_PORT` for the listener. Unset, everything behaves exactly as
+  before. **The bind is loopback by default and a non-loopback address is
+  refused** unless `COMFY_MCP_ALLOW_REMOTE_BIND=1` is also set: this server has
+  no authentication and neither does the ComfyUI it drives, so binding it wide
+  publishes arbitrary workflow execution and file access under ComfyUI's
+  directories to anything that can reach the host. An unrecognized transport, a
+  bad port, or a non-loopback bind without the opt-in each fail at startup with
+  a message naming the variable, rather than falling back to stdio and leaving
+  nothing listening on the port you expected.
+
 - **Comfy Desktop's port is discovered when nothing is configured.** Comfy
   Desktop picks its port per launch (it moves off 8000 when that is taken), so
   the hardcoded `127.0.0.1:8188` default was frequently the wrong ComfyUI. With
