@@ -4,10 +4,14 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [opened, synchronize, closed]
+    # `reopened` is here for the same reason as the last step in this job: it is
+    # the one activity a maintainer can trigger that produces a FRESH
+    # `cla-assistant` check run on an existing head, at any PR age.
+    types: [opened, reopened, synchronize, closed]
 
 permissions:
   actions: write
+  checks: write # create the `cla-assistant` check run when a re-run is impossible
   contents: read # 'read' is enough because signatures live in a REMOTE repo
   pull-requests: write
   statuses: write
@@ -94,3 +98,94 @@ jobs:
 
           custom-allsigned-prcomment: |
             ✅ All contributors have signed the CLA. Thank you! This PR is ready to be merged.
+
+      # The action clears the required `cla-assistant` check by RE-RUNNING the
+      # pull_request_target run that produced it. GitHub's retry API refuses a
+      # run older than 30 days, and the action logs that refusal without
+      # failing, so on a PR older than a month a valid signature leaves the
+      # required check red while the job still reports success. Seen on #284:
+      # the author signed 60 days after opening, the action logged "All
+      # contributors have signed the CLA" and then
+      #   Error occurred when re-running the workflow: HttpError: Unable to
+      #   retry this workflow run because it was created over a month ago
+      # and `cla-assistant` stayed at its September failure.
+      #
+      # So produce the result the ruleset reads, directly. It has to be a CHECK
+      # RUN and not a commit status: `cla-assistant` is already a check run on
+      # these heads, and when a check and a status share a name GitHub requires
+      # BOTH to pass, so a status of that name would leave the stale failure
+      # standing and add a second thing to satisfy. A newer check run of the
+      # same name supersedes the older one, which is exactly the mechanism the
+      # action's own re-run path relies on when the run is young enough.
+      #
+      # The condition mirrors this workflow's own rule rather than re-deriving
+      # the action's: every non-author committer is allowlisted in the step
+      # above, so the PR author is the only signature this repo asks for. The
+      # author is matched on their numeric account id, which is stable across a
+      # rename; a login match is accepted only for a record that carries no id
+      # at all. And the count has to be a number before anything is reported,
+      # so that a read which comes back empty cannot green an author.
+      - name: Report cla-assistant on the PR head when a re-run is impossible
+        if: >
+          github.event_name == 'issue_comment' && github.event.issue.pull_request && (
+            github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read and agree to the Contributor License Agreement'
+          )
+        env:
+          # comfy-cla is a public repo, so the repo-scoped token can read the
+          # signature store. The PAT the action needs is for WRITING it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_AUTHOR: ${{ github.event.issue.user.login }}
+          PR_AUTHOR_ID: ${{ github.event.issue.user.id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          head_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .head.sha)
+          # Read the store through the RAW media type. The JSON contents API
+          # base64-encodes the file and, once it passes 1 MB, answers with
+          # `content: ""` and `encoding: "none"` instead of failing -- and
+          # `base64 -d | jq` on that prints nothing and exits 0. An empty
+          # `signed` then made `[ "" -eq 0 ]` error with status 2, which an `if`
+          # treats as false and `set -e` does not see, so the step fell through
+          # and posted a PASS for an author it had not checked. cla.json is
+          # 100,490 bytes of that 1 MB at 516 signatures (read 2026-11-22), so
+          # the size trigger is ahead of us and not live -- but a gate must
+          # never be able to go green because a read came back empty, for any
+          # reason, so the count is required below to be a number. Raw also
+          # reads up to 100 MB, so the base64 path is gone rather than guarded.
+          #
+          # Match on the numeric account id, and fall back to the login ONLY for
+          # a record that carries no id. An id is stable across a rename, which
+          # is why it is first; the plain `or` this replaces also accepted a
+          # login match against a DIFFERENT id, and GitHub frees a login when an
+          # account is renamed, so whoever registered that freed login was
+          # matched against the original signer's record. All 516 records in the
+          # store today carry an id, so this changes no current verdict.
+          signed=$(gh api "repos/comfy-org/comfy-cla/contents/signatures/cla.json?ref=main" \
+            -H 'Accept: application/vnd.github.raw' \
+            | jq -r --argjson id "${PR_AUTHOR_ID}" --arg login "${PR_AUTHOR}" \
+                '[.signedContributors[]?
+                   | select(if .id then (.id == $id)
+                            else ((.name // "" | ascii_downcase) == ($login | ascii_downcase)) end)]
+                 | length')
+          case "${signed}" in
+            ''|*[!0-9]*)
+              echo "::error::could not count signatures for ${PR_AUTHOR} (${PR_AUTHOR_ID}): the store read produced '${signed}', not a number. Reporting nothing." >&2
+              exit 1
+              ;;
+          esac
+          if [ "${signed}" -eq 0 ]; then
+            echo "${PR_AUTHOR} (${PR_AUTHOR_ID}) has no signature on file -- reporting nothing"
+            exit 0
+          fi
+          echo "${PR_AUTHOR} is in the signature store; reporting cla-assistant on ${head_sha}"
+          gh api -X POST "repos/${REPO}/check-runs" \
+            -f name=cla-assistant \
+            -f head_sha="${head_sha}" \
+            -f status=completed \
+            -f conclusion=success \
+            -f details_url="${RUN_URL}" \
+            -f 'output[title]=CLA signed' \
+            -f "output[summary]=${PR_AUTHOR} is in Comfy-Org/comfy-cla signatures/cla.json. Reported here because the pull_request_target run that first set this check is outside GitHub's 30-day re-run window."

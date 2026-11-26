@@ -2660,7 +2660,17 @@ def test_download_rejects_a_supplied_timeout_seconds_where_unused(no_spawn, acti
 # — this is the one text the model reads BEFORE it calls. Kept deliberately
 # tight, like the whole-payload ceiling in `test_payload_budget.py`: the next
 # growth is a decision too.
-_DOWNLOAD_DOC_BUDGET_TOKENS = 245
+#
+# 245 -> 255 for the size check, and this is that decision. The docstring sat at
+# 244 of 245, and the first cut of the `completed`-is-not-proof correction added
+# the size check to `download_model` alone while the CHANGELOG and the comment
+# above `download` both claimed BOTH said it. `download` is the tool that
+# REPORTS `completed`, so it is the one that has to name the only check
+# available against a transfer that completed with a web page in it (2 of 6
+# panel reviewers). The clause cost 12 tokens; rewording the two proof clauses
+# into one sentence paid 5 of them back, and the remaining 6 are bought here
+# rather than by dropping something an agent branches on. Measured 251 of 255.
+_DOWNLOAD_DOC_BUDGET_TOKENS = 255
 
 
 def test_download_tool_docstring_within_its_own_token_budget():

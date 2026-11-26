@@ -4,7 +4,7 @@ Comfy Desktop (the Electron app) picks its port DYNAMICALLY per launch —
 falling back to another one when its preferred port is taken — and writes a
 ``port-<N>.json`` lock file per port it currently holds
 (``{"pid", "installationName", "timestamp"}``) under its own per-OS
-``port-locks`` directory. ``_comfy_target`` has no way to know that port ahead
+``port-locks`` directory. The server has no way to know that port ahead
 of time: with neither ``COMFYUI_URL`` nor ``COMFYUI_HOST`` set, it used to fall
 straight through to comfy-cli's hardcoded ``127.0.0.1:8188`` default, which is
 simply wrong whenever Desktop landed on a different port — a config that was
@@ -20,10 +20,15 @@ These lock in:
 3. ``_discover_comfy_desktop_port`` — exactly one LIVE lock resolves; zero,
    more than one, a STALE (dead-pid) lock, and a malformed lock file all
    resolve to None rather than guessing.
-4. ``_comfy_target`` wiring — the fallback only applies when neither
-   ``COMFYUI_URL`` nor ``COMFYUI_HOST`` is set (both still take unconditional
-   precedence, unchanged), and byte-identical ``None`` when discovery itself
-   finds nothing — the existing local-only default keeps governing.
+4. ``_forward_target`` wiring — the fallback lives there and NOT in
+   ``_comfy_target``, so a discovered Desktop is forwarded as ``--host``/
+   ``--port`` without reading as a configured remote to the remote-only guards.
+   It applies only when neither ``COMFYUI_URL`` nor ``COMFYUI_HOST`` is set
+   (both still take unconditional precedence, unchanged), stands down for ANY
+   non-empty ``COMFY_LOCAL_URL`` (the guard reads the variable's presence, not
+   whether the address it names is local), and is byte-identical ``None`` when
+   discovery itself finds nothing — the existing local-only default keeps
+   governing.
 """
 
 from __future__ import annotations
