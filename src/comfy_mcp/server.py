@@ -14663,6 +14663,156 @@ def _warm_template_gallery() -> None:
             return
 
 
+# ---------------------------------------------------------------------------
+# Transport selection
+# ---------------------------------------------------------------------------
+# `comfy-mcp` has served stdio and only stdio since it existed, and stdio stays
+# the DEFAULT: every client config in the README launches this as a subprocess
+# and speaks JSON-RPC over the pipe. What the default does not cover is the
+# shape asked for in comfy-mcp#273 — a server already running next to ComfyUI
+# (commonly in the same container) that several clients, or a client on another
+# machine, connect to over HTTP. That cannot be done by a client spawning a
+# subprocess, so it needs a listener.
+#
+# Configured by ENVIRONMENT, not by new flags. Two reasons, in order of weight:
+# `cli._handle_argv` deliberately intercepts exactly two human-facing flags and
+# lets everything else fall through untouched, so adding option parsing there
+# would widen a surface that module exists to keep narrow; and an `env` block is
+# how every MCP client config already passes settings to a server, so this is
+# the knob users can actually reach.
+_TRANSPORT_ENV = "COMFY_MCP_TRANSPORT"
+_HTTP_HOST_ENV = "COMFY_MCP_HOST"
+_HTTP_PORT_ENV = "COMFY_MCP_PORT"
+_ALLOW_REMOTE_BIND_ENV = "COMFY_MCP_ALLOW_REMOTE_BIND"
+
+#: The SDK's transport names. `http` is accepted as an alias for
+#: `streamable-http` because that is what people type and what the issue asked
+#: for; `sse` is deliberately NOT offered — it is deprecated in the MCP spec,
+#: and offering a transport this server would then have to keep working is a
+#: cost with no asked-for benefit.
+_STDIO_TRANSPORT = "stdio"
+_HTTP_TRANSPORT = "streamable-http"
+_TRANSPORTS = {
+    "stdio": _STDIO_TRANSPORT,
+    "streamable-http": _HTTP_TRANSPORT,
+    "http": _HTTP_TRANSPORT,
+}
+
+#: Loopback, matching the SDK's own default for `run_streamable_http_async`.
+#: Stated here anyway rather than left implicit: the loopback default is the
+#: security property this whole block is organized around, and a default that
+#: lives only in a dependency is one an upgrade can change silently.
+_DEFAULT_HTTP_HOST = "127.0.0.1"
+#: The SDK's default port, restated for the same reason.
+_DEFAULT_HTTP_PORT = 8000
+
+
+def _resolve_transport(env: Mapping[str, str]) -> tuple[str, dict[str, Any]]:
+    """The transport to serve and its keyword arguments, read from ``env``.
+
+    Returns ``("stdio", {})`` when ``COMFY_MCP_TRANSPORT`` is unset or empty, so
+    an install that sets none of this serves exactly what it served before.
+
+    Raises :class:`ComfyCliError` rather than falling back to stdio on a bad
+    value. A typo (``COMFY_MCP_TRANSPORT=htp``) that quietly served stdio would
+    present to the user as a server that starts, accepts no connection on the
+    port they expected, and says nothing — the same silent-hang failure
+    :mod:`comfy_mcp.cli` exists to prevent for a human running the bare command.
+    """
+    requested = env.get(_TRANSPORT_ENV, "").strip()
+    if not requested:
+        return _STDIO_TRANSPORT, {}
+    transport = _TRANSPORTS.get(requested.lower())
+    if transport is None:
+        accepted = ", ".join(sorted(_TRANSPORTS))
+        raise ComfyCliError(
+            f"{_TRANSPORT_ENV}={requested!r} is not a transport this server "
+            f"serves (accepted: {accepted})."
+        )
+    if transport == _STDIO_TRANSPORT:
+        # Host and port are read ONLY on the HTTP path, so `COMFY_MCP_HOST` set
+        # alongside stdio is ignored rather than rejected. Ignoring is the safe
+        # direction here and is the reason it is not an error: the combination a
+        # user reaches it by — host set, transport forgotten — binds nothing at
+        # all, and refusing to start would turn a harmless leftover variable
+        # into an outage.
+        return _STDIO_TRANSPORT, {}
+    return _HTTP_TRANSPORT, {
+        "host": _resolve_http_host(env),
+        "port": _resolve_http_port(env),
+    }
+
+
+def _resolve_http_host(env: Mapping[str, str]) -> str:
+    """The bind address for the HTTP transport, loopback unless opted out of.
+
+    This is the decision comfy-mcp#273 settled: **loopback by default, with an
+    explicit opt-in for anything wider.** The reason is the one
+    :data:`_NETWORK_EXPOSURE_STAKES` already states for ComfyUI itself and which
+    applies with equal force to this server — it has no authentication, and
+    every tool it exposes drives a ComfyUI that has none either, so a bind to
+    ``0.0.0.0`` hands workflow execution and file access under ComfyUI's
+    directories to anything that can route to this host.
+
+    The opt-in is its own variable rather than a token in
+    ``COMFY_MCP_ASSUME_CONSENT``. That mechanism pre-answers an elicitation
+    PROMPT on behalf of an operator who will not be present when a tool call
+    asks; there is no prompt to pre-answer here, because the bind happens in
+    :func:`main` before any session exists and therefore before there is anyone
+    to ask. Keeping them separate also keeps the property that block's own
+    comment claims: authorizing one gate must not silently authorize a bind.
+
+    Classification is :func:`_address_is_loopback`, unchanged and fail-closed —
+    anything it cannot positively place as loopback (a DNS name, an obfuscated
+    literal, a typo) needs the opt-in. The cost of being wrong in that direction
+    is one environment variable; the cost the other way is an unauthenticated
+    listener.
+    """
+    host = env.get(_HTTP_HOST_ENV, "").strip() or _DEFAULT_HTTP_HOST
+    if _address_is_loopback(host):
+        return host
+    if _env_opted_in(env, _ALLOW_REMOTE_BIND_ENV):
+        return host
+    raise ComfyCliError(
+        f"{_HTTP_HOST_ENV}={host!r} is not a loopback address, and this server "
+        f"has NO authentication: binding it there would publish every tool it "
+        f"exposes — running arbitrary workflows, and reading and writing files "
+        f"under whichever directories ComfyUI was started with — to every "
+        f"machine that can reach this one. Serving on loopback and reaching it "
+        f"through a tunnel or a reverse proxy that authenticates is the safer "
+        f"shape. To bind it anyway, set {_ALLOW_REMOTE_BIND_ENV}=1."
+    )
+
+
+def _resolve_http_port(env: Mapping[str, str]) -> int:
+    """The listen port for the HTTP transport.
+
+    Defaults to :data:`_DEFAULT_HTTP_PORT`. A value that is not an integer in
+    range is named here rather than reaching the SDK, where it surfaces as a
+    ``uvicorn``/``socket`` error with no mention of the variable that caused it.
+    """
+    raw = env.get(_HTTP_PORT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_HTTP_PORT
+    try:
+        port = int(raw, 10)
+    except ValueError:
+        raise ComfyCliError(f"{_HTTP_PORT_ENV}={raw!r} is not an integer.") from None
+    return argv._guard_log_port(port)
+
+
+def _env_opted_in(env: Mapping[str, str], name: str) -> bool:
+    """Whether ``name`` carries an affirmative opt-in.
+
+    Deliberately narrow — ``1``, ``true``, ``yes``, ``on``, case-insensitive.
+    Anything else, INCLUDING a non-empty value like ``0`` or ``false``, is not
+    an opt-in: "the variable is set to something" is the wrong test for a
+    security decision, because the shape a user reaches it by is
+    ``COMFY_MCP_ALLOW_REMOTE_BIND=0`` meaning "no".
+    """
+    return env.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main(args: list[str] | None = None) -> None:
     """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
 
@@ -14740,7 +14890,14 @@ def main(args: list[str] | None = None) -> None:
         # JSON-RPC channel and must never be written to is only true under
         # stdio. 2.x defaults to "stdio" today, but a default is a thing a
         # future SDK is free to change, and this one is load-bearing.
-        mcp.run(transport="stdio")
+        #
+        # Resolved from the environment, defaulting to stdio (see
+        # `_resolve_transport`). The stdout rule is NOT relaxed under HTTP even
+        # though it could be: `failure_log` keeping one discipline for both
+        # transports is a smaller thing to reason about than a rule that holds
+        # conditionally, and nothing here needs stdout.
+        transport, transport_kwargs = _resolve_transport(os.environ)
+        mcp.run(transport=transport, **transport_kwargs)
     except PermissionError as exc:
         # Prefer the exception's structured `filename` over re-parsing its text:
         # it is the authoritative path, and it is present for errnos the text
@@ -14757,6 +14914,16 @@ def main(args: list[str] | None = None) -> None:
             flush=True,
         )
         raise SystemExit(1) from exc
+    except ComfyCliError as exc:
+        # A misconfigured transport, bind address or port. Reported on stderr —
+        # where MCP clients collect server logs, and the only channel that is
+        # safe before the transport is even chosen — and then a non-zero exit,
+        # the same posture the TCC branch above takes. Specifically NOT re-raised
+        # as a traceback: every one of these is a value a human typed into an
+        # `env` block, so the useful output names the variable, and a stack
+        # through `_resolve_transport` names nothing they can act on.
+        print(f"comfy-mcp: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from exc
 
 
 if __name__ == "__main__":
